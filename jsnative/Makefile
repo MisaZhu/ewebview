@@ -8,7 +8,7 @@ TARGET_DIR = $(BUILD_DIR)
 # root; only the browser-side natives (DOM/event/web/canvas bridges) live
 # here. Everything is archived into one libmario.a so xBrowser links a
 # single -lmario.
-MARIO_VM = $(PROJS_ROOT_DIR)/mario_js
+MARIO_VM = ../mario_js
 
 NATIVE_PATH = $(MARIO_VM)/lang/js/native
 NATIVES_PATH_BUILTIN = $(NATIVE_PATH)/builtin
