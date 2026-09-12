@@ -1,4 +1,4 @@
-PROJS_ROOT_DIR=../..
+PROJS_ROOT_DIR=..
 include $(PROJS_ROOT_DIR)/make.inc
 
 BUILD_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
