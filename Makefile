@@ -1,6 +1,6 @@
 export PORTING = ewokos
 
-DIRS = libwebp litehtml jsnative ewebview
+DIRS = libtinyhttpsc libwebp litehtml jsnative ewebview
 
 all: basic_libs
 	@echo "all done."

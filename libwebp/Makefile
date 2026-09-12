@@ -1,7 +1,7 @@
 PROJS_ROOT_DIR=..
 include $(PROJS_ROOT_DIR)/$(PORTING).inc
 
-BUILD_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
+BUILD_DIR = $(SDK_DIR)
 TARGET_DIR = $(BUILD_DIR)
 
 # src/ holds the private headers (webp_internal.h, webp_vp8*.h); include/
