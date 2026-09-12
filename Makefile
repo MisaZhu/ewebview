@@ -1,3 +1,5 @@
+export PORTING = ewokos
+
 DIRS = libwebp litehtml jsnative ewebview
 
 all: basic_libs

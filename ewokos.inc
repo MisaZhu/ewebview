@@ -7,7 +7,7 @@ ifeq ($(ewokos),)
 # ewokos=/abs/path explicitly.  ':=' (not '=') is required: it captures
 # $(lastword $(MAKEFILE_LIST)) == make.inc at parse time, before the variable
 # is re-expanded later from the including Makefile.
-export ewokos := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
+export ewokos := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 endif
 
 ifeq ($(ARCH),)

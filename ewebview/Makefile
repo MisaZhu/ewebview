@@ -1,5 +1,5 @@
 PROJS_ROOT_DIR=..
-include $(PROJS_ROOT_DIR)/make.inc
+include $(PROJS_ROOT_DIR)/$(PORTING).inc
 
 BUILD_DIR = $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
 TARGET_DIR = $(BUILD_DIR)
@@ -13,7 +13,7 @@ TARGET_DIR = $(BUILD_DIR)
 #
 # <litehtml.h> and <mario/*.h> come from $(TARGET_DIR)/include, installed by
 # the sibling litehtml/mario Makefiles, so ewebview must build after them
-# (see DIRS in ../Makefile). -I include comes from make.inc.
+# (see DIRS in ../Makefile). -I include comes from $(PORTING).inc.
 CXXFLAGS += -I porting/include -MMD -MP
 CFLAGS   += -I porting/include -MMD -MP
 
@@ -26,7 +26,8 @@ EWEBVIEW_OBJS = \
 	$(ARCH)/src/EWebCookies.o \
 	$(ARCH)/src/eweb_el_input.o
 
-PORT_OBJS = $(ARCH)/porting/port_ewokos.o
+#PORT_OBJS = $(ARCH)/porting/sdl2/port_sdl2.o
+PORT_OBJS = $(ARCH)/porting/ewokos/port_ewokos.o
 
 TASK_OBJS = $(EWEBVIEW_OBJS) $(PORT_OBJS)
 
