@@ -26,8 +26,7 @@ EWEBVIEW_OBJS = \
 	$(ARCH)/src/EWebCookies.o \
 	$(ARCH)/src/eweb_el_input.o
 
-#PORT_OBJS = $(ARCH)/porting/sdl2/port_sdl2.o
-PORT_OBJS = $(ARCH)/porting/ewokos/port_ewokos.o
+PORT_OBJS = $(ARCH)/porting/$(PORTING)/port_$(PORTING).o
 
 TASK_OBJS = $(EWEBVIEW_OBJS) $(PORT_OBJS)
 

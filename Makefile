@@ -1,4 +1,6 @@
+ifeq ($(PORTING),)
 export PORTING = ewokos
+endif
 
 DIRS = libtinyhttpsc libwebp litehtml jsnative ewebview
 
