@@ -3,7 +3,7 @@ export PORTING = sdl2
 endif
 
 PROJS_ROOT_DIR=../..
-include $(PROJS_ROOT_DIR)/$(PORTING).inc
+include $(PROJS_ROOT_DIR)/make.inc
 
 BUILD_DIR = $(SDK_DIR)
 TARGET_DIR = $(BUILD_DIR)
