@@ -59,11 +59,21 @@ endif
 
 OBJS = $(ARCH)/main.o $(ARCH)/compat.o
 
+# Project archives the link consumes. Listing them as prerequisites makes an
+# engine-only rebuild (a lib changes but main.o/compat.o do not) relink
+# sdlbrowser instead of silently keeping a stale binary. The top-level Makefile
+# builds every one of these before it descends here, so they always exist.
+PROJ_LIBS = $(TARGET_DIR)/lib/libewebview.a \
+            $(TARGET_DIR)/lib/liblitehtml.a \
+            $(TARGET_DIR)/lib/libmario_jsn.a \
+            $(TARGET_DIR)/lib/libwebp.a \
+            $(TARGET_DIR)/lib/libtinyhttpsc.a
+
 TARGET = $(TARGET_DIR)/bin/sdlbrowser
 
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
+$(TARGET): $(OBJS) $(PROJ_LIBS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(OBJS) -o $@ $(LDFLAGS) $(LIBS)
 	cp -r res $(dir $@)
