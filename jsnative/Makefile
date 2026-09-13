@@ -70,7 +70,7 @@ BROWSER_NATIVE_OBJS = \
 
 TASK_OBJS = $(VM_OBJS) $(NATIVE_OBJS) $(BROWSER_NATIVE_OBJS)
 
-TASK = $(TARGET_DIR)/lib/libmario.a
+TASK = $(TARGET_DIR)/lib/libmario_jsn.a
 
 # Public headers, installed as <mario/*.h>. js_natives_priv.h stays private.
 MARIO_HEADERS = $(MARIO_VM)/mario/mario.h \
