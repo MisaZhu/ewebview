@@ -19,6 +19,8 @@ namespace litehtml
 protected:
 	litehtml::element*			m_parent;
 	litehtml::document*			m_doc;
+		/* display:contents children already lifted into the parent. */
+		bool						m_contents_spliced;
 		litehtml::box*				m_box;
 		elements_vector				m_children;
 		position					m_pos;
@@ -142,6 +144,9 @@ protected:
 		 * protected m_children. Returns false when `el` is null. */
 		virtual bool				insertBefore(const ptr &el, const ptr &ref);
 		virtual void				clearRecursive();
+		/* display:contents support: lift this element's children into the
+		 * parent's child list (see element.cpp). */
+		void						splice_contents_children();
 
 		virtual const tchar_t*		get_tagName() const;
 		virtual void				set_tagName(const tchar_t* tag);

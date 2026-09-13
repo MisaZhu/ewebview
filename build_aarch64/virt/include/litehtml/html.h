@@ -61,6 +61,14 @@ namespace litehtml
 		virtual void				get_media_features(litehtml::media_features& media) const = 0;
 		virtual void				get_language(litehtml::tstring& language, litehtml::tstring & culture) const = 0;
 		virtual litehtml::tstring	resolve_color(const litehtml::tstring& color) const  { return litehtml::tstring(); }
+
+		/* Paint the flattened geometry of an inline <svg> element: `counts`
+		 * closed polygons (device-space x,y pairs in `pts`, counts[i] vertices
+		 * each) filled with non-zero winding in `color`. Default: ignored. */
+		virtual void				draw_svg(litehtml::uint_ptr hdc, const litehtml::position& pos,
+											const litehtml::web_color& color,
+											const float* pts, const int* counts, int nsubs)
+		{ (void)hdc; (void)pos; (void)color; (void)pts; (void)counts; (void)nsubs; }
 	};
 
 	void trim(tstring &s);

@@ -68,6 +68,7 @@ namespace litehtml
 		litehtml::size						m_size;
 		position::vector					m_fixed_boxes;
 		media_query_list::vector			m_media_lists;
+		std::vector<element*>				m_contents_splice;
 		element::ptr						m_over_element;
 		elements_vector						m_tabular_elements;
 		media_features						m_media;
@@ -120,6 +121,11 @@ namespace litehtml
 		 * Nodes already styled at creation or by an earlier call are skipped via
 		 * element::sheets_applied(), so moving an existing subtree is a no-op. */
 		void style_detached_subtree(element* el);
+		/* display:contents: elements whose children must be lifted into
+		 * the parent's child list before the next layout. Filled by
+		 * parse_styles, drained by render() - a single point where no
+		 * child-list iteration is in flight. */
+		void queue_contents_splice(element* el);
 		element::ptr					root();
 		void							get_fixed_boxes(position::vector& fixed_boxes);
 		void							add_fixed_box(const position& pos);
