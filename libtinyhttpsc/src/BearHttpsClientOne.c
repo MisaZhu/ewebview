@@ -81,7 +81,7 @@ int64_t ewok_https_days_from_civil(int year, unsigned month, unsigned day);
 const char* ewok_gai_strerror_compat(int ecode);
 void ewok_freeaddrinfo_compat(struct addrinfo *res);
 
-#define __linux__ 1
+//#define __linux__ 1
 #define __unix__ 1
 #define open ewok_https_open_compat
 #define read ewok_https_read_compat
@@ -821,7 +821,7 @@ SOFTWARE.
 //#define _GET_ADDR_INFO_DEFAULT_
 
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__ewokos__)
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -909,7 +909,7 @@ SOFTWARE.
 
 
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__ewokos__)
 
 #define UNI_INVALID_SOCKET -1
 #define UNI_SOCKET_ERROR -1
@@ -1032,7 +1032,7 @@ typedef struct hostent Universal_hostent;
 //silver_chain_scope_end
 
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__ewokos__)
 
 typedef int Universal_socket_int;
 
@@ -16804,6 +16804,7 @@ const br_config_option *br_get_config(void);
     || defined __OpenBSD__ \
     || defined __DragonFly__ \
     || defined __linux__ \
+    || defined __ewokos__ \
     || (defined __sun && (defined __SVR4 || defined __svr4__)) \
     || (defined __APPLE__ && defined __MACH__)
 #define BR_USE_URANDOM   1
@@ -16908,7 +16909,7 @@ const br_config_option *br_get_config(void);
  */
 
 #ifndef BR_USE_UNIX_TIME
-#if defined __unix__ || defined __linux__ \
+#if defined __unix__ || defined __linux__  ||  defined __ewokos__ \
     || defined _POSIX_SOURCE || defined _POSIX_C_SOURCE \
     || (defined __APPLE__ && defined __MACH__)
 #define BR_USE_UNIX_TIME   1
@@ -24729,7 +24730,7 @@ Universal_hostent *Universal_gethostbyname(const char *hostname){
 
 
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__ewokos__)
 
 extern const char* Universal_inet_ntoa(Universal_in_addr addr) {
   static char buffer[INET_ADDRSTRLEN];
@@ -24752,7 +24753,7 @@ extern ssize_t Universal_recv (int fd, void *buf, size_t n, int flags){
 
 
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__ewokos__)
 
 
 extern char *Universal_GetLastError(){
@@ -24775,7 +24776,7 @@ extern char *Universal_GetLastError(){
 //silver_chain_scope_end
 
 
-#if defined(__linux__)
+#if defined(__linux__)  || defined(__ewokos__)
 
 extern int Universal_start_all (){
     return 0;
@@ -69134,6 +69135,7 @@ br_ssl_client_init_full(br_ssl_client_context *cc,
     || defined __OpenBSD__ \
     || defined __DragonFly__ \
     || defined __linux__ \
+    || defined __ewokos__ \
     || (defined __sun && (defined __SVR4 || defined __svr4__)) \
     || (defined __APPLE__ && defined __MACH__)
 #define BR_USE_URANDOM   1
