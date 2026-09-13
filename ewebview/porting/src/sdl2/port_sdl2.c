@@ -877,6 +877,10 @@ static void ek_font_metrics(void* ud, eweb_font_t* h, int size, eweb_font_metric
     if(!out) return;
     out->ascent = out->descent = out->height = out->x_height = 0;
     if(!h) return;
+    /* font-size:0 (GitHub hides table headers with font-size:0!important):
+     * report zero metrics so the line box collapses instead of rasterising
+     * at the 12px backstop inside a 0-height row. */
+    if(size <= 0) return;
     f = F(h);
     /* Rasterise at device resolution so glyphs are crisp on HiDPI, but report
      * LOGICAL metrics: litehtml lays out with these numbers, so the page keeps
@@ -899,6 +903,7 @@ static int ek_font_char_width(void* ud, eweb_font_t* h, int size, uint32_t codep
     int minx = 0, maxx = 0, miny = 0, maxy = 0, adv = 0;
     (void)ud;
     if(!h) return 0;
+    if(size <= 0) return 0;   /* font-size:0 glyphs advance nothing */
     f = F(h);
     face = sdl_font_face(f, sdl2_font_px(size));   /* device-px face, logical result */
     if(!face) return 0;
@@ -931,6 +936,7 @@ static void ek_font_text_size(void* ud, eweb_font_t* h, int size, const char* te
     if(w)  *w  = 0;
     if(hh) *hh = 0;
     if(!h || !text) return;
+    if(size <= 0) return;   /* font-size:0 measures empty */
     f = F(h);
     face = sdl_font_face(f, sdl2_font_px(size));
     if(!face) return;
@@ -949,6 +955,7 @@ static void ek_font_draw_text(void* ud, eweb_surface_t* sh, int x, int y, const 
     SDL_Rect dst;
     (void)ud;
     if(!sh || !fh || !text || !text[0]) return;
+    if(size <= 0) return;   /* font-size:0 draws nothing */
     s = S(sh);
     if(!s->surf) return;
     f = F(fh);

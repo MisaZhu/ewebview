@@ -3875,7 +3875,11 @@ void litehtml::html_tag::init_font(const tchar_t* own_font_size, const tchar_t* 
 				m_font_size = sz.calc_percent(parent_sz);
 			} else if(sz.units() == css_units_none)
 			{
-				m_font_size = parent_sz;
+				/* CSS permits a unitless zero length ("font-size:0", which
+				 * GitHub uses to hide directory table headers); any other
+				 * unitless value is invalid here and inherits. Treating 0 as
+				 * inherit kept the hidden headers' glyphs at full size. */
+				m_font_size = (sz.val() == 0) ? 0 : parent_sz;
 			} else
 			{
 				if (doc)
@@ -5021,6 +5025,30 @@ void litehtml::html_tag::render_positioned(render_type rt)
 				{
 					need_render = true;
                     el->m_pos.height = new_height;
+				}
+			}
+
+			/* Definite non-percentage sizes must reach the box even when no
+			 * offsets are given (the sr-only / visually-hidden pattern relies on
+			 * width:1px;height:1px + overflow:hidden to vanish). Without a render
+			 * pass the element keeps an un-laid-out natural size and its text
+			 * paints over the page. */
+			if(!el_w.is_predefined() && el_w.units() != css_units_percentage)
+			{
+				int w = get_document()->cvt_units(el_w, el->get_font_size(), parent_width);
+				if(w >= 0 && el->m_pos.width != w)
+				{
+					el->m_pos.width = w;
+					need_render = true;
+				}
+			}
+			if(!el_h.is_predefined() && el_h.units() != css_units_percentage)
+			{
+				int h = get_document()->cvt_units(el_h, el->get_font_size(), parent_height);
+				if(h >= 0 && el->m_pos.height != h)
+				{
+					el->m_pos.height = h;
+					need_render = true;
 				}
 			}
 

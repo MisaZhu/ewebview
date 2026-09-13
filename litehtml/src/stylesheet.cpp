@@ -185,7 +185,45 @@ bool css::parse_selectors( const tstring& txt, const litehtml::style::ptr& style
 	tstring selector = txt;
 	trim(selector);
 	string_vector tokens;
-	split_string(selector, tokens, _t(","));
+	/* A selector list splits only on TOP-LEVEL commas: commas inside
+	 * :is(...)/:where(...)/:not(...), [attr="a,b"] or strings belong to the
+	 * selector itself. Naive splitting turned ":where(h1,h2,h3,h4,h5,h6) .x"
+	 * into bare h2..h5 selectors and re-styled every heading on the page
+	 * (GitHub's primer-brand sheet wraps its reset rules that way). */
+	{
+		int depth = 0;
+		tchar_t quote = 0;
+		const tchar_t* beg = selector.c_str();
+		const tchar_t* tok = beg;
+		for(const tchar_t* p = beg; ; p++)
+		{
+			if(!*p || (*p == _t(',') && !depth && !quote))
+			{
+				tstring one(tok, p - tok);
+				trim(one);
+				if(!one.empty()) tokens.push_back(one);
+				if(!*p) break;
+				tok = p + 1;
+			}
+			else if(quote)
+			{
+				if(*p == _t('\\') && p[1]) p++;
+				else if(*p == quote) quote = 0;
+			}
+			else if(*p == _t('"') || *p == _t('\''))
+			{
+				quote = *p;
+			}
+			else if(*p == _t('(') || *p == _t('['))
+			{
+				depth++;
+			}
+			else if(*p == _t(')') || *p == _t(']'))
+			{
+				depth--;
+			}
+		}
+	}
 
 	bool added_something = false;
 

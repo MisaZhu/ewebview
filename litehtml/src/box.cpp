@@ -221,7 +221,12 @@ void litehtml::line_box::finish(bool last_box)
 		{
 			font_metrics fm;
 			el->get_font(&fm);
-			el->m_pos.y = m_height - base_line - fm.ascent;
+			/* base_line() is the (negative) descent, i.e. the baseline sits at
+			 * m_height + base_line from the line top; the text box top is that
+			 * minus the ascent. Subtracting base_line instead pushed every glyph
+			 * 2*|descent| below its line box, so overflow:hidden ancestors sliced
+			 * the bottoms off (GitHub directory rows, table headers). */
+			el->m_pos.y = m_height + base_line - fm.ascent;
 		} else
 		{
 			switch(el->get_vertical_align())
