@@ -4,24 +4,6 @@
 #include <string.h>
 #include <stddef.h>
 #include <stdlib.h>
-#include <ewoksys/kernel_tic.h>
-#include <ewoksys/klog.h>
-
-/*
- * xBrowser render/network diagnostics. Silenced by default so the console is
- * not flooded during normal browsing; build with -DXBROWSER_DEBUG=1 to enable.
- * Mirrors the EWOK_HTTPS_TLS_DEBUG switch in libtinyhttpsc. The "if (0)" form
- * keeps argument expressions referenced so perf-timing locals do not trip
- * -Wunused when logging is off.
- */
-#ifndef XBROWSER_DEBUG
-#define XBROWSER_DEBUG 0
-#endif
-#if !XBROWSER_DEBUG
-/* Gate klog() itself (every klog() here is an [xBrowser] trace). The macro's
- * self-reference is not re-expanded, so the real klog() stays under "if (0)". */
-#define klog(...) do { if (0) klog(__VA_ARGS__); } while (0)
-#endif
 
 #ifdef LITEHTML_LIFETIME_DEBUG
 /* Authoritative, non-dereferencing liveness lookup for html_tag objects,
@@ -106,7 +88,7 @@ static dom_internal_profile_t g_dom_internal_profile = {};
 
 static inline void add_dom_internal_time(uint32_t& slot, uint64_t start_ms)
 {
-	slot += (uint32_t)(kernel_tic_ms(0) - start_ms);
+	slot += (uint32_t)(sys_tic_ms(0) - start_ms);
 }
 
 template<typename T, typename... Args>
@@ -115,7 +97,6 @@ static T* litehtml_alloc(const char* label, Args... args)
 	void* mem = malloc(sizeof(T));
 	if(!mem)
 	{
-		klog("[xBrowser] litehtml oom: %s size=%u\n", label, (unsigned)sizeof(T));
 		return nullptr;
 	}
 	return new (mem) T(args...);
@@ -136,7 +117,7 @@ static inline void add_create_node_time(uint32_t& slot, uint64_t start_ms)
 	{
 		return;
 	}
-	slot += (uint32_t)(kernel_tic_ms(0) - start_ms);
+	slot += (uint32_t)(sys_tic_ms(0) - start_ms);
 }
 
 static inline void dump_create_node_profile()
@@ -145,14 +126,6 @@ static inline void dump_create_node_profile()
 	{
 		return;
 	}
-	klog("[xBrowser] create node detail: calls=%u elements=%u text=%u attrs=%u ms create=%u ms children=%u ms text_split=%u ms\n",
-		g_create_node_profile.calls,
-		g_create_node_profile.element_nodes,
-		g_create_node_profile.text_nodes,
-		g_create_node_profile.attrs_ms,
-		g_create_node_profile.create_element_ms,
-		g_create_node_profile.children_ms,
-		g_create_node_profile.text_split_ms);
 }
 
 }
@@ -177,8 +150,6 @@ static inline void dump_create_node_profile()
 #include "el_div.h"
 #include "el_font.h"
 #include "el_tr.h"
-#include <ewoksys/kernel_tic.h>
-#include <ewoksys/klog.h>
 #include <math.h>
 #include <stdio.h>
 #include <algorithm>
@@ -215,35 +186,6 @@ void litehtml::reset_dom_internal_profile()
 
 void litehtml::dump_dom_internal_profile()
 {
-	klog("[xBrowser] dom internal: apply_stylesheet=%u/%u sel=%u/%u ms select_el=%u/%u ms get_style=%u(hit=%u steps=%u)/%u ms init_font=%u(inherit=%u)/%u ms text_parse=%u(transform=%u measure=%u)/%u ms get_font=%u(hit=%u miss=%u)/%u ms cvt_units=%u/%u ms color=%u/%u ms\n",
-		g_dom_internal_profile.apply_stylesheet_calls,
-		g_dom_internal_profile.apply_stylesheet_ms,
-		g_dom_internal_profile.apply_stylesheet_selectors,
-		g_dom_internal_profile.select_calls,
-		g_dom_internal_profile.select_element_calls,
-		g_dom_internal_profile.select_element_ms,
-		g_dom_internal_profile.get_style_calls,
-		g_dom_internal_profile.get_style_cache_hits,
-		g_dom_internal_profile.get_style_parent_steps,
-		g_dom_internal_profile.get_style_ms,
-		g_dom_internal_profile.init_font_calls,
-		g_dom_internal_profile.init_font_inherit_hits,
-		g_dom_internal_profile.init_font_ms,
-		g_dom_internal_profile.text_parse_calls,
-		g_dom_internal_profile.text_transform_ms,
-		g_dom_internal_profile.text_measure_ms,
-		g_dom_internal_profile.text_parse_ms,
-		g_dom_internal_profile.get_font_calls,
-		g_dom_internal_profile.get_font_cache_hits,
-		g_dom_internal_profile.get_font_cache_misses,
-		g_dom_internal_profile.get_font_ms,
-		g_dom_internal_profile.cvt_units_calls,
-		g_dom_internal_profile.cvt_units_ms,
-		g_dom_internal_profile.color_parse_calls,
-		g_dom_internal_profile.color_parse_ms);
-	klog("[xBrowser] dom internal 2: select=%u/%u ms\n",
-		g_dom_internal_profile.select_calls,
-		g_dom_internal_profile.select_ms);
 }
 
 void litehtml::profile_apply_stylesheet(uint32_t selector_count, uint64_t start_ms)
@@ -346,11 +288,8 @@ litehtml::document::ptr litehtml::document::createFromString( const tchar_t* str
 litehtml::document::ptr litehtml::document::createFromUTF8(const char* str, litehtml::document_container* objPainter, litehtml::context* ctx, litehtml::css* user_styles)
 {
 	uint32_t len = str ? (uint32_t)strlen(str) : 0;
-	uint64_t total_start = kernel_tic_ms(0);
 	reset_dom_internal_profile();
-	uint64_t gumbo_start = kernel_tic_ms(0);
 	GumboOutput* output = gumbo_parse_with_options(&kGumboDefaultOptions, (const char*) str, len);
-	uint32_t gumbo_ms = (uint32_t)(kernel_tic_ms(0) - gumbo_start);
 
 	litehtml::document::ptr doc = litehtml_alloc<litehtml::document>("document", objPainter, ctx);
 	if(!output)
@@ -367,10 +306,8 @@ litehtml::document::ptr litehtml::document::createFromUTF8(const char* str, lite
 
 	// Create litehtml::elements.
 	elements_vector root_elements;
-	uint64_t create_node_start = kernel_tic_ms(0);
 	reset_create_node_profile();
 	doc->create_node(output->root, root_elements);
-	uint32_t create_node_ms = (uint32_t)(kernel_tic_ms(0) - create_node_start);
 	if (!root_elements.empty())
 	{
 		doc->m_root = root_elements.back();
@@ -395,16 +332,11 @@ litehtml::document::ptr litehtml::document::createFromUTF8(const char* str, lite
 		 * stays inactive. */
 		doc->register_master_media_lists();
 
-		uint64_t master_css_start = kernel_tic_ms(0);
 		doc->m_root->apply_stylesheet(ctx->master_css());
-		uint32_t master_css_ms = (uint32_t)(kernel_tic_ms(0) - master_css_start);
 
-		uint64_t attrs_start = kernel_tic_ms(0);
 		doc->m_root->parse_attributes();
-		uint32_t attrs_ms = (uint32_t)(kernel_tic_ms(0) - attrs_start);
 
 		media_query_list::ptr media;
-		uint64_t inline_css_start = kernel_tic_ms(0);
 		for (css_text::vector::iterator css = doc->m_css.begin(); css != doc->m_css.end(); css++)
 		{
 			if (!css->media.empty())
@@ -419,49 +351,31 @@ litehtml::document::ptr litehtml::document::createFromUTF8(const char* str, lite
 		}
 		// Sort css selectors using CSS rules.
 		doc->m_styles.sort_selectors();
-		uint32_t inline_css_ms = (uint32_t)(kernel_tic_ms(0) - inline_css_start);
 
-		uint64_t media_start = kernel_tic_ms(0);
 		if (!doc->m_media_lists.empty())
 		{
 			doc->update_media_lists(doc->m_media);
 		}
-		uint32_t media_ms = (uint32_t)(kernel_tic_ms(0) - media_start);
 
-		uint64_t doc_css_start = kernel_tic_ms(0);
 		doc->m_root->apply_stylesheet(doc->m_styles);
-		uint32_t doc_css_ms = (uint32_t)(kernel_tic_ms(0) - doc_css_start);
 
-		uint64_t user_css_start = kernel_tic_ms(0);
 		if (user_styles)
 		{
 			doc->m_root->apply_stylesheet(*user_styles);
 		}
-		uint32_t user_css_ms = (uint32_t)(kernel_tic_ms(0) - user_css_start);
 
-		uint64_t parse_styles_start = kernel_tic_ms(0);
 		reset_parse_style_profile();
 		doc->m_root->parse_styles();
 		dump_parse_style_profile();
 		dump_dom_internal_profile();
-		uint32_t parse_styles_ms = (uint32_t)(kernel_tic_ms(0) - parse_styles_start);
 
 		// Now the m_tabular_elements is filled with tabular elements.
 		// We have to check the tabular elements for missing table elements
 		// and create the anonymous boxes in visual table layout
-		uint64_t fix_tables_start = kernel_tic_ms(0);
 		doc->fix_tables_layout();
-		uint32_t fix_tables_ms = (uint32_t)(kernel_tic_ms(0) - fix_tables_start);
 
 		// Fanaly initialize elements
-		uint64_t init_start = kernel_tic_ms(0);
 		doc->m_root->init();
-		uint32_t init_ms = (uint32_t)(kernel_tic_ms(0) - init_start);
-
-		klog("[xBrowser] create dom detail: gumbo=%u node=%u master_css=%u attrs=%u inline_css=%u media=%u doc_css=%u user_css=%u parse_styles=%u fix_tables=%u init=%u total=%u ms\n",
-			gumbo_ms, create_node_ms, master_css_ms, attrs_ms, inline_css_ms, media_ms,
-			doc_css_ms, user_css_ms, parse_styles_ms, fix_tables_ms, init_ms,
-			(uint32_t)(kernel_tic_ms(0) - total_start));
 	}
 
 	return doc;
@@ -560,7 +474,7 @@ litehtml::uint_ptr litehtml::document::add_font( const tchar_t* name, int size, 
 
 litehtml::uint_ptr litehtml::document::get_font( const tchar_t* name, int size, const tchar_t* weight, const tchar_t* style, const tchar_t* decoration, font_metrics* fm )
 {
-	uint64_t start_ms = kernel_tic_ms(0);
+	uint64_t start_ms = sys_tic_ms(0);
 	if( !name || (name && !t_strcasecmp(name, _t("inherit"))) )
 	{
 		name = m_container->get_default_font_name();
@@ -680,7 +594,7 @@ void litehtml::document::draw( uint_ptr hdc, int x, int y, const position* clip 
 
 int litehtml::document::cvt_units( const tchar_t* str, int fontSize, bool* is_percent/*= 0*/ ) const
 {
-	uint64_t start_ms = kernel_tic_ms(0);
+	uint64_t start_ms = sys_tic_ms(0);
 	if(!str)	return 0;
 	
 	css_length val;
@@ -696,7 +610,7 @@ int litehtml::document::cvt_units( const tchar_t* str, int fontSize, bool* is_pe
 
 int litehtml::document::cvt_units( css_length& val, int fontSize, int size ) const
 {
-	uint64_t start_ms = kernel_tic_ms(0);
+	uint64_t start_ms = sys_tic_ms(0);
 	if(val.is_predefined())
 	{
 		profile_cvt_units(start_ms);
@@ -948,12 +862,6 @@ void style_detached_subtree_walk(litehtml::element* el,
 	 * name and no children, so skipping them costs nothing. */
 	if(!litehtml_tag_is_live(el))
 	{
-		static int s_dwalk_skip_log = 0;
-		if(s_dwalk_skip_log < 24)
-		{
-			s_dwalk_skip_log++;
-			klog("[lhtml] dwalk skip unreg el=%p magic=%d\n", el, (int)el->is_live_handle());
-		}
 		return;
 	}
 #else
@@ -1134,7 +1042,7 @@ bool litehtml::document::update_media_lists(const media_features& features)
 void litehtml::document::update_master_styles()
 {
 	/* Legacy unbounded entry point: run the chunked update to completion. */
-	while(!update_master_styles_step(kernel_tic_ms(0) + 10000))
+	while(!update_master_styles_step(sys_tic_ms(0) + 10000))
 	{
 	}
 }
@@ -1147,7 +1055,7 @@ bool litehtml::document::style_step_exhausted()
 	}
 	/* Sampling the clock on every element visit is measurable on a 1k-node
 	 * tree; check it once per 64 visits instead. */
-	if((++m_step_visits & 63) == 0 && kernel_tic_ms(0) >= m_step_deadline)
+	if((++m_step_visits & 63) == 0 && sys_tic_ms(0) >= m_step_deadline)
 	{
 		m_step_exhausted = true;
 	}
@@ -1178,7 +1086,7 @@ bool litehtml::document::update_master_styles_step(uint64_t deadline_ms)
 	{
 		reset_dom_internal_profile();
 		reset_parse_style_profile();
-		m_step_start = kernel_tic_ms(0);
+		m_step_start = sys_tic_ms(0);
 		m_step_apply_ms = 0;
 		m_step_parse_ms = 0;
 		/* Stylesheets may have been (re)loaded since document creation; their
@@ -1197,7 +1105,7 @@ bool litehtml::document::update_master_styles_step(uint64_t deadline_ms)
 
 	if(m_step_phase == 1)
 	{
-		uint64_t walk_start = kernel_tic_ms(0);
+		uint64_t walk_start = sys_tic_ms(0);
 		/* Single resumable walk: html_tag::apply_stylesheet applies the master
 		 * sheet and m_styles per element while stepping, so stamps stay in one
 		 * epoch and a paused subtree resumes at the frontier. A second walk
@@ -1205,7 +1113,7 @@ bool litehtml::document::update_master_styles_step(uint64_t deadline_ms)
 		 * redo the whole master pass from the root, so small time slices never
 		 * reached the end of the tree. */
 		m_root->apply_stylesheet(m_context->master_css());
-		m_step_apply_ms += (uint32_t)(kernel_tic_ms(0) - walk_start);
+		m_step_apply_ms += (uint32_t)(sys_tic_ms(0) - walk_start);
 		if(m_step_exhausted)
 		{
 			return false;
@@ -1218,13 +1126,13 @@ bool litehtml::document::update_master_styles_step(uint64_t deadline_ms)
 	}
 	if(m_step_phase == 2)
 	{
-		if(kernel_tic_ms(0) >= m_step_deadline)
+		if(sys_tic_ms(0) >= m_step_deadline)
 		{
 			return false;
 		}
-		uint64_t walk_start = kernel_tic_ms(0);
+		uint64_t walk_start = sys_tic_ms(0);
 		m_root->parse_styles();
-		m_step_parse_ms += (uint32_t)(kernel_tic_ms(0) - walk_start);
+		m_step_parse_ms += (uint32_t)(sys_tic_ms(0) - walk_start);
 		if(m_step_exhausted)
 		{
 			return false;
@@ -1234,8 +1142,6 @@ bool litehtml::document::update_master_styles_step(uint64_t deadline_ms)
 	dump_parse_style_profile();
 	dump_dom_internal_profile();
 	litehtml::dump_apply_phase_profile();
-	klog("[xBrowser] update master styles: apply=%u ms parse=%u ms total=%u ms (chunked)\n",
-		m_step_apply_ms, m_step_parse_ms, (uint32_t)(kernel_tic_ms(0) - m_step_start));
 	return true;
 }
 
@@ -1295,14 +1201,12 @@ void litehtml::document::create_node(GumboNode* node, elements_vector& elements,
 			g_create_node_profile.element_nodes++;
 			string_map attrs;
 			GumboAttribute* attr;
-			uint64_t attrs_start = kernel_tic_ms(0);
+			uint64_t attrs_start = sys_tic_ms(0);
 			for (unsigned int i = 0; i < node->v.element.attributes.length; i++)
 			{
 				attr = (GumboAttribute*)node->v.element.attributes.data[i];
 				if(!attr || !attr->name || !attr->value)
 				{
-					klog("[xBrowser] create_node: skip invalid attr depth=%d idx=%u attr=%p name=%p value=%p\n",
-						depth, i, attr, attr ? attr->name : nullptr, attr ? attr->value : nullptr);
 					continue;
 				}
 				attrs[tstring(litehtml_from_utf8(attr->name))] = litehtml_from_utf8(attr->value);
@@ -1312,7 +1216,7 @@ void litehtml::document::create_node(GumboNode* node, elements_vector& elements,
 
 			element::ptr ret = nullptr;
 			const char* tag = gumbo_normalized_tagname(node->v.element.tag);
-			uint64_t create_start = kernel_tic_ms(0);
+			uint64_t create_start = sys_tic_ms(0);
 			if (tag && tag[0])
 			{
 				ret = create_element(litehtml_from_utf8(tag), attrs);
@@ -1331,14 +1235,13 @@ void litehtml::document::create_node(GumboNode* node, elements_vector& elements,
 			if (ret)
 			{
 				elements_vector child;
-				uint64_t children_start = kernel_tic_ms(0);
+				uint64_t children_start = sys_tic_ms(0);
 				for (unsigned int i = 0; i < node->v.element.children.length; i++)
 				{
 					child.clear();
 					GumboNode* child_node = static_cast<GumboNode*> (node->v.element.children.data[i]);
 					if(!child_node)
 					{
-						klog("[xBrowser] create_node: skip null child depth=%d idx=%u node=%p\n", depth, i, node);
 						continue;
 					}
 					create_node(child_node, child, depth + 1);
@@ -1355,7 +1258,7 @@ void litehtml::document::create_node(GumboNode* node, elements_vector& elements,
 	case GUMBO_NODE_TEXT:
 		{
 			g_create_node_profile.text_nodes++;
-			uint64_t text_start = kernel_tic_ms(0);
+			uint64_t text_start = sys_tic_ms(0);
 			std::string str;
 			std::string spaces;
 			const char* str_in = node->v.text.text;

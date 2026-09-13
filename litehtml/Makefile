@@ -6,8 +6,17 @@ TARGET_DIR = $(BUILD_DIR)
 
 LDFLAGS = -L $(TARGET_DIR)/lib
 
-CFLAGS += -Iinclude -Iinclude/litehtml -Iinclude/gumbo -I $(TARGET_DIR)/include -fno-rtti -nostdinc++ -MMD -MP
-CXXFLAGS += -Iinclude -Iinclude/litehtml -Iinclude/gumbo -I $(TARGET_DIR)/include -fno-rtti -nostdinc++ -MMD -MP
+# -nostdinc++ hides the toolchain's C++ standard headers so that EWOK_STL (installed
+# into the SDK include dir) is the only C++ stdlib in scope. That is correct for the
+# EwokOS port, but the native sdl2 port builds against the host libc++/libstdc++ and
+# its SDK include dir ships no STL - so keeping -nostdinc++ there makes <string>/
+# <vector> unfindable. Apply it only for ewokos.
+ifeq ($(PORTING),ewokos)
+LITEHTML_STL_FLAGS = -nostdinc++
+endif
+
+CFLAGS += -Iinclude -Iinclude/litehtml -Iinclude/gumbo -I $(TARGET_DIR)/include -fno-rtti $(LITEHTML_STL_FLAGS) -MMD -MP
+CXXFLAGS += -Iinclude -Iinclude/litehtml -Iinclude/gumbo -I $(TARGET_DIR)/include -fno-rtti $(LITEHTML_STL_FLAGS) -MMD -MP
 
 LITEHTML_OBJS = \
 	$(ARCH)/src/el_break.o \

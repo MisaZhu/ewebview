@@ -2,7 +2,7 @@ ifeq ($(PORTING),)
 export PORTING = ewokos
 endif
 
-DIRS = libtinyhttpsc libwebp litehtml jsnative ewebview
+DIRS = libtinyhttpsc libwebp jsnative litehtml ewebview
 
 all: basic_libs
 	@echo "all done."

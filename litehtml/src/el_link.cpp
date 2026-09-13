@@ -1,8 +1,6 @@
 #include "html.h"
 #include "el_link.h"
 #include "document.h"
-#include <ewoksys/klog.h>
-
 
 litehtml::el_link::el_link(litehtml::document* doc) : litehtml::html_tag(doc)
 {

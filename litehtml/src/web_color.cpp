@@ -3,7 +3,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
-#include <ewoksys/kernel_tic.h>
 
 namespace litehtml {
 void profile_color_parse(uint64_t start_ms);
@@ -260,7 +259,7 @@ litehtml::def_color litehtml::g_def_colors[] =
 
 litehtml::web_color litehtml::web_color::from_string(const tchar_t* str, litehtml::document_container* callback)
 {
-	uint64_t start_ms = kernel_tic_ms(0);
+	uint64_t start_ms = sys_tic_ms(0);
 	if(!str || !str[0])
 	{
 		litehtml::profile_color_parse(start_ms);

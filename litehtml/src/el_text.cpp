@@ -2,7 +2,6 @@
 #include "el_text.h"
 #include "document.h"
 #include <stdint.h>
-#include <ewoksys/kernel_tic.h>
 
 namespace litehtml {
 void profile_text_parse(uint32_t transform_ms, uint32_t measure_ms, uint64_t start_ms);
@@ -68,7 +67,7 @@ void litehtml::el_text::parse_styles(bool is_reparse)
 			step_doc->style_step_stamp(this);
 		}
 	}
-	uint64_t start_ms = kernel_tic_ms(0);
+	uint64_t start_ms = sys_tic_ms(0);
 	uint32_t transform_ms = 0;
 	uint32_t measure_ms = 0;
 	if(m_parent)
@@ -86,9 +85,9 @@ void litehtml::el_text::parse_styles(bool is_reparse)
 		document* doc = get_document();
 		if (doc && doc->container())
 		{
-			uint64_t transform_start = kernel_tic_ms(0);
+			uint64_t transform_start = sys_tic_ms(0);
 			doc->container()->transform_text(m_transformed_text, m_text_transform);
-			transform_ms += (uint32_t)(kernel_tic_ms(0) - transform_start);
+			transform_ms += (uint32_t)(sys_tic_ms(0) - transform_start);
 		}
 	}
 
@@ -127,9 +126,9 @@ void litehtml::el_text::parse_styles(bool is_reparse)
 		document* doc = get_document();
 		if (doc && doc->container())
 		{
-			uint64_t measure_start = kernel_tic_ms(0);
+			uint64_t measure_start = sys_tic_ms(0);
 			m_size.width	= doc->container()->text_width(m_use_transformed ? m_transformed_text.c_str() : m_text.c_str(), font);
-			measure_ms += (uint32_t)(kernel_tic_ms(0) - measure_start);
+			measure_ms += (uint32_t)(sys_tic_ms(0) - measure_start);
 		} else
 		{
 			m_size.width = 0;

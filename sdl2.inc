@@ -1,14 +1,4 @@
-ifeq ($(ewokos),)
-# Default the EwokOS root to THIS repo, derived from make.inc's own location
-# (projects/make.inc -> repo root) so it is always an absolute path.  The old
-# "~/work/ewokos" default was handed to gcc verbatim - neither make nor gcc
-# expands '~' - which broke every -I$(SDK_DIR)/... (e.g. FLTK's <X11/Xlib.h>
-# under include/nx11) unless the caller exported ewokos= or passed
-# ewokos=/abs/path explicitly.  ':=' (not '=') is required: it captures
-# $(lastword $(MAKEFILE_LIST)) == make.inc at parse time, before the variable
-# is re-expanded later from the including Makefile.
-export ewokos := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
-endif
+export ewebview_root := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 
 ifeq ($(ARCH),)
 export ARCH=aarch64
@@ -18,24 +8,23 @@ ifeq ($(HW),)
 export HW=virt
 endif
 
-EWOKOS_ROOT_DIR = $(ewokos)
-EWOKOS_SYS_DIR = $(EWOKOS_ROOT_DIR)/system
+SDK_DIR= $(ewebview_root)/build_$(ARCH)/$(HW)
 
-# All arch output dirs, so that clean removes objects of every arch,
-# not only the one selected by $(ARCH).
-ALL_ARCH_DIRS = aarch64 arm x86 riscv
-
-SDK_DIR= build_$(ARCH)/$(HW)
-
-include $(EWOKOS_SYS_DIR)/platform/$(ARCH)/make.rule
+include $(ewebview_root)/sdl2.rule
 
 LDFLAGS = -L $(SDK_DIR)/lib
-# LITEHTML_LIFETIME_DEBUG is NOT a verbose-logging switch (that is XBROWSER_DEBUG):
-# it compiles in the html_tag lifetime registry and the authoritative liveness
-# gates in apply_stylesheet/apply_stylesheet_own/style_detached_subtree_walk.
-# Without it those gates fall back to the element magic, which a freed node whose
-# block the mario VM recycled reads back as "live" - so the style walk matches a
-# dangling html_tag and aborts in selector_key_lower's std::string copy (w3.org
-# freezes the whole window). Keep it on in EVERY build, including production.
-CFLAGS += -I include -I $(SDK_DIR)/include -DLITEHTML_LIFETIME_DEBUG $(CFLAGS_EXTRA)
-CXXFLAGS += -I include -I $(SDK_DIR)/include -DLITEHTML_LIFETIME_DEBUG $(CXXFLAGS_EXTRA)
+
+# SDL2 (plus companion SDL2_image/_ttf/_gfx) headers for the native sdl2 port:
+# port_sdl2.c includes <SDL.h>, <SDL_image.h>, <SDL_ttf.h>,
+# <SDL2_gfxPrimitives.h> and <SDL2_rotozoom.h>. Homebrew installs all of them
+# into the same include/SDL2 dir, so sdl2-config's --cflags (portable across
+# Apple Silicon /opt/homebrew, Intel /usr/local and Linux distros) covers them
+# and adds -D_THREAD_SAFE. Guarded so a host without sdl2-config still parses.
+SDL2_CONFIG := $(shell command -v sdl2-config 2>/dev/null)
+ifneq ($(SDL2_CONFIG),)
+CFLAGS_EXTRA   += $(shell $(SDL2_CONFIG) --cflags)
+CXXFLAGS_EXTRA += $(shell $(SDL2_CONFIG) --cflags)
+endif
+
+CFLAGS += -I include -I $(SDK_DIR)/include $(CFLAGS_EXTRA)
+CXXFLAGS += -I include -I $(SDK_DIR)/include $(CXXFLAGS_EXTRA)

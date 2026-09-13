@@ -1,7 +1,7 @@
 // litehtml document_container for ewebview, driven entirely by the porting HAL.
 //
 // Ported from widget++'s XContainer.cc. Platform calls map onto eweb_port_t:
-//   kernel_tic_ms     -> clock.tic_ms
+//   sys_tic_ms     -> clock.tic_ms
 //   font_*            -> font.*
 //   graph_*           -> gfx.*
 //   vfs_readfile      -> net.read_file

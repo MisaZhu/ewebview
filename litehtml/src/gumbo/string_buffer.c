@@ -20,7 +20,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <ewoksys/klog.h>
 
 #include "string_piece.h"
 #include "util.h"

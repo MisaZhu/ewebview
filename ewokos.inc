@@ -38,5 +38,5 @@ LDFLAGS = -L $(SDK_DIR)/lib
 # block the mario VM recycled reads back as "live" - so the style walk matches a
 # dangling html_tag and aborts in selector_key_lower's std::string copy (w3.org
 # freezes the whole window). Keep it on in EVERY build, including production.
-CFLAGS += -I include -I $(SDK_DIR)/include -DLITEHTML_LIFETIME_DEBUG $(CFLAGS_EXTRA)
-CXXFLAGS += -I include -I $(SDK_DIR)/include -DLITEHTML_LIFETIME_DEBUG $(CXXFLAGS_EXTRA)
+CFLAGS += -I include -I $(SDK_DIR)/include $(CFLAGS_EXTRA)
+CXXFLAGS += -I include -I $(SDK_DIR)/include $(CXXFLAGS_EXTRA)

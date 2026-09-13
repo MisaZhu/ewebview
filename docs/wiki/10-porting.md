@@ -70,7 +70,7 @@ EwokOS 移植是纯 C99、不足 400 行，结构就是"一组 `ek_*` 静态函�
 | net.request | tinyhttpsc/BearSSL；`SetTimeout(10000)` + **`SetMaxRedirections(0)`**（重定向交给核心） |
 | net.read_file | `vfs_readfile` |
 | net.resolve_resource | `x_get_res_name`（`res://`） |
-| clock | `kernel_tic_ms(0)` / `proc_usleep` |
+| clock | `sys_tic_ms(0)` / `proc_usleep` |
 | sys | `ewok_ptr_in_heap` / `klog` |
 
 **按需链接**：`port_ewokos.o` 编进 `libewebview.a`，但只有嵌入者真的调用了 `eweb_port_ewokos()` 才会被链接器拉入——外部平台链接 `libewebview.a` 并提供自己的移植时，**完全不会引入** graph/font/tinyhttpsc 符号（Makefile 头部注释即此设计）。

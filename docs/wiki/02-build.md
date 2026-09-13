@@ -124,7 +124,7 @@ cd litehtml/hosttest && ./build.sh   # 产出 build/lhtest
 ```
 
 - `main.cpp`：一个极简 `document_container`（假字体度量、记录 draw 调用），加载真实 HTML+CSS 后 dump 计算样式与几何；
-- `stub/ewoksys/*.h`、`stubs.c`：把 litehtml 里引用的少量 EwokOS 符号（`kernel_tic_ms`、`klog`）打桩；
+- `stub/ewoksys/*.h`、`stubs.c`：把 litehtml 里引用的少量 EwokOS 符号（`sys_tic_ms`、`klog`）打桩；
 - 用途：**不起 QEMU 就能复现排版问题**（样式缺失、宽高异常、选择器匹配）。移植或修 litehtml bug 时先在这里验证，比全链路 QEMU 快几个数量级。
 
 ## 2.7 调试开关

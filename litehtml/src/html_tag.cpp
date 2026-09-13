@@ -8,26 +8,7 @@
 #include <locale>
 #include <stdint.h>
 #include <string.h>
-#include <ewoksys/kernel_tic.h>
-#include <ewoksys/klog.h>
 #include "el_before_after.h"
-
-/*
- * xBrowser render/network diagnostics. Silenced by default so the console is
- * not flooded during normal browsing; build with -DXBROWSER_DEBUG=1 to enable.
- * Mirrors the EWOK_HTTPS_TLS_DEBUG switch in libtinyhttpsc. The "if (0)" form
- * keeps argument expressions referenced so perf-timing locals do not trip
- * -Wunused when logging is off. The [litehtml] corruption guard log below is
- * intentionally NOT gated: it only fires on real DOM slot corruption.
- */
-#ifndef XBROWSER_DEBUG
-#define XBROWSER_DEBUG 0
-#endif
-#if XBROWSER_DEBUG
-#define WB_LOG(...) klog(__VA_ARGS__)
-#else
-#define WB_LOG(...) do { if (0) klog(__VA_ARGS__); } while (0)
-#endif
 
 /*
  * O(1), non-dereferencing heap-membership test provided by the EwokOS libc
@@ -221,21 +202,21 @@ static inline void parse_style_profile_add(uint32_t& slot, uint64_t start_ms)
 {
 	if(g_parse_style_profile_active)
 	{
-		slot += (uint32_t)(kernel_tic_ms(0) - start_ms);
+		slot += (uint32_t)(sys_tic_ms(0) - start_ms);
 	}
 }
 
 struct select_scope_t
 {
 	uint64_t start_ms;
-	select_scope_t(): start_ms(kernel_tic_ms(0)) {}
+	select_scope_t(): start_ms(sys_tic_ms(0)) {}
 	~select_scope_t() { litehtml::profile_select(start_ms); }
 };
 
 struct select_element_scope_t
 {
 	uint64_t start_ms;
-	select_element_scope_t(): start_ms(kernel_tic_ms(0)) {}
+	select_element_scope_t(): start_ms(sys_tic_ms(0)) {}
 	~select_element_scope_t() { litehtml::profile_select_element(start_ms); }
 };
 
@@ -255,17 +236,6 @@ void dump_parse_style_profile()
 	{
 		return;
 	}
-	WB_LOG("[xBrowser] parse styles detail: nodes=%u inline=%u ms init_font=%u ms basic=%u ms flow=%u ms size=%u ms box=%u ms line_list=%u ms background=%u ms children=%u ms\n",
-		g_parse_style_profile.nodes,
-		g_parse_style_profile.inline_style_ms,
-		g_parse_style_profile.init_font_ms,
-		g_parse_style_profile.basic_ms,
-		g_parse_style_profile.flow_ms,
-		g_parse_style_profile.size_ms,
-		g_parse_style_profile.box_ms,
-		g_parse_style_profile.line_list_ms,
-		g_parse_style_profile.background_ms,
-		g_parse_style_profile.child_ms);
 	g_parse_style_profile_active = false;
 }
 
@@ -606,8 +576,6 @@ size_t litehtml_lifetime_count()
  * document::update_master_styles_step when a chunked update completes. */
 void litehtml::dump_apply_phase_profile()
 {
-	WB_LOG("[xBrowser] apply phases: calls=%u cand=%u ms match=%u ms add=%u ms recur=%u ms\n",
-		g_apply_calls, g_apply_cand_ms, g_apply_match_ms, g_apply_add_ms, g_apply_recur_ms);
 	g_apply_calls = 0;
 	g_apply_cand_ms = 0;
 	g_apply_match_ms = 0;
@@ -622,14 +590,7 @@ void litehtml::html_tag::apply_stylesheet( const litehtml::css& stylesheet )
 #ifdef LITEHTML_LIFETIME_DEBUG
 	if(!litehtml_tag_is_live(this))
 	{
-		/* Freed html_tag still linked in the tree: log the parent chain so the
-		 * mutation that left it behind can be identified, then prune. */
-		WB_LOG("[lhtml] UAF apply_stylesheet el=%p parent=%p\n", this, parent());
-		for(element* a = parent(); a; a = a->parent())
-		{
-			WB_LOG("[lhtml]   ^ %s=%p live=%d kids=%d\n", a->get_tagName(), a,
-				(int)litehtml_tag_is_live(a), (int)a->get_children_count());
-		}
+		/* Freed html_tag still linked in the tree: prune it. */
 		return;
 	}
 #endif
@@ -699,23 +660,18 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 	/* Backstop for every caller (apply_stylesheet and the detached-subtree
 	 * walk): never match styles against a freed html_tag. Reading m_class_values
 	 * off a block the mario VM has recycled aborts in selector_key_lower. The
-	 * registry lookup is non-dereferencing, so it is safe here, and logging the
-	 * element magic alongside it exposes a recycled block whose magic offset
-	 * still reads "live". */
+	 * registry lookup is non-dereferencing, so it is safe here. */
 	if(!litehtml_tag_is_live(this))
 	{
-		WB_LOG("[lhtml] UAF apply_stylesheet_own el=%p magic=%d parent=%p\n",
-			this, (int)is_live_handle(), parent());
 		return;
 	}
 #endif
 	m_sheets_applied = true;
 	if((const void*)&stylesheet == nullptr)
 	{
-		klog("[xBrowser] apply_stylesheet: NULL stylesheet on tag=%s\n", m_tag.c_str());
 		return;
 	}
-	uint64_t apply_start = kernel_tic_ms(0);
+	uint64_t apply_start = sys_tic_ms(0);
 	if(stylesheet.has_before_after())
 	{
 		remove_before_after();
@@ -860,7 +816,7 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 
 	css::selector_index& sel_idx = stylesheet.get_selector_index();
 	std::vector<int> candidates;
-	uint64_t cand_start = kernel_tic_ms(0);
+	uint64_t cand_start = sys_tic_ms(0);
 	{
 		uint32_t epoch = sel_idx.begin_visit();
 		auto push_bucket = [&](const css::selector_index::key_t& key)
@@ -900,29 +856,7 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 			key.second = selector_key_lower(tstring(own_id_attr));
 			push_bucket(key);
 		}
-#if defined(LITEHTML_LIFETIME_DEBUG) && XBROWSER_DEBUG
-		/* Mirror of ewok_stl string's private layout, used to validate each
-		 * class value before selector_key_lower copies it: the crash this
-		 * diagnoses reads a freed mario-VM buffer through a stale vector. */
-		struct str_layout { char* d; size_t len; size_t cap; };
-		for(size_t c = 0; c < m_class_values.size(); c++)
-		{
-			const str_layout& sl = (const str_layout&)m_class_values[c];
-			if(sl.len + 1 > sl.cap || sl.cap > (size_t)64 * 1024 * 1024)
-			{
-				WB_LOG("[lhtml] bad class vec: tag=%p(%s) live=%d n=%u [%u] d=%p len=%u cap=%u head=%.16s\n",
-					this, m_tag.c_str(), (int)litehtml_tag_is_live(this),
-					(unsigned)m_class_values.size(), (unsigned)c,
-					sl.d, (unsigned)sl.len, (unsigned)sl.cap, sl.d ? sl.d : "");
-				for(element* a = parent(); a; a = a->parent())
-				{
-					WB_LOG("[lhtml]   ^ %s=%p live=%d\n", a->get_tagName(), a,
-						(int)litehtml_tag_is_live(a));
-				}
-				break;
-			}
-		}
-#endif
+
 		for(size_t c = 0; c < m_class_values.size(); c++)
 		{
 			key.first = 1;
@@ -931,12 +865,12 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 		}
 		std::sort(candidates.begin(), candidates.end());
 	}
-	g_apply_cand_ms += kernel_tic_ms(0) - cand_start;
+	g_apply_cand_ms += sys_tic_ms(0) - cand_start;
 	g_apply_calls++;
 
 	for(size_t ci = 0; ci < candidates.size(); ci++)
 	{
-		uint64_t match_start = kernel_tic_ms(0);
+		uint64_t match_start = sys_tic_ms(0);
 		const litehtml::css_selector::ptr& sel = stylesheet.selectors()[candidates[ci]];
 		if(!sel->is_media_valid())
 		{
@@ -950,7 +884,7 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 
 		if(apply == select_no_match)
 		{
-			g_apply_match_ms += kernel_tic_ms(0) - match_start;
+			g_apply_match_ms += sys_tic_ms(0) - match_start;
 			continue;
 		}
 		if(apply & select_match_pseudo_class)
@@ -958,12 +892,12 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 			apply = select(*sel, true);
 			if(apply == select_no_match)
 			{
-				g_apply_match_ms += kernel_tic_ms(0) - match_start;
+				g_apply_match_ms += sys_tic_ms(0) - match_start;
 				continue;
 			}
 		}
-		g_apply_match_ms += kernel_tic_ms(0) - match_start;
-		uint64_t add_start = kernel_tic_ms(0);
+		g_apply_match_ms += sys_tic_ms(0) - match_start;
+		uint64_t add_start = sys_tic_ms(0);
 
 		if(apply != select_no_match)
 		{
@@ -1002,7 +936,7 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 				}
 			}
 		}
-		g_apply_add_ms += (uint32_t)(kernel_tic_ms(0) - add_start);
+		g_apply_add_ms += (uint32_t)(sys_tic_ms(0) - add_start);
 	}
 
 	/* The children walk and the per-root phase dump live in the
@@ -1066,7 +1000,7 @@ litehtml::uint_ptr litehtml::html_tag::get_font(font_metrics* fm)
 
 const litehtml::tchar_t* litehtml::html_tag::get_style_property( const tchar_t* name, bool inherited, const tchar_t* def /*= 0*/ )
 {
-	uint64_t start_ms = kernel_tic_ms(0);
+	uint64_t start_ms = sys_tic_ms(0);
 	if(!name)
 	{
 		litehtml::profile_get_style_property(false, 0, start_ms);
@@ -1532,7 +1466,7 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	if(profile_enabled)
 	{
 		g_parse_style_profile.nodes++;
-		part_start = kernel_tic_ms(0);
+		part_start = sys_tic_ms(0);
 	}
 	const tchar_t* style = get_attr(_t("style"));
 
@@ -1543,7 +1477,7 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	if(profile_enabled)
 	{
 		parse_style_profile_add(g_parse_style_profile.inline_style_ms, part_start);
-		part_start = kernel_tic_ms(0);
+		part_start = sys_tic_ms(0);
 	}
 
 	/* Resolve --custom-properties (inherited + own) and rewrite var()/
@@ -1559,7 +1493,7 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	if(profile_enabled)
 	{
 		parse_style_profile_add(g_parse_style_profile.init_font_ms, part_start);
-		part_start = kernel_tic_ms(0);
+		part_start = sys_tic_ms(0);
 	}
 	document* doc = get_document();
 	element::ptr el_parent = parent();
@@ -1641,7 +1575,7 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	if(profile_enabled)
 	{
 		parse_style_profile_add(g_parse_style_profile.basic_ms, part_start);
-		part_start = kernel_tic_ms(0);
+		part_start = sys_tic_ms(0);
 	}
 
 	if(m_el_position != element_position_static)
@@ -1752,7 +1686,7 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 				step_doc->style_step_stamp(this);
 			}
 			if(profile_enabled)
-				part_start = kernel_tic_ms(0);
+				part_start = sys_tic_ms(0);
 			for(auto& el : m_children)
 			{
 				if(step_parse && step_doc->style_step_exhausted())
@@ -1838,7 +1772,7 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 				step_doc->style_step_stamp(this);
 			}
 			if(profile_enabled)
-				part_start = kernel_tic_ms(0);
+				part_start = sys_tic_ms(0);
 			for(auto& el : m_children)
 			{
 				if(step_parse && step_doc->style_step_exhausted())
@@ -1887,7 +1821,7 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	}
 
 	if(profile_enabled)
-		part_start = kernel_tic_ms(0);
+		part_start = sys_tic_ms(0);
 	m_css_text_indent.fromString(	get_style_property(_t("text-indent"),	true,	_t("0")),	_t("0"));
 
 	const tchar_t* own_width = get_style_property_own(_t("width"));
@@ -1993,7 +1927,7 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	if(profile_enabled)
 	{
 		parse_style_profile_add(g_parse_style_profile.size_ms, part_start);
-		part_start = kernel_tic_ms(0);
+		part_start = sys_tic_ms(0);
 	}
 
 	const tchar_t* own_margin_left = get_style_property_own(_t("margin-left"));
@@ -2180,7 +2114,7 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	if(profile_enabled)
 	{
 		parse_style_profile_add(g_parse_style_profile.box_ms, part_start);
-		part_start = kernel_tic_ms(0);
+		part_start = sys_tic_ms(0);
 	}
 
 	const tchar_t* own_line_height = get_style_property_own(_t("line-height"));
@@ -2238,7 +2172,7 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	if(profile_enabled)
 	{
 		parse_style_profile_add(g_parse_style_profile.line_list_ms, part_start);
-		part_start = kernel_tic_ms(0);
+		part_start = sys_tic_ms(0);
 	}
 
 	parse_background();
@@ -2254,7 +2188,7 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 			step_doc->style_step_stamp(this);
 		}
 		if(profile_enabled)
-			part_start = kernel_tic_ms(0);
+			part_start = sys_tic_ms(0);
 		for(auto& el : m_children)
 		{
 			if(step_parse && step_doc->style_step_exhausted())
@@ -3764,7 +3698,7 @@ void litehtml::html_tag::init_font()
 
 void litehtml::html_tag::init_font(const tchar_t* own_font_size, const tchar_t* own_name, const tchar_t* own_weight, const tchar_t* own_style, const tchar_t* own_decoration)
 {
-	uint64_t start_ms = kernel_tic_ms(0);
+	uint64_t start_ms = sys_tic_ms(0);
 	bool inherit_fast = false;
 	static const tchar_t* s_inherit = _t("inherit");
 
@@ -5339,8 +5273,8 @@ void litehtml::html_tag::get_redraw_box(litehtml::position& pos, int x /*= 0*/, 
  * (e.g. 0x473e / 0x5ca2), and the very next e->get_display() / e->select()
  * dereferences it and takes a data abort deep inside the CSS sibling walk
  * (html_tag::find_adjacent_sibling). ewok_ptr_in_heap rejects such a pointer
- * WITHOUT reading through it, so we skip the damaged slot, keep the page
- * rendering, and log which node was hit to pinpoint the corruption source.
+ * WITHOUT reading through it, so we skip the damaged slot and keep the page
+ * rendering.
  */
 static bool child_slot_sane(const litehtml::html_tag* parent, const litehtml::element* e, int idx, int count, const char* walk)
 {
@@ -5348,8 +5282,6 @@ static bool child_slot_sane(const litehtml::html_tag* parent, const litehtml::el
 	{
 		return true;
 	}
-	klog("[litehtml] %s: corrupt m_children slot parent=%s idx=%d/%d bad=%p\n",
-		walk, parent ? parent->get_tagName() : _t("?"), idx, count, (void*)e);
 	return false;
 }
 

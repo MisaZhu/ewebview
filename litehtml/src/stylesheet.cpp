@@ -2,22 +2,6 @@
 #include "stylesheet.h"
 #include <algorithm>
 #include "document.h"
-#include <ewoksys/klog.h>
-
-/*
- * xBrowser render/network diagnostics. Silenced by default so the console is
- * not flooded during normal browsing; build with -DXBROWSER_DEBUG=1 to enable.
- * The "if (0)" form keeps argument expressions referenced so perf-timing
- * locals do not trip -Wunused when logging is off.
- */
-#ifndef XBROWSER_DEBUG
-#define XBROWSER_DEBUG 0
-#endif
-#if !XBROWSER_DEBUG
-/* Gate klog() itself (every klog() here is an [xBrowser] trace). The macro's
- * self-reference is not re-expanded, so the real klog() stays under "if (0)". */
-#define klog(...) do { if (0) klog(__VA_ARGS__); } while (0)
-#endif
 
 namespace litehtml
 {
@@ -326,8 +310,6 @@ css::selector_index& css::get_selector_index() const
 		 }
 	);
 	m_index.built = true;
-	klog("[xBrowser] selector index: buckets=%u universal=%u selectors=%u\n",
-		(unsigned)m_index.buckets.size(), (unsigned)m_index.universal.size(), (unsigned)m_selectors.size());
 	return m_index;
 }
 

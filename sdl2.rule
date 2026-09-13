@@ -1,0 +1,69 @@
+# use ccache transparently when installed (brew install ccache)
+CCACHE := $(shell command -v ccache 2>/dev/null)
+
+#PREIX = aarch64-none-elf-
+
+AR = $(PREIX)ar
+AS = $(PREIX)as
+CC = $(CCACHE) $(PREIX)gcc
+CXX = $(CCACHE) $(PREIX)c++
+LD_BIN = aarch64-none-elf-ld
+# ensure the output directory exists before linking (parallel-safe)
+LD = mkdir -p $(dir $@) && $(LD_BIN)
+OBJDUMP =  $(PREIX)objdump
+
+
+CFLAGS =  -march=armv8-a -Wno-incompatible-pointer-types -Wno-int-conversion \
+		-Wno-implicit-function-declaration \
+        -Wall -Wextra -fPIC \
+		-fno-builtin-memcpy \
+		-fno-builtin-memmove \
+		-fno-builtin-memset \
+        -Wno-unused-parameter \
+		-mstrict-align \
+        -mno-outline-atomics \
+        -std=c99
+
+CXXFLAGS = -march=armv8-a \
+        -Wall -Wextra -fPIC \
+		-fno-builtin-memcpy \
+		-fno-builtin-memmove \
+		-fno-builtin-memset \
+        -Wno-unused-parameter \
+        -pedantic \
+		-fno-rtti \
+		-mstrict-align \
+        -mno-outline-atomics \
+        -fno-exceptions \
+        -fno-use-cxa-atexit \
+        -std=c++14
+
+ifeq ($(DEBUG),yes)
+CFLAGS +=  -g
+CXXFLAGS +=  -g
+else
+CFLAGS +=  -O2
+CXXFLAGS +=  -O2
+endif
+
+STL_HEADERS_STAMP = $(BUILD_DIR)/include/.stl_headers_timestamp
+
+$(ARCH)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(ARCH)/%.o: %.cc
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(ARCH)/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(ARCH)/%.o: %.S
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(ARCH)/%.o: %.s
+	@mkdir -p $(dir $@)
+	$(AS) $(ARCH_CFLAGS) -o $@ $<

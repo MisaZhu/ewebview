@@ -37,8 +37,8 @@ SOFTWARE.
 #include <sys/errno.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <netdb.h>
 #include <sys/time.h>
-#include <ewokos_config.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -81,7 +81,7 @@ int64_t ewok_https_days_from_civil(int year, unsigned month, unsigned day);
 const char* ewok_gai_strerror_compat(int ecode);
 void ewok_freeaddrinfo_compat(struct addrinfo *res);
 
-#define __linux__ 1
+//#define __linux__ 1
 #define __unix__ 1
 #define open ewok_https_open_compat
 #define read ewok_https_read_compat
@@ -94,24 +94,6 @@ void ewok_freeaddrinfo_compat(struct addrinfo *res);
 
 #define EWOK_HTTPS_FAKE_URANDOM_FD (-0x7070)
 
-/*
- * TLS handshake diagnostics. Off by default; build with
- * -DEWOK_HTTPS_TLS_DEBUG=1 to re-enable the dns/read/write/http_tx traces.
- * klog() lives in libewoksys, which this library already depends on at link
- * time (kernel_tic/proc_usleep in the glue below). It is forward-declared here
- * rather than including <ewoksys/klog.h> to avoid include-path coupling and to
- * stay clear of the open/read/close/select/getsockopt macro remaps above.
- */
-#ifndef EWOK_HTTPS_TLS_DEBUG
-#define EWOK_HTTPS_TLS_DEBUG 0
-#endif
-#if EWOK_HTTPS_TLS_DEBUG
-extern void klog(const char *format, ...);
-#define EWOK_TLS_LOG(...) klog(__VA_ARGS__)
-#else
-#define EWOK_TLS_LOG(...) ((void)0)
-#endif
-
 uint64_t ewok_https_entropy_state = 0;
 
 uint64_t ewok_https_entropy_word(void) {
@@ -122,7 +104,7 @@ uint64_t ewok_https_entropy_word(void) {
     mix = usec;
     mix ^= ((uint64_t)(uint32_t)time(NULL) << 32);
     mix ^= (uint64_t)(uint32_t)getpid();
-    mix ^= (uint64_t)(ewokos_addr_t)&mix;
+    mix ^= (uint64_t)&mix;
     mix ^= ewok_https_entropy_state + 0x9e3779b97f4a7c15ULL;
     mix ^= mix << 13;
     mix ^= mix >> 7;
@@ -469,8 +451,6 @@ void ewok_freeaddrinfo_compat(struct addrinfo *res) {
 #define EINVAL 22
 #endif
 
-#define __linux__ 1
-#define __unix__ 1
 #ifndef BearsslHttps_allocate
 #define BearsslHttps_allocate malloc
 #endif
@@ -63434,7 +63414,7 @@ br_rsa_i15_private(unsigned char *x, const br_rsa_private_key *sk)
      * Ensure 32-bit alignment for value words.
      */
     mq = tmp;
-    if (((ewokos_addr_t)mq & 2) == 0) {
+    if (((size_t)mq & 2) == 0) {
         mq ++;
     }
 
@@ -64059,7 +64039,7 @@ br_rsa_i15_public(unsigned char *x, size_t xlen,
      * on a 32-bit boundary.
      */
     m = tmp;
-    if (((ewokos_addr_t)m & 2) == 0) {
+    if (((size_t)m & 2) == 0) {
         m ++;
     }
     a = m + fwlen;
