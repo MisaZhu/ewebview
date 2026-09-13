@@ -210,6 +210,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_engineScrollX(0)
     , m_engineScrollY(0)
     , m_needsStyleUpdate(false)
+    , m_styleNeedSince(0)
     , m_needsLayout(false)
     , m_pendingCss(0)
     , m_styleStepInFlight(false)
@@ -1191,6 +1192,7 @@ void EWebEngine::cleanupBuildResources()
     m_buildNeedsLayout = false;
     m_needsLayout = false;
     m_needsStyleUpdate = false;
+    m_styleNeedSince = 0;
     m_flushDeferredImages = false;
     m_defaultCssPrepared = false;
     m_defaultCssLoading = false;
@@ -1682,6 +1684,8 @@ bool EWebEngine::loadCSSContent(const std::string& url, const std::string& conte
             if(target_build) {
                 m_buildNeedsStyleUpdate = true;
             } else {
+                if(!m_needsStyleUpdate)
+                    m_styleNeedSince = ticMs();
                 m_needsStyleUpdate = true;
             }
             markLayoutDirty(target_build);
@@ -2025,6 +2029,7 @@ bool EWebEngine::applyPendingLayoutUpdates()
         style_build = true;
     } else if(m_doc && m_needsStyleUpdate &&
             (m_styleStepInFlight || m_pendingCss <= 0 ||
+             (m_styleNeedSince != 0 && (now - m_styleNeedSince) > kStyleMaxWaitMs) ||
              (m_layoutDirtyAt != 0 && (now - m_layoutDirtyAt) > 3000))) {
         style_doc = m_doc;
     }
@@ -2057,6 +2062,7 @@ bool EWebEngine::applyPendingLayoutUpdates()
             } else {
                 EWEB_LOG("[ewebview] apply css-update: chunk=%u ms (chunked)\n", chunk_ms);
                 m_needsStyleUpdate = false;
+                m_styleNeedSince = 0;
                 /* Layout now reflects the final styles; ask for one render. */
                 markLayoutDirty(false);
             }
@@ -2140,6 +2146,7 @@ bool EWebEngine::applyPendingLayoutUpdates()
         }
     } else {
         m_needsStyleUpdate = false;
+        m_styleNeedSince = 0;
         m_needsLayout = false;
         m_layoutDirtyAt = 0;
         m_layoutDirtySince = 0;

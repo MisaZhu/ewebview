@@ -70,6 +70,10 @@ static const int      kJsRunAbortMax     = 3;
 static const uint32_t kLayoutDebounceMs    = 30;
 static const uint32_t kLayoutMaxWaitMs     = 200;
 static const uint32_t kLayoutBehindStyleMs = 500;
+/* Cap on how long a pending master-style walk may wait for the remaining
+ * <link> sheets (m_pendingCss) while subresources keep re-dirtying layout:
+ * past it the walk starts anyway (new sheets restart it from scratch). */
+static const uint32_t kStyleMaxWaitMs      = 1500;
 /* Wall-clock budget for ONE chunk of a master-style pass, so the engine loop
  * returns to drain commands (STOP/NAVIGATE) and render frames even mid-walk. */
 static const uint64_t kStyleBudgetIdleMs   = 25;
@@ -452,6 +456,7 @@ public:
 
     /* Dirty flags consumed by the engine loop so render stays draw-only. */
     bool                        m_needsStyleUpdate;
+    uint64_t                    m_styleNeedSince;
     bool                        m_needsLayout;
     int                         m_pendingCss;
     bool                        m_styleStepInFlight;

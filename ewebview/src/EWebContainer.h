@@ -69,6 +69,9 @@ public:
     virtual void                       get_image_size(const litehtml::tchar_t* src, const litehtml::tchar_t* baseurl, litehtml::size& sz) override;
     virtual void                       draw_background(litehtml::uint_ptr hdc, const litehtml::background_paint& bg) override;
     virtual void                       draw_borders(litehtml::uint_ptr hdc, const litehtml::borders& borders, const litehtml::position& draw_pos, bool root) override;
+    virtual void                       draw_svg(litehtml::uint_ptr hdc, const litehtml::position& pos,
+                                                const litehtml::web_color& color,
+                                                const float* pts, const int* counts, int nsubs) override;
 
     virtual void                       transform_text(litehtml::tstring& text, litehtml::text_transform tt) override;
     virtual void                       set_clip(const litehtml::position& pos, const litehtml::border_radiuses& bdr_radius, bool valid_x, bool valid_y) override;
@@ -160,6 +163,12 @@ private:
     uint64_t m_char_width_keys[CHAR_WIDTH_CACHE_SIZE];
     int m_char_width_vals[CHAR_WIDTH_CACHE_SIZE];
     std::vector<std::string> m_pending_image_urls;
+
+    /* overflow/clip support: litehtml pushes a clip rectangle around the
+     * children of any box with overflow != visible; we mirror the stack onto
+     * the port surface clip so text, blits and fills all honour it. */
+    std::vector<litehtml::position> m_clips;
+    void* m_paint_surf;
 
     std::vector<eweb_el_input*> m_vecInput;
 

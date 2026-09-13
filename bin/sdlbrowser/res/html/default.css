@@ -147,6 +147,10 @@ img {
 	display: inline-block;
 }
 
+svg {
+	display: inline-block;
+}
+
 img[align="right"]
 {
 	float: right;
@@ -343,11 +347,11 @@ video {
 	display: none;
 }
 
-/* HTML5 static-rendering defaults. This browser runs without JS and without
-   plugin/SVG decoders, so elements whose payload only exists for those paths
-   are hidden instead of spilling fallback markup or raw text into the flow.
-   <canvas> and <noscript> keep their (correct no-JS) fallback content. */
-template, dialog, svg, math, audio, iframe,
+/* HTML5 static-rendering defaults. Elements whose payload needs decoders or
+   scripting this browser lacks are hidden instead of spilling fallback markup
+   or raw text into the flow. <svg> has a native renderer (el_svg), and
+   <canvas>/<noscript> keep their (correct no-JS) fallback content. */
+template, dialog, math, audio, iframe,
 frame, frameset, noframes, embed, object, applet, portal,
 source, track {
 	display: none;

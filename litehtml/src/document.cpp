@@ -136,6 +136,7 @@ static inline void dump_create_node_profile()
 #include "el_space.h"
 #include "el_body.h"
 #include "el_image.h"
+#include "el_svg.h"
 #include "el_table.h"
 #include "el_td.h"
 #include "el_link.h"
@@ -555,6 +556,15 @@ litehtml::uint_ptr litehtml::document::get_font( const tchar_t* name, int size, 
 int litehtml::document::render( int max_width, render_type rt )
 {
 	int ret = 0;
+	/* Lift display:contents children into their grandparents before any layout
+	 * walk starts (parse_styles queued them; no child iteration is in flight
+	 * here, so the vector moves are safe). */
+	if(!m_contents_splice.empty())
+	{
+		for(auto* el : m_contents_splice)
+			el->splice_contents_children();
+		m_contents_splice.clear();
+	}
 	/* Viewport units (vw/vh/vmin/vmax) resolve against m_media, snapshotted
 	 * from the container at create time - often before the widget had a client
 	 * size - and media_changed() only refreshes it when the page carries @media
@@ -894,6 +904,11 @@ void style_detached_subtree_walk(litehtml::element* el,
 }
 } // namespace
 
+void litehtml::document::queue_contents_splice(element* el)
+{
+	if(el) m_contents_splice.push_back(el);
+}
+
 void litehtml::document::style_detached_subtree(element* el)
 {
 	if(!el || !m_context)
@@ -923,6 +938,9 @@ litehtml::element::ptr litehtml::document::create_element(const tchar_t* tag_nam
 		} else if(!t_strcmp(tag_name, _t("img")))
 		{
 			newTag = litehtml_alloc<litehtml::el_image>("el_image", this);
+		} else if(!t_strcmp(tag_name, _t("svg")))
+		{
+			newTag = litehtml_alloc<litehtml::el_svg>("el_svg", this);
 		} else if(!t_strcmp(tag_name, _t("table")))
 		{
 			newTag = litehtml_alloc<litehtml::el_table>("el_table", this);

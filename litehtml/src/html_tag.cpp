@@ -8,6 +8,7 @@
 #include <locale>
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 #include "el_before_after.h"
 
 /*
@@ -1506,7 +1507,21 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 
 	m_el_position	= (element_position)	value_index((own_position && t_strcasecmp(own_position, _t("inherit"))) ? own_position : _t("static"),			element_position_strings,	element_position_fixed);
 	m_overflow		= (overflow)			value_index((own_overflow && t_strcasecmp(own_overflow, _t("inherit"))) ? own_overflow : _t("visible"),		overflow_strings,			overflow_visible);
-	m_display		= (style_display)		value_index((own_display && t_strcasecmp(own_display, _t("inherit"))) ? own_display : _t("inline"),			style_display_strings,		  display_block);
+	if(own_display && t_strcasecmp(own_display, _t("inherit")))
+	{
+		m_display = (style_display) value_index(own_display, style_display_strings, display_block);
+	}
+	else if(own_display && el_parent)
+	{
+		/* display:inherit resolves against the parent's computed value; the
+		 * style walk is top-down, so the parent's display is already final
+		 * (this is how apple.com chains display:contents down a wrapper). */
+		m_display = el_parent->get_display();
+	}
+	else
+	{
+		m_display = display_inline;
+	}
 	m_box_sizing	= (box_sizing)			value_index((own_box_sizing && t_strcasecmp(own_box_sizing, _t("inherit"))) ? own_box_sizing : _t("content-box"),	box_sizing_strings,			box_sizing_content_box);
 
 	/* UA behaviour for <details>: a closed widget renders only its <summary>,
@@ -1818,6 +1833,15 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		{
 			m_display = display_block;
 		}
+	}
+
+	/* display:contents generates no box of its own: queue the child lift for
+	 * the next document::render (the single safe point - no child-list
+	 * iteration is in flight there). */
+	if(m_display == display_contents && !m_contents_spliced)
+	{
+		m_contents_spliced = true;
+		if(doc) doc->queue_contents_splice(this);
 	}
 
 	if(profile_enabled)
@@ -3960,6 +3984,9 @@ int litehtml::html_tag::render_inline(const element::ptr &container, int max_wid
 		// Check if element is valid
 		if (!el) continue;
 
+		// display:contents elements generate no box of their own
+		if (el->get_display() == display_contents) continue;
+
 		// skip spaces to make rendering a bit faster
 		if (skip_spaces)
 		{
@@ -5887,6 +5914,9 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 
 	for (auto el : m_children)
 	{
+		// display:contents elements generate no box of their own
+		if (el->get_display() == display_contents) continue;
+
 		// we don't need process absolute and fixed positioned element on the second pass
 		if (second_pass)
 		{

@@ -137,6 +137,10 @@ img {
 	display: inline-block;
 }
 
+svg {
+	display: inline-block;
+}
+
 img[align="right"]
 {
 	float: right;

@@ -100,6 +100,36 @@ static void flex_parse_gap(html_tag* el, int avail, int& row_gap, int& col_gap)
 		row_gap = flex_len(grg, avail, el->get_font_size(), el->get_document());
 }
 
+/* Preferred (max-content-ish) width of a laid-out subtree. Block-level boxes
+ * report their *available* width as their own box width (block semantics), so
+ * when such a box is a flex item with flex-basis:auto its base size must be
+ * recovered from the children the last render() placed inside it; otherwise
+ * every auto-width block item (e.g. a <li> in a nav row) measures as the whole
+ * row and the shrink step slices the row into equal strips. */
+static int preferred_content_width(const litehtml::element::ptr& el)
+{
+	if(!el) return 0;
+	litehtml::style_display d = el->get_display();
+	if(el->is_replaced() || d == litehtml::display_inline_block ||
+	   d == litehtml::display_inline_text)
+	{
+		return el->width();
+	}
+	int w = 0;
+	size_t n = el->get_children_count();
+	for(size_t i = 0; i < n; i++)
+	{
+		litehtml::element::ptr c = el->get_child((int)i);
+		if(!c || !c->is_visible()) continue;
+		if(c->get_element_position() == litehtml::element_position_absolute ||
+		   c->get_element_position() == litehtml::element_position_fixed) continue;
+		int r = c->left() + preferred_content_width(c);
+		if(r > w) w = r;
+	}
+	return w + el->padding_left() + el->padding_right() +
+		   el->border_left() + el->border_right();
+}
+
 int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pass /*= false*/ )
 {
 	int parent_width = max_width;
@@ -166,6 +196,7 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		element_position ep = el->get_element_position();
 		if(ep == element_position_absolute || ep == element_position_fixed) continue;
 		if(el->is_white_space()) continue;
+		if(el->get_display() == display_contents) continue; /* box-less wrapper */
 
 		/* CSS blockifies flex items: inline-level boxes become block-level */
 		switch(el->get_display())
@@ -265,6 +296,20 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			else
 			{
 				it.base = it.el->render(0, 0, avail, second_pass);
+				/* block-level containers fill the available width (block
+				 * semantics); recover the content preferred width so the flex
+				 * base size is max-content, as the spec requires */
+				litehtml::style_display d = it.el->get_display();
+				if(!it.el->is_replaced() &&
+				   (d == litehtml::display_block || d == litehtml::display_list_item))
+				{
+					litehtml::css_length iw = it.el->get_css_width();
+					if(iw.is_predefined() || iw.units() == litehtml::css_units_none)
+					{
+						int pw = preferred_content_width(it.el);
+						if(pw > 0) it.base = pw + it.ml + it.mr;
+					}
+				}
 			}
 		}
 		if(it.base < it.ml + it.mr) it.base = it.ml + it.mr;
@@ -746,6 +791,7 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 		element_position ep = el->get_element_position();
 		if(ep == element_position_absolute || ep == element_position_fixed) continue;
 		if(el->is_white_space()) continue;
+		if(el->get_display() == display_contents) continue; /* box-less wrapper */
 		switch(el->get_display())
 		{
 		case display_inline:		el->set_display(display_block);		break;

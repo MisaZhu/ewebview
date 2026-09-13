@@ -20,7 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #include <vector>
+#include <algorithm>
 
 using namespace litehtml;
 
@@ -217,6 +219,7 @@ EWebContainer::EWebContainer(const eweb_port_t* port, EWebContainerHost* host)
     m_create_font_ms = 0;
     m_defer_image_load = false;
     m_abort = false;
+    m_paint_surf = 0;
     memset(m_char_width_keys, 0, sizeof(m_char_width_keys));
     memset(m_char_width_vals, 0, sizeof(m_char_width_vals));
 }
@@ -368,6 +371,7 @@ void EWebContainer::draw_text(litehtml::uint_ptr hdc, const litehtml::tchar_t* t
     }
 
     eweb_surface_t* s = (eweb_surface_t*)hdc;
+    m_paint_surf = (void*)hdc;
     if (!s || !m_port->font.draw_text) {
         return;
     }
@@ -436,6 +440,7 @@ const litehtml::tchar_t* EWebContainer::get_default_font_name() const
 void EWebContainer::draw_list_marker(litehtml::uint_ptr hdc, const litehtml::list_marker& marker)
 {
     eweb_surface_t* s = (eweb_surface_t*)hdc;
+    m_paint_surf = (void*)hdc;
     if (!s)
         return;
     const eweb_gfx_t* gfx = &m_port->gfx;
@@ -829,6 +834,7 @@ void EWebContainer::get_image_size(const litehtml::tchar_t* src, const litehtml:
 void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::background_paint& bg)
 {
     eweb_surface_t* s = (eweb_surface_t*)hdc;
+    m_paint_surf = (void*)hdc;
     if (!s)
         return;
     const eweb_gfx_t* gfx = &m_port->gfx;
@@ -877,6 +883,7 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
 void EWebContainer::draw_borders(litehtml::uint_ptr hdc, const litehtml::borders& borders, const litehtml::position& draw_pos, bool root)
 {
     eweb_surface_t* s = (eweb_surface_t*)hdc;
+    m_paint_surf = (void*)hdc;
     if (!s)
         return;
 
@@ -887,16 +894,139 @@ void EWebContainer::draw_borders(litehtml::uint_ptr hdc, const litehtml::borders
     }
 }
 
+void EWebContainer::draw_svg(litehtml::uint_ptr hdc, const litehtml::position& pos,
+                             const litehtml::web_color& color,
+                             const float* pts, const int* counts, int nsubs)
+{
+    eweb_surface_t* s = (eweb_surface_t*)hdc;
+    m_paint_surf = (void*)hdc;
+    if (!s || !pts || !counts || nsubs <= 0)
+        return;
+    const eweb_gfx_t* gfx = &m_port->gfx;
+    if (!gfx->fill_rect)
+        return;
+    uint32_t argb = web_color_to_argb(color);
+    if ((argb >> 24) == 0)
+        return;
+
+    /* Non-zero winding scanline fill over all subpaths at once (icon-font
+     * paths rely on winding, not parity, for their counters). Geometry is
+     * already in device space; spans are clipped to the element box. */
+    int total = 0;
+    for (int i = 0; i < nsubs; i++)
+        total += counts[i];
+    if (total < 3)
+        return;
+
+    float miny = pts[1], maxy = pts[1];
+    for (int i = 0; i < total; i++) {
+        float yy = pts[i * 2 + 1];
+        if (yy < miny) miny = yy;
+        if (yy > maxy) maxy = yy;
+    }
+    int y0 = (int)floorf(miny);
+    int y1 = (int)ceilf(maxy);
+    if (y0 < pos.y) y0 = pos.y;
+    if (y1 > pos.y + pos.height - 1) y1 = pos.y + pos.height - 1;
+
+    struct xedge { float x; int dir; };
+    std::vector<xedge> xs;
+    xs.reserve(64);
+
+    int base = 0;
+    for (int y = y0; y <= y1; y++) {
+        float fy = (float)y + 0.5f;
+        xs.clear();
+        base = 0;
+        for (int sp = 0; sp < nsubs; sp++) {
+            int n = counts[sp];
+            for (int i = 0; i < n; i++) {
+                float x1 = pts[(base + i) * 2];
+                float y1p = pts[(base + i) * 2 + 1];
+                float x2 = pts[(base + (i + 1) % n) * 2];
+                float y2p = pts[(base + (i + 1) % n) * 2 + 1];
+                if ((y1p <= fy && y2p > fy) || (y2p <= fy && y1p > fy)) {
+                    float t = (fy - y1p) / (y2p - y1p);
+                    xedge e;
+                    e.x = x1 + t * (x2 - x1);
+                    e.dir = (y2p > y1p) ? 1 : -1;
+                    xs.push_back(e);
+                }
+            }
+            base += n;
+        }
+        if (xs.size() < 2)
+            continue;
+        std::sort(xs.begin(), xs.end(), [](const xedge& a, const xedge& b) { return a.x < b.x; });
+
+        /* Sweep: paint where the running winding number is non-zero. */
+        int wind = 0;
+        int span_start = 0;
+        bool inside = false;
+        for (size_t i = 0; i < xs.size(); i++) {
+            wind += xs[i].dir;
+            bool now_inside = (wind != 0);
+            if (now_inside && !inside) {
+                span_start = (int)(xs[i].x + 0.5f);
+                inside = true;
+            } else if (!now_inside && inside) {
+                int span_end = (int)(xs[i].x + 0.5f);
+                int xa = span_start < pos.x ? pos.x : span_start;
+                int xb = span_end > pos.x + pos.width ? pos.x + pos.width : span_end;
+                if (xb > xa)
+                    gfx->fill_rect(gfx->ud, s, xa, y, xb - xa, 1, argb);
+                inside = false;
+            }
+        }
+    }
+}
+
 void EWebContainer::transform_text(litehtml::tstring& text, litehtml::text_transform tt)
 {
 }
 
 void EWebContainer::set_clip(const litehtml::position& pos, const litehtml::border_radiuses& bdr_radius, bool valid_x, bool valid_y)
 {
+    (void)bdr_radius;   /* rectangular clip only: radius clipping is cosmetic */
+    litehtml::position r = pos;
+    if(!valid_x) { r.x = -100000; r.width = 200000; }
+    if(!valid_y) { r.y = -100000; r.height = 200000; }
+    if(!m_clips.empty())
+    {
+        const litehtml::position& p = m_clips.back();
+        int x1 = r.x > p.x ? r.x : p.x;
+        int y1 = r.y > p.y ? r.y : p.y;
+        int x2 = r.right() < p.right() ? r.right() : p.right();
+        int y2 = r.bottom() < p.bottom() ? r.bottom() : p.bottom();
+        r.x = x1; r.y = y1;
+        r.width = x2 > x1 ? x2 - x1 : 0;
+        r.height = y2 > y1 ? y2 - y1 : 0;
+    }
+    m_clips.push_back(r);
+    if(m_paint_surf && m_port && m_port->gfx.surface_set_clip)
+    {
+        m_port->gfx.surface_set_clip(m_port->gfx.ud, (eweb_surface_t*)m_paint_surf,
+                                     r.x, r.y, r.width, r.height);
+    }
 }
 
 void EWebContainer::del_clip()
 {
+    if(m_clips.empty()) return;
+    m_clips.pop_back();
+    if(!m_paint_surf || !m_port) return;
+    if(m_clips.empty())
+    {
+        if(m_port->gfx.surface_unset_clip)
+            m_port->gfx.surface_unset_clip(m_port->gfx.ud, (eweb_surface_t*)m_paint_surf);
+    }
+    else
+    {
+        const litehtml::position& r = m_clips.back();
+        if(m_port->gfx.surface_set_clip)
+            m_port->gfx.surface_set_clip(m_port->gfx.ud, (eweb_surface_t*)m_paint_surf,
+                                         r.x, r.y, r.width, r.height);
+    }
 }
 
 void EWebContainer::clear_images()
