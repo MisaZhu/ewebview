@@ -1,5 +1,5 @@
 ifeq ($(PORTING),)
-export PORTING = ewokos
+export PORTING = sdl2
 endif
 
 DIRS = libtinyhttpsc libwebp jsnative litehtml ewebview
