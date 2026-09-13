@@ -167,6 +167,7 @@ litehtml::document::document(litehtml::document_container* objContainer, litehtm
 	m_size.height = 0;
 	m_def_color = web_color(0, 0, 0);
 	m_last_font_valid = false;
+	m_tables_dirty = false;
 	m_last_font_size = 0;
 	m_last_font = 0;
 	m_step_epoch = 0;
@@ -391,7 +392,7 @@ litehtml::uint_ptr litehtml::document::add_font( const tchar_t* name, int size, 
 		name = m_container->get_default_font_name();
 	}
 
-	if(!size)
+	if(size < 0)
 	{
 		size = container()->get_default_font_size();
 	}
@@ -481,7 +482,7 @@ litehtml::uint_ptr litehtml::document::get_font( const tchar_t* name, int size, 
 		name = m_container->get_default_font_name();
 	}
 
-	if(!size)
+	if(size < 0)
 	{
 		size = container()->get_default_font_size();
 	}
@@ -573,6 +574,14 @@ int litehtml::document::render( int max_width, render_type rt )
 	container()->get_media_features(m_media);
 	if(m_root)
 	{
+		/* A post-creation style update can flip a cell's computed display; the
+		 * grid captured in init() would keep the stale column set, so rebuild
+		 * the tabular grids before this layout pass measures them. */
+		if(m_tables_dirty)
+		{
+			m_tables_dirty = false;
+			m_root->init();
+		}
 		if(rt == render_fixed_only)
 		{
 			m_fixed_boxes.clear();
@@ -1157,6 +1166,9 @@ bool litehtml::document::update_master_styles_step(uint64_t deadline_ms)
 		}
 	}
 	m_step_phase = 0;
+	/* Computed displays may have flipped (a late sheet hiding table cells, a
+	 * media flip): table grids were built in init() against the old values. */
+	m_tables_dirty = true;
 	dump_parse_style_profile();
 	dump_dom_internal_profile();
 	litehtml::dump_apply_phase_profile();

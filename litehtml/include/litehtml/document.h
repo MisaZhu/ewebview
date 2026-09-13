@@ -69,6 +69,11 @@ namespace litehtml
 		position::vector					m_fixed_boxes;
 		media_query_list::vector			m_media_lists;
 		std::vector<element*>				m_contents_splice;
+		/* Set when a post-creation style update re-resolves computed styles:
+		 * table grids (html_tag::m_grid) were built in init() against the old
+		 * display values, so they must be rebuilt before the next layout or
+		 * cells whose display flipped (e.g. to none) keep occupying columns. */
+		bool								m_tables_dirty;
 		element::ptr						m_over_element;
 		elements_vector						m_tabular_elements;
 		media_features						m_media;

@@ -1046,6 +1046,20 @@ static bool browser_init(browser_t* b, int argc, char** argv) {
         return false;
     }
 
+    /* Initial geometry override: EWEB_WINDOW=WxH (logical points). Lets headless
+     * shots reproduce a specific viewport, e.g. a wide desktop layout. */
+    int init_w = DEFAULT_W, init_h = DEFAULT_H;
+    {
+        const char* ws = SDL_getenv("EWEB_WINDOW");
+        if(ws && ws[0]) {
+            int w = 0, h = 0;
+            if(sscanf(ws, "%dx%d", &w, &h) == 2 && w >= MIN_W && h >= MIN_H) {
+                init_w = w;
+                init_h = h;
+            }
+        }
+    }
+
     /* Request a native-resolution drawable with SDL_WINDOW_ALLOW_HIGHDPI so the
      * renderer works in real device pixels. The content canvas (ewebview
      * viewport) is then sized in those device pixels and its frame is blit 1:1 -
@@ -1055,7 +1069,7 @@ static bool browser_init(browser_t* b, int argc, char** argv) {
      * ui_scale from the two and scales the chrome + font to match. */
     b->window = SDL_CreateWindow("sdlbrowser",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        DEFAULT_W, DEFAULT_H,
+        init_w, init_h,
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if(!b->window) {
         SDL_Log("SDL_CreateWindow failed: %s", SDL_GetError());
@@ -1118,7 +1132,7 @@ static bool browser_init(browser_t* b, int argc, char** argv) {
     /* initial geometry. b->view is still NULL here, so browser_set_size only
      * lays out the chrome and sizes the frame texture; the viewport is pushed to
      * the engine right after it is created below. */
-    browser_set_size(b, DEFAULT_W, DEFAULT_H);
+    browser_set_size(b, init_w, init_h);
 
     /* create the ewebview engine with the SDL2 port */
     eweb_port_sdl2(&b->port, NULL);

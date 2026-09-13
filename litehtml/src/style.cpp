@@ -68,7 +68,13 @@ void litehtml::style::parse_property( const tstring& txt, const tchar_t* baseurl
 
 		trim(name);
 		trim(val);
-		lcase(name);
+		/* Custom property names are case-sensitive per spec (--fgColor-default
+		 * != --fgcolor-default); lowercasing them broke every var() reference
+		 * written with the original case (GitHub's theme tokens). */
+		if(!(name.length() > 2 && name[0] == _t('-') && name[1] == _t('-')))
+		{
+			lcase(name);
+		}
 
 		if(!name.empty() && !val.empty())
 		{
