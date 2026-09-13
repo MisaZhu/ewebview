@@ -1,0 +1,60 @@
+<html>
+<body>
+    <h1>sdlbrowser</h1>
+    <p>A minimal SDL2 desktop browser powered by <strong>ewebview</strong>.</p>
+
+    <h2>Quick Start</h2>
+    <ul>
+        <li>Type a URL in the address bar and press <strong>Enter</strong></li>
+        <li>Use the <strong>&lt;</strong> button (or Alt+Left) to go back</li>
+        <li>Use the <strong>X</strong> button (or Escape) to stop loading</li>
+        <li>Use the <strong>R</strong> button (or F5) to refresh</li>
+        <li>Scroll with the mouse wheel</li>
+        <li><strong>Ctrl+L</strong> focuses the address bar</li>
+    </ul>
+
+    <h2>About ewebview</h2>
+    <p>ewebview is a self-contained embedded web engine that renders HTML/CSS/JS
+    to an abstract ARGB8888 memory canvas. Platform dependencies are injected
+    via HAL callback tables (gfx, font, image, net, clock, sys).</p>
+
+    <h3>Core Technologies</h3>
+    <table border="1">
+        <tr><td><strong>Rendering</strong></td><td>litehtml (with Gumbo HTML5 parser)</td></tr>
+        <tr><td><strong>JavaScript</strong></td><td>mario bytecode VM (ES5 + ES6+)</td></tr>
+        <tr><td><strong>Image Decode</strong></td><td>SDL2_image + libwebp</td></tr>
+        <tr><td><strong>Networking</strong></td><td>libtinyhttpsc (BearSSL HTTP/HTTPS)</td></tr>
+        <tr><td><strong>Graphics</strong></td><td>SDL2 + SDL2_gfx + SDL2_ttf</td></tr>
+    </table>
+
+    <h2>Architecture</h2>
+    <pre>
+sdlbrowser/
+  main.c          SDL2 window shell + toolbar + event loop
+  Makefile        build rules (links libewebview + SDL2)
+  res/
+    default.html  this page
+    default.css   master stylesheet
+
+ewebview/         the web engine library
+  src/            core (C++14, platform-independent)
+  porting/sdl2/   SDL2 HAL port (C99)
+  include/        public C API headers
+    </pre>
+
+    <h2>Threading Model</h2>
+    <blockquote>
+        The engine thread owns the litehtml documents, the mario VM, and all
+        parsing/styling/layout/rasterization. The UI thread (this SDL2 app)
+        talks to the engine only through non-blocking queued commands and
+        drains events via ewebview_tick().
+    </blockquote>
+
+    <h2>Links</h2>
+    <p><a href="https://github.com/misazhu/ewokos">EwokOS on GitHub</a></p>
+    <p><a href="https://deepwiki.com/MisaZhu/ewokos">DeepWiki Documentation</a></p>
+
+    <hr/>
+    <p><em>Author: Misa.Z &lt;misa.zhu@gmail.com&gt;</em></p>
+</body>
+</html>

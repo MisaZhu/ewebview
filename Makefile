@@ -2,7 +2,7 @@ ifeq ($(PORTING),)
 export PORTING = sdl2
 endif
 
-DIRS = libtinyhttpsc libwebp jsnative litehtml ewebview
+DIRS = libtinyhttpsc libwebp jsnative litehtml ewebview bin/sdlbrowser
 
 all: basic_libs
 	@echo "all done."

@@ -13,14 +13,20 @@
  *                      HAL passes size per call, so we keep a small LRU-free
  *                      per-size cache inside one eweb_font_t.
  *   image.decode    -> SDL2_image (IMG_Load_RW) + ConvertSurfaceFormat(ARGB8888)
+ *   HiDPI           -> eweb_port_sdl2_set_dpr(): surface_new allocates logical
+ *                      size * dpr device pixels and every draw/font callback
+ *                      scales logical coords up, so layout stays in CSS pixels
+ *                      while rasterisation runs at native device resolution.
  *   net.request     -> libtinyhttpsc (BearSSL HTTP/HTTPS), one hop per call.
  *                      Kept identical to the EwokOS reference port: tinyhttpsc
  *                      lives in browser/ewebview/libtinyhttpsc/ and is a
  *                      portable BearSSL client with no OS-specific deps, so it
  *                      works on desktop builds unchanged.
  *   net.read_file   -> standard C fopen/fread (file://)
- *   net.resolve_res -> NULL (the "res://" scheme is EwokOS-specific; OPTIONAL)
- *   clock.tic_ms    -> SDL_GetTicks64 (or SDL_GetTicks pre-2.0.18)
+ *   net.resolve_res -> <program-dir>/res/<name> (res://, via SDL_GetBasePath)
+ *   clock.tic_ms    -> clock_gettime(CLOCK_MONOTONIC), matching litehtml's
+ *                      internal sys_tic_ms() so absolute deadline comparisons
+ *                      in the chunked style walk share one time base
  *   clock.sleep_ms  -> SDL_Delay
  *   sys.log         -> SDL_Log
  *   sys.ptr_sane    -> non-NULL heuristic (desktop OSes expose no cheap
@@ -63,6 +69,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -79,6 +86,14 @@
 typedef struct {
     SDL_Surface*  surf;
     SDL_Renderer* rend;   /* may be NULL for decoded images (blit sources only) */
+    /* HiDPI: the pixel buffer holds lw x lh LOGICAL pixels at `dpr` device
+     * pixels per logical pixel (surf->w/h == lw*dpr x lh*dpr). The core lays
+     * out and draws in logical pixels (surface_dims reports lw/lh); every draw
+     * callback scales by the TARGET surface's own dpr, so a surface keeps
+     * rendering consistently even if the global ratio changes later. Decoded
+     * images are natural-pixel buffers with dpr == 1. */
+    int           lw, lh;
+    float         dpr;
 } sdl_surf_t;
 
 #define S(h)  ((sdl_surf_t*)(h))
@@ -101,6 +116,40 @@ typedef struct {
 
 #define F(h)  ((sdl_font_t*)(h))
 #define FH(p) ((eweb_font_t*)(p))
+
+/* ------------------------------------------------------------------ */
+/* HiDPI device pixel ratio                                            */
+/* ------------------------------------------------------------------ */
+
+/* Embedder-settable ratio of device pixels per logical (CSS) pixel, e.g. 2 on
+ * a Retina panel. surface_new() allocates buffers at logical size * dpr and
+ * every draw/font callback scales logical coordinates up by the target
+ * surface's dpr, so the engine lays out at logical size (normal text metrics)
+ * while rasterising at native resolution (crisp text and hairlines, no page
+ * zoom). dpr == 1 keeps every path numerically identical to a plain 1x port. */
+static float g_dpr = 1.0f;
+
+void eweb_port_sdl2_set_dpr(float dpr) {
+    g_dpr = (dpr > 0.0f) ? dpr : 1.0f;
+}
+
+/* Scale one logical coordinate/length into a surface's device pixels. */
+static inline int sdl2_sp(const sdl_surf_t* s, int v) {
+    return (int)lroundf((float)v * s->dpr);
+}
+
+/* Scale a logical font size into device pixels for rasterisation. */
+static inline int sdl2_font_px_dpr(int size, float dpr) {
+    int d = (int)lroundf((float)size * dpr);
+    return d < 1 ? 1 : d;
+}
+static inline int sdl2_font_px(int size) { return sdl2_font_px_dpr(size, g_dpr); }
+
+/* Map a device-pixel font measurement back to the logical pixels the layout
+ * sees (rounded, so logical metrics stay integral like the HAL requires). */
+static inline int sdl2_logical_px(int dev) {
+    return (int)lroundf((float)dev / g_dpr);
+}
 
 /* ------------------------------------------------------------------ */
 /* Lazy companion-lib init                                             */
@@ -189,7 +238,17 @@ static eweb_surface_t* ek_surface_new(void* ud, int w, int h) {
     if(w <= 0 || h <= 0) return NULL;
     if(!sdl2_ensure_libs()) return NULL;
 
-    surf = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+    /* Allocate the logical w x h canvas at native resolution: the buffer becomes
+     * w*dpr x h*dpr device pixels while the core keeps seeing w x h logical
+     * pixels through surface_dims and draws in logical coordinates (scaled back
+     * up by every primitive below). */
+    {
+        int dw = (int)lroundf((float)w * g_dpr);
+        int dh = (int)lroundf((float)h * g_dpr);
+        if(dw < 1) dw = 1;
+        if(dh < 1) dh = 1;
+        surf = SDL_CreateRGBSurfaceWithFormat(0, dw, dh, 32, SDL_PIXELFORMAT_ARGB8888);
+    }
     if(!surf) return NULL;
     rend = SDL_CreateSoftwareRenderer(surf);
     if(!rend) { SDL_FreeSurface(surf); return NULL; }
@@ -203,6 +262,7 @@ static eweb_surface_t* ek_surface_new(void* ud, int w, int h) {
     if(!s) { SDL_DestroyRenderer(rend); SDL_FreeSurface(surf); return NULL; }
     s->surf = surf;
     s->rend = rend;
+    s->lw = w; s->lh = h; s->dpr = g_dpr;
     return SH(s);
 }
 
@@ -221,8 +281,12 @@ static void ek_surface_dims(void* ud, eweb_surface_t* h, int* w, int* hh) {
     (void)ud;
     if(!h) { if(w) *w = 0; if(hh) *hh = 0; return; }
     s = S(h);
-    if(w)  *w  = s->surf ? s->surf->w : 0;
-    if(hh) *hh = s->surf ? s->surf->h : 0;
+    /* LOGICAL pixels: this is the coordinate space the core lays out and draws
+     * in (frame-pool revalidation, cache strip heights, image intrinsic size).
+     * The device-pixel buffer size lives in surf->w/h and is what
+     * surface_native / surface_pixels expose to a DPI-aware embedder. */
+    if(w)  *w  = s->lw;
+    if(hh) *hh = s->lh;
 }
 
 static uint32_t* ek_surface_pixels(void* ud, eweb_surface_t* h, int* w, int* hh) {
@@ -269,7 +333,7 @@ static void ek_surface_set_clip(void* ud, eweb_surface_t* h, int x, int y, int w
     (void)ud;
     if(!h) return;
     s = S(h);
-    r.x = x; r.y = y; r.w = w; r.h = hh;
+    r.x = sdl2_sp(s, x); r.y = sdl2_sp(s, y); r.w = sdl2_sp(s, w); r.h = sdl2_sp(s, hh);
     if(s->surf) SDL_SetClipRect(s->surf, &r);
     if(s->rend) SDL_RenderSetClipRect(s->rend, &r);
 }
@@ -299,13 +363,15 @@ static void ek_fill_rect(void* ud, eweb_surface_t* h, int x, int y, int w, int h
      * composites src-over under the renderer's SDL_BLENDMODE_BLEND). */
     if((color >> 24) == 0xFF) {
         SDL_Rect r;
-        r.x = x; r.y = y; r.w = w; r.h = hh;
+        r.x = sdl2_sp(s, x); r.y = sdl2_sp(s, y); r.w = sdl2_sp(s, w); r.h = sdl2_sp(s, hh);
         SDL_FillRect(s->surf, &r, color);   /* opaque fast path; honours surf clip */
     } else if(s->rend) {
         Uint8 cr, cg, cb, ca;
+        int X = sdl2_sp(s, x), Y = sdl2_sp(s, y);
+        int W = sdl2_sp(s, w), H = sdl2_sp(s, hh);
         sdl2_unpack_argb(color, &cr, &cg, &cb, &ca);
-        boxRGBA(s->rend, (Sint16)x, (Sint16)y,
-                (Sint16)(x + w - 1), (Sint16)(y + hh - 1), cr, cg, cb, ca);
+        boxRGBA(s->rend, (Sint16)X, (Sint16)Y,
+                (Sint16)(X + W - 1), (Sint16)(Y + H - 1), cr, cg, cb, ca);
     }
 }
 
@@ -318,8 +384,12 @@ static void ek_rect(void* ud, eweb_surface_t* h, int x, int y, int w, int hh, ui
     if(!s->rend) return;
     sdl2_unpack_argb(color, &r, &g, &b, &a);
     /* SDL2_gfx rectangle coords are inclusive corners: (x,y)..(x+w-1,y+h-1). */
-    rectangleRGBA(s->rend, (Sint16)x, (Sint16)y,
-                  (Sint16)(x + w - 1), (Sint16)(y + hh - 1), r, g, b, a);
+    {
+        int X = sdl2_sp(s, x), Y = sdl2_sp(s, y);
+        int W = sdl2_sp(s, w), H = sdl2_sp(s, hh);
+        rectangleRGBA(s->rend, (Sint16)X, (Sint16)Y,
+                      (Sint16)(X + W - 1), (Sint16)(Y + H - 1), r, g, b, a);
+    }
 }
 
 static void ek_line(void* ud, eweb_surface_t* h, int x0, int y0, int x1, int y1, uint32_t color) {
@@ -330,7 +400,8 @@ static void ek_line(void* ud, eweb_surface_t* h, int x0, int y0, int x1, int y1,
     s = S(h);
     if(!s->rend) return;
     sdl2_unpack_argb(color, &r, &g, &b, &a);
-    lineRGBA(s->rend, (Sint16)x0, (Sint16)y0, (Sint16)x1, (Sint16)y1, r, g, b, a);
+    lineRGBA(s->rend, (Sint16)sdl2_sp(s, x0), (Sint16)sdl2_sp(s, y0),
+             (Sint16)sdl2_sp(s, x1), (Sint16)sdl2_sp(s, y1), r, g, b, a);
 }
 
 static void ek_wline(void* ud, eweb_surface_t* h, int x0, int y0, int x1, int y1, int w, uint32_t color) {
@@ -341,6 +412,9 @@ static void ek_wline(void* ud, eweb_surface_t* h, int x0, int y0, int x1, int y1
     s = S(h);
     if(!s->rend) return;
     sdl2_unpack_argb(color, &r, &g, &b, &a);
+    x0 = sdl2_sp(s, x0); y0 = sdl2_sp(s, y0);
+    x1 = sdl2_sp(s, x1); y1 = sdl2_sp(s, y1);
+    w  = sdl2_sp(s, w);
     if(w <= 1) {
         lineRGBA(s->rend, (Sint16)x0, (Sint16)y0, (Sint16)x1, (Sint16)y1, r, g, b, a);
     } else {
@@ -365,6 +439,8 @@ static void ek_circle(void* ud, eweb_surface_t* h, int x, int y, int radius, int
     if(!s->rend) return;
     sdl2_unpack_argb(color, &r, &g, &b, &a);
     if(rw < 1) rw = 1;
+    x = sdl2_sp(s, x); y = sdl2_sp(s, y);
+    radius = sdl2_sp(s, radius); rw = sdl2_sp(s, rw);
     for(i = 0; i < rw && (radius - i) > 0; i++) {
         circleRGBA(s->rend, (Sint16)x, (Sint16)y, (Sint16)(radius - i), r, g, b, a);
     }
@@ -378,7 +454,8 @@ static void ek_fill_circle(void* ud, eweb_surface_t* h, int x, int y, int radius
     s = S(h);
     if(!s->rend) return;
     sdl2_unpack_argb(color, &r, &g, &b, &a);
-    filledCircleRGBA(s->rend, (Sint16)x, (Sint16)y, (Sint16)radius, r, g, b, a);
+    filledCircleRGBA(s->rend, (Sint16)sdl2_sp(s, x), (Sint16)sdl2_sp(s, y),
+                     (Sint16)sdl2_sp(s, radius), r, g, b, a);
 }
 
 static void ek_arc(void* ud, eweb_surface_t* h, int x, int y, int radius, int rw,
@@ -395,6 +472,8 @@ static void ek_arc(void* ud, eweb_surface_t* h, int x, int y, int radius, int rw
     start_deg = sdl2_arc_deg(a1);   /* swapped: see sdl2_arc_deg comment */
     end_deg   = sdl2_arc_deg(a0);
     if(rw < 1) rw = 1;
+    x = sdl2_sp(s, x); y = sdl2_sp(s, y);
+    radius = sdl2_sp(s, radius); rw = sdl2_sp(s, rw);
     for(i = 0; i < rw && (radius - i) > 0; i++) {
         arcRGBA(s->rend, (Sint16)x, (Sint16)y, (Sint16)(radius - i),
                 start_deg, end_deg, r, g, b, a);
@@ -413,8 +492,8 @@ static void ek_fill_arc(void* ud, eweb_surface_t* h, int x, int y, int radius,
     sdl2_unpack_argb(color, &r, &g, &b, &a);
     start_deg = sdl2_arc_deg(a1);
     end_deg   = sdl2_arc_deg(a0);
-    filledPieRGBA(s->rend, (Sint16)x, (Sint16)y, (Sint16)radius,
-                  start_deg, end_deg, r, g, b, a);
+    filledPieRGBA(s->rend, (Sint16)sdl2_sp(s, x), (Sint16)sdl2_sp(s, y),
+                  (Sint16)sdl2_sp(s, radius), start_deg, end_deg, r, g, b, a);
 }
 
 /* ---- rounded rectangles ------------------------------------------- */
@@ -430,6 +509,11 @@ static void ek_round(void* ud, eweb_surface_t* h, int x, int y, int w, int hh,
     if(!s->rend) return;
     sdl2_unpack_argb(color, &r, &g, &b, &a);
     if(rw < 1) rw = 1;
+    /* Work in device pixels: scale once, then the per-ring inset loop below
+     * steps one device pixel per ring as before. */
+    x = sdl2_sp(s, x); y = sdl2_sp(s, y);
+    w = sdl2_sp(s, w); hh = sdl2_sp(s, hh);
+    radius = sdl2_sp(s, radius); rw = sdl2_sp(s, rw);
     /* Shrink the corner radius with each inner ring so the rounded outline
      * stays concentric; clamp at 0 (SDL2_gfx treats rad=0 as a plain rect). */
     for(i = 0; i < rw; i++) {
@@ -452,9 +536,14 @@ static void ek_fill_round(void* ud, eweb_surface_t* h, int x, int y, int w, int 
     s = S(h);
     if(!s->rend) return;
     sdl2_unpack_argb(color, &r, &g, &b, &a);
-    roundedBoxRGBA(s->rend, (Sint16)x, (Sint16)y,
-                   (Sint16)(x + w - 1), (Sint16)(y + hh - 1),
-                   (Sint16)(radius > 0 ? radius : 0), r, g, b, a);
+    {
+        int X = sdl2_sp(s, x), Y = sdl2_sp(s, y);
+        int W = sdl2_sp(s, w), H = sdl2_sp(s, hh);
+        int R = sdl2_sp(s, radius);
+        roundedBoxRGBA(s->rend, (Sint16)X, (Sint16)Y,
+                       (Sint16)(X + W - 1), (Sint16)(Y + H - 1),
+                       (Sint16)(R > 0 ? R : 0), r, g, b, a);
+    }
 }
 
 /* ---- curves -------------------------------------------------------- */
@@ -559,10 +648,13 @@ static void ek_stroke_quadratic(void* ud, eweb_surface_t* h, int x0, int y0,
     sdl2_unpack_argb(color, &r, &g, &b, &a);
     n = ek_flatten_quadratic(NULL, (float)x0, (float)y0, (float)cx, (float)cy,
                               (float)x1, (float)y1, pts, SDL2_STROKE_MAX_PTS);
-    px = x0; py = y0;
+    /* pts[] are LOGICAL floats (the core's scanline fill uses the same space);
+     * scale each vertex into device pixels only here at draw time. */
+    px = sdl2_sp(s, x0); py = sdl2_sp(s, y0);
+    w  = sdl2_sp(s, w);
     for(i = 0; i < n; i++) {
-        int nx = (int)lroundf(pts[i*2 + 0]);
-        int ny = (int)lroundf(pts[i*2 + 1]);
+        int nx = (int)lroundf(pts[i*2 + 0] * s->dpr);
+        int ny = (int)lroundf(pts[i*2 + 1] * s->dpr);
         if(w <= 1) lineRGBA(s->rend, (Sint16)px, (Sint16)py, (Sint16)nx, (Sint16)ny, r, g, b, a);
         else       thickLineRGBA(s->rend, (Sint16)px, (Sint16)py, (Sint16)nx, (Sint16)ny,
                                  (Uint8)(w > 255 ? 255 : w), r, g, b, a);
@@ -585,10 +677,12 @@ static void ek_stroke_bezier(void* ud, eweb_surface_t* h, int x0, int y0,
     n = ek_flatten_cubic(NULL, (float)x0, (float)y0,
                           (float)cx1, (float)cy1, (float)cx2, (float)cy2,
                           (float)x1, (float)y1, pts, SDL2_STROKE_MAX_PTS);
-    px = x0; py = y0;
+    /* pts[] are LOGICAL floats; scale each vertex into device pixels here. */
+    px = sdl2_sp(s, x0); py = sdl2_sp(s, y0);
+    w  = sdl2_sp(s, w);
     for(i = 0; i < n; i++) {
-        int nx = (int)lroundf(pts[i*2 + 0]);
-        int ny = (int)lroundf(pts[i*2 + 1]);
+        int nx = (int)lroundf(pts[i*2 + 0] * s->dpr);
+        int ny = (int)lroundf(pts[i*2 + 1] * s->dpr);
         if(w <= 1) lineRGBA(s->rend, (Sint16)px, (Sint16)py, (Sint16)nx, (Sint16)ny, r, g, b, a);
         else       thickLineRGBA(s->rend, (Sint16)px, (Sint16)py, (Sint16)nx, (Sint16)ny,
                                  (Uint8)(w > 255 ? 255 : w), r, g, b, a);
@@ -606,7 +700,7 @@ static void ek_set_pixel(void* ud, eweb_surface_t* h, int x, int y, uint32_t col
     s = S(h);
     if(!s->rend) return;
     sdl2_unpack_argb(color, &r, &g, &b, &a);
-    pixelRGBA(s->rend, (Sint16)x, (Sint16)y, r, g, b, a);
+    pixelRGBA(s->rend, (Sint16)sdl2_sp(s, x), (Sint16)sdl2_sp(s, y), r, g, b, a);
 }
 
 static uint32_t ek_get_pixel(void* ud, eweb_surface_t* h, int x, int y) {
@@ -616,6 +710,7 @@ static uint32_t ek_get_pixel(void* ud, eweb_surface_t* h, int x, int y) {
     if(!h) return 0;
     s = S(h);
     if(!s->surf) return 0;
+    x = sdl2_sp(s, x); y = sdl2_sp(s, y);   /* logical -> device; bounds below are device */
     if(x < 0 || y < 0 || x >= s->surf->w || y >= s->surf->h) return 0;
     px = (const uint32_t*)s->surf->pixels;
     /* Surface is always ARGB8888 (we create it that way and convert decoded
@@ -633,8 +728,11 @@ static void ek_blit(void* ud, eweb_surface_t* src_h, int sx, int sy, int sw, int
     if(!src_h || !dst_h) return;
     src = S(src_h); dst = S(dst_h);
     if(!src->surf || !dst->surf) return;
-    sr.x = sx; sr.y = sy; sr.w = sw; sr.h = sh;
-    dr.x = dx; dr.y = dy; dr.w = dw; dr.h = dh;
+    /* Each side lives in its own surface's pixel space: scale the src rect by
+     * the source's dpr (decoded images: 1, canvas/frame surfaces: the ratio
+     * they were created at) and the dst rect by the destination's dpr. */
+    sr.x = sdl2_sp(src, sx); sr.y = sdl2_sp(src, sy); sr.w = sdl2_sp(src, sw); sr.h = sdl2_sp(src, sh);
+    dr.x = sdl2_sp(dst, dx); dr.y = sdl2_sp(dst, dy); dr.w = sdl2_sp(dst, dw); dr.h = sdl2_sp(dst, dh);
     /* The reference graph_blt is a straight COPY, NOT a src-over composite:
      * its fast paths memcpy / copy rows and its resampling paths write the
      * sampled ARGB word verbatim (dst = src, alpha included). So blit must run
@@ -643,7 +741,7 @@ static void ek_blit(void* ud, eweb_surface_t* src_h, int sx, int sy, int sw, int
      * the src/dst rects differ in size, matching graph_blt's resample path.
      * dst->clip_rect (kept in sync by set_clip) bounds the write either way. */
     SDL_SetSurfaceBlendMode(src->surf, SDL_BLENDMODE_NONE);
-    if(sw == dw && sh == dh)
+    if(sr.w == dr.w && sr.h == dr.h)
         SDL_BlitSurface(src->surf, &sr, dst->surf, &dr);
     else
         SDL_BlitScaled(src->surf, &sr, dst->surf, &dr);
@@ -659,8 +757,10 @@ static void ek_blit_fit_alpha(void* ud, eweb_surface_t* src_h, int sx, int sy, i
     src = S(src_h); dst = S(dst_h);
     if(!src->surf || !dst->surf) return;
     if(sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
-    sr.x = sx; sr.y = sy; sr.w = sw; sr.h = sh;
-    dr.x = dx; dr.y = dy; dr.w = dw; dr.h = dh;
+    /* src rect in the source's pixel space (decoded images: natural pixels),
+     * dst rect in the destination's device pixels. */
+    sr.x = sdl2_sp(src, sx); sr.y = sdl2_sp(src, sy); sr.w = sdl2_sp(src, sw); sr.h = sdl2_sp(src, sh);
+    dr.x = sdl2_sp(dst, dx); dr.y = sdl2_sp(dst, dy); dr.w = sdl2_sp(dst, dw); dr.h = sdl2_sp(dst, dh);
     /* SDL_BlitScaled does the src-rect -> dst-rect resample in one call; the
      * per-surface alpha modulation multiplies into every source pixel's own
      * alpha before the blend, which is exactly the HAL's "alpha 0..255"
@@ -778,15 +878,18 @@ static void ek_font_metrics(void* ud, eweb_font_t* h, int size, eweb_font_metric
     out->ascent = out->descent = out->height = out->x_height = 0;
     if(!h) return;
     f = F(h);
-    face = sdl_font_face(f, size);
+    /* Rasterise at device resolution so glyphs are crisp on HiDPI, but report
+     * LOGICAL metrics: litehtml lays out with these numbers, so the page keeps
+     * its normal CSS-pixel geometry while the pixels come out at native dpi. */
+    face = sdl_font_face(f, sdl2_font_px(size));
     if(!face) return;
-    out->ascent  = TTF_FontAscent(face);
-    out->descent = TTF_FontDescent(face);   /* negative below baseline, matches litehtml */
-    out->height  = TTF_FontHeight(face);
+    out->ascent  = sdl2_logical_px(TTF_FontAscent(face));
+    out->descent = sdl2_logical_px(TTF_FontDescent(face));   /* negative below baseline, matches litehtml */
+    out->height  = sdl2_logical_px(TTF_FontHeight(face));
     /* x_height: top of the 'x' glyph above the baseline. TTF_GlyphMetrics
      * returns maxy as the distance above baseline, which IS the x-height. */
     if(TTF_GlyphMetrics(face, (Uint16)'x', &minx, &maxx, &miny, &maxy, &adv) == 0) {
-        out->x_height = maxy;
+        out->x_height = sdl2_logical_px(maxy);
     }
 }
 
@@ -797,14 +900,14 @@ static int ek_font_char_width(void* ud, eweb_font_t* h, int size, uint32_t codep
     (void)ud;
     if(!h) return 0;
     f = F(h);
-    face = sdl_font_face(f, size);
+    face = sdl_font_face(f, sdl2_font_px(size));   /* device-px face, logical result */
     if(!face) return 0;
     /* BMP fast path: TTF_GlyphMetrics is O(1) (FreeType charmap lookup),
      * which matters because char_width is the hottest layout callback. */
     if(codepoint <= 0xFFFF) {
         if(TTF_GlyphMetrics(face, (Uint16)codepoint, &minx, &maxx, &miny, &maxy, &adv) < 0)
             return 0;
-        return adv;
+        return sdl2_logical_px(adv);
     }
     /* Supplementary planes: encode as UTF-8 and let TTF_SizeUTF8 walk the
      * (surrogate-paired) glyph. Rare enough that the extra cost is fine. */
@@ -815,7 +918,7 @@ static int ek_font_char_width(void* ud, eweb_font_t* h, int size, uint32_t codep
         if(n <= 0) return 0;
         buf[n] = 0;
         if(TTF_SizeUTF8(face, buf, &w, &hh) < 0) return 0;
-        return w;
+        return sdl2_logical_px(w);
     }
 }
 
@@ -829,11 +932,11 @@ static void ek_font_text_size(void* ud, eweb_font_t* h, int size, const char* te
     if(hh) *hh = 0;
     if(!h || !text) return;
     f = F(h);
-    face = sdl_font_face(f, size);
+    face = sdl_font_face(f, sdl2_font_px(size));
     if(!face) return;
     if(TTF_SizeUTF8(face, text, &ww, &hgt) < 0) return;
-    if(w)  *w  = ww;
-    if(hh) *hh = hgt;
+    if(w)  *w  = sdl2_logical_px(ww);
+    if(hh) *hh = sdl2_logical_px(hgt);
 }
 
 static void ek_font_draw_text(void* ud, eweb_surface_t* sh, int x, int y, const char* text,
@@ -849,7 +952,10 @@ static void ek_font_draw_text(void* ud, eweb_surface_t* sh, int x, int y, const 
     s = S(sh);
     if(!s->surf) return;
     f = F(fh);
-    face = sdl_font_face(f, size);
+    /* Rasterise at the TARGET surface's device resolution and place the glyph
+     * bitmap at the surface's device coordinates (s->dpr, not g_dpr: a surface
+     * created before a ratio change keeps rendering consistently). */
+    face = sdl_font_face(f, sdl2_font_px_dpr(size, s->dpr));
     if(!face) return;
     c.r = (Uint8)((color >> 16) & 0xFF);
     c.g = (Uint8)((color >> 8)  & 0xFF);
@@ -862,7 +968,7 @@ static void ek_font_draw_text(void* ud, eweb_surface_t* sh, int x, int y, const 
     txt = TTF_RenderUTF8_Blended(face, text, c);
     if(!txt) return;
     SDL_SetSurfaceBlendMode(txt, SDL_BLENDMODE_BLEND);
-    dst.x = x; dst.y = y; dst.w = txt->w; dst.h = txt->h;
+    dst.x = sdl2_sp(s, x); dst.y = sdl2_sp(s, y); dst.w = txt->w; dst.h = txt->h;
     SDL_BlitSurface(txt, NULL, s->surf, &dst);
     SDL_FreeSurface(txt);
 }
@@ -918,6 +1024,8 @@ static eweb_surface_t* ek_image_decode(void* ud, const uint8_t* data, int size) 
     if(!s) { SDL_FreeSurface(argb); return NULL; }
     s->surf = argb;
     s->rend = NULL;
+    /* Natural-pixel buffer: intrinsic size == pixel size, no HiDPI scaling. */
+    s->lw = argb->w; s->lh = argb->h; s->dpr = 1.0f;
     return SH(s);
 }
 
@@ -1030,29 +1138,55 @@ static uint8_t* ek_net_read_file(void* ud, const char* path, int* out_size) {
     return buf;
 }
 
-/* "res://" is an EwokOS-specific scheme (libx x_get_res_name resolves it
- * against the running app's resource directory). Desktop builds have no
- * equivalent, and the HAL marks resolve_resource OPTIONAL, so return NULL
- * and let the core fall back to treating the URL as unsupported. */
+/* "res://" is the port's private resource scheme. The core strips the scheme and
+ * hands us the remainder (e.g. "default.css" for "res://default.css"); we resolve
+ * it against the directory of the running program, i.e. <program-dir>/res/<name>,
+ * mirroring the EwokOS port's x_get_res_name.
+ *
+ * g_res_base caches "<program-dir>/res/" (trailing slash), computed once in
+ * eweb_port_sdl2() from SDL_GetBasePath() on the UI thread before ewebview_create
+ * spawns the download worker, so this resolver stays lock-free and re-entrant.
+ *
+ * The result MUST be absolute: the core dresses it as "file:/" + <result> and
+ * loadURL only treats a URL beginning with "file://" as a local read, which needs
+ * <result> to start with '/'. SDL_GetBasePath() always returns an absolute path
+ * with a trailing separator, so that holds. An absolute remainder is passed
+ * through unchanged; if the base path was unavailable we return NULL (scheme
+ * unsupported) rather than emit a broken relative path. */
+static char g_res_base[1024] = {0};
+
 static const char* ek_net_resolve_resource(void* ud, const char* res, char* buf, int bufsize) {
-    (void)ud; (void)res; (void)buf; (void)bufsize;
-    return NULL;
+    int n;
+    (void)ud;
+    if(!res || !buf || bufsize <= 0) return NULL;
+    if(res[0] == '/')
+        n = snprintf(buf, (size_t)bufsize, "%s", res);
+    else if(g_res_base[0])
+        n = snprintf(buf, (size_t)bufsize, "%s%s", g_res_base, res);
+    else
+        return NULL;   /* base path unavailable; leave res:// unsupported */
+    if(n <= 0 || n >= bufsize || buf[0] == 0) return NULL;
+    return buf;
 }
 
 /* ------------------------------------------------------------------ */
 /* Clock                                                               */
 /* ------------------------------------------------------------------ */
 
-/* SDL_GetTicks64 landed in SDL 2.0.18; fall back to the 32-bit SDL_GetTicks
- * (wraps every ~49 days, still monotonic across the wrap for difference-only
- * use, which is all the HAL promises) on older toolchains. */
+/* The core's chunked style walk (litehtml document::update_master_styles_step)
+ * compares an absolute deadline computed here against litehtml's internal
+ * sys_tic_ms(), which reads clock_gettime(CLOCK_MONOTONIC). If the port clock
+ * used a different epoch (SDL_GetTicks counts from SDL_Init, CLOCK_MONOTONIC
+ * from boot), the deadline comparison would be meaningless - sys_tic_ms() would
+ * always dwarf the deadline and every chunk would bail immediately, spinning the
+ * engine thread at 100% without ever finishing the style pass. Reading the same
+ * CLOCK_MONOTONIC keeps the two bases identical. Every other ticMs() use in the
+ * core is difference-only, so the epoch choice is irrelevant to them. */
 static uint64_t ek_clock_tic_ms(void* ud) {
     (void)ud;
-#if SDL_VERSION_ATLEAST(2, 0, 18)
-    return (uint64_t)SDL_GetTicks64();
-#else
-    return (uint64_t)SDL_GetTicks();
-#endif
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
 static void ek_clock_sleep_ms(void* ud, uint32_t ms) {
@@ -1085,6 +1219,19 @@ static void ek_sys_log(void* ud, const char* text) {
 void eweb_port_sdl2(eweb_port_t* port, void* ud) {
     if(!port) return;
     memset(port, 0, sizeof(*port));
+
+    /* Cache "<program-dir>/res/" once for the res:// resolver (see
+     * ek_net_resolve_resource). Read here on the UI thread - before
+     * ewebview_create() spawns the download worker that later calls the resolver
+     * - so g_res_base can be used lock-free. Guarded so repeat inits don't
+     * re-query SDL_GetBasePath(). */
+    if(g_res_base[0] == 0) {
+        char* bp = SDL_GetBasePath();
+        if(bp) {
+            snprintf(g_res_base, sizeof(g_res_base), "%sres/", bp);
+            SDL_free(bp);
+        }
+    }
 
     port->gfx.ud = ud;
     port->gfx.surface_new       = ek_surface_new;
