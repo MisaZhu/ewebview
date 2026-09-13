@@ -17,6 +17,21 @@ TARGET_DIR = $(BUILD_DIR)
 CXXFLAGS += -I porting/include -MMD -MP
 CFLAGS   += -I porting/include -MMD -MP
 
+# port_sdl2.c (the sdl2 PORT_OBJS below) includes <SDL.h> plus the companion
+# SDL2_image/_ttf/_gfx headers, which Homebrew installs under include/SDL2.
+# make.inc leaves CFLAGS_EXTRA empty, so pull those dirs (and -D_THREAD_SAFE)
+# from sdl2-config here - portable across Apple Silicon /opt/homebrew, Intel
+# /usr/local and Linux distros. Scoped to PORTING=sdl2 and guarded on
+# sdl2-config existing, so other ports and hosts without SDL2 still build.
+ifeq ($(PORTING),sdl2)
+SDL2_CONFIG := $(shell command -v sdl2-config 2>/dev/null)
+ifneq ($(SDL2_CONFIG),)
+SDL2_CFLAGS := $(shell $(SDL2_CONFIG) --cflags)
+CFLAGS   += $(SDL2_CFLAGS)
+CXXFLAGS += $(SDL2_CFLAGS)
+endif
+endif
+
 EWEBVIEW_OBJS = \
 	$(ARCH)/src/ewebview.o \
 	$(ARCH)/src/EWebContainer.o \

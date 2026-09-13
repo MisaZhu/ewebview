@@ -49,7 +49,7 @@ LDFLAGS += -L $(TARGET_DIR)/lib
 # Link order matters: ewebview references litehtml/mario/webp/tinyhttpsc
 # symbols, and the SDL2 port inside libewebview.a references SDL2 companions.
 # libewebview.a is C++14 internally, so link with $(CXX) to pull in libstdc++.
-LIBS = -lewebview -llitehtml -lmario -lwebp -ltinyhttpsc \
+LIBS = -lewebview -llitehtml -lmario_jsn -lwebp -ltinyhttpsc \
        $(SDL2_LIBS) -lm -lpthread
 
 OBJS = $(ARCH)/main.o $(ARCH)/compat.o
