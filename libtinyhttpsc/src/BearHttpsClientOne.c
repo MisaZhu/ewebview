@@ -97,10 +97,13 @@ void ewok_freeaddrinfo_compat(struct addrinfo *res);
 uint64_t ewok_https_entropy_state = 0;
 
 uint64_t ewok_https_entropy_word(void) {
+    struct timespec ts;
     uint64_t usec = 0;
     uint64_t mix;
 
-    kernel_tic(NULL, &usec);
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+        usec = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+    }
     mix = usec;
     mix ^= ((uint64_t)(uint32_t)time(NULL) << 32);
     mix ^= (uint64_t)(uint32_t)getpid();
