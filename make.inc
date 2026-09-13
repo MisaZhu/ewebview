@@ -10,6 +10,13 @@ ifeq ($(ewokos),)
 export ewokos := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 endif
 
+export ewebview_root := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+
+# All arch output dirs, so that clean removes objects of every arch,
+# not only the one selected by $(ARCH).
+ALL_ARCH_DIRS = aarch64 arm x86 riscv
+
+
 ifeq ($(ARCH),)
 export ARCH=aarch64
 endif
@@ -18,17 +25,16 @@ ifeq ($(HW),)
 export HW=virt
 endif
 
-
-EWOKOS_ROOT_DIR = $(ewokos)
-EWOKOS_SYS_DIR = $(EWOKOS_ROOT_DIR)/system
-
-# All arch output dirs, so that clean removes objects of every arch,
-# not only the one selected by $(ARCH).
-ALL_ARCH_DIRS = aarch64 arm x86 riscv
-
+ifeq ($(OS_TYPE),ewokos)
+EWOKOS_ROOT_DIR=$(ewokos)
+EWOKOS_SYS_DIR=$(EWOKOS_ROOT_DIR)/system
 SDK_DIR= $(EWOKOS_SYS_DIR)/build_$(ARCH)/$(HW)
-
 include $(EWOKOS_SYS_DIR)/platform/$(ARCH)/make.rule
+else
+SDK_DIR= $(ewebview_root)/build_$(ARCH)/$(HW)
+include $(ewebview_root)/host.rule
+endif
+
 
 LDFLAGS = -L $(SDK_DIR)/lib
 # LITEHTML_LIFETIME_DEBUG is NOT a verbose-logging switch (that is XBROWSER_DEBUG):

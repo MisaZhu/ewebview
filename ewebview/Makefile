@@ -1,5 +1,5 @@
 PROJS_ROOT_DIR=..
-include $(PROJS_ROOT_DIR)/$(PORTING).inc
+include $(PROJS_ROOT_DIR)/make.inc
 
 BUILD_DIR = $(SDK_DIR)
 TARGET_DIR = $(BUILD_DIR)
@@ -13,7 +13,7 @@ TARGET_DIR = $(BUILD_DIR)
 #
 # <litehtml.h> and <mario/*.h> come from $(TARGET_DIR)/include, installed by
 # the sibling litehtml/mario Makefiles, so ewebview must build after them
-# (see DIRS in ../Makefile). -I include comes from $(PORTING).inc.
+# (see DIRS in ../Makefile). -I include comes from make.inc.
 CXXFLAGS += -I porting/include -MMD -MP
 CFLAGS   += -I porting/include -MMD -MP
 

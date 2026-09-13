@@ -45,12 +45,12 @@ libwebp → litehtml → jsnative → ewebview
 
 ```make
 PROJS_ROOT_DIR=../..
-include $(PROJS_ROOT_DIR)/$(PORTING).inc
+include $(PROJS_ROOT_DIR)/make.inc
 ```
 
-`browser/$(PORTING).inc` 做的事：
+`browser/make.inc` 做的事：
 
-- `ewokos`：EwokOS 源码树根目录，默认取本仓库根（`$(PORTING).inc` 自身位置推导），可用 `make ewokos=/path/to/ewokos` 覆盖；
+- `ewokos`：EwokOS 源码树根目录，默认取本仓库根（`make.inc` 自身位置推导），可用 `make ewokos=/path/to/ewokos` 覆盖；
 - `ARCH=aarch64`、`HW=virt` 默认值；
 - `SDK_DIR = $(ewokos)/system/build_$(ARCH)/$(HW)`——所有库的 `lib*.a` 与头文件都安装到这里；
 - `include $(EWOKOS_SYS_DIR)/platform/$(ARCH)/make.rule`——注入交叉工具链（`CROSS_COMPILE`）、`-ffreestanding` 等通用 flags；

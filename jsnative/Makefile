@@ -1,5 +1,5 @@
 PROJS_ROOT_DIR=..
-include $(PROJS_ROOT_DIR)/$(PORTING).inc
+include $(PROJS_ROOT_DIR)/make.inc
 
 BUILD_DIR = $(SDK_DIR)
 TARGET_DIR = $(BUILD_DIR)
@@ -7,7 +7,7 @@ TARGET_DIR = $(BUILD_DIR)
 # The mario VM sources live in the mario_js submodule at the browser repo
 # root; only the browser-side natives (DOM/event/web/canvas bridges) live
 # here. Everything is archived into one libmario.a so xBrowser links a
-# single -lmario.
+# single -lmario_jsn.
 MARIO_VM = ../mario_js
 
 NATIVE_PATH = $(MARIO_VM)/lang/js/native
