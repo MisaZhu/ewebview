@@ -313,12 +313,6 @@ void eweb_port_init(eweb_port_t* port);
 /* Reference EwokOS port                                               */
 /* ------------------------------------------------------------------ */
 
-/* Fill `port` with the EwokOS implementation: surfaces are graph_t*, fonts are
- * font_t*, images decode via graph_image/libwebp/plutosvg, network uses
- * tinyhttpsc + vfs_readfile, resources resolve via libx x_get_res_name, and the
- * clock is sys_tic_ms. `ud` is stored in every table's ud and may be NULL
- * (the EwokOS port keeps no per-instance state). Declared here so an embedder
- * can opt into the reference port without knowing its internals. */
 void eweb_port_ewokos(eweb_port_t* port, void* ud);
 
 #ifdef __cplusplus

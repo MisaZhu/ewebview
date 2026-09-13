@@ -8,7 +8,7 @@
  *   net.request     -> libtinyhttpsc (BearSSL HTTP/HTTPS), one hop per call
  *   net.read_file   -> vfs_readfile  (file://)
  *   net.resolve_res -> x_get_res_name (res://)
- *   clock.tic_ms    -> sys_tic_ms
+ *   clock.tic_ms    -> kernel_tic_ms
  *
  * The two opaque handles are the concrete EwokOS pointers plain-cast, so an
  * embedder that IS this port (widget++) can recover the graph_t* of a frame
@@ -315,7 +315,10 @@ static const char* ek_net_resolve_resource(void* ud, const char* res, char* buf,
 /* Clock                                                               */
 /* ------------------------------------------------------------------ */
 
-static uint64_t ek_clock_tic_ms(void* ud) { (void)ud; return sys_tic_ms(0); }
+/* sys_tic_ms() is the host helper in litehtml/os_types.h (clock_gettime based)
+ * and lives in a C++ header, so this C99 port cannot see it - use the EwokOS
+ * kernel clock from <ewoksys/kernel_tic.h> instead. */
+static uint64_t ek_clock_tic_ms(void* ud) { (void)ud; return kernel_tic_ms(0); }
 static void ek_clock_sleep_ms(void* ud, uint32_t ms) { (void)ud; proc_usleep(ms * 1000); }
 
 /* ------------------------------------------------------------------ */

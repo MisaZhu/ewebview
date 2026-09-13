@@ -81,7 +81,7 @@ int64_t ewok_https_days_from_civil(int year, unsigned month, unsigned day);
 const char* ewok_gai_strerror_compat(int ecode);
 void ewok_freeaddrinfo_compat(struct addrinfo *res);
 
-//#define __linux__ 1
+#define __linux__ 1
 #define __unix__ 1
 #define open ewok_https_open_compat
 #define read ewok_https_read_compat
@@ -94415,7 +94415,6 @@ static int private_BearHttps_connect_host(BearHttpsRequest *self, BearHttpsRespo
              * the observed symptom. Log the resolved IP so it can be compared
              * against a known-good resolution for the same hostname.
              */
-            EWOK_TLS_LOG("[tinyhttps] dns: %s -> %s\n", host, ip_str ? ip_str : "(null)");
 
             if(ip_str != NULL) {
                 int sockfd = private_BearHttpsRequest_connect_ipv4_no_error_raise(ip_str, port, self->connection_timeout);
@@ -94686,13 +94685,8 @@ static int private_BearHttps_sock_read(void *ctx, unsigned char *buf, size_t len
             if (read_len < 0 && (errno == EINTR || errno == EAGAIN)) {
                 continue;
             }
-            EWOK_TLS_LOG("[tinyhttps] tls_read STOP fd=%d req=%d ret=%d errno=%d (%s)\n",
-                *(int*)ctx, (int)len, (int)read_len, errno,
-                read_len == 0 ? "peer FIN/orderly close" : "socket hard error");
             return -1;
         }
-        EWOK_TLS_LOG("[tinyhttps] tls_read ok fd=%d req=%d got=%d\n",
-            *(int*)ctx, (int)len, (int)read_len);
         return (int)read_len;
     }
 }
@@ -94707,12 +94701,8 @@ static int private_BearHttps_sock_write(void *ctx, const unsigned char *buf, siz
             if (write_len < 0 && (errno == EINTR || errno == EAGAIN)) {
                 continue;
             }
-            EWOK_TLS_LOG("[tinyhttps] tls_write STOP fd=%d req=%d ret=%d errno=%d\n",
-                *(int*)ctx, (int)len, (int)write_len, errno);
             return -1;
         }
-        EWOK_TLS_LOG("[tinyhttps] tls_write ok fd=%d req=%d sent=%d\n",
-            *(int*)ctx, (int)len, (int)write_len);
         return (int)write_len;
     }
 }
@@ -95566,7 +95556,6 @@ int private_BearHttpsResponse_write(BearHttpsResponse *self,unsigned char *bufer
        * whether a server that FINs right after the request is rejecting a
        * malformed request line/header or something else.
        */
-      EWOK_TLS_LOG("[tinyhttps] http_tx %ld bytes: [%.*s]\n", size, (int)size, (char*)bufer);
       int wret = br_sslio_write_all(&self->ssl_io, bufer, size);
       /*
        * The TLS handshake is driven by the first write: br_sslio_write_all()
@@ -95584,7 +95573,6 @@ int private_BearHttpsResponse_write(BearHttpsResponse *self,unsigned char *bufer
           snprintf(werr, sizeof(werr),
               "tls handshake/write fail: ret=%d errno=%d ssl_state=0x%x ssl_err=%d",
               wret, errno, ssl_state, ssl_err);
-          EWOK_TLS_LOG("[tinyhttps] %s\n", werr);
           BearHttpsResponse_set_error(self, werr, BEARSSL_HTTPS_IMPOSSIBLE_TO_SEND_DATA);
       }
       return wret;
