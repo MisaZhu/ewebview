@@ -2,6 +2,8 @@
 #include "el_text.h"
 #include "document.h"
 #include <stdint.h>
+#include <cstdlib>
+#include <new>
 
 namespace litehtml {
 void profile_text_parse(uint32_t transform_ms, uint32_t measure_ms, uint64_t start_ms);
@@ -21,6 +23,16 @@ litehtml::el_text::el_text(const tchar_t* text, litehtml::document* doc) : eleme
 litehtml::el_text::~el_text()
 {
 
+}
+
+litehtml::element::ptr litehtml::el_text::clone_node(bool deep)
+{
+	/* A text node has no children, so deep and shallow clones are identical.
+	 * Built with malloc + placement-new exactly like litehtml_alloc and
+	 * jsCreateTextNode, keeping the matching free() on teardown balanced. */
+	void* mem = malloc(sizeof(el_text));
+	if(!mem) return nullptr;
+	return new (mem) el_text(m_text.c_str(), m_doc);
 }
 
 void litehtml::el_text::get_content_size( size& sz, int max_width )

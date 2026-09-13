@@ -126,6 +126,7 @@ namespace litehtml
 		virtual bool				appendChild(const element::ptr &el) override;
 		virtual bool				removeChild(const element::ptr &el) override;
 		virtual bool				insertBefore(const element::ptr &el, const element::ptr &ref) override;
+		virtual element::ptr		clone_node(bool deep) override;
 		virtual void				clearRecursive() override;
 		virtual const tchar_t*		get_tagName() const override;
 		virtual void				set_tagName(const tchar_t* tag) override;

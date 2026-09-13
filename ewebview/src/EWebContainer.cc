@@ -866,7 +866,20 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
     if(!do_image) {
         if(alpha == 0)
             return;
-        if(gfx->fill_rect)
+        int rad_x = bg.border_radius.top_left_x;
+        int rad_y = bg.border_radius.top_left_y;
+        bool rounded = (rad_x > 0 || rad_y > 0) &&
+            bg.border_radius.top_right_x == rad_x &&
+            bg.border_radius.bottom_left_x == rad_x &&
+            bg.border_radius.bottom_right_x == rad_x &&
+            bg.border_radius.top_left_y == rad_y &&
+            bg.border_radius.top_right_y == rad_y &&
+            bg.border_radius.bottom_left_y == rad_y &&
+            bg.border_radius.bottom_right_y == rad_y;
+        if(rounded && gfx->fill_round)
+            gfx->fill_round(gfx->ud, s, bg.clip_box.x, bg.clip_box.y, bg.clip_box.width, bg.clip_box.height,
+                rad_x > rad_y ? rad_x : rad_y, color);
+        else if(gfx->fill_rect)
             gfx->fill_rect(gfx->ud, s, bg.clip_box.x, bg.clip_box.y, bg.clip_box.width, bg.clip_box.height, color);
     } else {
         // Keep image boxes visible before the real bitmap arrives so HTML can
@@ -886,12 +899,59 @@ void EWebContainer::draw_borders(litehtml::uint_ptr hdc, const litehtml::borders
     m_paint_surf = (void*)hdc;
     if (!s)
         return;
+    (void)root;
 
-    if (borders.top.width != 0 && borders.top.style > litehtml::border_style_hidden) {
-        uint32_t color = web_color_to_argb(borders.top.color);
-        if(m_port->gfx.rect)
-            m_port->gfx.rect(m_port->gfx.ud, s, draw_pos.x, draw_pos.y, draw_pos.width, draw_pos.height, color);
+    const eweb_gfx_t* gfx = &m_port->gfx;
+    const litehtml::border& t = borders.top;
+    const litehtml::border& r = borders.right;
+    const litehtml::border& b = borders.bottom;
+    const litehtml::border& l = borders.left;
+
+    bool has_top    = t.width > 0 && t.style > litehtml::border_style_hidden;
+    bool has_right  = r.width > 0 && r.style > litehtml::border_style_hidden;
+    bool has_bottom = b.width > 0 && b.style > litehtml::border_style_hidden;
+    bool has_left   = l.width > 0 && l.style > litehtml::border_style_hidden;
+    if (!has_top && !has_right && !has_bottom && !has_left)
+        return;
+
+    int rad = borders.radius.top_left_x;
+    bool uniform_radius = borders.radius.top_right_x == rad &&
+                          borders.radius.bottom_left_x == rad &&
+                          borders.radius.bottom_right_x == rad &&
+                          borders.radius.top_left_y == rad &&
+                          borders.radius.top_right_y == rad &&
+                          borders.radius.bottom_left_y == rad &&
+                          borders.radius.bottom_right_y == rad;
+
+    /* Rounded outline with one shared width/color: single stroked round-rect
+     * (the .button pill case). Otherwise paint each side independently with
+     * its own width/color, which also fixes border-bottom-only rules that
+     * used to be drawn as a full 1px outline. */
+    if (rad > 0 && uniform_radius && has_top && t.width == r.width && t.width == b.width && t.width == l.width &&
+        web_color_to_argb(t.color) == web_color_to_argb(r.color) &&
+        web_color_to_argb(t.color) == web_color_to_argb(b.color) &&
+        web_color_to_argb(t.color) == web_color_to_argb(l.color) && gfx->round) {
+        gfx->round(gfx->ud, s, draw_pos.x, draw_pos.y, draw_pos.width, draw_pos.height,
+                   rad, t.width, web_color_to_argb(t.color));
+        return;
     }
+
+    if (has_top && gfx->fill_rect) {
+        int x = draw_pos.x + (has_left ? l.width : 0);
+        int w = draw_pos.width - (has_left ? l.width : 0) - (has_right ? r.width : 0);
+        if (w > 0)
+            gfx->fill_rect(gfx->ud, s, x, draw_pos.y, w, t.width, web_color_to_argb(t.color));
+    }
+    if (has_bottom && gfx->fill_rect) {
+        int x = draw_pos.x + (has_left ? l.width : 0);
+        int w = draw_pos.width - (has_left ? l.width : 0) - (has_right ? r.width : 0);
+        if (w > 0)
+            gfx->fill_rect(gfx->ud, s, x, draw_pos.y + draw_pos.height - b.width, w, b.width, web_color_to_argb(b.color));
+    }
+    if (has_left && gfx->fill_rect)
+        gfx->fill_rect(gfx->ud, s, draw_pos.x, draw_pos.y, l.width, draw_pos.height, web_color_to_argb(l.color));
+    if (has_right && gfx->fill_rect)
+        gfx->fill_rect(gfx->ud, s, draw_pos.x + draw_pos.width - r.width, draw_pos.y, r.width, draw_pos.height, web_color_to_argb(r.color));
 }
 
 void EWebContainer::draw_svg(litehtml::uint_ptr hdc, const litehtml::position& pos,

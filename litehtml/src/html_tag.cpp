@@ -307,6 +307,25 @@ bool litehtml::html_tag::appendChild(const element::ptr &el)
 	return false;
 }
 
+litehtml::element::ptr litehtml::html_tag::clone_node(bool deep)
+{
+	/* Recreate the same tag with the same attributes through the document factory
+	 * (which picks the right element subclass), then deep-copy the children. The
+	 * clone is unstyled and detached; appendChild + style_detached_subtree on the
+	 * engine side match the styles once it is spliced into the live tree. */
+	element::ptr dst = m_doc->create_element(m_tag.c_str(), m_attrs);
+	if(dst && deep)
+	{
+		for(auto& c : m_children)
+		{
+			if(!c) continue;
+			element::ptr cc = c->clone_node(true);
+			if(cc) dst->appendChild(cc);
+		}
+	}
+	return dst;
+}
+
 bool litehtml::html_tag::removeChild(const element::ptr &el)
 {
 	if(el && el->parent() == this)
@@ -4205,6 +4224,7 @@ int litehtml::html_tag::place_element(const element::ptr &el, int max_width)
 			{
 			case display_inline_block:
 			case display_inline_grid:
+			case display_inline_flex:
 				ret_width = el->render(line_ctx.left, line_ctx.top, line_ctx.right);
 				break;
 			case display_block:		
@@ -4542,6 +4562,7 @@ litehtml::element_float litehtml::html_tag::get_float() const
 bool litehtml::html_tag::is_floats_holder() const
 {
 	if(	m_display == display_inline_block || 
+		m_display == display_inline_flex || 
 		m_display == display_table_cell || 
 		!have_parent() ||
 		is_body() || 

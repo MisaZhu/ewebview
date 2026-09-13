@@ -23,6 +23,10 @@ namespace litehtml
 	struct flex_item
 	{
 		element::ptr	el;
+		/* non-empty: anonymous flex item wrapping a contiguous text run
+		 * (words + separating spaces); real CSS boxifies such runs into a
+		 * single item, per-word items would overlap when the line shrinks */
+		std::vector<element::ptr>	run;
 		int				order;
 		float			grow;
 		float			shrink;
@@ -105,8 +109,141 @@ static void flex_parse_gap(html_tag* el, int avail, int& row_gap, int& col_gap)
  * when such a box is a flex item with flex-basis:auto its base size must be
  * recovered from the children the last render() placed inside it; otherwise
  * every auto-width block item (e.g. a <li> in a nav row) measures as the whole
- * row and the shrink step slices the row into equal strips. */
+ * row and the shrink step slices the row into equal strips.
+ * Child positions are deliberately NOT consulted: a centered line box or a
+ * justify-content:center flex row stores the centering lead in left(), which
+ * would inflate the preferred width by that lead. Inline siblings share one
+ * line (widths add up), block-level children stack (widths compete). */
 static int preferred_content_width(const litehtml::element::ptr& el)
+{
+	if(!el) return 0;
+	litehtml::style_display d = el->get_display();
+	if(el->is_replaced() || d == litehtml::display_inline_block ||
+	   d == litehtml::display_inline_text)
+	{
+		return el->width();
+	}
+	if(d == litehtml::display_flex || d == litehtml::display_inline_flex)
+	{
+		/* row flex: the items sit side by side, so their widths add up */
+		int w = 0;
+		size_t n = el->get_children_count();
+		for(size_t i = 0; i < n; i++)
+		{
+			litehtml::element::ptr c = el->get_child((int)i);
+			if(!c || !c->is_visible()) continue;
+			if(c->get_element_position() == litehtml::element_position_absolute ||
+			   c->get_element_position() == litehtml::element_position_fixed) continue;
+			w += c->margin_left() + c->margin_right() + preferred_content_width(c);
+		}
+		return w + el->padding_left() + el->padding_right() +
+			   el->border_left() + el->border_right();
+	}
+	int w = 0;
+	int line = 0;
+	size_t n = el->get_children_count();
+	for(size_t i = 0; i < n; i++)
+	{
+		litehtml::element::ptr c = el->get_child((int)i);
+		if(!c || !c->is_visible()) continue;
+		if(c->get_element_position() == litehtml::element_position_absolute ||
+		   c->get_element_position() == litehtml::element_position_fixed) continue;
+		int mw = c->margin_left() + c->margin_right();
+		if(c->is_break())
+		{
+			if(line > w) w = line;
+			line = 0;
+			continue;
+		}
+		litehtml::style_display cd = c->get_display();
+		if(cd == litehtml::display_inline || cd == litehtml::display_inline_text ||
+		   cd == litehtml::display_inline_block || cd == litehtml::display_inline_flex ||
+		   cd == litehtml::display_inline_grid || cd == litehtml::display_inline_table)
+		{
+			/* inline-level siblings flow into the same line */
+			line += mw + preferred_content_width(c);
+		}
+		else
+		{
+			if(line > w) w = line;
+			line = 0;
+			int cw = mw + preferred_content_width(c);
+			if(cw > w) w = cw;
+		}
+	}
+	if(line > w) w = line;
+	return w + el->padding_left() + el->padding_right() +
+		   el->border_left() + el->border_right();
+}
+
+/* Height of a bare text flex item: line-height (number x font-size, or an
+ * explicit length) instead of the raw font box, so a button with
+ * line-height:1.5 gets the same cross size a line box would give it. */
+static int flex_text_height(const litehtml::element::ptr& el, int fallback)
+{
+	const litehtml::tchar_t* lh = el->get_style_property(_t("line-height"), true, _t("normal"));
+	if(!lh) return fallback;
+	litehtml::css_length l;
+	l.fromString(lh);
+	if(l.is_predefined()) return fallback;
+	int fs = el->get_font_size();
+	if(fs <= 0 && el->parent()) fs = el->parent()->get_font_size();
+	if(l.units() == litehtml::css_units_none)
+		return (int)(l.val() * fs + 0.5f);
+	return el->get_document()->cvt_units(l, fs, 0);
+}
+
+/* Greedy word wrap of an anonymous text run into inner px of main size.
+ * With place set, every word node's m_pos is written relative to (ox, oy),
+ * the flex container's content-box origin, exactly like the single-text
+ * placement path. Returns the wrapped block height. */
+static int flex_run_wrap(const std::vector<litehtml::element::ptr>& run, int inner,
+		bool place, int ox, int oy)
+{
+	int lx = 0, ly = 0, lh = 0, pend = 0;
+	for(size_t i = 0; i < run.size(); i++)
+	{
+		const litehtml::element::ptr& nd = run[i];
+		if(nd->is_white_space())
+		{
+			if(lx > 0)
+			{
+				litehtml::size ssz;
+				nd->get_content_size(ssz, inner);
+				pend = ssz.width;
+			}
+			continue;
+		}
+		litehtml::size sz;
+		nd->get_content_size(sz, inner);
+		int nlh = flex_text_height(nd, sz.height);
+		if(lx > 0 && lx + pend + sz.width > inner)
+		{
+			ly += lh;
+			lx = 0;
+			pend = 0;
+			lh = 0;
+		}
+		int nx = (lx > 0) ? lx + pend : 0;
+		if(place)
+		{
+			litehtml::position& np = nd->get_position();
+			np.x		= ox + nx;
+			np.y		= oy + ly;
+			np.width	= sz.width;
+			np.height	= nlh;
+		}
+		lx = nx + sz.width;
+		pend = 0;
+		if(nlh > lh) lh = nlh;
+	}
+	return ly + lh;
+}
+
+/* Automatic minimum size of a flex item (min-content): shrinking below the
+ * widest unsplittable word makes glyphs overflow into the neighbour item,
+ * which is exactly the nav-row overlap real flexbox never shows. */
+static int flex_min_content_inner(const litehtml::element::ptr& el)
 {
 	if(!el) return 0;
 	litehtml::style_display d = el->get_display();
@@ -123,10 +260,16 @@ static int preferred_content_width(const litehtml::element::ptr& el)
 		if(!c || !c->is_visible()) continue;
 		if(c->get_element_position() == litehtml::element_position_absolute ||
 		   c->get_element_position() == litehtml::element_position_fixed) continue;
-		int r = c->left() + preferred_content_width(c);
-		if(r > w) w = r;
+		int cw = flex_min_content_inner(c);
+		if(cw > w) w = cw;
 	}
-	return w + el->padding_left() + el->padding_right() +
+	return w;
+}
+
+static int flex_min_content(const litehtml::element::ptr& el)
+{
+	if(!el) return 0;
+	return flex_min_content_inner(el) + el->padding_left() + el->padding_right() +
 		   el->border_left() + el->border_right();
 }
 
@@ -195,8 +338,41 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		if(!el || !el->is_visible()) continue;
 		element_position ep = el->get_element_position();
 		if(ep == element_position_absolute || ep == element_position_fixed) continue;
-		if(el->is_white_space()) continue;
+		if(el->is_white_space())
+		{
+			/* Whitespace separates words *inside* an anonymous text run; on its
+			 * own (source formatting between element siblings) it is no box. */
+			if(!items.empty() && !items.back().run.empty())
+			{
+				items.back().run.push_back(el);
+			}
+			continue;
+		}
 		if(el->get_display() == display_contents) continue; /* box-less wrapper */
+		if(el->get_display() == display_inline_text)
+		{
+			/* contiguous text boxifies into ONE anonymous flex item */
+			if(!items.empty() && !items.back().run.empty())
+			{
+				items.back().run.push_back(el);
+			}
+			else
+			{
+				flex_item it;
+				it.el		= el;
+				it.run.push_back(el);
+				it.grow		= 0;
+				it.shrink	= 1;
+				it.base		= 0;
+				it.has_main	= false;
+				it.main		= 0;
+				it.cross	= 0;
+				it.ml = it.mr = it.mt = it.mb = 0;
+				it.order	= 0;
+				items.push_back(it);
+			}
+			continue;
+		}
 
 		/* CSS blockifies flex items: inline-level boxes become block-level */
 		switch(el->get_display())
@@ -274,6 +450,17 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		items.push_back(it);
 	}
 
+	/* drop trailing separators; a whitespace-only run is not an item */
+	for(size_t i = items.size(); i-- > 0;)
+	{
+		if(items[i].run.empty()) continue;
+		while(!items[i].run.empty() && items[i].run.back()->is_white_space())
+		{
+			items[i].run.pop_back();
+		}
+		if(items[i].run.empty()) items.erase(items.begin() + i);
+	}
+
 	if(items.empty())
 	{
 		m_pos.width = avail;
@@ -290,14 +477,19 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 	{
 		if(!it.has_main)
 		{
-			if(it.el->get_display() == display_inline_text)
+			if(!it.run.empty())
 			{
-				/* text nodes have no render() override (base element::render returns 0),
-				 * so measure them via get_content_size exactly as place_element does;
-				 * otherwise a bare text flex item collapses to base 0 */
-				litehtml::size sz;
-				it.el->get_content_size(sz, avail);
-				it.base = sz.width + it.ml + it.mr;
+				/* max-content: all words plus separators on one line.
+				 * Measure via get_content_size (m_size): m_pos.width is only
+				 * written once the run is placed, so width() is stale here. */
+				int w = 0;
+				for(size_t k = 0; k < it.run.size(); k++)
+				{
+					litehtml::size sz;
+					it.run[k]->get_content_size(sz, avail);
+					w += sz.width;
+				}
+				it.base = w + it.ml + it.mr;
 			}
 			else
 			{
@@ -319,6 +511,18 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			}
 		}
 		if(it.base < it.ml + it.mr) it.base = it.ml + it.mr;
+	}
+
+	/* An inline-flex atom sizes to its content (max-content), so resolve its
+	 * own avail from the items before packing: packing first at the line's
+	 * avail bakes the justify-content lead into the used width, which then
+	 * widens the atom and shifts its label off the padding edge. */
+	if(width_auto && m_display == display_inline_flex && !items.empty())
+	{
+		int intrinsic = 0;
+		for(size_t i = 0; i < items.size(); i++) intrinsic += items[i].base;
+		intrinsic += col_gap * (int)(items.size() - 1);
+		avail = intrinsic;
 	}
 
 	// break into flex lines
@@ -391,6 +595,23 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				flex_item& it = items[line[i]];
 				int sh = (int)((float)(-free) * it.shrink * (float)it.base / total_shrink);
 				it.main = it.base - sh;
+				/* automatic minimum size: never below min-content */
+				int minc = 0;
+				if(!it.run.empty())
+				{
+					for(size_t k = 0; k < it.run.size(); k++)
+					{
+						litehtml::size sz;
+						it.run[k]->get_content_size(sz, avail);
+						if(sz.width > minc) minc = sz.width;
+					}
+				}
+				else
+				{
+					minc = flex_min_content(it.el);
+				}
+				minc += it.ml + it.mr;
+				if(it.main < minc) it.main = minc;
 				if(it.main < it.ml + it.mr) it.main = it.ml + it.mr;
 			}
 			free = 0;
@@ -409,13 +630,12 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		for(size_t i = 0; i < line.size(); i++)
 		{
 			flex_item& it = items[line[i]];
-			if(it.el->get_display() == display_inline_text)
+			if(!it.run.empty())
 			{
-				/* text has no render(); size it here so its height feeds line_cross */
-				litehtml::size sz;
-				it.el->get_content_size(sz, it.main);
-				it.el->m_pos = sz;
-				it.cross = sz.height + it.mt + it.mb;
+				/* wrap the run at the resolved main size so its height feeds line_cross */
+				int inner = it.main - it.ml - it.mr;
+				if(inner < 0) inner = 0;
+				it.cross = flex_run_wrap(it.run, inner, false, 0, 0) + it.mt + it.mb;
 			}
 			else
 			{
@@ -472,9 +692,9 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		{
 			flex_item& it = items[line[i]];
 			int iy = 0;
-			bool is_text = (it.el->get_display() == display_inline_text);
+			bool is_run = !it.run.empty();
 			css_length ch = it.el->get_css_height();
-			if(!is_text && flex_flag(ai_s, "stretch", "normal") && ch.is_predefined())
+			if(!is_run && flex_flag(ai_s, "stretch", "normal") && ch.is_predefined())
 			{
 				iy = 0;
 				it.el->get_position().height = line_h - it.mt - it.mb;
@@ -488,16 +708,15 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			{
 				iy = line_h - it.cross;
 			}
-			if(is_text)
+			if(is_run)
 			{
-				/* position the text box directly; render() is a no-op for text.
-				 * Coordinates are relative to this flex container's content-box
-				 * origin (m_pos already holds that origin): adding m_pos.x again
-				 * double-counted the container's own offset during the recursive
-				 * draw pass, pushing items of any non-left-aligned flex box (e.g.
-				 * grid tiles) far to the right. */
-				it.el->m_pos.x = xs[i];
-				it.el->m_pos.y = bottom + iy;
+				/* place every word of the run; coordinates are relative to this
+				 * flex container's content-box origin (m_pos already holds that
+				 * origin): adding m_pos.x again would double-count the container's
+				 * own offset during the recursive draw pass. */
+				int inner = it.main - it.ml - it.mr;
+				if(inner < 0) inner = 0;
+				flex_run_wrap(it.run, inner, true, xs[i] + it.ml, bottom + iy + it.mt);
 			}
 			else
 			{
@@ -809,45 +1028,106 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 	}
 
 	int bottom = 0;
-	int cur_row_h = 0;
+
+	/* grid-auto-rows: minmax(L, ...) floors every row height; items then
+	 * stretch to the row height (align-self:stretch default), which is what
+	 * centers captions vertically inside the square member tiles. */
+	int row_min = 0;
+	const tchar_t* ar = get_style_property(_t("grid-auto-rows"), false, 0);
+	if(ar)
+	{
+		std::vector<grid_track> rt;
+		grid_parse_tracks(ar, avail, m_font_size, get_document(), rt, col_gap);
+		if(!rt.empty())
+		{
+			row_min = rt[0].min_w > 0 ? rt[0].min_w : (rt[0].is_fixed ? rt[0].fixed_w : 0);
+		}
+	}
+
+	/* Author-specified heights, saved so the stretch pass below can force a
+	 * row height and a later relayout measures from the clean state again. */
+	std::vector<css_length> orig_h(items.size());
+	std::vector<int> crossv(items.size(), 0);
 	for(size_t i = 0; i < items.size(); i++)
 	{
-		int col = (int)(i % (size_t)n);
-
-		if(col == 0 && i != 0)
+		if(items[i]->get_display() != display_inline_text)
 		{
-			bottom += cur_row_h + row_gap;
-			cur_row_h = 0;
+			orig_h[i] = static_cast<html_tag*>(items[i])->m_css_height;
 		}
-
-		int ix = 0;
-		for(int c = 0; c < col; c++)
-			ix += col_w[c] + col_gap;
-
-		element::ptr el = items[i];
-		int outer = col_w[col];
-		int cross = 0;
-		/* Item coordinates are relative to this grid container's content-box
-		 * origin (m_pos already holds that origin). Seeding ix with m_pos.x and
-		 * y with m_pos.y double-counted the container offset during the draw
-		 * pass, shifting every tile of a non-left-aligned grid to the right. */
-		if(el->get_display() == display_inline_text)
-		{
-			litehtml::size sz;
-			el->get_content_size(sz, outer);
-			el->m_pos = sz;
-			el->m_pos.x = ix;
-			el->m_pos.y = bottom;
-			cross = sz.height;
-		}
-		else
-		{
-			el->render(ix, bottom, outer, second_pass);
-			cross = el->get_position().height + el->margin_top() + el->margin_bottom();
-		}
-		if(cross > cur_row_h) cur_row_h = cross;
 	}
-	bottom += cur_row_h;
+
+	size_t i = 0;
+	while(i < items.size())
+	{
+		size_t row_end = i + (size_t)n;
+		if(row_end > items.size()) row_end = items.size();
+
+		int cur_row_h = 0;
+		for(size_t k = i; k < row_end; k++)
+		{
+			int col = (int)(k % (size_t)n);
+
+			int ix = 0;
+			for(int c = 0; c < col; c++)
+				ix += col_w[c] + col_gap;
+
+			element::ptr el = items[k];
+			int outer = col_w[col];
+			int cross = 0;
+			/* Item coordinates are relative to this grid container's content-box
+			 * origin (m_pos already holds that origin). Seeding ix with m_pos.x and
+			 * y with m_pos.y double-counted the container offset during the draw
+			 * pass, shifting every tile of a non-left-aligned grid to the right. */
+			if(el->get_display() == display_inline_text)
+			{
+				litehtml::size sz;
+				el->get_content_size(sz, outer);
+				el->m_pos = sz;
+				el->m_pos.x = ix;
+				el->m_pos.y = bottom;
+				cross = sz.height;
+			}
+			else
+			{
+				static_cast<html_tag*>(el)->m_css_height = orig_h[k];
+				el->render(ix, bottom, outer, second_pass);
+				cross = el->get_position().height + el->margin_top() + el->margin_bottom();
+			}
+			crossv[k] = cross;
+			if(cross > cur_row_h) cur_row_h = cross;
+		}
+
+		int row_h = cur_row_h > row_min ? cur_row_h : row_min;
+		/* stretch: the default align-self fills the row height */
+		for(size_t k = i; k < row_end; k++)
+		{
+			element::ptr el = items[k];
+			if(el->get_display() == display_inline_text) continue;
+			if(crossv[k] >= row_h) continue;
+			int col = (int)(k % (size_t)n);
+			int ix = 0;
+			for(int c = 0; c < col; c++)
+				ix += col_w[c] + col_gap;
+			css_length h;
+			h = (float)(row_h - el->margin_top() - el->margin_bottom());
+			static_cast<html_tag*>(el)->m_css_height = h;
+			el->render(ix, bottom, col_w[col], second_pass);
+		}
+
+		bottom += row_h;
+		if(row_end < items.size()) bottom += row_gap;
+		i = row_end;
+	}
+
+	/* Drop the forced row heights again: m_pos already carries the stretched
+	 * boxes, and the next relayout must measure the author's heights. */
+	for(size_t k = 0; k < items.size(); k++)
+	{
+		if(items[k]->get_display() != display_inline_text)
+		{
+			static_cast<html_tag*>(items[k])->m_css_height = orig_h[k];
+		}
+	}
 
 	m_pos.width = width_auto ? avail : avail;
 	m_pos.height = bottom;

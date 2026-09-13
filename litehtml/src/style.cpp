@@ -33,8 +33,24 @@ litehtml::style::~style()
 
 void litehtml::style::parse( const tchar_t* txt, const tchar_t* baseurl )
 {
+	/* CSS comments are equivalent to whitespace. Leaving them in makes a
+	 * declaration that follows a trailing comment parse with the comment
+	 * glued onto its property name, silently dropping it. */
+	tstring clean;
+	for(const tchar_t* p = txt; *p; )
+	{
+		if(p[0] == _t('/') && p[1] == _t('*'))
+		{
+			const tchar_t* e = p + 2;
+			while(*e && !(e[0] == _t('*') && e[1] == _t('/'))) e++;
+			p = *e ? e + 2 : e;
+			clean += _t(' ');
+			continue;
+		}
+		clean += *p++;
+	}
 	std::vector<tstring> properties;
-	split_string(txt, properties, _t(";"));
+	split_string(clean.c_str(), properties, _t(";"));
 
 	for(std::vector<tstring>::const_iterator i = properties.begin(); i != properties.end(); i++)
 	{

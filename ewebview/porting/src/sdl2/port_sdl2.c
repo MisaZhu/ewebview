@@ -786,8 +786,15 @@ static void ek_blit_fit_alpha(void* ud, eweb_surface_t* src_h, int sx, int sy, i
  * literal). */
 static const char* sdl2_find_font_path(const char* family) {
     static const char* const s_paths[] = {
-        /* macOS: PingFang SC/TC (full CJK coverage, UTF-8). */
+        /* macOS: PingFang SC/TC (full CJK coverage, UTF-8). Present on
+         * stock macOS but not on every machine (notably stripped VMs). */
         "/System/Library/Fonts/PingFang.ttc",
+        /* macOS: verified-present CJK faces, full Latin coverage too. */
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
         /* Linux: Noto CJK (covers Chinese/Japanese/Korean). */
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
@@ -998,6 +1005,116 @@ static bool sdl2_looks_like_svg(const uint8_t* data, int sz) {
     return false;
 }
 
+/* Parse one SVG number ("12", "1.5", "-4"); returns the position after it or
+ * NULL if the next token is not a number. Hand-rolled on purpose: strtod()
+ * honours the locale decimal separator and SVG always uses '.'. */
+static const char* sdl2_svg_num(const char* p, const char* end, double* out) {
+    double v = 0.0, frac = 0.0, div = 1.0;
+    int neg = 0;
+    while(p < end && (*p == ' ' || *p == '\t' || *p == ',' || *p == '\n' || *p == '\r')) p++;
+    if(p < end && (*p == '-' || *p == '+')) { neg = (*p == '-'); p++; }
+    if(p >= end || ((*p < '0' || *p > '9') && *p != '.')) return NULL;
+    while(p < end && *p >= '0' && *p <= '9') { v = v * 10.0 + (*p - '0'); p++; }
+    if(p < end && *p == '.') {
+        p++;
+        while(p < end && *p >= '0' && *p <= '9') { frac = frac * 10.0 + (*p - '0'); div *= 10.0; p++; }
+    }
+    *out = neg ? -(v + frac / div) : (v + frac / div);
+    return p;
+}
+
+/* Intrinsic raster size of an SVG, for IMG_LoadSizedSVG_RW: absolute px
+ * width/height attributes win; otherwise the viewBox extent; otherwise 0x0
+ * (caller falls back to the unsized load, which lets nanosvg decide). Only the
+ * <svg root tag is scanned - width/height/viewBox always live there. */
+static void sdl2_svg_natural_size(const uint8_t* data, int sz, int* w, int* h) {
+    const char* p = (const char*)data;
+    const char* end = p + sz;
+    const char* tag;
+    const char* tend;
+    double dw = 0.0, dh = 0.0, vb[4];
+    int have_w = 0, have_h = 0, i;
+    *w = 0; *h = 0;
+    /* Locate the <svg root tag (same scan as sdl2_looks_like_svg). */
+    tag = NULL;
+    for(p = (const char*)data; p + 3 < end; p++) {
+        if(p[0] == '<' && (p[1] == 's' || p[1] == 'S') &&
+           (p[2] == 'v' || p[2] == 'V') && (p[3] == 'g' || p[3] == 'G')) {
+            tag = p;
+            break;
+        }
+    }
+    if(!tag) return;
+    tend = tag;
+    while(tend < end && *tend != '>') tend++;
+    for(p = tag; p < tend; p++) {
+        int namelen;
+        const char* vp;
+        char quote;
+        if(*p != 'w' && *p != 'h' && *p != 'v') continue;
+        /* Attribute-name boundary: reject matches inside longer names such as
+         * stroke-width / line-height. */
+        if(p > tag) {
+            char prev = p[-1];
+            if((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') ||
+               (prev >= '0' && prev <= '9') || prev == '-' || prev == ':' || prev == '_')
+                continue;
+        }
+        if(!strncmp(p, "width", 5)) namelen = 5;
+        else if(!strncmp(p, "height", 6)) namelen = 6;
+        else if(!strncmp(p, "viewBox", 7) || !strncmp(p, "viewbox", 7)) namelen = 7;
+        else continue;
+        vp = p + namelen;
+        while(vp < tend && (*vp == ' ' || *vp == '\t')) vp++;
+        if(vp >= tend || *vp != '=') continue;
+        vp++;
+        while(vp < tend && (*vp == ' ' || *vp == '\t')) vp++;
+        if(vp >= tend || (*vp != '"' && *vp != '\'')) continue;
+        quote = *vp++;
+        if(namelen == 7) {
+            const char* q = vp;
+            for(i = 0; i < 4; i++) {
+                q = sdl2_svg_num(q, tend, &vb[i]);
+                if(!q) break;
+            }
+            if(i == 4 && vb[2] > 0 && vb[3] > 0) {
+                if(!have_w) { dw = vb[2]; have_w = 2; }
+                if(!have_h) { dh = vb[3]; have_h = 2; }
+            }
+        } else {
+            double val = 0.0, mult = 1.0;
+            const char* q = sdl2_svg_num(vp, tend, &val);
+            if(!q || val <= 0) continue;
+            /* Physical units convert to CSS px at 96dpi (w3c.svg ships
+             * width="5in"); %/em/rem carry no intrinsic size. */
+            if(q < tend && *q != quote && *q != ' ' && *q != '\t') {
+                if(!strncmp(q, "px", 2))       mult = 1.0;
+                else if(!strncmp(q, "in", 2))  mult = 96.0;
+                else if(!strncmp(q, "cm", 2))  mult = 96.0 / 2.54;
+                else if(!strncmp(q, "mm", 2))  mult = 96.0 / 25.4;
+                else if(!strncmp(q, "pt", 2))  mult = 96.0 / 72.0;
+                else if(!strncmp(q, "pc", 2))  mult = 16.0;
+                else continue;
+            }
+            val *= mult;
+            if(namelen == 5) { dw = val; have_w = 1; }
+            else             { dh = val; have_h = 1; }
+        }
+        /* Resume scanning after the closing quote of this attribute. */
+        p = vp;
+        while(p < tend && *p != quote) p++;
+        if(p >= tend) break;
+    }
+    if(have_w && have_h) {
+        *w = (int)(dw + 0.5);
+        *h = (int)(dh + 0.5);
+        if(*w > 4096) *w = 4096;
+        if(*h > 4096) *h = 4096;
+    } else {
+        *w = 0; *h = 0;
+    }
+}
+
 static eweb_surface_t* ek_image_decode(void* ud, const uint8_t* data, int size) {
     SDL_RWops* rw;
     SDL_Surface* img;
@@ -1006,11 +1123,32 @@ static eweb_surface_t* ek_image_decode(void* ud, const uint8_t* data, int size) 
     (void)ud;
     if(!data || size <= 0) return NULL;
     if(!sdl2_ensure_libs()) return NULL;
-    (void)sdl2_looks_like_svg;   /* informational; SDL_image handles what it can */
 
-    rw = SDL_RWFromConstMem(data, size);
-    if(!rw) return NULL;
-    img = IMG_Load_RW(rw, 1);   /* frees rw */
+    if(sdl2_looks_like_svg(data, size)) {
+        /* SVG is vector text: rasterise it ourselves at the intrinsic size so
+         * nanosvg's parser (inside SDL2_image) gets explicit dimensions even
+         * for roots that only carry a viewBox or percentage sizes. The sized
+         * loader never closes the RWops, so we own it in both outcomes. */
+        int vw = 0, vh = 0;
+        sdl2_svg_natural_size(data, size, &vw, &vh);
+        img = NULL;
+        if(vw > 0 && vh > 0) {
+            rw = SDL_RWFromConstMem(data, size);
+            if(rw) {
+                img = IMG_LoadSizedSVG_RW(rw, vw, vh);
+                SDL_RWclose(rw);
+            }
+        }
+        if(!img) {
+            rw = SDL_RWFromConstMem(data, size);
+            if(!rw) return NULL;
+            img = IMG_Load_RW(rw, 1);   /* frees rw */
+        }
+    } else {
+        rw = SDL_RWFromConstMem(data, size);
+        if(!rw) return NULL;
+        img = IMG_Load_RW(rw, 1);   /* frees rw */
+    }
     if(!img) return NULL;
 
     /* Normalise to ARGB8888 so surface_pixels / get_pixel can index the

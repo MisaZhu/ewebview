@@ -6,6 +6,7 @@
 
 litehtml::el_before_after_base::el_before_after_base(litehtml::document* doc, bool before) : html_tag(doc)
 {
+	m_box_content = false;
 	if(before)
 	{
 		set_tagName(_t("::before"));
@@ -28,6 +29,12 @@ void litehtml::el_before_after_base::add_style(const litehtml::style& st)
 	if(!content.empty())
 	{
 		int idx = value_index(content.c_str(), content_property_string);
+		/* content keywords: none(0) / normal(1) suppress the box; anything
+		 * else (quotes, strings, attr(), counters) generates one */
+		if(idx < 0 || idx > 1)
+		{
+			m_box_content = true;
+		}
 		if(idx < 0)
 		{
 			tstring fnc;
@@ -197,4 +204,13 @@ litehtml::tchar_t litehtml::el_before_after_base::convert_escape( const tchar_t*
 void litehtml::el_before_after_base::apply_stylesheet( const litehtml::css& stylesheet )
 {
 
+}
+
+litehtml::style_display litehtml::el_before_after_base::get_display() const
+{
+	if(!m_box_content)
+	{
+		return display_none;
+	}
+	return html_tag::get_display();
 }

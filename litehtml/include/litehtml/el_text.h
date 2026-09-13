@@ -18,6 +18,7 @@ namespace litehtml
 		virtual ~el_text();
 
 		virtual void				get_text(tstring& text) override;
+		virtual element::ptr		clone_node(bool deep) override;
 		virtual const tchar_t*		get_style_property(const tchar_t* name, bool inherited, const tchar_t* def = 0) override;
 		virtual void				parse_styles(bool is_reparse) override;
 		virtual int					get_base_line() override;

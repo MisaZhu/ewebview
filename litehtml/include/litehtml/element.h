@@ -216,6 +216,10 @@ protected:
 		virtual int					get_font_size() const;
 		virtual void				get_text(tstring& text);
 		virtual void				parse_attributes();
+		/* Deep/shallow node clone backing the DOM bridge's cloneNode(). Returns a
+		 * freshly created, not-yet-styled element (styles are matched again when it
+		 * is inserted). The abstract base has no tag to recreate, so it yields null. */
+		virtual element::ptr		clone_node(bool deep);
 		virtual int					select(const css_selector& selector, bool apply_pseudo = true);
 		virtual int					select(const css_element_selector& selector, bool apply_pseudo = true);
 		virtual element::ptr		find_ancestor(const css_selector& selector, bool apply_pseudo = true, bool* is_pseudo = 0);

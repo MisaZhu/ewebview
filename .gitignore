@@ -68,4 +68,4 @@ Testing/
 .cache/
 
 .DS_Store
-build_*
+build_*/
