@@ -2,6 +2,9 @@
 
 #include <string.h>
 #include <ctype.h>
+#if !defined( WIN32 ) && !defined( WINCE )
+#include <strings.h>
+#endif
 
 #include <stdint.h>
 #include <time.h>
@@ -80,9 +83,10 @@ namespace litehtml
 	#define t_strcmp			strcmp
 	#define t_strncmp			strncmp
 
-	// 使用 strcmp 替代 strcasecmp（简化处理）
-	#define t_strcasecmp		strcmp
-	#define t_strncasecmp		strncmp
+	// CSS keyword / colour-name matching is case-insensitive per spec;
+	// a plain strcmp here silently dropped every lower-case named color.
+	#define t_strcasecmp		strcasecmp
+	#define t_strncasecmp		strncasecmp
 	#define t_itoa(value, buffer, size, radix)	snprintf(buffer, size, "%d", value)
 
 	#define t_strtol			strtol

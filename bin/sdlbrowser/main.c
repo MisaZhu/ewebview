@@ -35,6 +35,10 @@
 #include <stdint.h>
 #include <math.h>
 
+#if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+
 #include <ewebview.h>
 #include <ewebview_port.h>
 
@@ -42,6 +46,31 @@
  * not declared in the public header; declare it here. */
 extern void eweb_port_sdl2(eweb_port_t* port, void* ud);
 extern void eweb_port_sdl2_set_dpr(float dpr);
+
+/* ------------------------------------------------------------------ */
+/* OS color scheme                                                     */
+/* ------------------------------------------------------------------ */
+
+/* Seed EWEB_COLOR_SCHEME from the OS appearance so pages that gate styles on
+ * prefers-color-scheme (e.g. GitHub's dark theme) follow the desktop.  A
+ * value already in the environment always wins. */
+static void browser_detect_color_scheme(void) {
+#if defined(__APPLE__)
+    CFStringRef v;
+    if(getenv("EWEB_COLOR_SCHEME")) return;
+    /* The global preferences domain's identifier is literally the string
+     * "kCFPreferencesGlobalDomain"; CoreFoundation ships no constant for it. */
+    v = (CFStringRef)CFPreferencesCopyValue(CFSTR("AppleInterfaceStyle"),
+            CFSTR("kCFPreferencesGlobalDomain"),
+            kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    if(v) {
+        int dark = (CFGetTypeID(v) == CFStringGetTypeID() &&
+                    CFStringCompare(v, CFSTR("Dark"), 0) == kCFCompareEqualTo);
+        setenv("EWEB_COLOR_SCHEME", dark ? "dark" : "light", 1);
+        CFRelease(v);
+    }
+#endif
+}
 
 /* ------------------------------------------------------------------ */
 /* UI geometry                                                         */
@@ -151,6 +180,12 @@ typedef struct {
     bool          running;
     bool          content_dirty;  /* re-upload frame texture */
     uint32_t      last_tick_ms;
+
+    /* headless screenshot mode: `sdlbrowser <url> --shot out.bmp [settle_ms]`
+     * saves one frame of the page surface and exits (regression / CI use). */
+    const char*   shot_path;
+    uint32_t      shot_settle_ms;
+    uint32_t      shot_start_ms;
 } browser_t;
 
 /* ------------------------------------------------------------------ */
@@ -1109,18 +1144,36 @@ static bool browser_init(browser_t* b, int argc, char** argv) {
      * the shell no longer depends on the current working directory. */
     ewebview_set_default_css(b->view, "res://html/default.css");
 
-    /* initial URL */
-    const char* url = (argc > 1) ? argv[1] : "res://html/default.html";
+    /* initial URL: first positional argument (flags like --shot are skipped) */
+    const char* url = "res://html/default.html";
+    for(int i = 1; i < argc; i++) {
+        if(strcmp(argv[i], "--shot") == 0) { i++; continue; }
+        url = argv[i];
+        break;
+    }
     char initial[ADDRESS_MAX + 1];
     normalize_url(url, initial, sizeof(initial));
     snprintf(b->address.text, sizeof(b->address.text), "%s", initial);
     b->address.cursor = (int)strlen(b->address.text);
 
+    /* --shot <out.bmp> [settle_ms] */
+    b->shot_path = NULL;
+    b->shot_settle_ms = 8000;
+    b->shot_start_ms = 0;
+    for(int i = 1; i < argc; i++) {
+        if(strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
+            b->shot_path = argv[i + 1];
+            if(i + 2 < argc) b->shot_settle_ms = (uint32_t)atoi(argv[i + 2]);
+            break;
+        }
+    }
+
     /* nojs flag */
-    if(argc > 2 && strcmp(argv[2], "nojs") == 0)
-        ewebview_set_js_enabled(b->view, false);
+    for(int i = 1; i < argc; i++)
+        if(strcmp(argv[i], "nojs") == 0) { ewebview_set_js_enabled(b->view, false); break; }
 
     ewebview_load(b->view, initial);
+    b->shot_start_ms = SDL_GetTicks();
 
     return true;
 }
@@ -1148,6 +1201,7 @@ static void browser_destroy(browser_t* b) {
 
 int main(int argc, char** argv) {
     browser_t browser;
+    browser_detect_color_scheme();
     if(!browser_init(&browser, argc, argv)) {
         browser_destroy(&browser);
         return 1;
@@ -1170,6 +1224,15 @@ int main(int argc, char** argv) {
 
         /* render */
         browser_render(b);
+
+        /* headless screenshot: once the page has settled, save one frame and exit */
+        if(b->shot_path && (SDL_GetTicks() - b->shot_start_ms) >= b->shot_settle_ms) {
+            SDL_Surface* surf = NULL;
+            if(b->frame && b->port.gfx.surface_native)
+                surf = (SDL_Surface*)b->port.gfx.surface_native(b->port.gfx.ud, b->frame);
+            if(surf) SDL_SaveBMP(surf, b->shot_path);
+            b->running = false;
+        }
 
         /* frame pacing */
         uint32_t elapsed = SDL_GetTicks() - t0;

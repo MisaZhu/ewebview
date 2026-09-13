@@ -2405,6 +2405,49 @@ int litehtml::html_tag::select(const css_selector& selector, bool apply_pseudo)
 	return right_res;
 }
 
+/* Split a selector list on top-level commas: commas inside parentheses or
+ * brackets belong to a nested pseudo-class argument, not to the list. */
+static void split_selector_list(const litehtml::tstring& txt, std::vector<litehtml::tstring>& out)
+{
+	int depth = 0;
+	litehtml::tstring cur;
+	for(litehtml::tstring::const_iterator it = txt.begin(); it != txt.end(); ++it)
+	{
+		litehtml::tchar_t ch = *it;
+		if(ch == '(' || ch == '[') depth++;
+		else if(ch == ')' || ch == ']') depth--;
+		if(ch == ',' && depth == 0)
+		{
+			out.push_back(cur);
+			cur.clear();
+			continue;
+		}
+		cur += ch;
+	}
+	out.push_back(cur);
+}
+
+/* Match an element against a selector list (the argument of :is/:where/:not).
+ * Returns true when any member of the list matches the element. */
+static bool match_selector_list(litehtml::html_tag* el, const litehtml::tstring& param, bool apply_pseudo)
+{
+	std::vector<litehtml::tstring> parts;
+	split_selector_list(param, parts);
+	for(size_t i = 0; i < parts.size(); i++)
+	{
+		litehtml::tstring part = parts[i];
+		litehtml::trim(part);
+		if(part.empty()) continue;
+		litehtml::css_selector sel(nullptr);
+		if(!sel.parse(part)) continue;
+		if(el->select(sel, apply_pseudo) != litehtml::select_no_match)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 int litehtml::html_tag::select(const css_element_selector& selector, bool apply_pseudo)
 {
 	select_element_scope_t scope;
@@ -2628,9 +2671,21 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 					break;
 				case pseudo_class_not:
 					{
-						css_element_selector sel;
-						sel.parse(selector_param);
-						if(select(sel, apply_pseudo))
+						/* :not() takes a selector list: the element matches
+						 * the pseudo-class only when no member matches. */
+						if(match_selector_list(this, selector_param, apply_pseudo))
+						{
+							return select_no_match;
+						}
+					}
+					break;
+				case pseudo_class_where:
+				case pseudo_class_is:
+					{
+						/* :where() and :is() are forgiving selector lists:
+						 * they match when any member matches (the two differ
+						 * only in specificity contribution). */
+						if(!match_selector_list(this, selector_param, apply_pseudo))
 						{
 							return select_no_match;
 						}

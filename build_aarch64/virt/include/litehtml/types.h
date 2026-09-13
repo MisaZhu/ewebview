@@ -495,7 +495,7 @@ namespace litehtml
 	};
 
 
-#define pseudo_class_strings		_t("only-child;only-of-type;first-child;first-of-type;last-child;last-of-type;nth-child;nth-of-type;nth-last-child;nth-last-of-type;not;lang;root")
+#define pseudo_class_strings		_t("only-child;only-of-type;first-child;first-of-type;last-child;last-of-type;nth-child;nth-of-type;nth-last-child;nth-last-of-type;not;lang;root;where;is")
 
 	enum pseudo_class
 	{
@@ -512,6 +512,8 @@ namespace litehtml
 		pseudo_class_not,
 		pseudo_class_lang,
 		pseudo_class_root,
+		pseudo_class_where,
+		pseudo_class_is,
 	};
 
 #define content_property_string		_t("none;normal;open-quote;close-quote;no-open-quote;no-close-quote")
@@ -745,6 +747,7 @@ namespace litehtml
 		int			color_index;	// The number of entries in the color lookup table of the output device. If the device does not use a color lookup table, the value is zero.
 		int			monochrome;		// The number of bits per pixel in a monochrome frame buffer. If the device is not a monochrome device, the output device value will be 0.
 		int			resolution;		// The resolution of the output device (in DPI)
+		int			color_scheme;	// Preferred color scheme, encoded like the prefers-color-scheme value list ("dark;light"): 0 = dark, 1 = light
 	};
 
 	enum render_type

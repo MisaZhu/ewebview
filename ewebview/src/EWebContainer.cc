@@ -1146,6 +1146,11 @@ void EWebContainer::get_media_features(litehtml::media_features& media) const
     media.monochrome  = 0;
     media.color_index = 256;
     media.resolution  = 96;
+    /* Preferred color scheme, "dark;light" encoding (0 = dark, 1 = light).
+     * The shell seeds EWEB_COLOR_SCHEME from the OS appearance at startup;
+     * an explicit value always wins so pages can be forced either way. */
+    const char* cs = getenv("EWEB_COLOR_SCHEME");
+    media.color_scheme = (cs && !strcasecmp(cs, "dark")) ? 0 : 1;
 }
 
 void EWebContainer::get_language(litehtml::tstring& language, litehtml::tstring& culture) const
