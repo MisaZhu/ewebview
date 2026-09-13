@@ -778,27 +778,31 @@ static void ek_blit_fit_alpha(void* ud, eweb_surface_t* src_h, int sx, int sy, i
 
 /* SDL2_ttf needs a real font FILE; desktop OSes scatter them across a dozen
  * possible paths. Honour EWEBVIEW_SDL2_FONT first (lets the embedder pin a
- * specific face, including CJK), then walk a short list of near-universal
- * fallbacks. Returns a path that is safe to keep for the process lifetime
- * (either getenv's storage or a string literal). */
+ * specific face), then walk a short fallback list. The list is CJK-first: the
+ * default face must cover Chinese/Japanese/Korean glyphs (UTF-8 pages), so the
+ * CJK collections (PingFang / Noto Sans CJK / Microsoft YaHei) come before the
+ * Latin-only faces, which stay as last-resort fallbacks. Returns a path that is
+ * safe to keep for the process lifetime (either getenv's storage or a string
+ * literal). */
 static const char* sdl2_find_font_path(const char* family) {
     static const char* const s_paths[] = {
-        /* Linux: DejaVu (near-universal), Liberation (metric-compatible with
-         * Arial/Times/Courier), Noto CJK (covers Chinese/Japanese/Korean). */
+        /* macOS: PingFang SC/TC (full CJK coverage, UTF-8). */
+        "/System/Library/Fonts/PingFang.ttc",
+        /* Linux: Noto CJK (covers Chinese/Japanese/Korean). */
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        /* Windows: Microsoft YaHei. */
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        /* Latin-only last resorts. */
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        /* macOS */
         "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/Library/Fonts/Arial.ttf",
-        "/System/Library/Fonts/PingFang.ttc",
-        /* Windows */
         "C:\\Windows\\Fonts\\arial.ttf",
-        "C:\\Windows\\Fonts\\msyh.ttc",
         NULL
     };
     const char* env;

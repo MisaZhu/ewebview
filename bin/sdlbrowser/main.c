@@ -1091,14 +1091,20 @@ static bool browser_init(browser_t* b, int argc, char** argv) {
      * itself is opened by browser_apply_scale() at the HiDPI-scaled pixel size. */
     const char* font_path = SDL_getenv("EWEBVIEW_SDL2_FONT");
     if(!font_path || !font_path[0]) {
+        /* CJK-first, same ordering as the SDL2 port: the default face must
+         * render Chinese/Japanese/Korean glyphs from UTF-8 pages. */
         static const char* const paths[] = {
+            "/System/Library/Fonts/PingFang.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "C:\\Windows\\Fonts\\msyh.ttc",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/TTF/DejaVuSans.ttf",
             "/usr/share/fonts/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
             "/System/Library/Fonts/Supplemental/Arial.ttf",
             "/Library/Fonts/Arial.ttf",
-            "/System/Library/Fonts/PingFang.ttc",
             "C:\\Windows\\Fonts\\arial.ttf",
             NULL
         };
