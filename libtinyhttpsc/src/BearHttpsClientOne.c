@@ -95202,7 +95202,19 @@ const unsigned char *BearHttpsResponse_read_body(BearHttpsResponse *self) {
         if ((total_readded + self->body_chunk_size + 2) > body_allocated) {
             
             while(body_allocated < (total_readded+ self->body_chunk_size + 2)) {
-                body_allocated *= self->body_realloc_factor;
+                /* (long)(body_allocated * factor) truncates toward zero, so a
+                 * body_allocated of 1 yields (long)(1 * 1.5) == 1 and this loop
+                 * never grew - it spun at 100% CPU forever. That is reached when
+                 * a short/chunked response (e.g. w3.org's 301 + Transfer-Encoding:
+                 * chunked) buffers exactly one body byte alongside the headers,
+                 * leaving body_size == 1 as the starting body_allocated here.
+                 * Guarantee forward progress by at least one chunk whenever the
+                 * factor fails to increase the size (also covers factor <= 1.0). */
+                long grown = (long)(body_allocated * self->body_realloc_factor);
+                if(grown <= body_allocated) {
+                    grown = body_allocated + (self->body_chunk_size > 0 ? self->body_chunk_size : 1024);
+                }
+                body_allocated = grown;
             }
 
             if (self->max_body_size != -1 && body_allocated > self->max_body_size) {
