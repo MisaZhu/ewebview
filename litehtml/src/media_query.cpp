@@ -724,7 +724,9 @@ bool litehtml::media_query_expression::check( const media_features& features ) c
 		{
 			return true;
 		}
-		return val == 1;	/* light */
+		/* val and features.color_scheme share the "dark;light" encoding
+		 * (0 = dark, 1 = light) set up at parse time. */
+		return val == features.color_scheme;
 	case media_feature_prefers_contrast:
 	case media_feature_prefers_reduced_motion:
 	case media_feature_forced_colors:

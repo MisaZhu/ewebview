@@ -226,6 +226,7 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		it.order = v ? atoi(v) : 0;
 
 		const tchar_t* sh = el->get_style_property(_t("flex"), false, 0);
+		bool basis_set = false;
 		if(sh)
 		{
 			float g = 0, s = 1, b = -1;
@@ -236,24 +237,13 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			{
 				it.base = (int)b + it.ml + it.mr;
 				it.has_main = true;
+				basis_set = true;
 			}
 		}
 		v = el->get_style_property(_t("flex-grow"), false, 0);
 		if(v) it.grow = (float)atof(v);
 		v = el->get_style_property(_t("flex-shrink"), false, 0);
 		if(v) it.shrink = (float)atof(v);
-
-		css_length cw = el->get_css_width();
-		/* css_units_none means "no explicit width" (auto / unset). A default-constructed
-		 * css_length has is_predefined()==false yet units none and value 0 — that is what
-		 * text nodes and other never-width-styled items report. Treating it as an explicit
-		 * 0 width collapsed them (e.g. the text inside a `display:flex` nav-link measured
-		 * base=0 and was never rendered). Require a real unit before using width as base. */
-		if(!cw.is_predefined() && cw.units() != css_units_none)
-		{
-			it.base = get_document()->cvt_units(cw, el->get_font_size(), avail) + it.ml + it.mr;
-			it.has_main = true;
-		}
 		v = el->get_style_property(_t("flex-basis"), false, 0);
 		if(v && !flex_flag(v, "auto", "content"))
 		{
@@ -263,7 +253,23 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			{
 				it.base = get_document()->cvt_units(bl, el->get_font_size(), avail) + it.ml + it.mr;
 				it.has_main = true;
+				basis_set = true;
 			}
+		}
+		css_length cw = el->get_css_width();
+		/* css_units_none means "no explicit width" (auto / unset). A default-constructed
+		 * css_length has is_predefined()==false yet units none and value 0 — that is what
+		 * text nodes and other never-width-styled items report. Treating it as an explicit
+		 * 0 width collapsed them (e.g. the text inside a `display:flex` nav-link measured
+		 * base=0 and was never rendered). Require a real unit before using width as base.
+		 * A specified flex-basis (shorthand third component or longhand) wins over width
+		 * for the base size, per spec; width only supplies it when the basis is auto —
+		 * otherwise `flex:1 1 0` + `width:100%` items (primer PageLayout columns) would
+		 * each fill a flex line and wrap into a vertical stack. */
+		if(!basis_set && !cw.is_predefined() && cw.units() != css_units_none)
+		{
+			it.base = get_document()->cvt_units(cw, el->get_font_size(), avail) + it.ml + it.mr;
+			it.has_main = true;
 		}
 		items.push_back(it);
 	}

@@ -52,6 +52,11 @@ LDFLAGS += -L $(TARGET_DIR)/lib
 LIBS = -lewebview -llitehtml -lmario_jsn -lwebp -ltinyhttpsc \
        $(SDL2_LIBS) -lm -lpthread
 
+# macOS appearance detection (AppleInterfaceStyle) uses CoreFoundation.
+ifeq ($(shell uname -s),Darwin)
+LIBS += -framework CoreFoundation
+endif
+
 OBJS = $(ARCH)/main.o $(ARCH)/compat.o
 
 TARGET = $(TARGET_DIR)/bin/sdlbrowser
