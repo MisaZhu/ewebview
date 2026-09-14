@@ -308,6 +308,9 @@ public:
     /* Fire a non-cancelable DOM event (focus/blur/focusin/focusout/...) at an
      * element. No-op without a VM. */
     void jsDispatchSimpleEvent(litehtml::element* el, const char* type, bool bubbles);
+    /* Fire a cancelable DOM event (e.g. "submit") at an element; returns false
+     * when a listener called preventDefault(). True (no-op) without a VM. */
+    bool jsDispatchCancelableEvent(litehtml::element* el, const char* type, bool bubbles);
     /* Follow an <a href> under a left-button release. cx/cy are client coords. */
     void handleAnchorClick(int cx, int cy);
 
@@ -343,6 +346,17 @@ public:
     void submitForm(litehtml::element* field);
     /* Draw an open <select>'s dropdown overlay onto the frame (after the page). */
     void drawSelectPopup(eweb_surface_t* cache);
+    /* Compute the open <select>'s dropdown overlay rect (logical/cache coords)
+     * plus its row height and visible row count; false when nothing is open.
+     * Shared by drawSelectPopup() and the popup mouse hit-test so they agree. */
+    bool selectPopupRect(litehtml::position& out, int& rowH, int& visibleRows);
+    /* Uncheck the same-name radio siblings of `widget` across the active doc. */
+    void clearRadioSiblings(void* widget);
+    /* Fire a bubbling, non-cancelable input/change event at a form control. */
+    void fireWidgetEvent(litehtml::element* el, const char* type);
+    /* Keyboard page scroll (line/page step): adopts the offset, repaints, fires
+     * the page's scroll handlers and republishes it to the embedder. */
+    void scrollByKey(int dx, int dy);
     void jsRunPendingNavigation();
     void jsInvalidateHandles();
     void jsFreeDetachedNodes();

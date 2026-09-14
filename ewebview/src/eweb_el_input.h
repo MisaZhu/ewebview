@@ -101,7 +101,38 @@ public:
     bool isDropdownOpen() const { return m_dropdownOpen; }
     int  activeOption() const { return m_activeOption; }
 
+    /* ---- engine interaction surface (default-action layer) ---- */
+    /* The control family, so the engine can branch its default actions. */
+    EWebInputType inputType() const { return m_inputType; }
+    /* Text caret placement from a click given in the control's BORDER-box local
+     * coordinates (relative to get_placement()'s origin). These fold in the
+     * text inset draw() uses, so the engine never touches padding/borders. */
+    void placeCaretAt(int localX, int localY);
+    /* Extend the selection to a border-box-local X, keeping the anchor (drag). */
+    void dragSelectTo(int localX);
+    /* Double-click: select the word under a border-box-local X. */
+    void selectWordAtLocal(int localX);
+    /* <select> popup contents + geometry, exposed for the engine-drawn dropdown
+     * overlay (draw and hit-test share popupRowHeight() so they agree). */
+    int  dropdownRowCount() { return optionCount(); }
+    std::string dropdownRowText(int i);
+    int  selectedOption() { return selectedOptionIndex(); }
+    void setActiveOption(int i) { m_activeOption = i; }
+    /* Move the committed selection by `dir` while the popup is closed (arrow
+     * keys on a focused <select>). */
+    void stepSelectedOption(int dir);
+    /* Nudge a range slider's value by `dir` (arrow keys on a focused slider). */
+    void stepRange(int dir);
+    /* Row height (logical px) of the dropdown overlay, from the control font. */
+    int  popupRowHeight();
+    /* Paint the expanded option list at (x,y) in the target surface, `width`
+     * wide, `visibleRows` tall using `rowH`. Highlights activeOption() and
+     * marks selectedOption(). */
+    void drawDropdown(eweb_surface_t* s, int x, int y, int width, int rowH, int visibleRows);
+
 private:
+    /* Left inset from the border box to where the text/caret starts. */
+    int textInsetLeft() const { return m_padding.left + m_borders.left + 4; }
     const eweb_port_t* m_port;
     EWebInputType m_inputType;
     bool m_focused;   /* holds keyboard focus (engine-driven) */

@@ -36,7 +36,13 @@ eweb_el_input::eweb_el_input(
     m_checked(false),
     m_hasChecked(false),
     m_dropdownOpen(false),
-    m_activeOption(-1)
+    m_activeOption(-1),
+    /* element::ptr is a RAW pointer, so these range-slider part slots must be
+     * explicitly nulled: part_color()/part_dim() test `if(!p)` and would else
+     * read construction-time garbage, intermittently dereferencing a bogus
+     * address and crashing every <input type=range>. */
+    m_part_thumb(nullptr),
+    m_part_track(nullptr)
 {
     m_display = litehtml::display_inline_block;
 }
@@ -524,6 +530,144 @@ void eweb_el_input::keyActivate()
     }
 }
 
+/* ==================================================================
+ * Engine interaction surface (the default-action layer).
+ *
+ * The engine drives these from the mouse/keyboard handlers; coordinates are
+ * the control's BORDER-box local pair (relative to get_placement()'s origin),
+ * so the text inset draw() applies is folded in here and the engine never
+ * reaches into padding/borders.
+ * ================================================================== */
+
+void eweb_el_input::placeCaretAt(int localX, int localY)
+{
+    setCaretFromPoint(localX - textInsetLeft(), localY);
+}
+
+void eweb_el_input::dragSelectTo(int localX)
+{
+    int off = xToOffset(localX - textInsetLeft());
+    m_caret = off;
+    m_selActive = (m_selAnchor != m_caret);
+}
+
+void eweb_el_input::selectWordAtLocal(int localX)
+{
+    selectWordAt(localX - textInsetLeft());
+}
+
+std::string eweb_el_input::dropdownRowText(int i)
+{
+    litehtml::element::ptr op = optionAt(i);
+    if(!op) return std::string();
+    litehtml::tstring t;
+    op->get_text(t);
+    return std::string(t.c_str());
+}
+
+void eweb_el_input::stepSelectedOption(int dir)
+{
+    int n = optionCount();
+    if(n <= 0) return;
+    int cur = selectedOptionIndex() + dir;
+    if(cur < 0) cur = 0;
+    if(cur >= n) cur = n - 1;
+    selectOptionIndex(cur);
+    m_activeOption = cur;
+}
+
+void eweb_el_input::stepRange(int dir)
+{
+    if(m_inputType != EWEB_INPUT_RANGE) return;
+    const litehtml::tchar_t* mn = get_attr(_t("min"));
+    const litehtml::tchar_t* mx = get_attr(_t("max"));
+    const litehtml::tchar_t* st = get_attr(_t("step"));
+    double dmin = mn ? atof(mn) : 0.0;
+    double dmax = mx ? atof(mx) : 100.0;
+    if(dmax <= dmin) dmax = dmin + 1.0;
+    double step = st ? atof(st) : 0.0;
+    if(step <= 0.0) step = (dmax - dmin) / 100.0;
+    double v = atof(value().c_str());
+    v += dir * step;
+    if(v < dmin) v = dmin;
+    if(v > dmax) v = dmax;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%g", v);
+    set_attr(_t("value"), buf);
+}
+
+int eweb_el_input::popupRowHeight()
+{
+    litehtml::font_metrics fm;
+    litehtml::uint_ptr f = get_font(&fm);
+    int h = f ? fm.height : 16;
+    h += 6;
+    if(h < 18) h = 18;
+    return h;
+}
+
+void eweb_el_input::drawDropdown(eweb_surface_t* s, int x, int y, int width,
+                                 int rowH, int visibleRows)
+{
+    if(!s || !m_port || visibleRows <= 0 || rowH <= 0) return;
+    litehtml::document* doc = get_document();
+    if(!doc || !doc->container()) return;
+    const eweb_gfx_t* gfx = &m_port->gfx;
+    int rows = optionCount();
+    if(rows <= 0) return;
+    if(width < 40) width = 40;
+    int h = visibleRows * rowH + 2;
+
+    /* White list box with a gray outline, matching the UA widget chrome. */
+    if(gfx->fill_rect) gfx->fill_rect(gfx->ud, s, x, y, width, h, 0xFFFFFFFF);
+    if(gfx->rect)      gfx->rect(gfx->ud, s, x, y, width, h, 0xFF767676);
+
+    bool clipped = false;
+    if(gfx->surface_set_clip) {
+        gfx->surface_set_clip(gfx->ud, s, x, y, width, h);
+        clipped = true;
+    }
+    litehtml::font_metrics fm;
+    litehtml::uint_ptr f = get_font(&fm);
+    litehtml::web_color fgc = get_color(_t("color"), true, litehtml::web_color(0, 0, 0, 255));
+    uint32_t fgcol = ((uint32_t)(fgc.alpha ? fgc.alpha : 255) << 24) |
+                     ((uint32_t)fgc.red << 16) | ((uint32_t)fgc.green << 8) | fgc.blue;
+
+    int active = m_activeOption;
+    int sel = selectedOptionIndex();
+    /* Scroll the window so the highlighted row stays visible. */
+    int top = 0;
+    if(rows > visibleRows && active >= 0) {
+        if(active >= visibleRows) top = active - visibleRows + 1;
+        if(top > rows - visibleRows) top = rows - visibleRows;
+    }
+
+    for(int i = 0; i < visibleRows; i++) {
+        int idx = top + i;
+        if(idx >= rows) break;
+        int ry = y + 1 + i * rowH;
+        if(idx == active && gfx->fill_rect)
+            gfx->fill_rect(gfx->ud, s, x + 1, ry, width - 2, rowH, 0xFF3399FF);
+        else if(idx == sel && gfx->fill_rect)
+            gfx->fill_rect(gfx->ud, s, x + 1, ry, width - 2, rowH, 0xFFDDDDDD);
+        std::string txt = dropdownRowText(idx);
+        if(!txt.empty() && f) {
+            uint32_t col = (idx == active) ? 0xFFFFFFFF : fgcol;
+            litehtml::web_color wc((litehtml::byte)((col >> 16) & 0xFF),
+                                   (litehtml::byte)((col >> 8) & 0xFF),
+                                   (litehtml::byte)(col & 0xFF),
+                                   (litehtml::byte)((col >> 24) & 0xFF));
+            litehtml::position tp;
+            tp.x = x + 6;
+            tp.y = ry + (rowH - fm.height) / 2;
+            tp.width = width - 12;
+            tp.height = fm.height;
+            doc->container()->draw_text((litehtml::uint_ptr)s, txt.c_str(), f, wc, tp);
+        }
+    }
+    if(clipped && gfx->surface_unset_clip) gfx->surface_unset_clip(gfx->ud, s);
+}
+
 uint32_t eweb_el_input::make_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
 {
     return ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
@@ -565,8 +709,12 @@ std::string eweb_el_input::label(bool* is_placeholder)
         return std::string(t.c_str());
     }
     case EWEB_INPUT_SELECT: {
-        /* The selected <option>, falling back to the first one. */
-        litehtml::element::ptr first;
+        /* The selected <option>, falling back to the first one.
+         * element::ptr is a RAW pointer (typedef element* ptr), so it must be
+         * explicitly null-initialized: an uninitialized `first` reads back the
+         * caller's register garbage and the `if(!first)`/`if(first)` guards
+         * then deref a bogus address, crashing every <select> on layout. */
+        litehtml::element::ptr first = nullptr;
         for (int i = 0; i < get_children_count(); i++) {
             litehtml::element::ptr ch = get_child(i);
             if (!ch || !ch->get_tagName() || t_strcasecmp(ch->get_tagName(), _t("option"))) {

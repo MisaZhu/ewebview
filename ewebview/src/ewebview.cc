@@ -647,6 +647,44 @@ void EWebEngine::engineLoop()
     engineTeardown();
 }
 
+/* Convert a viewport-relative client point (cx,cy) into a form control's
+ * BORDER-box local coordinates, using the control's document placement and the
+ * engine's scroll offset. Shared by every mouse-driven widget interaction. */
+static void widgetLocalCoords(eweb_el_input* w, int cx, int cy,
+                              int scrollX, int scrollY, int& lx, int& ly)
+{
+    litehtml::position pl = ((litehtml::element*)w)->get_placement();
+    lx = cx + scrollX - pl.x;
+    ly = cy + scrollY - pl.y;
+}
+
+/* Collect every form control (eweb_el_input) in the subtree under `e`, in
+ * document order. Used for radio-group clearing and form field collection. */
+static void collectWidgets(litehtml::element* e, std::vector<eweb_el_input*>& out)
+{
+    if(e == nullptr) return;
+    void* w = e->eweb_form_widget();
+    if(w != nullptr) out.push_back((eweb_el_input*)w);
+    size_t n = e->get_children_count();
+    for(size_t i = 0; i < n; ++i)
+        collectWidgets(e->get_child((int)i), out);
+}
+
+/* application/x-www-form-urlencoded: space -> '+', unreserved verbatim,
+ * everything else %XX. */
+static std::string eweb_urlencode(const char* s)
+{
+    std::string out;
+    if(s == nullptr) return out;
+    for(const unsigned char* p = (const unsigned char*)s; *p != 0; ++p) {
+        unsigned char c = *p;
+        if(isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += (char)c;
+        else if(c == ' ') out += '+';
+        else { char b[4]; snprintf(b, sizeof(b), "%%%02X", c); out += b; }
+    }
+    return out;
+}
+
 bool EWebEngine::engineHandleCommand(const EWebCmd& cmd)
 {
     /* ENGINE-THREAD ONLY. Consume one UI->engine command. Returns false only
@@ -708,38 +746,149 @@ bool EWebEngine::engineHandleCommand(const EWebCmd& cmd)
         return true;
 
     case ECMD_INPUT: {
-        /* Dispatch the DOM mouse events and follow <a href> clicks. cx/cy are
-         * the viewport-relative client coords the embedder pre-computed (the
-         * engine cannot walk the embedder's window geometry). A local copy is
-         * taken because the dispatch may outlive `cmd`. */
+        /* Dispatch the DOM mouse events and drive the form-control default
+         * actions. cx/cy are the viewport-relative client coords the embedder
+         * pre-computed (the engine cannot walk the embedder's window geometry).
+         * A local copy is taken because the dispatch may outlive `cmd`. */
         eweb_event_t ev = cmd.ev;
-        bool allowed = jsDispatchMouseEvent(ev.mouse_state, ev.button, cmd.x, cmd.y);
-        /* Click-to-focus: a left press moves keyboard focus to the nearest
-         * focusable element under the pointer (a form widget or <a href>), or
-         * clears focus when the press lands on blank space. Runs AFTER the DOM
-         * mouse events so a mousedown handler sees the old focus, matching the
-         * browser order (focus changes between mousedown and click). */
-        if(ev.mouse_state == EWEB_MOUSE_DOWN &&
-                ev.button == EWEB_BUTTON_LEFT) {
-            litehtml::element* target = hitElementAt(cmd.x, cmd.y);
-            setFocus(target != nullptr ? focusableAt(target) : nullptr);
+        int cx = cmd.x, cy = cmd.y;
+
+        /* An open <select> popup floats above the page and is NOT part of the
+         * litehtml tree, so it captures the pointer before the page hit-test. */
+        if(m_openSelect != nullptr) {
+            eweb_el_input* sel = (eweb_el_input*)m_openSelect;
+            litehtml::position r; int rowH = 0, visible = 0;
+            bool have = selectPopupRect(r, rowH, visible);
+            bool inside = have && rowH > 0 &&
+                          cx >= r.x && cx < r.x + r.width &&
+                          cy >= r.y && cy < r.y + r.height;
+            if(ev.mouse_state == EWEB_MOUSE_MOVE) {
+                if(inside) {
+                    int idx = (cy - r.y - 1) / rowH;
+                    if(idx < 0) idx = 0;
+                    if(idx >= sel->dropdownRowCount()) idx = sel->dropdownRowCount() - 1;
+                    if(idx != sel->activeOption()) { sel->setActiveOption(idx); markContentDirty(); }
+                }
+                return true;   /* popup open: swallow hover, never hit the page */
+            }
+            if(ev.mouse_state == EWEB_MOUSE_DOWN) {
+                if(inside && have) {
+                    int idx = (cy - r.y - 1) / rowH;
+                    if(idx >= 0 && idx < sel->dropdownRowCount()) {
+                        sel->setActiveOption(idx);
+                        markContentDirty();
+                    }
+                } else {
+                    sel->toggleDropdown();   /* a click outside closes it */
+                    m_openSelect = nullptr;
+                    markContentDirty();
+                }
+                return true;
+            }
+            if(ev.mouse_state == EWEB_MOUSE_UP) {
+                if(inside && have) {
+                    int idx = (cy - r.y - 1) / rowH;
+                    if(idx >= 0 && idx < sel->dropdownRowCount()) {
+                        sel->setActiveOption(idx);
+                        sel->chooseActiveOption();
+                        m_openSelect = nullptr;
+                        fireWidgetEvent((litehtml::element*)sel, "input");
+                        fireWidgetEvent((litehtml::element*)sel, "change");
+                        markContentDirty();
+                    }
+                }
+                return true;
+            }
+            /* wheel / other states fall through to the page dispatch below */
         }
-        /* Click-vs-drag bookkeeping and the anchor follow live here, NOT
-         * inside jsDispatchMouseEvent: link clicking must keep working on
-         * pages with no VM (or JS disabled), where the dispatch returns
-         * early. The verdict is honoured when a script did run
-         * (preventDefault suppresses the follow). */
-        if(ev.mouse_state == EWEB_MOUSE_DOWN &&
-                ev.button == EWEB_BUTTON_LEFT) {
-            m_pressX = cmd.x;
-            m_pressY = cmd.y;
+
+        bool allowed = jsDispatchMouseEvent(ev.mouse_state, ev.button, cx, cy);
+
+        if(ev.mouse_state == EWEB_MOUSE_DOWN && ev.button == EWEB_BUTTON_LEFT) {
+            /* Click-to-focus: a left press moves keyboard focus to the nearest
+             * focusable element under the pointer (a form widget or <a href>),
+             * or clears focus when the press lands on blank space. Runs AFTER
+             * the DOM mouse events so a mousedown handler sees the old focus,
+             * matching the browser order (focus changes between mousedown and
+             * click). */
+            litehtml::element* target = hitElementAt(cx, cy);
+            setFocus(target != nullptr ? focusableAt(target) : nullptr);
+            /* Caret placement + drag start for text fields and range sliders. */
+            void* wv = (target != nullptr) ? widgetAt(target) : nullptr;
+            if(wv != nullptr) {
+                eweb_el_input* w = (eweb_el_input*)wv;
+                int lx, ly;
+                widgetLocalCoords(w, cx, cy, m_engineScrollX, m_engineScrollY, lx, ly);
+                if(w->isTextEditing()) {
+                    w->placeCaretAt(lx, ly);
+                    m_textDragging = true;
+                    m_dragWidget = wv;
+                    markContentDirty();
+                } else if(w->inputType() == EWEB_INPUT_RANGE) {
+                    w->setRangeFromX(lx);
+                    m_rangeDragging = true;
+                    m_dragWidget = wv;
+                    fireWidgetEvent((litehtml::element*)w, "input");
+                    markContentDirty();
+                }
+            }
+            /* Click-vs-drag bookkeeping for the anchor follow (below). */
+            m_pressX = cx;
+            m_pressY = cy;
             m_pressValid = true;
-        } else if(ev.mouse_state == EWEB_MOUSE_UP &&
-                ev.button == EWEB_BUTTON_LEFT) {
+        } else if(ev.mouse_state == EWEB_MOUSE_DOUBLE_CLICK &&
+                  ev.button == EWEB_BUTTON_LEFT) {
+            litehtml::element* target = hitElementAt(cx, cy);
+            void* wv = (target != nullptr) ? widgetAt(target) : nullptr;
+            if(wv != nullptr && ((eweb_el_input*)wv)->isTextEditing()) {
+                int lx, ly;
+                widgetLocalCoords((eweb_el_input*)wv, cx, cy,
+                                  m_engineScrollX, m_engineScrollY, lx, ly);
+                ((eweb_el_input*)wv)->selectWordAtLocal(lx);
+                markContentDirty();
+            }
+        } else if(ev.mouse_state == EWEB_MOUSE_MOVE) {
+            if(m_dragWidget != nullptr && (m_rangeDragging || m_textDragging)) {
+                eweb_el_input* w = (eweb_el_input*)m_dragWidget;
+                int lx, ly;
+                widgetLocalCoords(w, cx, cy, m_engineScrollX, m_engineScrollY, lx, ly);
+                if(m_rangeDragging) {
+                    w->setRangeFromX(lx);
+                    fireWidgetEvent((litehtml::element*)w, "input");
+                } else {
+                    w->dragSelectTo(lx);
+                }
+                markContentDirty();
+            }
+        } else if(ev.mouse_state == EWEB_MOUSE_UP && ev.button == EWEB_BUTTON_LEFT) {
+            /* End a drag: a completed range/text edit commits with "change". */
+            if(m_dragWidget != nullptr && (m_rangeDragging || m_textDragging))
+                fireWidgetEvent((litehtml::element*)(eweb_el_input*)m_dragWidget, "change");
+            m_rangeDragging = false;
+            m_textDragging = false;
+            m_dragWidget = nullptr;
+            /* The anchor follow lives here, NOT inside jsDispatchMouseEvent:
+             * link clicking must keep working on pages with no VM (or JS
+             * disabled), where the dispatch returns early. preventDefault
+             * suppresses the follow. */
             if(allowed)
-                handleAnchorClick(cmd.x, cmd.y);
+                handleAnchorClick(cx, cy);
             else
                 m_pressValid = false;
+        } else if(ev.mouse_state == EWEB_MOUSE_CLICK && ev.button == EWEB_BUTTON_LEFT) {
+            /* Activation behaviour (checkbox/radio/select/button) runs on the
+             * click, gated on the DOM click handler not cancelling it. Text and
+             * range were already handled on the press/drag. */
+            if(allowed) {
+                litehtml::element* target = hitElementAt(cx, cy);
+                void* wv = (target != nullptr) ? widgetAt(target) : nullptr;
+                if(wv != nullptr) {
+                    int lx, ly;
+                    widgetLocalCoords((eweb_el_input*)wv, cx, cy,
+                                      m_engineScrollX, m_engineScrollY, lx, ly);
+                    activateWidget(wv, lx, ly);
+                }
+            }
         }
         return true;
     }
@@ -1236,11 +1385,204 @@ void EWebEngine::postKey(const eweb_key_event_t& ev)
 void EWebEngine::handleKeyDefault(const eweb_key_event_t& kev, const char* domKey, unsigned mods)
 {
     /* ENGINE-THREAD ONLY. The built-in response to a key the page did not
-     * cancel. Stage 1 wires up the keydown/keyup dispatch only, so there is no
-     * default action yet; the later stages fill this in with text editing on
-     * the focused field, Space/Enter control activation, Tab focus traversal
-     * and arrow-key navigation of an open <select>. */
-    (void)kev; (void)domKey; (void)mods;
+     * cancel: Tab focus traversal, arrow-key navigation of an open <select>,
+     * text editing on the focused field, Space/Enter activation of a focused
+     * control, and page scrolling when nothing editable has focus. */
+    (void)domKey; (void)mods;
+    const bool shift = (kev.mods & EWEB_MOD_SHIFT) != 0;
+    const bool ctrl  = (kev.mods & EWEB_MOD_CTRL)  != 0;
+    const bool alt   = (kev.mods & EWEB_MOD_ALT)   != 0;
+    /* Space reaches the engine either as EWEB_KEY_SPACE or - from the IME /
+     * SDL_TEXTINPUT path, which is how the real frontend delivers a printable
+     * key - as a CHAR carrying " ". Treat both as the space key for control
+     * activation and page scrolling (a focused text field inserts it instead,
+     * handled in its own branch below). */
+    const bool space = (kev.key == EWEB_KEY_SPACE) ||
+                       (kev.key == EWEB_KEY_CHAR && kev.text[0] == ' ' && kev.text[1] == 0);
+
+    /* Tab / Shift+Tab cycles focus regardless of what currently has it. */
+    if(kev.key == EWEB_KEY_TAB) { focusNext(shift); return; }
+
+    /* An open <select> popup captures the keyboard until it is chosen/closed. */
+    if(m_openSelect != nullptr) {
+        eweb_el_input* sel = (eweb_el_input*)m_openSelect;
+        switch(kev.key) {
+        case EWEB_KEY_UP:   sel->moveOption(-1); markContentDirty(); return;
+        case EWEB_KEY_DOWN: sel->moveOption(+1); markContentDirty(); return;
+        case EWEB_KEY_ENTER:
+            sel->chooseActiveOption();
+            m_openSelect = nullptr;
+            fireWidgetEvent((litehtml::element*)sel, "input");
+            fireWidgetEvent((litehtml::element*)sel, "change");
+            markContentDirty();
+            return;
+        case EWEB_KEY_ESCAPE:
+            sel->toggleDropdown();   /* closes */
+            m_openSelect = nullptr;
+            markContentDirty();
+            return;
+        default: break;
+        }
+        if(space) {
+            sel->chooseActiveOption();
+            m_openSelect = nullptr;
+            fireWidgetEvent((litehtml::element*)sel, "input");
+            fireWidgetEvent((litehtml::element*)sel, "change");
+            markContentDirty();
+            return;
+        }
+    }
+
+    litehtml::element* focusEl = (litehtml::element*)m_focusElement;
+    eweb_el_input* w = (focusEl != nullptr) ? (eweb_el_input*)widgetAt(focusEl) : nullptr;
+
+    /* Text editing on the focused field. */
+    if(w != nullptr && w->isTextEditing()) {
+        /* Ctrl+A arrives as the physical 'a' with CTRL from the frontend, or as
+         * a CHAR "a" with CTRL from the injector; TEXTINPUT is suppressed for
+         * command chords on the real path. */
+        const bool ctrlA = ctrl && !alt &&
+            (kev.key == 'a' || kev.key == 'A' ||
+             (kev.key == EWEB_KEY_CHAR && (kev.text[0] == 'a' || kev.text[0] == 'A')));
+        if(ctrlA) { w->selectAll(); markContentDirty(); return; }
+        /* Ctrl+C / Ctrl+X / Ctrl+V ride the port's system clipboard
+         * (sys.clipboard_set / sys.clipboard_get; OPTIONAL tables, so a port
+         * without them leaves the chords inert). Like Ctrl+A they arrive as
+         * the physical key with CTRL, or as a CHAR with CTRL from injection. */
+        auto chord = [&](char c) {
+            return ctrl && !alt &&
+                (kev.key == c || kev.key == c - 32 ||
+                 (kev.key == EWEB_KEY_CHAR &&
+                  (kev.text[0] == c || kev.text[0] == c - 32)));
+        };
+        if(chord('c') || chord('x')) {
+            if(m_port.sys.clipboard_set != nullptr) {
+                std::string sel = w->selectedText();
+                if(!sel.empty())
+                    m_port.sys.clipboard_set(m_port.sys.ud, sel.c_str());
+            }
+            if(chord('x')) {
+                w->deleteSelection();
+                fireWidgetEvent(focusEl, "input");
+                markContentDirty();
+            }
+            return;
+        }
+        if(chord('v')) {
+            if(m_port.sys.clipboard_get != nullptr) {
+                char* txt = m_port.sys.clipboard_get(m_port.sys.ud);
+                if(txt != nullptr) {
+                    w->insertText(txt);   /* replaces an active selection */
+                    free(txt);            /* port contract: core releases it */
+                    fireWidgetEvent(focusEl, "input");
+                    markContentDirty();
+                }
+            }
+            return;
+        }
+        bool edited = true;
+        switch(kev.key) {
+        case EWEB_KEY_CHAR:
+            if(ctrl || alt) edited = false;   /* a shortcut chord, not text */
+            else w->insertText(kev.text);
+            break;
+        case EWEB_KEY_BACKSPACE: w->deleteBack();    break;
+        case EWEB_KEY_DELETE:    w->deleteForward(); break;
+        case EWEB_KEY_LEFT:      w->moveCaret(-1, shift); edited = false; break;
+        case EWEB_KEY_RIGHT:     w->moveCaret(+1, shift); edited = false; break;
+        case EWEB_KEY_HOME:      w->moveCaret(-2, shift); edited = false; break;
+        case EWEB_KEY_END:       w->moveCaret(+2, shift); edited = false; break;
+        case EWEB_KEY_ENTER:
+            if(w->inputType() == EWEB_INPUT_TEXTAREA) w->insertText("\n");
+            else { submitForm(focusEl); return; }
+            break;
+        default: edited = false; break;
+        }
+        if(edited) fireWidgetEvent(focusEl, "input");
+        markContentDirty();
+        return;
+    }
+
+    /* Non-text form controls: Space/Enter activate, arrows adjust. */
+    if(w != nullptr) {
+        switch(w->inputType()) {
+        case EWEB_INPUT_CHECKBOX:
+            if(space) {
+                w->keyActivate();
+                fireWidgetEvent(focusEl, "input");
+                fireWidgetEvent(focusEl, "change");
+                markContentDirty(); return;
+            }
+            break;
+        case EWEB_INPUT_RADIO:
+            if(space && !w->isChecked()) {
+                w->setChecked(true);
+                clearRadioSiblings(w);
+                fireWidgetEvent(focusEl, "input");
+                fireWidgetEvent(focusEl, "change");
+                markContentDirty(); return;
+            }
+            break;
+        case EWEB_INPUT_SELECT:
+            if(space || kev.key == EWEB_KEY_ENTER) {
+                w->keyActivate();   /* opens the popup */
+                m_openSelect = w->isDropdownOpen() ? (void*)w : nullptr;
+                markContentDirty(); return;
+            }
+            if(kev.key == EWEB_KEY_UP || kev.key == EWEB_KEY_LEFT) {
+                w->stepSelectedOption(-1);
+                fireWidgetEvent(focusEl, "input");
+                fireWidgetEvent(focusEl, "change");
+                markContentDirty(); return;
+            }
+            if(kev.key == EWEB_KEY_DOWN || kev.key == EWEB_KEY_RIGHT) {
+                w->stepSelectedOption(+1);
+                fireWidgetEvent(focusEl, "input");
+                fireWidgetEvent(focusEl, "change");
+                markContentDirty(); return;
+            }
+            break;
+        case EWEB_INPUT_RANGE:
+            if(kev.key == EWEB_KEY_LEFT || kev.key == EWEB_KEY_DOWN) {
+                w->stepRange(-1); fireWidgetEvent(focusEl, "input");
+                markContentDirty(); return;
+            }
+            if(kev.key == EWEB_KEY_RIGHT || kev.key == EWEB_KEY_UP) {
+                w->stepRange(+1); fireWidgetEvent(focusEl, "input");
+                markContentDirty(); return;
+            }
+            break;
+        case EWEB_INPUT_BUTTON:
+            if(space || kev.key == EWEB_KEY_ENTER) {
+                /* Keyboard activation fires a click, then the native action. */
+                if(jsDispatchCancelableEvent(focusEl, "click", true))
+                    activateWidget(w, 0, 0);
+                return;
+            }
+            break;
+        default: break;
+        }
+    }
+
+    /* Escape drops focus (and any text selection). */
+    if(kev.key == EWEB_KEY_ESCAPE) { clearFocus(); return; }
+
+    /* Nothing editable focused: arrows / space / page keys scroll the document,
+     * matching the browser default the embedder's wheel gesture also drives. */
+    const int line = 24;
+    const int page = (m_clientHeight > line) ? (m_clientHeight - line) : line;
+    switch(kev.key) {
+    case EWEB_KEY_DOWN:     scrollByKey(0, line);  return;
+    case EWEB_KEY_UP:       scrollByKey(0, -line); return;
+    case EWEB_KEY_RIGHT:    scrollByKey(line, 0);  return;
+    case EWEB_KEY_LEFT:     scrollByKey(-line, 0); return;
+    case EWEB_KEY_PAGEDOWN: scrollByKey(0, page);  return;
+    case EWEB_KEY_PAGEUP:   scrollByKey(0, -page); return;
+    case EWEB_KEY_HOME:     scrollByKey(0, -m_engineScrollY); return;
+    case EWEB_KEY_END:      scrollByKey(0, m_doc ? m_doc->height() : 0); return;
+    default: break;
+    }
+    if(space) { scrollByKey(0, shift ? -page : page); return; }
 }
 
 /* Collect the focusable elements (form widgets + <a href>) under `e` in
@@ -1360,6 +1702,176 @@ void EWebEngine::focusNext(bool reverse)
     else if(reverse) next = (idx - 1 + n) % n;
     else             next = (idx + 1) % n;
     setFocus(list[next]);
+}
+
+void EWebEngine::fireWidgetEvent(litehtml::element* el, const char* type)
+{
+    /* input/change bubble and are not cancelable (matching the DOM), so the
+     * simple dispatch is exactly right. */
+    jsDispatchSimpleEvent(el, type, true);
+}
+
+void EWebEngine::clearRadioSiblings(void* widget)
+{
+    /* A radio button belongs to the group of same-name radios in its tree; turn
+     * the others off so only the newly-checked one stays selected. */
+    if(widget == nullptr) return;
+    eweb_el_input* w = (eweb_el_input*)widget;
+    litehtml::element* wel = (litehtml::element*)w;
+    const litehtml::tchar_t* name = wel->get_attr(_t("name"));
+    if(name == nullptr || name[0] == 0) return;   /* unnamed radios form no group */
+    litehtml::document* doc = jsActiveDoc();
+    if(doc == nullptr) return;
+    std::vector<eweb_el_input*> all;
+    collectWidgets(doc->root(), all);
+    for(size_t i = 0; i < all.size(); ++i) {
+        eweb_el_input* o = all[i];
+        if(o == w || o->inputType() != EWEB_INPUT_RADIO) continue;
+        const litehtml::tchar_t* on = ((litehtml::element*)o)->get_attr(_t("name"));
+        if(on != nullptr && !t_strcasecmp(on, name)) o->setChecked(false);
+    }
+}
+
+void EWebEngine::activateWidget(void* widget, int localX, int localY)
+{
+    /* ENGINE-THREAD ONLY. The native activation for a control the user clicked
+     * (or activated by key). localX/localY are the control's border-box local
+     * coords. Text caret/editing is driven by the press + key paths instead. */
+    if(widget == nullptr) return;
+    eweb_el_input* w = (eweb_el_input*)widget;
+    litehtml::element* el = (litehtml::element*)w;
+    switch(w->inputType()) {
+    case EWEB_INPUT_CHECKBOX:
+        w->activate(localX, localY);   /* toggles */
+        fireWidgetEvent(el, "input");
+        fireWidgetEvent(el, "change");
+        break;
+    case EWEB_INPUT_RADIO:
+        if(!w->isChecked()) {
+            w->setChecked(true);
+            clearRadioSiblings(w);
+            fireWidgetEvent(el, "input");
+            fireWidgetEvent(el, "change");
+        }
+        break;
+    case EWEB_INPUT_SELECT:
+        /* Only one popup is open at a time. */
+        if(m_openSelect != nullptr && m_openSelect != widget)
+            ((eweb_el_input*)m_openSelect)->toggleDropdown();
+        w->toggleDropdown();
+        m_openSelect = w->isDropdownOpen() ? widget : nullptr;
+        break;
+    case EWEB_INPUT_RANGE:
+        w->setRangeFromX(localX);
+        fireWidgetEvent(el, "input");
+        break;
+    case EWEB_INPUT_BUTTON: {
+        /* <input type=submit> and a <button> with no type submit their form;
+         * type=button/reset have no native navigation here. */
+        const litehtml::tchar_t* ty = el->get_attr(_t("type"));
+        const litehtml::tchar_t* tag = el->get_tagName();
+        bool isSubmit;
+        if(ty != nullptr && ty[0] != 0) isSubmit = !t_strcasecmp(ty, _t("submit"));
+        else isSubmit = (tag != nullptr && !t_strcasecmp(tag, _t("button")));
+        if(isSubmit) submitForm(el);
+        break;
+    }
+    default:
+        break;   /* text/hidden: nothing to activate on click */
+    }
+    markContentDirty();
+}
+
+void EWebEngine::submitForm(litehtml::element* field)
+{
+    if(field == nullptr) return;
+    /* Walk up to the enclosing <form>; a control with no form does nothing. */
+    litehtml::element* form = nullptr;
+    for(litehtml::element* e = field; e != nullptr; e = e->parent()) {
+        const litehtml::tchar_t* tag = e->get_tagName();
+        if(tag != nullptr && !t_strcasecmp(tag, _t("form"))) { form = e; break; }
+    }
+    if(form == nullptr) return;
+
+    /* A submit listener may preventDefault() (e.g. to run an XHR submit). */
+    if(!jsDispatchCancelableEvent(form, "submit", true)) return;
+
+    const litehtml::tchar_t* actionA = form->get_attr(_t("action"));
+    std::string action = (actionA != nullptr && actionA[0] != 0)
+                         ? std::string(actionA) : m_currentHtmlUrl;
+    /* Drop any existing query/fragment before appending the new one. */
+    size_t cut = action.find_first_of("?#");
+    if(cut != std::string::npos) action = action.substr(0, cut);
+
+    /* Collect the successful controls: named, not disabled, checked for
+     * checkbox/radio, buttons excluded. */
+    std::vector<eweb_el_input*> all;
+    collectWidgets(form, all);
+    std::string query;
+    for(size_t i = 0; i < all.size(); ++i) {
+        eweb_el_input* w = all[i];
+        litehtml::element* we = (litehtml::element*)w;
+        if(we->get_attr(_t("disabled")) != nullptr) continue;
+        const litehtml::tchar_t* nameA = we->get_attr(_t("name"));
+        if(nameA == nullptr || nameA[0] == 0) continue;
+        EWebInputType t = w->inputType();
+        if(t == EWEB_INPUT_BUTTON) continue;
+        if((t == EWEB_INPUT_CHECKBOX || t == EWEB_INPUT_RADIO) && !w->isChecked()) continue;
+        if(!query.empty()) query += "&";
+        query += eweb_urlencode(nameA);
+        query += "=";
+        query += eweb_urlencode(w->value().c_str());
+    }
+
+    std::string url = action;
+    if(!query.empty()) { url += "?"; url += query; }
+    /* NOTE: only GET navigation is supported; a method=post form has no POST
+     * navigation channel here, so it is submitted as GET (documented limit). */
+    queueNavigation(url);
+}
+
+bool EWebEngine::selectPopupRect(litehtml::position& out, int& rowH, int& visibleRows)
+{
+    out = litehtml::position(0, 0, 0, 0);
+    rowH = 0;
+    visibleRows = 0;
+    if(m_openSelect == nullptr) return false;
+    eweb_el_input* w = (eweb_el_input*)m_openSelect;
+    if(!w->isDropdownOpen()) return false;
+    int rows = w->dropdownRowCount();
+    if(rows <= 0) return false;
+    const int maxRows = 8;
+    visibleRows = (rows < maxRows) ? rows : maxRows;
+    rowH = w->popupRowHeight();
+
+    litehtml::position pl = ((litehtml::element*)w)->get_placement();
+    int px = pl.x - m_engineScrollX;
+    int py = pl.y - m_engineScrollY + pl.height;   /* just below the control */
+    int h = visibleRows * rowH + 2;
+    /* Flip above the control when it would overflow the viewport bottom. */
+    if(py + h > m_clientHeight) py = pl.y - m_engineScrollY - h;
+    if(py < 0) py = 0;
+    out.x = px; out.y = py; out.width = pl.width; out.height = h;
+    return true;
+}
+
+void EWebEngine::drawSelectPopup(eweb_surface_t* cache)
+{
+    litehtml::position r; int rowH = 0, visible = 0;
+    if(!selectPopupRect(r, rowH, visible)) return;
+    ((eweb_el_input*)m_openSelect)->drawDropdown(cache, r.x, r.y, r.width, rowH, visible);
+}
+
+void EWebEngine::scrollByKey(int dx, int dy)
+{
+    /* ENGINE-THREAD ONLY. Adopt the stepped offset, repaint, fire the page's
+     * scroll handlers and republish the authoritative offset to the embedder
+     * (postScrollClamp clamps to the doc geometry and snaps the UI's offset). */
+    m_engineScrollX += dx;
+    m_engineScrollY += dy;
+    markContentDirty();
+    postScrollClamp();
+    jsFireScrollEvent();
 }
 
 void EWebEngine::cleanupBuildResources()
@@ -2780,6 +3292,9 @@ void EWebEngine::drawPageToCacheLocked(int stripY, int stripH)
      * offset as m_doc->draw so canvases track scroll; the clip confines them
      * to the strip. litehtml itself draws nothing for <canvas>. */
     compositeCanvases(cache, -m_engineScrollX, -m_engineScrollY);
+    /* An open <select> dropdown floats above the page: draw it last so it is
+     * never covered by the laid-out document. No-op unless one is open. */
+    drawSelectPopup(cache);
     if(m_port.gfx.surface_unset_clip != nullptr)
         m_port.gfx.surface_unset_clip(m_port.gfx.ud, cache);
     uint32_t draw_ms = (uint32_t)(ticMs() - draw_start);

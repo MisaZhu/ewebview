@@ -1649,6 +1649,27 @@ void EWebEngine::jsDispatchSimpleEvent(litehtml::element* el, const char* type, 
     jsVmExit();
 }
 
+bool EWebEngine::jsDispatchCancelableEvent(litehtml::element* el, const char* type, bool bubbles)
+{
+    /* Like jsDispatchSimpleEvent but cancelable, so a page handler can call
+     * preventDefault() (e.g. a "submit" listener doing an XHR submit instead of
+     * a navigation). Returns false when prevented, true otherwise - including
+     * when there is no VM, so the caller's default action still runs. */
+    if(m_jsVm == nullptr || !m_jsEnabled || m_jsPageDisabled || m_jsInScript) return true;
+    if(el == nullptr || type == nullptr) return true;
+    js_event_init_t in;
+    js_event_init(&in, type);
+    in.on = JS_EVENT_ON_ELEMENT;
+    in.target = (void*)el;
+    in.bubbles = bubbles;
+    in.cancelable = true;
+    in.trusted = true;
+    jsVmEnter();
+    bool allowed = js_event_dispatch(m_jsVm, &in);
+    jsVmExit();
+    return allowed;
+}
+
 /* ==================================================================
  * Keyboard input -> DOM key events
  * ================================================================== */
