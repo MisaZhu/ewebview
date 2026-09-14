@@ -534,7 +534,34 @@ typedef bool (*compiler_func_t)(bytecode_t *bc, const char* input);
 #define VAR_CACHE_MAX_DEF   128
 #define LOAD_NCACHE_MAX_DEF 128
 
-#define VM_STACK_MAX    32
+/* Value stack capacity. Every live script call frame parks its `env` here for
+ * the whole duration of the nested vm_run (func_call pushes it, pops it on
+ * return), so the stack must hold one slot per recursion level PLUS operand
+ * temporaries. vm_push() silently drops a value once stack_top reaches this cap
+ * (while still taking a ref), which desyncs the stack and makes a later vm_pop()
+ * dereference garbage - so this must stay comfortably above the deepest call
+ * chain the recursion guard below allows. */
+#define VM_STACK_MAX    256
+
+/* Cap on nested script func_call frames. Two independent limits bound recursion:
+ *  - the native thread stack: each level costs ~0.6-0.7 KB (func_call + vm_run),
+ *    so an unbounded runaway recursion would blow the (often 512 KB) engine
+ *    thread stack and crash the whole process with a Bus error;
+ *  - the VM's fixed value/scope stacks (VM_STACK_MAX / VM_SCOPE_STACK_MAX), which
+ *    corrupt silently if overflowed.
+ * func_call() raises a catchable RangeError ("Maximum call stack size exceeded",
+ * exactly like a real JS engine) once call_depth reaches this cap OR either fixed
+ * stack nears its capacity, so runaway recursion unwinds cleanly instead of
+ * crashing. Override with -DMARIO_MAX_CALL_DEPTH for a differently sized stack. */
+#ifndef MARIO_MAX_CALL_DEPTH
+#define MARIO_MAX_CALL_DEPTH    128
+#endif
+/* Head-room kept free on the fixed stacks so the RangeError delivery path
+ * (vm_push(err) + scope unwinding) still has slots to work with when the guard
+ * trips near capacity. */
+#define MARIO_STACK_HEADROOM    16
+#define MARIO_SCOPE_HEADROOM    8
+
 
 //scope of vm runing
 typedef struct st_scope {
@@ -561,7 +588,19 @@ typedef struct st_scope {
 	//continue and break anchor for loop(while/for)
 } scope_t;
 
-#define VM_SCOPE_STACK_MAX    32
+#define VM_SCOPE_STACK_MAX    128
+
+/* Hard bound on walking a function's captured lexical chain (closure.var /
+ * closure.func, climbed via "@@lex"). That chain is meant to be strictly
+ * outer-ward and acyclic, but closure.func is a raw func_t* with no refcount of
+ * its own: if the func_t it points at is recycled (a use-after-free - see
+ * func_bind_closure_func / gc_mark in mario.c) the chain can close into a cycle.
+ * Every walk of it (vm_find_in_scopes, gc_mark) runs inside a single vm_run
+ * instruction dispatch or a gc pass, so an unbounded loop there is invisible to
+ * the step-hook watchdog and either pins the engine thread at 100% CPU or
+ * overflows the C stack. Real lexical nesting is nowhere near this deep, so
+ * tripping the cap means a corrupted chain - stop the walk instead of hanging. */
+#define VM_CLOSURE_CHAIN_MAX  4096
 
 typedef struct st_vm {
 	bytecode_t          bc;
@@ -601,6 +640,7 @@ typedef struct st_vm {
 	var_t*              root;
 	var_t*              new_target; // ES6 `new.target`: the constructor of the in-progress `new`; consumed (bound into env, then cleared) by func_call
 	int32_t             to_str_depth; // guards var_to_str's object->toString() call against unbounded re-entrancy
+	int32_t             call_depth;   // live script func_call frames; func_call raises RangeError at MARIO_MAX_CALL_DEPTH so runaway recursion can't overflow the native thread stack
 
 	m_array_t           included;
 
@@ -628,6 +668,7 @@ typedef struct st_vm {
 		var_t*          var_BigInt;
 		var_t*          var_Error;
 		var_t*          var_Array;
+		var_t*          var_Function; // the Function class; find_func resolves call/apply/bind off its prototype for callable receivers
 		var_t*          var_true;
 		var_t*          var_false;
 		var_t*          var_null;
@@ -719,6 +760,10 @@ var_t*      var_new_bigint(vm_t* vm, bignum_t* b); // takes ownership of b (free
 bignum_t*   var_get_bigint(var_t* var);            // NULL unless var is a V_BIGINT
 bool        var_is_number(var_t* var);
 func_t*     var_get_func(var_t* var);
+/* Build a callable function object backed by a C native (func->native/data set).
+ * Returns a baseline refs==0 var, the same contract var-returning natives obey.
+ * Used by Function.prototype.bind to mint a bound-function object. */
+var_t*      var_new_native_func(vm_t* vm, native_func_t native, void* data);
 var_t*      var_get_prototype(var_t* var);
 void        var_set_prototype(var_t* var, var_t* proto);
 bool        var_instanceof(var_t* var, var_t* proto);
