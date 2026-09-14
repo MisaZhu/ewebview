@@ -75,6 +75,20 @@ namespace litehtml
 		css_margins				m_css_margins;
 		css_margins				m_css_padding;
 		css_borders				m_css_borders;
+		/* When >0, overrides the width percentage padding/margin/borders resolve
+		 * against in calc_outlines (flex items: spec says their containing block
+		 * is the flex container content box, not their resolved main size). */
+		int						m_pct_cb_width = 0;
+		/* Parsed CSS `transform` function list, paint-time only: the box's
+		 * borders are drawn through the composed matrix (see draw_background).
+		 * Empty list = identity. Not inherited. */
+		struct transform_fn
+		{
+			int			type;		// 0 rotate, 1 translate, 2 translateX, 3 translateY
+			float		deg;		// rotate angle in degrees
+			css_length	x, y;		// translate lengths (percentages resolve at paint)
+		};
+		std::vector<transform_fn>	m_transform;
 		css_length				m_css_width;
 		css_length				m_css_height;
 		css_length				m_css_min_width;
@@ -86,6 +100,12 @@ namespace litehtml
 
 		overflow				m_overflow;
 		visibility				m_visibility;
+		/* Own CSS 'opacity' (0..1, default 1) and the cumulative product with
+		 * every ancestor's opacity, resolved top-down in parse_styles. The
+		 * cumulative value drives drawing: ~0 skips the subtree entirely, an
+		 * intermediate value scales background/border alpha. */
+		float					m_opacity;
+		float					m_opacity_cum;
 		int						m_z_index;
 		box_sizing				m_box_sizing;
 
@@ -187,9 +207,15 @@ namespace litehtml
 		virtual style_display		get_display() const override;
 	void				set_display(style_display d) override { m_display = d; }
 		virtual visibility			get_visibility() const override;
+		virtual float				get_opacity_cum() const override { return m_opacity_cum; }
 		virtual void				parse_styles(bool is_reparse = false) override;
 		virtual void				draw(uint_ptr hdc, int x, int y, const position* clip) override;
 		virtual void				draw_background(uint_ptr hdc, int x, int y, const position* clip) override;
+		/* CSS transform subset (rotate/translate*): parse into m_transform and
+		 * compose the device-space paint matrix for `box` (origin = box center,
+		 * translate percentages against the box size). False = identity. */
+		void						parse_transform_list(const tchar_t* val);
+		bool						compute_transform_matrix(const position& box, float m[6]) const;
 
 		virtual const tchar_t*		get_style_property_own(const tchar_t* name) const override;
 		virtual const tchar_t*		get_style_property(const tchar_t* name, bool inherited, const tchar_t* def = 0) override;

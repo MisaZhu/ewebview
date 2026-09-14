@@ -367,6 +367,7 @@ void litehtml::element::render_positioned(render_type rt)							LITEHTML_EMPTY_F
 int litehtml::element::get_zindex() const											LITEHTML_RETURN_FUNC(0)
 bool litehtml::element::fetch_positioned()											LITEHTML_RETURN_FUNC(false)
 litehtml::visibility litehtml::element::get_visibility() const						LITEHTML_RETURN_FUNC(visibility_visible)
+float litehtml::element::get_opacity_cum() const									LITEHTML_RETURN_FUNC(1.0f)
 void litehtml::element::apply_vertical_align()										LITEHTML_EMPTY_FUNC
 void litehtml::element::set_css_width( css_length& w )								LITEHTML_EMPTY_FUNC
 litehtml::element::ptr litehtml::element::get_child( int idx ) const				LITEHTML_RETURN_FUNC(0)
@@ -454,6 +455,11 @@ void litehtml::element::get_text( tstring& text )									LITEHTML_EMPTY_FUNC
 void litehtml::element::parse_attributes()											LITEHTML_EMPTY_FUNC
 int litehtml::element::select( const css_selector& selector, bool apply_pseudo)		LITEHTML_RETURN_FUNC(select_no_match)
 int litehtml::element::select( const css_element_selector& selector, bool apply_pseudo /*= true*/ )	LITEHTML_RETURN_FUNC(select_no_match)
+void litehtml::element::add_widget_part_style( const tstring& part, const litehtml::style& st )
+{
+	(void) part;
+	(void) st;
+}
 litehtml::element::ptr litehtml::element::find_ancestor(const css_selector& selector, bool apply_pseudo, bool* is_pseudo)	LITEHTML_RETURN_FUNC(0)
 bool litehtml::element::is_first_child_inline(const element::ptr& el) const			LITEHTML_RETURN_FUNC(false)
 bool litehtml::element::is_last_child_inline(const element::ptr& el)				LITEHTML_RETURN_FUNC(false)

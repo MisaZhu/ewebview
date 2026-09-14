@@ -1037,9 +1037,14 @@ void litehtml::document::style_detached_subtree(element* el)
 litehtml::element::ptr litehtml::document::create_element(const tchar_t* tag_name, const string_map& attributes)
 {
 	element::ptr newTag = nullptr;
-	// XContainer only customizes <input>; avoid unnecessary virtual dispatch
-	// for every other tag during DOM construction.
-	if(m_container && tag_name && !t_strcmp(tag_name, _t("input")))
+	// XContainer customizes the form controls (<input>, <button>, <select>,
+	// <textarea>); every other tag stays on the fast built-in path to avoid a
+	// virtual dispatch per node during DOM construction.
+	if(m_container && tag_name &&
+	   (!t_strcmp(tag_name, _t("input")) ||
+	    !t_strcmp(tag_name, _t("button")) ||
+	    !t_strcmp(tag_name, _t("select")) ||
+	    !t_strcmp(tag_name, _t("textarea"))))
 	{
 		newTag = m_container->create_element(tag_name, attributes, this);
 	}

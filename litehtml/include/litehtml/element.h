@@ -210,6 +210,12 @@ protected:
 		virtual style_display		get_display() const;
 	virtual void			set_display(style_display) {}
 		virtual visibility			get_visibility() const;
+		/* Cumulative opacity (self x all ancestors). 1.0 = fully opaque.
+		 * Elements that carry no CSS opacity keep the default so drawing is
+		 * unaffected; html_tag overrides this after parse_styles resolves the
+		 * 'opacity' property. Used to fade or skip semi/fully transparent
+		 * subtrees (e.g. Material state-layer ::before/::after with opacity:0). */
+		virtual float				get_opacity_cum() const;
 		virtual element_position	get_element_position(css_offsets* offsets = 0) const;
 		virtual void				get_inline_boxes(position::vector& boxes);
 		virtual void				parse_styles(bool is_reparse = false);
@@ -257,6 +263,13 @@ protected:
 		virtual void				calc_document_size(litehtml::size& sz, int x = 0, int y = 0);
 		virtual void				get_redraw_box(litehtml::position& pos, int x = 0, int y = 0);
 		virtual void				add_style(const litehtml::style& st);
+		/* Form-widget part pseudo-elements (::-webkit-slider-thumb,
+		 * ::-moz-range-track, ...) hand their declaration block here instead of
+		 * being dropped as unknown pseudo-elements. The base ignores them;
+		 * replaced controls (eweb_el_input) keep the block to paint their
+		 * track/thumb chrome with the page colours. part is the lowercased
+		 * pseudo-element name without the :: prefix. */
+		virtual void				add_widget_part_style(const tstring& part, const litehtml::style& st);
 		virtual element::ptr		get_element_by_point(int x, int y, int client_x, int client_y);
 		virtual element::ptr		get_child_by_point(int x, int y, int client_x, int client_y, draw_flag flag, int zindex);
 		virtual const background*	get_background(bool own_only = false);

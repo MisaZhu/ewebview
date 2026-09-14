@@ -2,7 +2,6 @@
 #include "html_tag.h"
 #include "document.h"
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
 #include <algorithm>
 #include <vector>
@@ -33,6 +32,7 @@ namespace litehtml
 		int				base;		// outer main size before free-space distribution
 		bool			has_main;	// base came from flex-basis / width
 		int				ml, mr, mt, mb;
+		bool			aml, amr;	// auto margins: container-resolved, see collection
 		int				main;		// final outer main size
 		int				cross;		// final outer cross size
 	};
@@ -320,7 +320,35 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 	const tchar_t* dir_s = get_style_property(_t("flex-direction"), false, _t("row"));
 	if(flex_flag(dir_s, "column", "column-reverse"))
 	{
-		// a single flex column is block flow for the subset we support
+		/* A single flex column is block flow for the subset we support, but
+		 * `order` still reorders the stack (w3.org .card__text{order:1} puts
+		 * the card image above its text). Reorder the child list for the
+		 * duration of this render so block flow stacks them in flex order. */
+		bool col_reverse = flex_flag(dir_s, "column-reverse");
+		bool dirty = col_reverse;
+		std::vector<int> ord(m_children.size(), 0);
+		for(size_t i = 0; i < m_children.size(); i++)
+		{
+			const tchar_t* o = m_children[i]->get_style_property(_t("order"), false, _t("0"));
+			ord[i] = o ? atoi(o) : 0;
+			if(ord[i] != 0) dirty = true;
+		}
+		if(dirty)
+		{
+			elements_vector saved = m_children;
+			std::vector<size_t> idx(m_children.size());
+			for(size_t i = 0; i < idx.size(); i++) idx[i] = i;
+			std::stable_sort(idx.begin(), idx.end(),
+					[&ord](size_t a, size_t b){ return ord[a] < ord[b]; });
+			if(col_reverse) std::reverse(idx.begin(), idx.end());
+			elements_vector reordered;
+			reordered.reserve(idx.size());
+			for(size_t i = 0; i < idx.size(); i++) reordered.push_back(saved[idx[i]]);
+			m_children = reordered;
+			int rw = render_box(x, y, max_width, second_pass);
+			m_children = saved;
+			return rw;
+		}
 		return render_box(x, y, max_width, second_pass);
 	}
 	bool row_reverse = flex_flag(dir_s, "row-reverse");
@@ -368,6 +396,7 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				it.main		= 0;
 				it.cross	= 0;
 				it.ml = it.mr = it.mt = it.mb = 0;
+				it.aml = it.amr = false;
 				it.order	= 0;
 				items.push_back(it);
 			}
@@ -397,6 +426,20 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		it.mr = el->margin_right();
 		it.mt = el->margin_top();
 		it.mb = el->margin_bottom();
+		/* Auto margins on a flex item are the CONTAINER's to resolve (they
+		 * absorb leftover free space after flexing). Left alone the item's own
+		 * render() runs calc_auto_margins against its own width and the
+		 * resolved value feeds the next pass' base size - a positive feedback
+		 * loop that walked w3.org's nav button (margin-inline-start:auto)
+		 * ~1000px further right on every relayout until the menu ul sat at
+		 * x=15000, off screen. Track them and zero them for packing. */
+		{
+			html_tag* iht = static_cast<html_tag*>(el);
+			it.aml = iht->m_css_margins.left.is_predefined();
+			it.amr = iht->m_css_margins.right.is_predefined();
+		}
+		if(it.aml) it.ml = 0;
+		if(it.amr) it.mr = 0;
 
 		const tchar_t* v = el->get_style_property(_t("order"), false, _t("0"));
 		it.order = v ? atoi(v) : 0;
@@ -493,7 +536,16 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			}
 			else
 			{
+				/* pin auto margins to their packed value so the item's own
+				 * calc_auto_margins cannot re-resolve them against its own
+				 * width (feedback loop, see collection note) */
+				html_tag* mht = static_cast<html_tag*>(it.el);
+				css_length sml = mht->m_css_margins.left, smr = mht->m_css_margins.right;
+				if(it.aml){ css_length v; v = (float)it.ml; mht->m_css_margins.left = v; }
+				if(it.amr){ css_length v; v = (float)it.mr; mht->m_css_margins.right = v; }
 				it.base = it.el->render(0, 0, avail, second_pass);
+				mht->m_css_margins.left = sml;
+				mht->m_css_margins.right = smr;
 				/* block-level containers fill the available width (block
 				 * semantics); recover the content preferred width so the flex
 				 * base size is max-content, as the spec requires */
@@ -547,6 +599,31 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 
 	int bottom = 0;
 	int used_width = 0;
+
+	/* Render a non-run item at its resolved main size while telling the item
+	 * that its percentage padding/margin/borders resolve against THIS
+	 * container's content width: per spec a flex item's containing block is
+	 * the flex container content box, never the item's own used size. Without
+	 * the override w3.org's `.component--columns > ul li { padding:1.5% }`
+	 * resolved against the shrunken item while the ul's matching
+	 * `margin:-1.5%` resolved against the container, netting a negative lead
+	 * that drifted the whole first column under the container's overflow
+	 * clip. Only percentage outline lengths observe the override (cvt_units
+	 * ignores the width base for absolute units), so the item's internal
+	 * layout is untouched. */
+	auto render_item = [&](flex_item& it, int ix, int iy)
+	{
+		html_tag* ht = static_cast<html_tag*>(it.el);
+		int saved = ht->m_pct_cb_width;
+		ht->m_pct_cb_width = avail;
+		css_length sml = ht->m_css_margins.left, smr = ht->m_css_margins.right;
+		if(it.aml){ css_length v; v = (float)it.ml; ht->m_css_margins.left = v; }
+		if(it.amr){ css_length v; v = (float)it.mr; ht->m_css_margins.right = v; }
+		it.el->render(ix, iy, it.main, second_pass);
+		ht->m_css_margins.left = sml;
+		ht->m_css_margins.right = smr;
+		ht->m_pct_cb_width = saved;
+	};
 
 	/* A flex container with a definite cross size (e.g. height:100vh) must give
 	 * its single flex line that height, otherwise align-items centers within
@@ -625,6 +702,27 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		}
 		if(free < 0) free = 0;
 
+		/* auto margins absorb leftover free space before justify-content */
+		{
+			int na = 0;
+			for(size_t i = 0; i < line.size(); i++)
+			{
+				if(items[line[i]].aml) na++;
+				if(items[line[i]].amr) na++;
+			}
+			if(na > 0 && free > 0)
+			{
+				int share = free / na;
+				for(size_t i = 0; i < line.size(); i++)
+				{
+					flex_item& it = items[line[i]];
+					if(it.aml){ it.ml += share; it.main += share; }
+					if(it.amr){ it.mr += share; it.main += share; }
+				}
+				free = 0;
+			}
+		}
+
 		// lay the items out at their final main size to learn cross sizes
 		int line_cross = 0;
 		for(size_t i = 0; i < line.size(); i++)
@@ -639,7 +737,7 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			}
 			else
 			{
-				it.el->render(0, 0, it.main, second_pass);
+				render_item(it, 0, 0);
 				it.cross = it.el->get_position().height + it.mt + it.mb;
 			}
 			if(it.cross > line_cross) line_cross = it.cross;
@@ -720,7 +818,7 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			}
 			else
 			{
-				it.el->render(xs[i], bottom + iy, it.main, second_pass);
+				render_item(it, xs[i], bottom + iy);
 			}
 		}
 

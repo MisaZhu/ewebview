@@ -257,6 +257,87 @@ litehtml::def_color litehtml::g_def_colors[] =
 };
 
 
+/* color-mix(in srgb, <color> [<pct>%], <color> [<pct>%]): linear sRGB blend
+ * of the two stops. Missing percentages split the remainder (50/50 when both
+ * absent). Modern design systems lean on it for translucent accents
+ * (`border-color: color-mix(in srgb, var(--accent) 45%, transparent)`);
+ * without it the value is an invalid colour and the border vanishes. */
+static bool parse_color_mix(const litehtml::tchar_t* str, litehtml::document_container* callback, litehtml::web_color& out)
+{
+	if(t_strncasecmp(str, _t("color-mix("), 10))
+	{
+		return false;
+	}
+	litehtml::tstring inner = str + 10;
+	litehtml::tstring::size_type rp = inner.find_last_of(_t(')'));
+	if(rp == litehtml::tstring::npos)
+	{
+		return false;
+	}
+	inner = inner.substr(0, rp);
+
+	/* split on top-level commas only (a stop colour may hold its own) */
+	std::vector<litehtml::tstring> parts;
+	int depth = 0;
+	litehtml::tstring cur;
+	for(size_t i = 0; i < inner.length(); i++)
+	{
+		litehtml::tchar_t c = inner[i];
+		if(c == _t('(')) depth++;
+		else if(c == _t(')')) depth--;
+		if(c == _t(',') && depth == 0)
+		{
+			parts.push_back(cur);
+			cur.clear();
+		}
+		else
+		{
+			cur += c;
+		}
+	}
+	parts.push_back(cur);
+	if(parts.size() < 3)
+	{
+		return false;
+	}
+
+	litehtml::web_color cs[2];
+	double ps[2] = { -1.0, -1.0 };
+	for(int k = 0; k < 2; k++)
+	{
+		litehtml::tstring part = parts[k + 1];
+		litehtml::trim(part);
+		litehtml::tstring col = part;
+		litehtml::tstring::size_type sp = part.find_last_of(_t(' '));
+		if(sp != litehtml::tstring::npos)
+		{
+			litehtml::tstring tail = part.substr(sp + 1);
+			if(!tail.empty() && tail[tail.length() - 1] == _t('%'))
+			{
+				ps[k] = t_strtod(tail.c_str(), 0);
+				col = part.substr(0, sp);
+				litehtml::trim(col);
+			}
+		}
+		cs[k] = litehtml::web_color::from_string(col.c_str(), callback);
+	}
+	double p1 = ps[0] >= 0 ? ps[0] : (ps[1] >= 0 ? 100.0 - ps[1] : 50.0);
+	double p2 = ps[1] >= 0 ? ps[1] : 100.0 - p1;
+	double sum = p1 + p2;
+	if(sum <= 0)
+	{
+		return false;
+	}
+	p1 /= sum;
+	p2 /= sum;
+	out = litehtml::web_color(
+		(litehtml::byte)litehtml::clamp255((int)(cs[0].red   * p1 + cs[1].red   * p2)),
+		(litehtml::byte)litehtml::clamp255((int)(cs[0].green * p1 + cs[1].green * p2)),
+		(litehtml::byte)litehtml::clamp255((int)(cs[0].blue  * p1 + cs[1].blue  * p2)),
+		(litehtml::byte)litehtml::clamp255((int)(cs[0].alpha * p1 + cs[1].alpha * p2)));
+	return true;
+}
+
 litehtml::web_color litehtml::web_color::from_string(const tchar_t* str, litehtml::document_container* callback)
 {
 	uint64_t start_ms = sys_tic_ms(0);
@@ -264,6 +345,12 @@ litehtml::web_color litehtml::web_color::from_string(const tchar_t* str, litehtm
 	{
 		litehtml::profile_color_parse(start_ms);
 		return web_color(0, 0, 0, 0);
+	}
+	web_color mixed;
+	if(parse_color_mix(str, callback, mixed))
+	{
+		litehtml::profile_color_parse(start_ms);
+		return mixed;
 	}
 	if(str[0] == _t('#'))
 	{
@@ -455,6 +542,10 @@ litehtml::tstring litehtml::web_color::resolve_name(const tchar_t* name, litehtm
 bool litehtml::web_color::is_color(const tchar_t* str)
 {
 	if(!t_strncasecmp(str, _t("rgb"), 3) || str[0] == _t('#'))
+	{
+		return true;
+	}
+	if(!t_strncasecmp(str, _t("color-mix("), 10))
 	{
 		return true;
 	}

@@ -69,3 +69,5 @@ Testing/
 
 .DS_Store
 build_*/
+.temp*
+.tmp*

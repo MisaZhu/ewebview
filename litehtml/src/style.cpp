@@ -151,6 +151,33 @@ void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, con
 	{
 		name = _t("padding-bottom");
 	} else
+	/* Logical sizing properties: w3.org sizes its border-trick chevrons with
+	 * block-size/inline-size; unmapped they would parse to a 0x0 box and the
+	 * chevron borders would never show. */
+	if(!t_strcmp(name, _t("inline-size")))
+	{
+		name = _t("width");
+	} else
+	if(!t_strcmp(name, _t("block-size")))
+	{
+		name = _t("height");
+	} else
+	if(!t_strcmp(name, _t("min-inline-size")))
+	{
+		name = _t("min-width");
+	} else
+	if(!t_strcmp(name, _t("max-inline-size")))
+	{
+		name = _t("max-width");
+	} else
+	if(!t_strcmp(name, _t("min-block-size")))
+	{
+		name = _t("min-height");
+	} else
+	if(!t_strcmp(name, _t("max-block-size")))
+	{
+		name = _t("max-height");
+	} else
 	if(!t_strcmp(name, _t("margin-inline")) || !t_strcmp(name, _t("padding-inline")) ||
 	   !t_strcmp(name, _t("margin-block")) || !t_strcmp(name, _t("padding-block")))
 	{
@@ -463,7 +490,8 @@ void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, con
 	if(!t_strcmp(name, _t("margin")) || !t_strcmp(name, _t("padding")))
 	{
 		string_vector tokens;
-		split_string(val, tokens, _t(" "));
+		/* Paren-aware: a calc()/min() stop must stay one token. */
+		split_string(val, tokens, _t(" "), _t(""), _t("("));
 		if(tokens.size() >= 4)
 		{
 			add_parsed_property(tstring(name) + _t("-top"),		tokens[0], important);
@@ -510,7 +538,9 @@ void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, con
 		split_string(name, nametokens, _t("-"));
 
 		string_vector tokens;
-		split_string(val, tokens, _t(" "));
+		/* Paren-aware: color-mix()/var() values hold spaces and commas that
+		 * must not scatter across the four sides. */
+		split_string(val, tokens, _t(" "), _t(""), _t("("));
 		if(tokens.size() >= 4)
 		{
 			add_parsed_property(nametokens[0] + _t("-top-")		+ nametokens[1],	tokens[0], important);

@@ -72,6 +72,8 @@ public:
     virtual void                       draw_svg(litehtml::uint_ptr hdc, const litehtml::position& pos,
                                                 const litehtml::web_color& color,
                                                 const float* pts, const int* counts, int nsubs) override;
+    virtual void                       push_paint_transform(const float m[6]) override;
+    virtual void                       pop_paint_transform() override;
 
     virtual void                       transform_text(litehtml::tstring& text, litehtml::text_transform tt) override;
     virtual void                       set_clip(const litehtml::position& pos, const litehtml::border_radiuses& bdr_radius, bool valid_x, bool valid_y) override;
@@ -173,9 +175,19 @@ private:
 
     /* overflow/clip support: litehtml pushes a clip rectangle around the
      * children of any box with overflow != visible; we mirror the stack onto
-     * the port surface clip so text, blits and fills all honour it. */
-    std::vector<litehtml::position> m_clips;
+     * the port surface clip so text, blits and fills all honour it. The border
+     * radius travels with the entry so image compositing under a rounded clip
+     * (the .avatar border-radius:50% + overflow:hidden case) can mask the blit
+     * to the round box; the HAL clip itself stays rectangular. */
+    struct clip_entry { litehtml::position r; int radius; };
+    std::vector<clip_entry> m_clips;
+    int                        top_clip_radius() const;
     void* m_paint_surf;
+
+    /* Paint-time affine transform (CSS transform of the box whose borders are
+     * being drawn), see litehtml document_container::push_paint_transform. */
+    bool m_xform_on;
+    float m_xform[6];
 
     std::vector<eweb_el_input*> m_vecInput;
 

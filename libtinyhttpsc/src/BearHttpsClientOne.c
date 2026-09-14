@@ -94882,7 +94882,29 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
         }
          
          private_BearHttpsResponse_write(response, (unsigned char*)start_msg, private_BearsslHttps_strlen(start_msg));
-         private_BearHttpsResponse_write(response, (unsigned char*)requisition_props->hostname, private_BearsslHttps_strlen(requisition_props->hostname));
+         /*
+          * RFC 7230 5.4: the Host field-value must be identical to the target
+          * URI's authority, which includes the port whenever it is not the
+          * scheme default. The URL parser above strips ":port" off hostname
+          * (it NUL-terminates at the ':'), so writing hostname alone sent
+          * "Host: 10.91.9.216" for a request to 10.91.9.216:8819. Strict
+          * servers / vhost routers reject a Host that does not match the port
+          * they were reached on by closing the connection with zero response
+          * bytes -- surfacing as INVALID_HTTP_RESPONSE (recv()==0) while curl,
+          * which does send the port, works. Rebuild the authority here.
+          */
+         char host_header[BEARSSL_DNS_CACHE_HOST_SIZE + 8];
+         host_header[0] = '\0';
+         if(requisition_props->port > 0 &&
+            !((requisition_props->is_https && requisition_props->port == 443) ||
+              (!requisition_props->is_https && requisition_props->port == 80))){
+             snprintf(host_header, sizeof(host_header), "%s:%d",
+                 requisition_props->hostname, requisition_props->port);
+         }
+         else{
+             snprintf(host_header, sizeof(host_header), "%s", requisition_props->hostname);
+         }
+         private_BearHttpsResponse_write(response, (unsigned char*)host_header, private_BearsslHttps_strlen(host_header));
          private_BearHttpsResponse_write(response, (unsigned char*)"\r\n", 2);
 
          /*
@@ -95519,27 +95541,39 @@ void private_BearHttpsResponse_read_til_end_of_headers_or_reach_limit(
         }
 
 
-        for(int i = 3; i < readded;i++){
+        /*
+         * Scan the ACCUMULATED buffer for the blank line that ends the headers,
+         * not just the chunk we just read. The old loop inspected only
+         * content_point[3..readded), so a "\r\n\r\n" straddling a chunk
+         * boundary was never matched: with a ~202-byte header block read in
+         * 200-byte chunks the terminator split across two chunks, the scan kept
+         * consuming the whole body until recv() returned 0, and the response was
+         * mis-reported as INVALID_HTTP_RESPONSE. Start 3 bytes before this chunk
+         * so a boundary-split terminator is still caught.
+         */
+        long total_size = content_size + readded;
+        long scan_start = content_size >= 3 ? content_size - 3 : 0;
+        for(long i = scan_start + 3; i < total_size; i++){
             if(
-                content_point[i-3] == '\r' &&
-                content_point[i-2] == '\n' &&
-                content_point[i-1] == '\r' &&
-                content_point[i] == '\n' )
+                self->raw_content[i-3] == '\r' &&
+                self->raw_content[i-2] == '\n' &&
+                self->raw_content[i-1] == '\r' &&
+                self->raw_content[i] == '\n' )
             {
 
-                self->body_start_index =content_size + i+1;
-                self->body_size = ((content_size+readded) - self->body_start_index);
+                self->body_start_index = i+1;
+                self->body_size = (total_size - self->body_start_index);
                 self->extra_body_remaning_to_send = self->body_size;
                 self->body_readded_size = self->body_size;
                 self->body = (unsigned char*)BearsslHttps_allocate(self->body_size+2);
                 memcpy(self->body,self->raw_content + self->body_start_index,self->body_size);
                 self->body[self->body_size] = '\0';
 
-                private_BearHttpsResponse_parse_headers(self,content_size + i-1);
+                private_BearHttpsResponse_parse_headers(self, (int)(i-1));
                 return;
             }
         }
-        content_size+=readded;
+        content_size = total_size;
 
     }
 

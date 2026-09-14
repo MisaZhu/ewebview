@@ -161,6 +161,15 @@ namespace litehtml
 		 * pass per element, so a resumed chunk keeps a single consistent stamp
 		 * epoch instead of re-walking the tree once per sheet. */
 		const litehtml::css&			doc_styles() const { return m_styles; }
+		/* The context (master) sheet set. Async containers (ewebview) feed every
+		 * fetched <link> sheet to context::load_master_stylesheet, so doc_styles
+		 * alone can be empty; late-cascade sites (el_svg shape children) must
+		 * match against both. */
+		const litehtml::css&			master_styles() const
+		{
+			static const litehtml::css no_master;
+			return m_context ? m_context->master_css() : no_master;
+		}
 		/* Progress counters for the chunked walk: stamped is cumulative across
 		 * chunks (so it must keep climbing, otherwise the walk is stuck redoing
 		 * the same elements), visits is per chunk. */

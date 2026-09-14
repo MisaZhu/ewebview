@@ -333,10 +333,6 @@ void litehtml::el_svg::collect_shape(const element::ptr& el)
 	tstring tag = el->get_tagName();
 	lcase(tag);
 
-	/* fill="none" shapes paint nothing (stroke is unsupported). */
-	const tchar_t* fill = el->get_attr(_t("fill"));
-	if(fill && !t_strcasecmp(fill, _t("none"))) return;
-
 	if(tag == _t("g") || tag == _t("svg") || tag == _t("a"))
 	{
 		int cnt = el->get_children_count();
@@ -344,6 +340,12 @@ void litehtml::el_svg::collect_shape(const element::ptr& el)
 			collect_shape(el->get_child(i));
 		return;
 	}
+
+	/* remember the owning shape: fill/stroke are resolved per paint from its
+	 * attributes, computed style and the SVG paint-inheritance chain. */
+	#define SVG_PUSH_SHAPE(sp) \
+		(sp).shape = el;
+
 	if(tag == _t("path"))
 	{
 		const tchar_t* d = el->get_attr(_t("d"));
@@ -357,6 +359,8 @@ void litehtml::el_svg::collect_shape(const element::ptr& el)
 				{
 					svg_subpath sp;
 					sp.pts = subs[i];
+					sp.stroke_pts = subs[i];
+					SVG_PUSH_SHAPE(sp)
 					m_subpaths.push_back(sp);
 				}
 			}
@@ -380,11 +384,133 @@ void litehtml::el_svg::collect_shape(const element::ptr& el)
 			sp.pts.push_back(x + w); sp.pts.push_back(y);
 			sp.pts.push_back(x + w); sp.pts.push_back(y + h);
 			sp.pts.push_back(x);     sp.pts.push_back(y + h);
+			sp.stroke_pts = sp.pts;
+			sp.stroke_closed = true;
+			SVG_PUSH_SHAPE(sp)
 			m_subpaths.push_back(sp);
 		}
 		return;
 	}
-	/* circle/ellipse/line/text/defs: unsupported in this minimal path. */
+	if(tag == _t("circle") || tag == _t("ellipse"))
+	{
+		const tchar_t* acx = el->get_attr(_t("cx"));
+		const tchar_t* acy = el->get_attr(_t("cy"));
+		float cx = acx ? (float)atof(acx) : 0;
+		float cy = acy ? (float)atof(acy) : 0;
+		float rx, ry;
+		if(tag == _t("circle"))
+		{
+			const tchar_t* ar = el->get_attr(_t("r"));
+			rx = ry = ar ? (float)atof(ar) : 0;
+		}
+		else
+		{
+			const tchar_t* arx = el->get_attr(_t("rx"));
+			const tchar_t* ary = el->get_attr(_t("ry"));
+			rx = arx ? (float)atof(arx) : 0;
+			ry = ary ? (float)atof(ary) : 0;
+		}
+		if(rx > 0 && ry > 0)
+		{
+			svg_subpath sp;
+			const int steps = 24;
+			for(int i = 0; i < steps; i++)
+			{
+				float a = (float)i * 2.0f * 3.14159265358979f / (float)steps;
+				sp.pts.push_back(cx + rx * cosf(a));
+				sp.pts.push_back(cy + ry * sinf(a));
+			}
+			sp.stroke_pts = sp.pts;
+			sp.stroke_closed = true;
+			SVG_PUSH_SHAPE(sp)
+			m_subpaths.push_back(sp);
+		}
+		return;
+	}
+	#undef SVG_PUSH_SHAPE
+	/* line/text/defs: unsupported in this minimal path. */
+}
+
+/* SVG paint value for a shape: own attribute, own computed style, then the
+ * same pair up the ancestor chain (fill/stroke inherit in SVG), stopping at
+ * the <svg> root. Returns null when nothing specifies it. */
+static const litehtml::tchar_t* svg_paint_value(const litehtml::element::ptr& shape, const litehtml::tchar_t* prop)
+{
+	for(litehtml::element::ptr el = shape; el; el = el->parent())
+	{
+		const litehtml::tchar_t* v = el->get_attr(prop);
+		if(!v || !*v)
+		{
+			v = el->get_style_property(prop, false, 0);
+		}
+		if(v && *v)
+		{
+			return v;
+		}
+		if(!t_strcasecmp(el->get_tagName(), _t("svg")))
+		{
+			break;
+		}
+	}
+	return nullptr;
+}
+
+/* Per-paint paint resolution: fill (attribute -> computed style -> inherited
+ * chain, so CSS like `.brand-mark rect{fill:var(--accent)}` or an svg-level
+ * `fill:none` reaches the shape as soon as the document style walk has run)
+ * and stroke (+stroke-width). "none" leaves the subpath unpainted;
+ * "currentColor"/unparseable fill falls back to the svg's inherited text
+ * colour at draw time. */
+void litehtml::el_svg::resolve_subpath_colors()
+{
+	document_container* cont = get_document() ? get_document()->container() : nullptr;
+	size_t n = m_subpaths.size();
+	m_subpath_colors.assign(n, web_color(0, 0, 0, 0));
+	m_subpath_has_color.assign(n, 0);
+	m_subpath_strokes.assign(n, web_color(0, 0, 0, 0));
+	m_subpath_has_stroke.assign(n, 0);
+	m_subpath_stroke_w.assign(n, 1.0f);
+	for(size_t i = 0; i < n; i++)
+	{
+		const svg_subpath& sp = m_subpaths[i];
+		if(!sp.shape)
+		{
+			continue;
+		}
+		const tchar_t* fill = svg_paint_value(sp.shape, _t("fill"));
+		if(fill)
+		{
+			if(!t_strcasecmp(fill, _t("none")))
+			{
+				m_subpath_has_color[i] = 2;
+			}
+			else if(t_strcasecmp(fill, _t("currentColor")) && t_strcasecmp(fill, _t("inherit")) && cont)
+			{
+				web_color c = web_color::from_string(fill, cont);
+				if(c.alpha != 0 || c.red != 0 || c.green != 0 || c.blue != 0)
+				{
+					m_subpath_colors[i] = c;
+					m_subpath_has_color[i] = 1;
+				}
+			}
+		}
+		const tchar_t* stroke = svg_paint_value(sp.shape, _t("stroke"));
+		if(stroke && t_strcasecmp(stroke, _t("none")) && cont)
+		{
+			web_color c = web_color::from_string(stroke, cont);
+			if(c.alpha != 0 || c.red != 0 || c.green != 0 || c.blue != 0)
+			{
+				m_subpath_strokes[i] = c;
+				m_subpath_has_stroke[i] = 1;
+				const tchar_t* sw = svg_paint_value(sp.shape, _t("stroke-width"));
+				if(sw)
+				{
+					float wv = (float)atof(sw);
+					if(wv > 0) m_subpath_stroke_w[i] = wv;
+				}
+			}
+		}
+	}
 }
 
 void litehtml::el_svg::parse_attributes()
@@ -477,7 +603,10 @@ void litehtml::el_svg::draw(uint_ptr hdc, int x, int y, const position* clip)
 
 	/* The shape children only exist once the whole subtree has been
 	 * parsed, so tessellation happens lazily on first paint (parse_attributes
-	 * runs at creation time, when <path> siblings are not attached yet). */
+	 * runs at creation time, when <path> siblings are not attached yet).
+	 * Only the GEOMETRY latches here; fill colours are resolved every paint
+	 * (resolve_subpath_colors) because the page sheets may land after the
+	 * first progressive frame. */
 	if(!m_shapes_ready)
 	{
 		m_shapes_ready = true;
@@ -486,6 +615,7 @@ void litehtml::el_svg::draw(uint_ptr hdc, int x, int y, const position* clip)
 			collect_shape(c);
 	}
 	if(m_subpaths.empty()) return;
+	resolve_subpath_colors();
 
 	position pos = m_pos;
 	pos.x += x;
@@ -502,34 +632,134 @@ void litehtml::el_svg::draw(uint_ptr hdc, int x, int y, const position* clip)
 	float dx = (pos.width - vbw * s) / 2.0f - m_vb_x * s;
 	float dy = (pos.height - vbh * s) / 2.0f - m_vb_y * s;
 
-	std::vector<float> pts;
-	std::vector<int> counts;
-	for(auto& sp : m_subpaths)
+	/* Paint consecutive same-colour subpaths together (one draw_svg call each)
+	 * so nonzero-winding counters inside a shape survive, while differently
+	 * filled shapes (accent rect + bg-coloured dot) layer in document order.
+	 * has_color: 0 = currentColor fallback, 1 = resolved colour, 2 = "none"
+	 * (skip). */
+	web_color cc = get_color(_t("color"), true, web_color(0, 0, 0));
+	auto run_color = [&](size_t i) -> web_color
 	{
-		int n = (int)sp.pts.size() / 2;
-		if(n < 3) continue;
-		counts.push_back(n);
-		for(int i = 0; i < n; i++)
+		return m_subpath_has_color[i] == 1 ? m_subpath_colors[i] : cc;
+	};
+	size_t run_start = 0;
+	bool run_started = false;
+	auto flush_run = [&](size_t begin, size_t end)
+	{
+		if(!run_started) return;
+		std::vector<float> pts;
+		std::vector<int> counts;
+		for(size_t si = begin; si < end; si++)
 		{
-			pts.push_back(sp.pts[i * 2] * s + dx + pos.x);
-			pts.push_back(sp.pts[i * 2 + 1] * s + dy + pos.y);
+			if(m_subpath_has_color[si] == 2) continue;
+			const svg_subpath& sp = m_subpaths[si];
+			int n = (int)sp.pts.size() / 2;
+			if(n < 3) continue;
+			counts.push_back(n);
+			for(int i = 0; i < n; i++)
+			{
+				pts.push_back(sp.pts[i * 2] * s + dx + pos.x);
+				pts.push_back(sp.pts[i * 2 + 1] * s + dy + pos.y);
+			}
+		}
+		if(counts.empty()) return;
+		doc->container()->draw_svg(hdc, pos, run_color(begin), pts.data(), counts.data(), (int)counts.size());
+	};
+	for(size_t i = 0; i < m_subpaths.size(); i++)
+	{
+		if(m_subpath_has_color[i] == 2)
+		{
+			/* "none" ends the current run and paints nothing itself. */
+			flush_run(run_start, i);
+			run_started = false;
+			continue;
+		}
+		if(!run_started)
+		{
+			run_start = i;
+			run_started = true;
+			continue;
+		}
+		web_color a = run_color(run_start);
+		web_color b = run_color(i);
+		if(a.red != b.red || a.green != b.green || a.blue != b.blue || a.alpha != b.alpha)
+		{
+			flush_run(run_start, i);
+			run_start = i;
 		}
 	}
-	if(counts.empty()) return;
+	flush_run(run_start, m_subpaths.size());
 
-	/* Icons inherit the text color unless fill pins one down. "currentColor"
-	 * (and any unparseable/absent fill) means "use the inherited color":
-	 * web_color cannot resolve the keyword and would yield alpha 0. */
-	web_color cc = get_color(_t("color"), true, web_color(0, 0, 0));
-	web_color c = cc;
-	const tchar_t* fillv = get_attr(_t("fill"));
-	if(!fillv) fillv = get_style_property(_t("fill"), true, 0);
-	if(fillv && t_strcasecmp(fillv, _t("none")) != 0 &&
-	   t_strcasecmp(fillv, _t("currentColor")) != 0)
+	/* Strokes: expand every outline segment into a width-quad and fill the
+	 * batch (the port has no line primitive). Painted after the fills, in
+	 * document order, grouped by colour. */
+	std::vector<float> spts;
+	std::vector<int> scounts;
+	web_color scol(0, 0, 0, 0);
+	bool srun = false;
+	auto flush_strokes = [&]()
 	{
-		c = get_color(_t("fill"), true, cc);
+		if(!srun || scounts.empty())
+		{
+			spts.clear();
+			scounts.clear();
+			srun = false;
+			return;
+		}
+		doc->container()->draw_svg(hdc, pos, scol, spts.data(), scounts.data(), (int)scounts.size());
+		spts.clear();
+		scounts.clear();
+		srun = false;
+	};
+	auto same_stroke = [&](const web_color& a, const web_color& b)
+	{
+		return a.red == b.red && a.green == b.green && a.blue == b.blue && a.alpha == b.alpha;
+	};
+	for(size_t i = 0; i < m_subpaths.size(); i++)
+	{
+		if(!m_subpath_has_stroke[i])
+		{
+			continue;
+		}
+		if(srun && !same_stroke(scol, m_subpath_strokes[i]))
+		{
+			flush_strokes();
+		}
+		if(!srun)
+		{
+			scol = m_subpath_strokes[i];
+			srun = true;
+		}
+		const svg_subpath& sp = m_subpaths[i];
+		float hw = m_subpath_stroke_w[i] * 0.5f;
+		size_t pn = sp.stroke_pts.size() / 2;
+		size_t segs = sp.stroke_closed ? pn : (pn > 0 ? pn - 1 : 0);
+		for(size_t k = 0; k < segs; k++)
+		{
+			float x0 = sp.stroke_pts[k * 2], y0 = sp.stroke_pts[k * 2 + 1];
+			size_t k1 = (k + 1) % pn;
+			float x1 = sp.stroke_pts[k1 * 2], y1 = sp.stroke_pts[k1 * 2 + 1];
+			float dxs = x1 - x0, dys = y1 - y0;
+			float len = sqrtf(dxs * dxs + dys * dys);
+			if(len < 1e-4f)
+			{
+				continue;
+			}
+			float nx = -dys / len * hw, ny = dxs / len * hw;
+			float q[8] = {
+				(x0 + nx) * s + dx + pos.x, (y0 + ny) * s + dy + pos.y,
+				(x1 + nx) * s + dx + pos.x, (y1 + ny) * s + dy + pos.y,
+				(x1 - nx) * s + dx + pos.x, (y1 - ny) * s + dy + pos.y,
+				(x0 - nx) * s + dx + pos.x, (y0 - ny) * s + dy + pos.y,
+			};
+			scounts.push_back(4);
+			for(int q_i = 0; q_i < 8; q_i++)
+			{
+				spts.push_back(q[q_i]);
+			}
+		}
 	}
-	doc->container()->draw_svg(hdc, pos, c, pts.data(), counts.data(), (int)counts.size());
+	flush_strokes();
 }
 
 void litehtml::el_svg::draw_children(uint_ptr /*hdc*/, int /*x*/, int /*y*/,

@@ -1504,6 +1504,15 @@ static bool mq_cond_match(const char* c, int vw, int vh) {
     if(js_ascii_casecmp(name, "device-pixel-ratio") == 0)      return (n == 1);
     if(js_ascii_casecmp(name, "min-device-pixel-ratio") == 0)  return (1 >= n);
     if(js_ascii_casecmp(name, "max-device-pixel-ratio") == 0)  return (1 <= n);
+    /* Interaction media features, pinned like litehtml's media_query: the
+     * shell is mouse-driven desktop (fine/hover/browser). w3.org gates its
+     * advanced stylesheet bootstrap on matchMedia("... (pointer: fine) ...");
+     * reporting false left <html> at class="no-js" and hid the nav carets. */
+    if(js_ascii_casecmp(name, "pointer") == 0)     return (js_ascii_casecmp(val, "fine") == 0);
+    if(js_ascii_casecmp(name, "any-pointer") == 0) return (js_ascii_casecmp(val, "fine") == 0);
+    if(js_ascii_casecmp(name, "hover") == 0)       return (js_ascii_casecmp(val, "hover") == 0);
+    if(js_ascii_casecmp(name, "any-hover") == 0)   return (js_ascii_casecmp(val, "hover") == 0);
+    if(js_ascii_casecmp(name, "display-mode") == 0) return (js_ascii_casecmp(val, "browser") == 0);
     return false;
 }
 

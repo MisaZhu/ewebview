@@ -210,7 +210,16 @@ void litehtml::line_box::finish(bool last_box)
 		base_line += (line_height - m_height) / 2;
 	}
 
+	/* strut_h = the tallest font box on the line (half-leading is measured
+	 * against it). When CSS line-height exceeds the font box (generous
+	 * leading) the baseline anchor below must stay tied to the font box,
+	 * not to line_height, or every glyph sinks by one full leading and its
+	 * descent spills into the next block - whose background then paints
+	 * over the slice (the "half-cut list rows" artifact). */
+	int strut_h = m_height;
 	m_height = line_height;
+	int lead = line_height - strut_h;
+	if(lead < 0) lead = 0;
 
 	int y1	= 0;
 	int y2	= m_height;
@@ -225,8 +234,11 @@ void litehtml::line_box::finish(bool last_box)
 			 * m_height + base_line from the line top; the text box top is that
 			 * minus the ascent. Subtracting base_line instead pushed every glyph
 			 * 2*|descent| below its line box, so overflow:hidden ancestors sliced
-			 * the bottoms off (GitHub directory rows, table headers). */
-			el->m_pos.y = m_height + base_line - fm.ascent;
+			 * the bottoms off (GitHub directory rows, table headers).
+			 * -lead re-anchors the baseline to the font strut instead of the
+			 * (possibly taller) line box; it is 0 for line-height:normal so
+			 * those pages keep today's geometry exactly. */
+			el->m_pos.y = m_height + base_line - fm.ascent - lead;
 		} else
 		{
 			switch(el->get_vertical_align())

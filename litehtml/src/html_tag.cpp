@@ -7,9 +7,37 @@
 #include <algorithm>
 #include <locale>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 #include "el_before_after.h"
+
+/* Opacity support ---------------------------------------------------------
+ * litehtml historically ignored CSS 'opacity' entirely, so Material-style
+ * state layers (::before/::after painted with opacity:0 until hovered) drew
+ * as solid coloured pills/boxes over buttons and inputs. Cumulative opacity
+ * is resolved in parse_styles (html_tag::m_opacity_cum); these helpers apply
+ * it at draw time: a subtree whose cumulative opacity rounds to zero paints
+ * nothing, an intermediate value scales the alpha of backgrounds/borders. */
+static const float OPACITY_EPS = 0.004f;
+
+static inline bool opacity_hidden(float cum)
+{
+	return cum <= OPACITY_EPS;
+}
+
+static inline int opacity_scale_alpha(int a, float cum)
+{
+	if(cum >= 1.0f)
+	{
+		return a;
+	}
+	int v = (int)((float)a * cum + 0.5f);
+	if(v < 0) v = 0;
+	if(v > 255) v = 255;
+	return v;
+}
 
 /*
  * O(1), non-dereferencing heap-membership test provided by the EwokOS libc
@@ -266,6 +294,8 @@ litehtml::html_tag::html_tag(litehtml::document* doc) : litehtml::element(doc)
 	m_lh_predefined			= false;
 	m_line_height			= 0;
 	m_visibility			= visibility_visible;
+	m_opacity				= 1.0f;
+	m_opacity_cum			= 1.0f;
 	m_border_spacing_x		= 0;
 	m_border_spacing_y		= 0;
 	m_border_collapse		= border_collapse_separate;
@@ -679,6 +709,25 @@ void litehtml::html_tag::apply_stylesheet( const litehtml::css& stylesheet )
 	}
 }
 
+/* The pseudo-element part name of a selector (lowercase, no "::" prefix), or
+ * an empty string when it carries none. Both style-dispatch sites use it to
+ * route widget-part rules to element::add_widget_part_style. */
+static litehtml::tstring selector_pseudo_element_val( const litehtml::css_selector::ptr& sel )
+{
+	if(!sel)
+	{
+		return litehtml::tstring();
+	}
+	for(const auto& attr : sel->m_right.m_attrs)
+	{
+		if(attr.condition == litehtml::select_pseudo_element)
+		{
+			return attr.val;
+		}
+	}
+	return litehtml::tstring();
+}
+
 void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 {
 #ifdef LITEHTML_LIFETIME_DEBUG
@@ -954,6 +1003,16 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 					{
 						el->add_style(*sel->m_style);
 					}
+				} else if(apply & select_match_with_widget)
+				{
+					/* Form-widget part rule: the selector targets a painted
+					 * sub-part of a replaced control, not a tree node. */
+					tstring part = selector_pseudo_element_val(sel);
+					if(!part.empty())
+					{
+						ensure_used_style();
+						add_widget_part_style(part, *sel->m_style);
+					}
 				} else
 				{
 					add_style(*sel->m_style);
@@ -1007,6 +1066,13 @@ void litehtml::html_tag::get_content_size( size& sz, int max_width )
 
 void litehtml::html_tag::draw( uint_ptr hdc, int x, int y, const position* clip )
 {
+	/* opacity:0 (own or inherited from an ancestor) paints nothing. Layout is
+	 * untouched - this only suppresses drawing of the element's own box. */
+	if(opacity_hidden(m_opacity_cum))
+	{
+		return;
+	}
+
 	position pos = m_pos;
 	pos.x	+= x;
 	pos.y	+= y;
@@ -1615,6 +1681,14 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		m_text_transform = text_transform_none;
 	}
 
+	/* transform is not inherited: an absent own declaration is the identity */
+	m_transform.clear();
+	const tchar_t* own_transform = get_style_property_own(_t("transform"));
+	if(own_transform)
+	{
+		parse_transform_list(own_transform);
+	}
+
 	const tchar_t* own_white_space = own_style_ref_ptr(own_refs.white_space);
 	if(own_white_space && t_strcasecmp(own_white_space, _t("inherit")))
 	{
@@ -1629,6 +1703,24 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		m_white_space = white_space_normal;
 	}
 
+	/* text-overflow:ellipsis is defined for single-line boxes only. Without
+	 * this, a clipped list row (fixed height + overflow:hidden) wraps to a
+	 * second line that the clip then slices mid-glyph - the "torn row"
+	 * artifact on dense news lists. Browsers never produce that second line
+	 * because ellipsis implies nowrap; mirror that here so the box lays out
+	 * one line and the clip cuts cleanly at the right edge instead. */
+	if(m_white_space == white_space_normal)
+	{
+		const tchar_t* tovl = get_style_property(_t("text-overflow"), false, _t("clip"));
+		const tchar_t* ovf  = get_style_property(_t("overflow"), false, _t("visible"));
+		if(tovl && ovf &&
+		   !t_strcmp(tovl, _t("ellipsis")) &&
+		   t_strcmp(ovf, _t("visible")))
+		{
+			m_white_space = white_space_nowrap;
+		}
+	}
+
 	const tchar_t* own_visibility = own_style_ref_ptr(own_refs.visibility);
 	if(own_visibility && t_strcasecmp(own_visibility, _t("inherit")))
 	{
@@ -1641,6 +1733,31 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	else
 	{
 		m_visibility = visibility_visible;
+	}
+
+	/* CSS 'opacity' (non-inherited, 0..1). The visible transparency is the
+	 * product of this element's opacity and every ancestor's, so accumulate
+	 * top-down: the style walk visits parents first (see the display:inherit
+	 * path above), therefore the parent's cumulative value is already final.
+	 * opacity:0 keeps layout but must paint nothing - handled at draw time. */
+	{
+		const tchar_t* own_opacity = get_style_property(_t("opacity"), false, _t("1"));
+		float op = own_opacity ? (float)atof(own_opacity) : 1.0f;
+		if(op < 0.0f) op = 0.0f;
+		if(op > 1.0f) op = 1.0f;
+		/* Script-reveal guard: SSR pages (Google sign-in ships a trailing
+		 * `body{opacity:0}`) hide the document until their hydration JS flips it
+		 * back. A JS-limited engine can never run that script, so honouring the
+		 * guard would leave the page permanently blank; treat a fully
+		 * transparent document root as "revealed". Scoped to html/body only -
+		 * opacity:0 on real content (Material state layers) still hides. */
+		if(op <= 0.0f && (m_tag == _t("html") || m_tag == _t("body")))
+		{
+			op = 1.0f;
+		}
+		m_opacity = op;
+		float parent_cum = el_parent ? el_parent->get_opacity_cum() : 1.0f;
+		m_opacity_cum = parent_cum * op;
 	}
 	if(profile_enabled)
 	{
@@ -2609,6 +2726,17 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 			} else if(i->val == _t("before"))
 			{
 				res |= select_match_with_before;
+			} else if(i->val == _t("-webkit-slider-thumb") ||
+					  i->val == _t("-webkit-slider-runnable-track") ||
+					  i->val == _t("-moz-range-thumb") ||
+					  i->val == _t("-moz-range-track") ||
+					  i->val == _t("-moz-range-progress"))
+			{
+				/* Form-widget part pseudo-element: the rule paints a sub-part
+				 * of a replaced control (range slider thumb/track). Match it and
+				 * let the dispatch sites hand the block to the element; unknown
+				 * pseudo-elements still refuse to match. */
+				res |= select_match_with_widget;
 			} else
 			{
 				return select_no_match;
@@ -3499,20 +3627,25 @@ void litehtml::html_tag::add_positioned(const element::ptr &el)
 
 void litehtml::html_tag::calc_outlines( int parent_width )
 {
-	m_padding.left	= get_document()->cvt_units(m_css_padding.left,	m_font_size, parent_width);
-	m_padding.right	= get_document()->cvt_units(m_css_padding.right,	m_font_size, parent_width);
+	/* Flex items set m_pct_cb_width: per spec their percentage padding/margin
+	 * resolve against the flex container content box, while render() hands them
+	 * their resolved main size as parent_width. */
+	int pcb = m_pct_cb_width > 0 ? m_pct_cb_width : parent_width;
 
-	m_borders.left	= m_css_borders.left.width.calc_percent(parent_width);
-	m_borders.right	= m_css_borders.right.width.calc_percent(parent_width);
+	m_padding.left	= get_document()->cvt_units(m_css_padding.left,	m_font_size, pcb);
+	m_padding.right	= get_document()->cvt_units(m_css_padding.right,	m_font_size, pcb);
 
-	m_margins.left	= get_document()->cvt_units(m_css_margins.left,	m_font_size, parent_width);
-	m_margins.right	= get_document()->cvt_units(m_css_margins.right,	m_font_size, parent_width);
+	m_borders.left	= m_css_borders.left.width.calc_percent(pcb);
+	m_borders.right	= m_css_borders.right.width.calc_percent(pcb);
 
-	m_margins.top		= get_document()->cvt_units(m_css_margins.top,		m_font_size, parent_width);
-	m_margins.bottom	= get_document()->cvt_units(m_css_margins.bottom,	m_font_size, parent_width);
+	m_margins.left	= get_document()->cvt_units(m_css_margins.left,	m_font_size, pcb);
+	m_margins.right	= get_document()->cvt_units(m_css_margins.right,	m_font_size, pcb);
 
-	m_padding.top		= get_document()->cvt_units(m_css_padding.top,		m_font_size, parent_width);
-	m_padding.bottom	= get_document()->cvt_units(m_css_padding.bottom,	m_font_size, parent_width);
+	m_margins.top		= get_document()->cvt_units(m_css_margins.top,		m_font_size, pcb);
+	m_margins.bottom	= get_document()->cvt_units(m_css_margins.bottom,	m_font_size, pcb);
+
+	m_padding.top		= get_document()->cvt_units(m_css_padding.top,		m_font_size, pcb);
+	m_padding.bottom	= get_document()->cvt_units(m_css_padding.bottom,	m_font_size, pcb);
 }
 
 void litehtml::html_tag::calc_auto_margins(int parent_width)
@@ -3978,6 +4111,93 @@ void litehtml::html_tag::set_tagName( const tchar_t* tag )
 	m_tag = s_val;
 }
 
+/* Supported CSS transform subset: a list of rotate()/translate()/translateX()/
+ * translateY() functions - enough for the border-trick chevrons modern design
+ * systems rotate into place (w3.org breadcrumb separators and nav carets). Any
+ * other function (scale/matrix/skew/...) aborts the parse and leaves the
+ * identity, which beats drawing a half-understood transform. */
+void litehtml::html_tag::parse_transform_list(const tchar_t* val)
+{
+	const tchar_t* p = val;
+	while(p && *p)
+	{
+		while(*p == ' ' || *p == '\t') p++;
+		if(!*p) break;
+		int type;
+		if(!t_strncmp(p, _t("rotate("), 7))			{ type = 0; p += 7; }
+		else if(!t_strncmp(p, _t("translateX("), 11))	{ type = 2; p += 11; }
+		else if(!t_strncmp(p, _t("translateY("), 11))	{ type = 3; p += 11; }
+		else if(!t_strncmp(p, _t("translate("), 10))	{ type = 1; p += 10; }
+		else { m_transform.clear(); return; }
+		tstring args;
+		while(*p && *p != ')') args += *p++;
+		if(*p == ')') p++;
+		transform_fn fn;
+		fn.type = type;
+		fn.deg = 0;
+		if(type == 0)
+		{
+			char* end = 0;
+			fn.deg = (float)strtod(args.c_str(), &end);
+			if(end && !t_strncmp(end, _t("rad"), 3))		fn.deg *= 57.2957795f;
+			else if(end && !t_strncmp(end, _t("turn"), 4))	fn.deg *= 360.0f;
+			else if(end && !t_strncmp(end, _t("grad"), 4))	fn.deg *= 0.9f;
+		}
+		else
+		{
+			string_vector toks;
+			split_string(args, toks, _t(", "));
+			if(toks.size() >= 1) fn.x.fromString(toks[0].c_str());
+			if(toks.size() >= 2) fn.y.fromString(toks[1].c_str());
+		}
+		m_transform.push_back(fn);
+	}
+}
+
+bool litehtml::html_tag::compute_transform_matrix(const position& box, float m[6]) const
+{
+	if(m_transform.empty()) return false;
+	float a = 1, b = 0, c = 0, d = 1, e = 0, f = 0;
+	for(size_t i = 0; i < m_transform.size(); i++)
+	{
+		const transform_fn& fn = m_transform[i];
+		float fa = 1, fb = 0, fc = 0, fd = 1, fe = 0, ff = 0;
+		if(fn.type == 0)
+		{
+			float th = fn.deg * 3.14159265358979f / 180.0f;
+			float cs = cosf(th), sn = sinf(th);
+			fa = cs; fb = sn; fc = -sn; fd = cs;
+		}
+		else
+		{
+			float dx = 0, dy = 0;
+			/* cvt_units takes css_length&; fn is const here. */
+			css_length lx = fn.x, ly = fn.y;
+			if(fn.type == 1 || fn.type == 2) dx = (float)get_document()->cvt_units(lx, m_font_size, box.width);
+			if(fn.type == 1)					dy = (float)get_document()->cvt_units(ly, m_font_size, box.height);
+			if(fn.type == 3)					dy = (float)get_document()->cvt_units(lx, m_font_size, box.height);
+			fe = dx; ff = dy;
+		}
+		/* m = m * fn: the new function acts in the local frame of the product */
+		float na = a * fa + c * fb;
+		float nb = b * fa + d * fb;
+		float nc = a * fc + c * fd;
+		float nd = b * fc + d * fd;
+		float ne = a * fe + c * ff + e;
+		float nf = b * fe + d * ff + f;
+		a = na; b = nb; c = nc; d = nd; e = ne; f = nf;
+	}
+	/* conjugate by the transform-origin (box centre), then move from the
+	 * box-local frame into device space */
+	float ox = box.width * 0.5f, oy = box.height * 0.5f;
+	float es = e + ox - (a * ox + c * oy);
+	float fs = f + oy - (b * ox + d * oy);
+	m[0] = a; m[1] = b; m[2] = c; m[3] = d;
+	m[4] = es + box.x - (a * box.x + c * box.y);
+	m[5] = fs + box.y - (b * box.x + d * box.y);
+	return true;
+}
+
 void litehtml::html_tag::draw_background( uint_ptr hdc, int x, int y, const position* clip )
 {
 	position pos = m_pos;
@@ -3998,6 +4218,9 @@ void litehtml::html_tag::draw_background( uint_ptr hdc, int x, int y, const posi
 				background_paint bg_paint;
 				init_background_paint(pos, bg_paint, bg);
 
+				/* Partial opacity: fade the background fill. */
+				bg_paint.color.alpha = opacity_scale_alpha(bg_paint.color.alpha, m_opacity_cum);
+
 				get_document()->container()->draw_background(hdc, bg_paint);
 			}
 			position border_box = pos;
@@ -4007,7 +4230,26 @@ void litehtml::html_tag::draw_background( uint_ptr hdc, int x, int y, const posi
 			borders bdr = m_css_borders;
 			bdr.radius = m_css_borders.radius.calc_percents(border_box.width, border_box.height);
 
+			/* Partial opacity: fade each border edge colour. */
+			if(m_opacity_cum < 1.0f)
+			{
+				bdr.left.color.alpha	= opacity_scale_alpha(bdr.left.color.alpha, m_opacity_cum);
+				bdr.top.color.alpha		= opacity_scale_alpha(bdr.top.color.alpha, m_opacity_cum);
+				bdr.right.color.alpha	= opacity_scale_alpha(bdr.right.color.alpha, m_opacity_cum);
+				bdr.bottom.color.alpha	= opacity_scale_alpha(bdr.bottom.color.alpha, m_opacity_cum);
+			}
+
+			float xform[6];
+			bool have_xform = compute_transform_matrix(border_box, xform);
+			if(have_xform)
+			{
+				get_document()->container()->push_paint_transform(xform);
+			}
 			get_document()->container()->draw_borders(hdc, bdr, border_box, have_parent() ? false : true);
+			if(have_xform)
+			{
+				get_document()->container()->pop_paint_transform();
+			}
 		}
 	} else
 	{
@@ -4071,10 +4313,18 @@ void litehtml::html_tag::draw_background( uint_ptr hdc, int x, int y, const posi
 				if(bg)
 				{
 					bg_paint.border_radius = bdr.radius.calc_percents(bg_paint.border_box.width, bg_paint.border_box.width);
+					bg_paint.color.alpha = opacity_scale_alpha(bg_paint.color.alpha, m_opacity_cum);
 					get_document()->container()->draw_background(hdc, bg_paint);
 				}
 				borders b = bdr;
 				b.radius = bdr.radius.calc_percents(box->width, box->height);
+				if(m_opacity_cum < 1.0f)
+				{
+					b.left.color.alpha	= opacity_scale_alpha(b.left.color.alpha, m_opacity_cum);
+					b.top.color.alpha		= opacity_scale_alpha(b.top.color.alpha, m_opacity_cum);
+					b.right.color.alpha	= opacity_scale_alpha(b.right.color.alpha, m_opacity_cum);
+					b.bottom.color.alpha	= opacity_scale_alpha(b.bottom.color.alpha, m_opacity_cum);
+				}
 				get_document()->container()->draw_borders(hdc, b, *box, false);
 			}
 		}
@@ -4953,13 +5203,23 @@ void litehtml::html_tag::draw_list_marker( uint_ptr hdc, const position &pos )
 
 void litehtml::html_tag::draw_children( uint_ptr hdc, int x, int y, const position* clip, draw_flag flag, int zindex )
 {
+	/* A fully transparent subtree (opacity:0 here or on any ancestor) paints
+	 * nothing at all; skip the whole recursion, not just this box. */
+	if(opacity_hidden(m_opacity_cum))
+	{
+		return;
+	}
+
 	/* The standard "visually hidden" accessibility pattern (skip links,
 	 * screen-reader-only spans such as the w3.org logo label) sizes the box to
 	 * 1px with overflow:hidden and relies on clipping to keep the text from
 	 * painting. Without a general clip implementation the text would still be
 	 * drawn over neighbouring content, so treat a degenerate clipped box as
-	 * painting nothing. */
-	if(m_overflow > overflow_visible && m_pos.width <= 1 && m_pos.height <= 1)
+	 * painting nothing. A box that only RESERVES space via padding (the
+	 * .l-frame aspect-ratio trick) is NOT degenerate: its children still have
+	 * to paint inside the padding box. */
+	if(m_overflow > overflow_visible &&
+	   m_pos.width + m_padding.width() <= 1 && m_pos.height + m_padding.height() <= 1)
 	{
 		return;
 	}
@@ -5291,7 +5551,11 @@ bool litehtml::html_tag::is_nth_child(const element::ptr& el, int num, int off, 
 	int idx = 1;
 	for(const auto& child : m_children)
 	{
-		if(child->get_display() != display_inline_text)
+		/* Pseudo-elements (::before/::after) are not element siblings for
+		 * :nth-* counting; counting them made w3.org's breadcrumb
+		 * li:not(:last-child)::after chevron land on the last item too. */
+		const tchar_t* cn = child->get_tagName();
+		if(child->get_display() != display_inline_text && !(cn && cn[0] == ':'))
 		{
 			if( (!of_type) || (of_type && !t_strcmp(el->get_tagName(), child->get_tagName())) )
 			{
@@ -5323,7 +5587,9 @@ bool litehtml::html_tag::is_nth_last_child(const element::ptr& el, int num, int 
 	int idx = 1;
 	for(elements_vector::const_reverse_iterator child = m_children.rbegin(); child != m_children.rend(); child++)
 	{
-		if((*child)->get_display() != display_inline_text)
+		/* pseudo-elements are not element siblings, see is_nth_child */
+		const tchar_t* cn = (*child)->get_tagName();
+		if((*child)->get_display() != display_inline_text && !(cn && cn[0] == ':'))
 		{
 			if( !of_type || (of_type && !t_strcmp(el->get_tagName(), (*child)->get_tagName())) )
 			{
@@ -5745,6 +6011,16 @@ void litehtml::html_tag::refresh_styles()
 					{
 						el->add_style(*usel.m_selector->m_style);
 					}
+				} else if(apply & select_match_with_widget)
+				{
+					/* Form-widget part rule: re-dispatch the block to the
+					 * replaced control (mirrors apply_stylesheet_own). */
+					tstring part = selector_pseudo_element_val(usel.m_selector);
+					if(!part.empty())
+					{
+						add_widget_part_style(part, *usel.m_selector->m_style);
+						usel.m_used = true;
+					}
 				} else
 				{
 					add_style(*usel.m_selector->m_style);
@@ -5997,7 +6273,12 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 
 	if (m_display != display_table_cell && !m_css_width.is_predefined())
 	{
-		int w = calc_width(parent_width);
+		/* Flex items set m_pct_cb_width: per spec their percentage width /
+		 * max-width resolve against the flex container content box, while
+		 * render() hands them their resolved main size as parent_width. */
+		int w = (m_pct_cb_width > 0 && m_css_width.units() == css_units_percentage)
+			? get_document()->cvt_units(m_css_width, m_font_size, m_pct_cb_width)
+			: calc_width(parent_width);
 		
 		if (m_box_sizing == box_sizing_border_box)
 		{
@@ -6016,7 +6297,8 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 	// check for max-width (on the first pass only)
 	if (!m_css_max_width.is_predefined() && !second_pass)
 	{
-		int mw = get_document()->cvt_units(m_css_max_width, m_font_size, parent_width);
+		int mw = get_document()->cvt_units(m_css_max_width, m_font_size,
+			m_pct_cb_width > 0 ? m_pct_cb_width : parent_width);
 		if (m_box_sizing == box_sizing_border_box)
 		{
 			mw -= m_padding.left + m_borders.left + m_padding.right + m_borders.right;
@@ -6608,12 +6890,19 @@ void litehtml::html_tag::draw_children_box(uint_ptr hdc, int x, int y, const pos
 		border_box += m_padding;
 		border_box += m_borders;
 
+		/* CSS clips overflow at the PADDING edge, not the content edge. Boxes
+		 * whose space comes from padding alone (the .l-frame aspect-ratio
+		 * trick: content height 0 + padding-bottom, absolutely positioned
+		 * media inside) would otherwise clip every child away - the w3.org
+		 * card images never painted at all. */
+		position pad_box = pos;
+		pad_box += m_padding;
+
 		border_radiuses bdr_radius = m_css_borders.radius.calc_percents(border_box.width, border_box.height);
 
 		bdr_radius -= m_borders;
-		bdr_radius -= m_padding;
 
-		doc->container()->set_clip(pos, bdr_radius, true, true);
+		doc->container()->set_clip(pad_box, bdr_radius, true, true);
 	}
 
 	position browser_wnd;

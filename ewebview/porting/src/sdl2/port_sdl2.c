@@ -1246,6 +1246,20 @@ static bool ek_net_request(void* ud, const char* url,
     resp->body      = (uint8_t*)body;   /* response-owned; freed with it */
     resp->body_size = (body && body_size > 0) ? body_size : 0;
     resp->native    = st;
+    /* The HAL response only carries `error`/`status`, so the core's loadURL
+     * failure branches cannot show WHY a transport failed. Surface tinyhttpsc's
+     * own error string/code here (same stderr stream as the [ewebview] logs) on
+     * a transport error or a non-2xx status, so a failed fetch is diagnosable
+     * without a rebuild. */
+    if(resp->error || resp->status < 200 || resp->status > 299) {
+        fprintf(stderr,
+            "[ewebview] net.request diag: url=%s status=%d error=%d code=%d "
+            "msg=%s body=%d\n",
+            url, resp->status, resp->error ? 1 : 0,
+            HttpsResponseGetErrorCode(response),
+            HttpsResponseGetErrorMsg(response) ? HttpsResponseGetErrorMsg(response) : "(null)",
+            resp->body_size);
+    }
     return true;
 }
 

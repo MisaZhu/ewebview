@@ -196,6 +196,89 @@ static bool is_redirect_status(int status)
 
 } /* anonymous namespace */
 
+/* Non-zero winding scanline fill over all subpaths at once (icon-font paths
+ * rely on winding, not parity, for their counters). Geometry is already in
+ * device space; spans are clipped to clip. Shared by draw_svg and the
+ * transformed border quads, hence the extraction. */
+static void fill_polys_nz(eweb_surface_t* s, const eweb_gfx_t* gfx,
+                          const litehtml::position& clip,
+                          const float* pts, const int* counts, int nsubs,
+                          uint32_t argb)
+{
+    if (!s || !pts || !counts || nsubs <= 0 || !gfx->fill_rect)
+        return;
+    if ((argb >> 24) == 0)
+        return;
+
+    int total = 0;
+    for (int i = 0; i < nsubs; i++)
+        total += counts[i];
+    if (total < 3)
+        return;
+
+    float miny = pts[1], maxy = pts[1];
+    for (int i = 0; i < total; i++) {
+        float yy = pts[i * 2 + 1];
+        if (yy < miny) miny = yy;
+        if (yy > maxy) maxy = yy;
+    }
+    int y0 = (int)floorf(miny);
+    int y1 = (int)ceilf(maxy);
+    if (y0 < clip.y) y0 = clip.y;
+    if (y1 > clip.y + clip.height - 1) y1 = clip.y + clip.height - 1;
+
+    struct xedge { float x; int dir; };
+    std::vector<xedge> xs;
+    xs.reserve(64);
+
+    int base = 0;
+    for (int y = y0; y <= y1; y++) {
+        float fy = (float)y + 0.5f;
+        xs.clear();
+        base = 0;
+        for (int sp = 0; sp < nsubs; sp++) {
+            int n = counts[sp];
+            for (int i = 0; i < n; i++) {
+                float x1 = pts[(base + i) * 2];
+                float y1p = pts[(base + i) * 2 + 1];
+                float x2 = pts[(base + (i + 1) % n) * 2];
+                float y2p = pts[(base + (i + 1) % n) * 2 + 1];
+                if ((y1p <= fy && y2p > fy) || (y2p <= fy && y1p > fy)) {
+                    float t = (fy - y1p) / (y2p - y1p);
+                    xedge e;
+                    e.x = x1 + t * (x2 - x1);
+                    e.dir = (y2p > y1p) ? 1 : -1;
+                    xs.push_back(e);
+                }
+            }
+            base += n;
+        }
+        if (xs.size() < 2)
+            continue;
+        std::sort(xs.begin(), xs.end(), [](const xedge& a, const xedge& b) { return a.x < b.x; });
+
+        /* Sweep: paint where the running winding number is non-zero. */
+        int wind = 0;
+        int span_start = 0;
+        bool inside = false;
+        for (size_t i = 0; i < xs.size(); i++) {
+            wind += xs[i].dir;
+            bool now_inside = (wind != 0);
+            if (now_inside && !inside) {
+                span_start = (int)(xs[i].x + 0.5f);
+                inside = true;
+            } else if (!now_inside && inside) {
+                int span_end = (int)(xs[i].x + 0.5f);
+                int xa = span_start < clip.x ? clip.x : span_start;
+                int xb = span_end > clip.x + clip.width ? clip.x + clip.width : span_end;
+                if (xb > xa)
+                    gfx->fill_rect(gfx->ud, s, xa, y, xb - xa, 1, argb);
+                inside = false;
+            }
+        }
+    }
+}
+
 static inline int char_width_cache_slot(uint64_t key)
 {
     return (int)(key & 8191ULL);
@@ -220,6 +303,8 @@ EWebContainer::EWebContainer(const eweb_port_t* port, EWebContainerHost* host)
     m_defer_image_load = false;
     m_abort = false;
     m_paint_surf = 0;
+    m_xform_on = false;
+    memset(m_xform, 0, sizeof(m_xform));
     memset(m_char_width_keys, 0, sizeof(m_char_width_keys));
     memset(m_char_width_vals, 0, sizeof(m_char_width_vals));
 }
@@ -849,12 +934,119 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
                 img = it->second.image;
             }
 
-            if (img != NULL && gfx->blit_fit_alpha && gfx->surface_dims) {
+            if (img != NULL && gfx->surface_dims && (gfx->blit || gfx->blit_fit_alpha)) {
                 int iw = 0, ih = 0;
                 gfx->surface_dims(gfx->ud, img, &iw, &ih);
-                gfx->blit_fit_alpha(gfx->ud, img, 0, 0, iw, ih,
-                    s, bg.clip_box.x, bg.clip_box.y, bg.clip_box.width, bg.clip_box.height, 0xFF);
-                return;
+                if (iw > 0 && ih > 0) {
+                    /* Tile the image at its resolved background-size starting
+                     * at (position_x, position_y), honouring background-repeat
+                     * and clipping to clip_box. Stretching the whole bitmap
+                     * into the clip box (the old blit_fit_alpha shortcut)
+                     * smeared sprite sheets across every small box that
+                     * references them - the garbled-icon noise on dense
+                     * pages. */
+                    int tw = bg.image_size.width  > 0 ? bg.image_size.width  : iw;
+                    int th = bg.image_size.height > 0 ? bg.image_size.height : ih;
+                    if (tw <= 0 || th <= 0)
+                        return;
+                    const litehtml::position& cb = bg.clip_box;
+                    bool tile_x = (bg.repeat == litehtml::background_repeat_repeat ||
+                                   bg.repeat == litehtml::background_repeat_repeat_x);
+                    bool tile_y = (bg.repeat == litehtml::background_repeat_repeat ||
+                                   bg.repeat == litehtml::background_repeat_repeat_y);
+                    int x0 = bg.position_x;
+                    int y0 = bg.position_y;
+                    if (tile_x) {
+                        while (x0 > cb.x) x0 -= tw;
+                        while (x0 + tw <= cb.x) x0 += tw;
+                    }
+                    if (tile_y) {
+                        while (y0 > cb.y) y0 -= th;
+                        while (y0 + th <= cb.y) y0 += th;
+                    }
+                    int y_end = cb.y + cb.height;
+                    int x_end = cb.x + cb.width;
+                    for (int ty = y0; ty < y_end; ty += th) {
+                        if (!tile_y && ty != y0) break;
+                        for (int tx = x0; tx < x_end; tx += tw) {
+                            if (!tile_x && tx != x0) break;
+                            /* dst = tile rect intersected with the clip box */
+                            int dx = tx > cb.x ? tx : cb.x;
+                            int dy = ty > cb.y ? ty : cb.y;
+                            int dr = (tx + tw) < x_end ? (tx + tw) : x_end;
+                            int db = (ty + th) < y_end ? (ty + th) : y_end;
+                            int dw = dr - dx;
+                            int dh = db - dy;
+                            if (dw <= 0 || dh <= 0)
+                                continue;
+                            /* matching src sub-rect in natural image pixels */
+                            int sx = (int)((long)(dx - tx) * iw / tw);
+                            int sy = (int)((long)(dy - ty) * ih / th);
+                            int sw = (int)((long)dw * iw / tw);
+                            int sh = (int)((long)dh * ih / th);
+                            if (sw <= 0) sw = 1;
+                            if (sh <= 0) sh = 1;
+                            if (sx + sw > iw) sw = iw - sx;
+                            if (sy + sh > ih) sh = ih - sy;
+                            if (sw <= 0 || sh <= 0)
+                                continue;
+                            /* Decoded images must composite src-over: the HAL
+                             * blit is a straight copy (BLENDMODE_NONE) that
+                             * writes transparent pixels' black RGB verbatim -
+                             * the black field behind alpha images painted at
+                             * natural size (w3.org hero illustration). */
+                            bool masked = false;
+                            int crad = top_clip_radius();
+                            if (crad > 0 && gfx->surface_new && gfx->surface_pixels &&
+                                gfx->surface_free && gfx->blit_fit_alpha) {
+                                /* Rounded clip (.avatar border-radius:50% with
+                                 * overflow:hidden): the HAL clip is rectangular,
+                                 * so mask the tile against the round box in a
+                                 * temp surface and composite that with alpha. */
+                                eweb_surface_t* tmp = gfx->surface_new(gfx->ud, dw, dh);
+                                if (tmp) {
+                                    gfx->surface_clear(gfx->ud, tmp, 0);
+                                    gfx->blit_fit_alpha(gfx->ud, img, sx, sy, sw, sh, tmp, 0, 0, dw, dh, 0xFF);
+                                    int tw2 = 0, th2 = 0;
+                                    uint32_t* px = gfx->surface_pixels(gfx->ud, tmp, &tw2, &th2);
+                                    if (px && tw2 > 0 && th2 > 0) {
+                                        const litehtml::position& cr = m_clips.back().r;
+                                        /* tmp covers exactly the dst tile, but its
+                                         * buffer may sit at device resolution
+                                         * (dpr>1): map each native pixel back to
+                                         * the logical point of the tile it is. */
+                                        float kx = (float)dw / (float)tw2;
+                                        float ky = (float)dh / (float)th2;
+                                        for (int yy = 0; yy < th2; yy++) {
+                                            float Y = dy + (yy + 0.5f) * ky;
+                                            float cy = Y < cr.y + crad ? cr.y + crad :
+                                                       (Y > cr.y + cr.height - crad ? cr.y + cr.height - crad : Y);
+                                            for (int xx = 0; xx < tw2; xx++) {
+                                                float X = dx + (xx + 0.5f) * kx;
+                                                float cx = X < cr.x + crad ? cr.x + crad :
+                                                           (X > cr.x + cr.width - crad ? cr.x + cr.width - crad : X);
+                                                float ddx = X - cx, ddy = Y - cy;
+                                                if (ddx * ddx + ddy * ddy > (float)crad * crad)
+                                                    px[yy * tw2 + xx] = 0;
+                                            }
+                                        }
+                                        gfx->blit_fit_alpha(gfx->ud, tmp, 0, 0, dw, dh, s, dx, dy, dw, dh, 0xFF);
+                                        masked = true;
+                                    }
+                                    gfx->surface_free(gfx->ud, tmp);
+                                }
+                            }
+                            if (!masked) {
+                                if (gfx->blit_fit_alpha) {
+                                    gfx->blit_fit_alpha(gfx->ud, img, sx, sy, sw, sh, s, dx, dy, dw, dh, 0xFF);
+                                } else if (gfx->blit) {
+                                    gfx->blit(gfx->ud, img, sx, sy, sw, sh, s, dx, dy, sw, sh);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
             }
         }
         do_image = true;
@@ -915,18 +1107,86 @@ void EWebContainer::draw_borders(litehtml::uint_ptr hdc, const litehtml::borders
         return;
 
     int rad = borders.radius.top_left_x;
-    bool uniform_radius = borders.radius.top_right_x == rad &&
-                          borders.radius.bottom_left_x == rad &&
-                          borders.radius.bottom_right_x == rad &&
-                          borders.radius.top_left_y == rad &&
-                          borders.radius.top_right_y == rad &&
-                          borders.radius.bottom_left_y == rad &&
-                          borders.radius.bottom_right_y == rad;
+    /* border-radius:50% on a box whose sides differ by a pixel or two (line
+     * box rounding) yields x/y radii that differ by one; tolerate that. */
+    bool uniform_radius =
+                          borders.radius.top_right_x >= rad - 1 && borders.radius.top_right_x <= rad + 1 &&
+                          borders.radius.bottom_left_x >= rad - 1 && borders.radius.bottom_left_x <= rad + 1 &&
+                          borders.radius.bottom_right_x >= rad - 1 && borders.radius.bottom_right_x <= rad + 1 &&
+                          borders.radius.top_left_y >= rad - 1 && borders.radius.top_left_y <= rad + 1 &&
+                          borders.radius.top_right_y >= rad - 1 && borders.radius.top_right_y <= rad + 1 &&
+                          borders.radius.bottom_left_y >= rad - 1 && borders.radius.bottom_left_y <= rad + 1 &&
+                          borders.radius.bottom_right_y >= rad - 1 && borders.radius.bottom_right_y <= rad + 1;
 
     /* Rounded outline with one shared width/color: single stroked round-rect
      * (the .button pill case). Otherwise paint each side independently with
      * its own width/color, which also fixes border-bottom-only rules that
      * used to be drawn as a full 1px outline. */
+    int minside = draw_pos.width < draw_pos.height ? draw_pos.width : draw_pos.height;
+    if (getenv("EWEB_DBG_B"))
+        fprintf(stderr, "[dbg borders] box=%d,%d %dx%d rad=%d unif=%d minside=%d t=%d r=%d b=%d l=%d xf=%d\n",
+                draw_pos.x, draw_pos.y, draw_pos.width, draw_pos.height, rad, (int)uniform_radius,
+                minside, (int)has_top, (int)has_right, (int)has_bottom, (int)has_left, (int)m_xform_on);
+    /* Only a square box with radius >= half its side is a true circle (.avatar).
+     * A wide pill (border-radius:999px) must NOT take this path or it collapses
+     * to a ring; let it fall through to the rounded-rect stroke below. */
+    bool square = (draw_pos.width - minside) <= 2 && (draw_pos.height - minside) <= 2;
+    if (square && rad > 0 && uniform_radius && minside > 0 && rad >= minside / 2 - 1 && gfx->circle) {
+        /* Fully round box (border-radius:50%): stroke a ring, not four rect
+         * edges - the w3.org .avatar circle. */
+        int bw = 0; uint32_t col = 0;
+        if (has_top)         { bw = t.width; col = web_color_to_argb(t.color); }
+        else if (has_right)  { bw = r.width; col = web_color_to_argb(r.color); }
+        else if (has_bottom) { bw = b.width; col = web_color_to_argb(b.color); }
+        else if (has_left)   { bw = l.width; col = web_color_to_argb(l.color); }
+        if (bw > 0)
+            gfx->circle(gfx->ud, s, draw_pos.x + draw_pos.width / 2, draw_pos.y + draw_pos.height / 2,
+                        minside / 2, bw, col);
+        return;
+    }
+
+    if (m_xform_on) {
+        /* CSS transform: push each border edge through the paint matrix as a
+         * quad and fill with the winding scanline filler (border-trick
+         * chevrons: a 2px L rotated 45 degrees). */
+        const float* M = m_xform;
+        auto quad = [&](float x0, float y0, float x1, float y1,
+                        float x2, float y2, float x3, float y3, uint32_t col) {
+            float px[4] = {x0, x1, x2, x3}, py[4] = {y0, y1, y2, y3};
+            std::vector<float> pts(8);
+            float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f;
+            for (int i = 0; i < 4; i++) {
+                float dx = M[0] * px[i] + M[2] * py[i] + M[4];
+                float dy = M[1] * px[i] + M[3] * py[i] + M[5];
+                pts[i * 2] = dx; pts[i * 2 + 1] = dy;
+                if (dx < minx) minx = dx;
+                if (dx > maxx) maxx = dx;
+                if (dy < miny) miny = dy;
+                if (dy > maxy) maxy = dy;
+            }
+            litehtml::position cp;
+            cp.x = (int)floorf(minx); cp.y = (int)floorf(miny);
+            cp.width = (int)ceilf(maxx) - cp.x + 1;
+            cp.height = (int)ceilf(maxy) - cp.y + 1;
+            std::vector<int> counts(1, 4);
+            fill_polys_nz(s, gfx, cp, pts.data(), counts.data(), (int)counts.size(), col);
+        };
+        float bx = (float)draw_pos.x, by = (float)draw_pos.y;
+        float bw = (float)draw_pos.width, bh = (float)draw_pos.height;
+        if (has_top) {
+            float x0 = bx + (has_left ? l.width : 0), x1 = bx + bw - (has_right ? r.width : 0);
+            quad(x0, by, x1, by, x1, by + t.width, x0, by + t.width, web_color_to_argb(t.color));
+        }
+        if (has_bottom) {
+            float x0 = bx + (has_left ? l.width : 0), x1 = bx + bw - (has_right ? r.width : 0);
+            quad(x0, by + bh - b.width, x1, by + bh - b.width, x1, by + bh, x0, by + bh, web_color_to_argb(b.color));
+        }
+        if (has_left)
+            quad(bx, by, bx + l.width, by, bx + l.width, by + bh, bx, by + bh, web_color_to_argb(l.color));
+        if (has_right)
+            quad(bx + bw - r.width, by, bx + bw, by, bx + bw, by + bh, bx + bw - r.width, by + bh, web_color_to_argb(r.color));
+        return;
+    }
     if (rad > 0 && uniform_radius && has_top && t.width == r.width && t.width == b.width && t.width == l.width &&
         web_color_to_argb(t.color) == web_color_to_argb(r.color) &&
         web_color_to_argb(t.color) == web_color_to_argb(b.color) &&
@@ -963,97 +1223,47 @@ void EWebContainer::draw_svg(litehtml::uint_ptr hdc, const litehtml::position& p
     if (!s || !pts || !counts || nsubs <= 0)
         return;
     const eweb_gfx_t* gfx = &m_port->gfx;
-    if (!gfx->fill_rect)
-        return;
-    uint32_t argb = web_color_to_argb(color);
-    if ((argb >> 24) == 0)
-        return;
-
-    /* Non-zero winding scanline fill over all subpaths at once (icon-font
-     * paths rely on winding, not parity, for their counters). Geometry is
-     * already in device space; spans are clipped to the element box. */
-    int total = 0;
-    for (int i = 0; i < nsubs; i++)
-        total += counts[i];
-    if (total < 3)
-        return;
-
-    float miny = pts[1], maxy = pts[1];
-    for (int i = 0; i < total; i++) {
-        float yy = pts[i * 2 + 1];
-        if (yy < miny) miny = yy;
-        if (yy > maxy) maxy = yy;
-    }
-    int y0 = (int)floorf(miny);
-    int y1 = (int)ceilf(maxy);
-    if (y0 < pos.y) y0 = pos.y;
-    if (y1 > pos.y + pos.height - 1) y1 = pos.y + pos.height - 1;
-
-    struct xedge { float x; int dir; };
-    std::vector<xedge> xs;
-    xs.reserve(64);
-
-    int base = 0;
-    for (int y = y0; y <= y1; y++) {
-        float fy = (float)y + 0.5f;
-        xs.clear();
-        base = 0;
-        for (int sp = 0; sp < nsubs; sp++) {
-            int n = counts[sp];
-            for (int i = 0; i < n; i++) {
-                float x1 = pts[(base + i) * 2];
-                float y1p = pts[(base + i) * 2 + 1];
-                float x2 = pts[(base + (i + 1) % n) * 2];
-                float y2p = pts[(base + (i + 1) % n) * 2 + 1];
-                if ((y1p <= fy && y2p > fy) || (y2p <= fy && y1p > fy)) {
-                    float t = (fy - y1p) / (y2p - y1p);
-                    xedge e;
-                    e.x = x1 + t * (x2 - x1);
-                    e.dir = (y2p > y1p) ? 1 : -1;
-                    xs.push_back(e);
-                }
-            }
-            base += n;
-        }
-        if (xs.size() < 2)
-            continue;
-        std::sort(xs.begin(), xs.end(), [](const xedge& a, const xedge& b) { return a.x < b.x; });
-
-        /* Sweep: paint where the running winding number is non-zero. */
-        int wind = 0;
-        int span_start = 0;
-        bool inside = false;
-        for (size_t i = 0; i < xs.size(); i++) {
-            wind += xs[i].dir;
-            bool now_inside = (wind != 0);
-            if (now_inside && !inside) {
-                span_start = (int)(xs[i].x + 0.5f);
-                inside = true;
-            } else if (!now_inside && inside) {
-                int span_end = (int)(xs[i].x + 0.5f);
-                int xa = span_start < pos.x ? pos.x : span_start;
-                int xb = span_end > pos.x + pos.width ? pos.x + pos.width : span_end;
-                if (xb > xa)
-                    gfx->fill_rect(gfx->ud, s, xa, y, xb - xa, 1, argb);
-                inside = false;
-            }
-        }
-    }
+    fill_polys_nz(s, gfx, pos, pts, counts, nsubs, web_color_to_argb(color));
 }
 
 void EWebContainer::transform_text(litehtml::tstring& text, litehtml::text_transform tt)
 {
 }
 
+void EWebContainer::push_paint_transform(const float m[6])
+{
+    /* Record the box's CSS transform; the border edges drawn between this push
+     * and the matching pop go through the matrix as quads (border-trick
+     * chevrons rotated 45 degrees). Backgrounds/text stay untransformed. */
+    if(!m) { m_xform_on = false; return; }
+    for(int i = 0; i < 6; i++) m_xform[i] = m[i];
+    m_xform_on = true;
+}
+
+void EWebContainer::pop_paint_transform()
+{
+    m_xform_on = false;
+    memset(m_xform, 0, sizeof(m_xform));
+}
+
+int EWebContainer::top_clip_radius() const
+{
+    if(m_clips.empty()) return 0;
+    const clip_entry& e = m_clips.back();
+    /* A radius only rounds the box if it stays inside it */
+    if(e.radius <= 0) return 0;
+    int half = (e.r.width < e.r.height ? e.r.width : e.r.height) / 2;
+    return e.radius < half ? e.radius : half;
+}
+
 void EWebContainer::set_clip(const litehtml::position& pos, const litehtml::border_radiuses& bdr_radius, bool valid_x, bool valid_y)
 {
-    (void)bdr_radius;   /* rectangular clip only: radius clipping is cosmetic */
     litehtml::position r = pos;
     if(!valid_x) { r.x = -100000; r.width = 200000; }
     if(!valid_y) { r.y = -100000; r.height = 200000; }
     if(!m_clips.empty())
     {
-        const litehtml::position& p = m_clips.back();
+        const litehtml::position& p = m_clips.back().r;
         int x1 = r.x > p.x ? r.x : p.x;
         int y1 = r.y > p.y ? r.y : p.y;
         int x2 = r.right() < p.right() ? r.right() : p.right();
@@ -1062,7 +1272,19 @@ void EWebContainer::set_clip(const litehtml::position& pos, const litehtml::bord
         r.width = x2 > x1 ? x2 - x1 : 0;
         r.height = y2 > y1 ? y2 - y1 : 0;
     }
-    m_clips.push_back(r);
+    /* keep a uniform radius with the entry so image compositing under a
+     * rounded clip can mask to the round box; mixed corners stay rect */
+    int rad = 0;
+    if(bdr_radius.top_left_x > 0 &&
+       bdr_radius.top_left_x == bdr_radius.top_right_x &&
+       bdr_radius.top_left_x == bdr_radius.bottom_left_x &&
+       bdr_radius.top_left_x == bdr_radius.bottom_right_x)
+    {
+        rad = bdr_radius.top_left_x;
+    }
+    m_clips.push_back(clip_entry{r, rad});
+    if (getenv("EWEB_DBG_C"))
+        fprintf(stderr, "[dbg clip] r=%d,%d %dx%d rad=%d\n", r.x, r.y, r.width, r.height, rad);
     if(m_paint_surf && m_port && m_port->gfx.surface_set_clip)
     {
         m_port->gfx.surface_set_clip(m_port->gfx.ud, (eweb_surface_t*)m_paint_surf,
@@ -1082,7 +1304,7 @@ void EWebContainer::del_clip()
     }
     else
     {
-        const litehtml::position& r = m_clips.back();
+        const litehtml::position& r = m_clips.back().r;
         if(m_port->gfx.surface_set_clip)
             m_port->gfx.surface_set_clip(m_port->gfx.ud, (eweb_surface_t*)m_paint_surf,
                                          r.x, r.y, r.width, r.height);
@@ -1176,19 +1398,52 @@ litehtml::element* EWebContainer::create_element(const litehtml::tchar_t* tag_na
     if(m_abort || (m_host && m_host->buildAbortRequested()))
         return NULL;
     if (!t_strcasecmp(tag_name, _t("input"))) {
+        const litehtml::tchar_t* type = _t("text");
         auto iter = attributes.find(_t("type"));
         if (iter != attributes.end()) {
-            if (!t_strcasecmp(iter->second.c_str(), _t("text"))) {
-                auto input = new eweb_el_input(doc, m_port, EWEB_INPUT_TEXT);
-                m_vecInput.push_back(input);
-                return input;
-            }
-            else if (!t_strcasecmp(iter->second.c_str(), _t("button"))) {
-                auto input = new eweb_el_input(doc, m_port, EWEB_INPUT_BUTTON);
-                m_vecInput.push_back(input);
-                return input;
-            }
+            type = iter->second.c_str();
         }
+        EWebInputType it;
+        if (!t_strcasecmp(type, _t("button")) ||
+            !t_strcasecmp(type, _t("submit")) ||
+            !t_strcasecmp(type, _t("reset"))) {
+            it = EWEB_INPUT_BUTTON;
+        }
+        else if (!t_strcasecmp(type, _t("checkbox"))) {
+            it = EWEB_INPUT_CHECKBOX;
+        }
+        else if (!t_strcasecmp(type, _t("radio"))) {
+            it = EWEB_INPUT_RADIO;
+        }
+        else if (!t_strcasecmp(type, _t("hidden"))) {
+            it = EWEB_INPUT_HIDDEN;
+        }
+        else if (!t_strcasecmp(type, _t("range"))) {
+            it = EWEB_INPUT_RANGE;
+        }
+        else {
+            /* text, password, search, email, url, tel, number, and the
+             * type-less default all render as a single-line text box. */
+            it = EWEB_INPUT_TEXT;
+        }
+        auto input = new eweb_el_input(doc, m_port, it);
+        m_vecInput.push_back(input);
+        return input;
+    }
+    if (!t_strcasecmp(tag_name, _t("button"))) {
+        auto input = new eweb_el_input(doc, m_port, EWEB_INPUT_BUTTON);
+        m_vecInput.push_back(input);
+        return input;
+    }
+    if (!t_strcasecmp(tag_name, _t("select"))) {
+        auto input = new eweb_el_input(doc, m_port, EWEB_INPUT_SELECT);
+        m_vecInput.push_back(input);
+        return input;
+    }
+    if (!t_strcasecmp(tag_name, _t("textarea"))) {
+        auto input = new eweb_el_input(doc, m_port, EWEB_INPUT_TEXTAREA);
+        m_vecInput.push_back(input);
+        return input;
     }
     return NULL;
 }

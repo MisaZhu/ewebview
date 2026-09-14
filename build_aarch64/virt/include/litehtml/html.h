@@ -43,6 +43,12 @@ namespace litehtml
 		virtual void				get_image_size(const litehtml::tchar_t* src, const litehtml::tchar_t* baseurl, litehtml::size& sz) = 0;
 		virtual void				draw_background(litehtml::uint_ptr hdc, const litehtml::background_paint& bg) = 0;
 		virtual void				draw_borders(litehtml::uint_ptr hdc, const litehtml::borders& borders, const litehtml::position& draw_pos, bool root) = 0;
+		/* Optional paint-time affine transform, row-major [a b c d e f] with
+		 * x' = a*x + c*y + e, y' = b*x + d*y + f (device space). Border quads
+		 * drawn between push and pop go through it (CSS transform on the box);
+		 * the default no-op keeps containers that ignore transforms working. */
+		virtual void				push_paint_transform(const float m[6]) { (void)m; }
+		virtual void				pop_paint_transform() { }
 
 		virtual	void				set_caption(const litehtml::tchar_t* caption) = 0;
 		virtual	void				set_base_url(const litehtml::tchar_t* base_url) = 0;

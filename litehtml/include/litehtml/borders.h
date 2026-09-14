@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include "css_length.h"
 #include "types.h"
 
@@ -207,6 +208,28 @@ namespace litehtml
 			ret.top_right_y = top_right_y.calc_percent(height);
 			ret.bottom_right_x = bottom_right_x.calc_percent(width);
 			ret.bottom_right_y = bottom_right_y.calc_percent(height);
+			/* CSS Borders 3 "overlaying curves": when the two radii on a side
+			 * sum to more than the side length, ALL radii scale down by a
+			 * common factor f so the corner curves never overlap. Without
+			 * this a pill radius (border-radius: 999px) on a small box hands
+			 * the raw 999px arcs to the painter, which sweeps them into a
+			 * giant disc covering the page. */
+			double f = 1.0;
+			if(ret.top_left_x + ret.top_right_x > width)		f = std::min(f, (double) width / (ret.top_left_x + ret.top_right_x));
+			if(ret.bottom_left_x + ret.bottom_right_x > width)	f = std::min(f, (double) width / (ret.bottom_left_x + ret.bottom_right_x));
+			if(ret.top_left_y + ret.bottom_left_y > height)	f = std::min(f, (double) height / (ret.top_left_y + ret.bottom_left_y));
+			if(ret.top_right_y + ret.bottom_right_y > height)	f = std::min(f, (double) height / (ret.top_right_y + ret.bottom_right_y));
+			if(f < 1.0)
+			{
+				ret.top_left_x = (int) (ret.top_left_x * f);
+				ret.top_left_y = (int) (ret.top_left_y * f);
+				ret.top_right_x = (int) (ret.top_right_x * f);
+				ret.top_right_y = (int) (ret.top_right_y * f);
+				ret.bottom_right_x = (int) (ret.bottom_right_x * f);
+				ret.bottom_right_y = (int) (ret.bottom_right_y * f);
+				ret.bottom_left_x = (int) (ret.bottom_left_x * f);
+				ret.bottom_left_y = (int) (ret.bottom_left_y * f);
+			}
 			return ret;
 		}
 	};
