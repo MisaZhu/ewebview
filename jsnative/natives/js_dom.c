@@ -169,6 +169,48 @@ static var_t* native_alert(vm_t* vm, var_t* env, void* data) {
 }
 
 /* ------------------------------------------------------------------ */
+/* eval(src)                                                          */
+/*                                                                     */
+/* The engine has no lexical-scope eval; run the source in the global  */
+/* scope instead (what page feature-detects actually need). The        */
+/* expression form is tried first by assigning into a hidden global    */
+/* (`eval("1+1")` yields 2); if that does not compile, the source runs */
+/* as plain statements and yields undefined. Non-string arguments are  */
+/* returned unchanged, per spec.                                       */
+/* ------------------------------------------------------------------ */
+
+#define EVAL_RET_KEY "@@evalret"
+
+static var_t* native_eval(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* args = get_func_args(env);
+    node_t* n = (args != NULL) ? var_array_get(args, 0) : NULL;
+    if(n == NULL || n->var == NULL)
+        return NULL;
+    if(n->var->type != V_STRING)
+        return n->var; /* borrowed, like native_Object_getPrototypeOf */
+    const char* src = var_get_str(n->var);
+    if(src == NULL || src[0] == 0)
+        return NULL;
+
+    mstr_t* code = mstr_new(EVAL_RET_KEY " = (");
+    mstr_append(code, src);
+    mstr_append(code, "\n);"); /* the newline guards a trailing // comment */
+    /* The expression-form attempt is speculative: a statement-shaped body is
+     * expected to fail here and be retried below, so silence its diagnostics. */
+    extern void js_compile_set_quiet(bool quiet);
+    js_compile_set_quiet(true);
+    bool ok = vm_load_run_native(vm, code->cstr);
+    js_compile_set_quiet(false);
+    mstr_free(code);
+    if(!ok) {
+        vm_load_run_native(vm, src);
+        return NULL;
+    }
+    return var_find_own_member_var(vm->root, EVAL_RET_KEY); /* borrowed */
+}
+
+/* ------------------------------------------------------------------ */
 /* document.write / writeln                                           */
 /* ------------------------------------------------------------------ */
 
@@ -531,6 +573,51 @@ static var_t* js_date_getMonth(vm_t* vm, var_t* env, void* data)    { (void)data
 static var_t* js_date_getDate(vm_t* vm, var_t* env, void* data)     { (void)data; return js_date_field(vm, env, 5); }
 static var_t* js_date_getDay(vm_t* vm, var_t* env, void* data)      { (void)data; return js_date_field(vm, env, 6); }
 
+/* setTime(ms): replace the stamp, return it (per spec). */
+static var_t* js_date_set_time(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* obj = this_from_env(env);
+    if(obj == NULL) return NULL;
+    var_t* arg = get_obj(env, "ms");
+    int64_t ms = (arg != NULL && arg->type != V_UNDEF) ? (int64_t)var_get_float(arg) : 0;
+    obj->value = (void*)(intptr_t)ms;
+    obj->free_func = js_date_free;
+    return var_new_float64(vm, (double)ms);
+}
+
+/* "Wed, 21 Oct 2015 07:28:00 GMT" - toGMTString is the legacy alias of
+ * toUTCString; both appear in cookie and analytics code. */
+static var_t* js_date_to_gmt_string(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    int64_t ms = js_date_ms_of(this_from_env(env));
+    time_t sec = (time_t)(ms / 1000);
+    struct tm t;
+    memset(&t, 0, sizeof(t));
+    gmtime_r(&sec, &t);
+    static const char* wd[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    static const char* mo[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%s, %02d %s %d %02d:%02d:%02d GMT",
+             wd[t.tm_wday % 7], t.tm_mday, mo[t.tm_mon % 12], t.tm_year + 1900,
+             t.tm_hour, t.tm_min, t.tm_sec);
+    return var_new_str(vm, buf);
+}
+
+/* getTimezoneOffset(): minutes west of UTC (local time is the engine's clock
+ * source, so derive the offset from the C library). */
+static var_t* js_date_tz_offset(vm_t* vm, var_t* env, void* data) {
+    (void)data; (void)env;
+    time_t now = time(NULL);
+    struct tm lt;
+    memset(&lt, 0, sizeof(lt));
+    localtime_r(&now, &lt);
+#if defined(__APPLE__) || defined(__linux__)
+    return var_new_int(vm, -(int)(lt.tm_gmtoff / 60));
+#else
+    return var_new_int(vm, 0);
+#endif
+}
+
 /* Fetch the class var straight off vm->root (side-effect free) rather than
  * vm_new_class(), which would re-run do_extends(); vm_reg_* then resolve to
  * the class prototype and var_add replaces the engine's same-named member. */
@@ -547,6 +634,10 @@ static void js_patch_date(vm_t* vm) {
     vm_reg_native(vm, cls, "getMonth()",   js_date_getMonth, NULL);
     vm_reg_native(vm, cls, "getDate()",    js_date_getDate, NULL);
     vm_reg_native(vm, cls, "getDay()",     js_date_getDay, NULL);
+    vm_reg_native(vm, cls, "setTime(ms)",       js_date_set_time, NULL);
+    vm_reg_native(vm, cls, "toGMTString()",     js_date_to_gmt_string, NULL);
+    vm_reg_native(vm, cls, "toUTCString()",     js_date_to_gmt_string, NULL);
+    vm_reg_native(vm, cls, "getTimezoneOffset()", js_date_tz_offset, NULL);
     /* Statics live on the class var itself, not its prototype. */
     vm_reg_static(vm, cls, "now()", js_date_now, NULL);
 }
@@ -2200,6 +2291,19 @@ static var_t* native_el_blur(vm_t* vm, var_t* env, void* data) {
     return NULL;
 }
 
+/* `new Image()` is the classic preloader idiom; per the constructor-override
+ * rule (an object returned from a constructor replaces `this`), returning the
+ * createElement('img') wrapper makes the result a fully usable element, so
+ * `img.src = ...` / `img.onload = ...` behave exactly like a parsed <img>. */
+static var_t* native_image_ctor(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    (void)env;
+    if(st == NULL || st->cb.create_element == NULL) return NULL;
+    js_element_t el = st->cb.create_element(st->ctx, "img");
+    if(el == NULL) return NULL;
+    return wrap_element(vm, el);
+}
+
 bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) {
     if(vm == NULL || cb == NULL) return false;
 
@@ -2227,6 +2331,8 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
 
     /* alert() is a global function. */
     vm_reg_static(vm, NULL, "alert(v)", native_alert, bridge);
+    /* eval() runs global-scope (no lexical capture); see native_eval. */
+    vm_reg_static(vm, NULL, "eval(src)", native_eval, bridge);
 
     /* Document class + singleton `document`. */
     var_t* doc_cls = vm_new_class(vm, CLS_DOCUMENT);
@@ -2364,6 +2470,10 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
      * search/hash/assign/...). */
     var_t* loc_cls = vm_new_class(vm, CLS_LOCATION);
     reg_accessor(vm, loc_cls, "href", native_location_get_href, NULL, bridge);
+
+    /* `new Image()` constructs an <img> element wrapper (preloader idiom). */
+    var_t* img_cls = vm_new_class(vm, "Image");
+    vm_reg_native(vm, img_cls, "constructor(w, h)", native_image_ctor, bridge);
 
     var_t* location = new_obj(vm, CLS_LOCATION, 0);
     /* A browser's `window` IS the global object: a UMD bundle that exports

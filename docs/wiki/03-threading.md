@@ -22,14 +22,14 @@ ewebview's concurrency design answers three questions: how the UI never blocks, 
          │ m_taskQueue / m_resultQueue (one mutex each)
          ▼
 ┌──────────────────────┐
-│ Download thread       │  net.request / net.read_file / image.decode
-│  (1 on demand)        │  touches only the task and result queues, exits when done
+│ Download worker pool  │  net.request / net.read_file / image.decode
+│  (0..8 on demand)     │  touches only the task and result queues; each worker exits after 4 s idle
 │  taskLoop()          │
 └──────────────────────┘
 ```
 
 - The **engine thread** is created at `ewebview_create()` time (`engineStart()`); after creation it waits on `m_cmdCond` until the first command arrives. It **owns exclusively** all non-thread-safe objects: the two litehtml documents (visible page + page under construction), the two litehtml contexts, the mario VM, and the surface it is currently painting. **It never touches the embedder's window.**
-- The **download thread** is spun up on demand (`addTask()` calls `pthread_create` for a `taskLoop()` when it finds no live worker); it exits on its own once the queue drains, and a new one starts the next time there is a task.
+- The **download worker pool** starts empty and is grown on demand: `addTask()` wakes a parked worker, or calls `pthread_create` for a new `taskLoop()` when every live worker is busy — capped at 8 (`kTaskPoolMax`). A worker that stays idle for 4 s (`kTaskIdleExitMs`) tears itself down, so the pool shrinks back toward zero once a page's fetches drain.
 - The **UI thread** is the embedder's own main loop. Between it and the engine there are only two channels: the command queue (UI→engine) and the event queue (engine→UI), plus the ownership handoff of frame-pool pointers.
 
 ## 3.2 UI → Engine: The Command Queue
@@ -148,8 +148,8 @@ The primitives used by the EwokOS reference port (graph/font/tinyhttpsc/kernel_t
 ## 3.7 Why No More Locks Are Needed
 
 - litehtml documents, the mario VM, canvases: single-thread (engine) ownership, zero locks;
-- CookieJar: shared by the download thread (storing Set-Cookie) and the engine thread (document.cookie), **carries its own mutex** (`EWebCookies.h`);
-- Task/result queues: one mutex each, worker and engine take locks without nesting;
+- CookieJar: shared by the download workers (storing Set-Cookie) and the engine thread (document.cookie), **carries its own mutex** (`EWebCookies.h`);
+- Task/result queues + the pool counters (`m_taskThreads`/`m_taskBusy`) and `m_taskPageUrl`: one mutex each, the (up to 8) workers and the engine take locks without nesting; the port's `net.request`/`image.decode` are per-call reentrant, so concurrent workers never share HTTP/decode state;
 - Frame pool: only pointers are handed off, one narrow `m_uiMutex`;
 - Listener table: read/written by the UI thread + `m_uiMutex` protecting the engine side's snapshot when posting events.
 

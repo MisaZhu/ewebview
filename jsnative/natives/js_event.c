@@ -764,6 +764,7 @@ static var_t* ev_inline_compile(vm_t* vm, js_event_state* st, const char* src) {
      * from swallowing the closing brace. */
     mstr_append(code, "; };");
     bool ok = vm_load_run_native(vm, code->cstr);
+    if(!ok) mario_printf("[js] inline handler compile failed, src=[%s]\n", src);
     mstr_free(code);
     if(!ok) return NULL;
 

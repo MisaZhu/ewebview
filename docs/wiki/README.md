@@ -18,7 +18,7 @@ Reading in order is recommended; each chapter builds on the concepts of the prev
 | --- | --- | --- |
 | Ch. 1 | [Overall Architecture](01-overview.md) | What the engine is, the layered structure, the module map, the data flow of one page load |
 | Ch. 2 | [Directory Layout & Build System](02-build.md) | Build order of the five sub-libraries, host/cross build modes, SDK install, link order, debug switches |
-| Ch. 3 | [Threading Model & Frame Delivery](03-threading.md) | Engine thread / download thread / UI thread, command and event queues, frame pool and backpressure |
+| Ch. 3 | [Threading Model & Frame Delivery](03-threading.md) | Engine thread / download worker pool / UI thread, command and event queues, frame pool and backpressure |
 | Ch. 4 | [Page Load Pipeline](04-page-pipeline.md) | The six stages of the build state machine, build abort, style sharding, progressive painting |
 | Ch. 5 | [HTML & CSS: Parsing, Layout, and the Container](05-html-css.md) | How gumbo → litehtml → document_container callbacks map onto the porting layer |
 | Ch. 6 | [JavaScript: mario VM Integration & Script Scheduling](06-js-vm.md) | Script extraction, VM lifecycle, the run-budget watchdog, document.write re-parsing |
@@ -35,7 +35,7 @@ Reading in order is recommended; each chapter builds on the concepts of the prev
 ```
    URL (http/https/file/res)
         │
-        ▼  Download thread: net.request / net.read_file / image.decode   ── Ch. 9
+        ▼  Download worker pool: net.request / net.read_file / image.decode   ── Ch. 9
   HTML byte stream + CSS + images
         │
         ▼  gumbo parse → litehtml document tree + stylesheets + layout     ── Ch. 5

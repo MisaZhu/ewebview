@@ -2,13 +2,13 @@
 
 > Language: **English** | [中文](09-network-cookies.zh.md)
 
-ewebview's networking subsystem solves three problems: how subresources come in **without blocking the engine thread**; how redirects and cookies stay safe when **cross-site**; and how JS's `document.cookie` and `localStorage` share state with the HTTP side. The core structure is only two queues, one download thread, and one process-level CookieJar.
+ewebview's networking subsystem solves three problems: how subresources come in **without blocking the engine thread**; how redirects and cookies stay safe when **cross-site**; and how JS's `document.cookie` and `localStorage` share state with the HTTP side. The core structure is only two queues, a download **worker pool**, and one process-level CookieJar.
 
-## 9.1 The Subresource Task Queue & Download Thread
+## 9.1 The Subresource Task Queue & Download Worker Pool
 
 ```
-Engine thread (producer)              Download thread (consumer, spun up on demand)
-  addTask({url,type}) ──► m_taskQueue ──► getTask() takes one not-loading
+Engine thread (producer)              Download worker pool (consumers, 0..8 on demand)
+  addTask({url,type}) ──► m_taskQueue ──► getTaskLocked() takes one not-loading
         ▲                                    │ loadHtmlTask / loadCSSTask / loadImageTask / loadScriptTask
         │                                    │   └─ EWebContainer::loadURL() (may include redirects)
  m_resultQueue ◄── pushResult({url,ok,content,image})
@@ -18,8 +18,8 @@ Engine thread (producer)              Download thread (consumer, spun up on dema
 ```
 
 - **Task types** are the public constants `EWEB_TASK_HTML / EWEB_TASK_CSS / EWEB_TASK_IMAGE / EWEB_TASK_SCRIPT` (what the embedder sees via the `on_task_*` listeners; `EWEB_TASK_SCRIPT` is the download of an external `<script src>`, see Ch. 6).
-- **`addTask` deduplicates by URL** (the same image appearing ten times on a page downloads once) and, when there is no worker, **spins up** the download thread on demand via `pthread_create` + `pthread_detach`; once the queue drains, the worker emits one `EUET_TASKS_END` and **exits on its own** — no idle thread is kept, and one is created again next time there is a task.
-- **The worker's discipline**: it touches only the mutex-protected `m_taskQueue`/`m_resultQueue` and the porting table's `net.*`/`image.decode` callbacks, **never the document or VM**; notifications to the UI (`EUET_TASK_START/END/FAILED`) all go through `postUiEvent`, delivered by the UI thread inside `ewebview_tick()` — the worker never calls embedder hooks directly.
+- **`addTask` deduplicates by URL** (the same image appearing ten times on a page downloads once). The pool **starts empty** (`m_taskThreads == 0`); each `addTask` first **wakes a parked worker** (`pthread_cond_signal(m_taskCond)`), and only when every live worker is busy (`m_taskThreads - m_taskBusy <= 0`) does it **grow the pool** via `pthread_create` + `pthread_detach`, capped at `kTaskPoolMax = 8`. A worker with nothing to do parks on `m_taskCond` in bounded slices and **tears itself down once it has been idle for `kTaskIdleExitMs = 4000` ms**, so the pool shrinks back toward zero after a page's fetches drain; `EUET_TASKS_END` fires once when the queue empties and no worker is mid-fetch (`m_taskBusy == 0`).
+- **The worker's discipline**: it touches only the mutex-protected `m_taskQueue`/`m_resultQueue` and the porting table's `net.*`/`image.decode` callbacks, **never the document or VM**; notifications to the UI (`EUET_TASK_START/END/FAILED`) all go through `postUiEvent`, delivered by the UI thread inside `ewebview_tick()` — the worker never calls embedder hooks directly. Because up to 8 workers run concurrently, everything they share (the queues, `m_taskPageUrl`, the CookieJar, and the port's `net.request`/`image.decode`) is either mutex-guarded or per-call reentrant.
 - **topLevel semantics**: `loadHtmlTask` passes `topLevel=true` (a top-level navigation), CSS/images pass `false` (subresources). This boolean, together with `pageUrl` (the URL of the initiating document), drives the SameSite decision (see 9.4).
 - **Images decode on the worker thread**: `loadImageTask` runs `decodeImageData()` in place after downloading (pure heap operations); by the time the engine thread receives the result the bitmap is ready, and it only does the O(1) `mountImage` mount — tens of milliseconds of decoding for a single image will not stall layout.
 

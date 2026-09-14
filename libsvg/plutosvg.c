@@ -2601,16 +2601,12 @@ plutovg_surface_t* plutosvg_document_render_to_surface(const plutosvg_document_t
 
     plutovg_surface_t* surface = plutovg_surface_create(width, height);
     if(surface == NULL) {
-        fprintf(stderr, "[plutosvg] surface_create failed width=%d height=%d extents=%g,%g %gx%g\n",
-                width, height, extents.x, extents.y, extents.w, extents.h);
         return NULL;
     }
     plutovg_canvas_t* canvas = plutovg_canvas_create(surface);
     plutovg_canvas_scale(canvas, width / extents.w, height / extents.h);
     plutovg_canvas_translate(canvas, -extents.x, -extents.y);
     if(!plutosvg_document_render(document, id, canvas, current_color, palette_func, closure)) {
-        fprintf(stderr, "[plutosvg] document_render failed width=%d height=%d extents=%g,%g %gx%g\n",
-                width, height, extents.x, extents.y, extents.w, extents.h);
         plutovg_canvas_destroy(canvas);
         plutovg_surface_destroy(surface);
         return NULL;

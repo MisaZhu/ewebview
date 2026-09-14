@@ -78,6 +78,13 @@ static const uint32_t kStyleMaxWaitMs      = 1500;
  * returns to drain commands (STOP/NAVIGATE) and render frames even mid-walk. */
 static const uint64_t kStyleBudgetIdleMs   = 25;
 
+/* Download worker pool. The pool starts empty; addTask() wakes a parked
+ * worker or spawns a new one (up to kTaskPoolMax) only when every live
+ * worker is busy. A worker idle for kTaskIdleExitMs tears itself down, so
+ * the pool shrinks back to zero once a page's fetches drain. */
+static const int      kTaskPoolMax         = 8;
+static const uint32_t kTaskIdleExitMs      = 4000;
+
 /* ------------------------------------------------------------------ */
 /* Download worker payload types                                       */
 /* ------------------------------------------------------------------ */
@@ -218,7 +225,11 @@ public:
     void engineLoop();
     void engineStart();
     void engineStop();
-    void taskLoop();                                 /* download worker body */
+    void taskLoop();                                 /* one pool worker's body */
+    /* Park on m_taskCond (m_taskMutex held on entry AND exit) until a task is
+     * claimable, shutdown is raised or timeout_ms elapses; true = a task is
+     * waiting. */
+    bool taskWaitLocked(uint32_t timeout_ms);
     void postCommand(const EWebCmd& cmd);            /* UI -> engine (any thread) */
     void postUiEvent(const EWebUiEvent& ev);         /* engine/worker -> UI */
     bool engineHandleCommand(const EWebCmd& cmd);    /* false on ECMD_SHUTDOWN */
@@ -248,6 +259,7 @@ public:
     bool addTask(const EWebTask& task);
     void removeTask(const std::string& url);
     bool getTask(EWebTask& task);
+    bool getTaskLocked(EWebTask& task);   /* m_taskMutex held */
     std::string taskPageUrl();
     void setTaskPageUrl(const std::string& url);
     bool loadHtmlTask(const std::string& url);
@@ -470,11 +482,16 @@ public:
     litehtml::context           m_buildContext;
     litehtml::context*          m_buildTargetContext;
 
-    /* Download-worker lifecycle. m_task_running says a worker thread is alive
-     * (set by addTask, cleared by the worker as it exits); m_task_ended is the
-     * shutdown flag. Both cross threads, hence volatile. */
-    volatile bool               m_task_running;
+    /* Download worker-pool lifecycle (all guarded by m_taskMutex):
+     * m_taskThreads counts the live pool workers (0 by default, grown by
+     * addTask up to kTaskPoolMax, each worker decrements it on exit);
+     * m_taskBusy counts the ones mid-fetch; m_taskCond wakes parked workers
+     * (new task queued / shutdown). m_task_ended is the shutdown flag - read
+     * outside the lock by the workers' wait loops, hence volatile. */
+    int                         m_taskThreads;
+    int                         m_taskBusy;
     volatile bool               m_task_ended;
+    pthread_cond_t              m_taskCond;
     int                         m_clientWidth;
     int                         m_clientHeight;
 

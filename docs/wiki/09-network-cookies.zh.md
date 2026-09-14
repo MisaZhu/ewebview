@@ -2,13 +2,13 @@
 
 > 语言: [English](09-network-cookies.md) | **中文**
 
-ewebview 的网络子系统解决三个问题：子资源怎么在**不阻塞引擎线程**的前提下进来；重定向与 Cookie 怎么在**跨站**时仍然安全；JS 的 `document.cookie` 与 `localStorage` 怎么跟 HTTP 侧共享状态。核心结构只有两条队列、一个下载线程和一个进程级 CookieJar。
+ewebview 的网络子系统解决三个问题：子资源怎么在**不阻塞引擎线程**的前提下进来；重定向与 Cookie 怎么在**跨站**时仍然安全；JS 的 `document.cookie` 与 `localStorage` 怎么跟 HTTP 侧共享状态。核心结构只有两条队列、一个下载**线程池**和一个进程级 CookieJar。
 
-## 9.1 子资源任务队列与下载线程
+## 9.1 子资源任务队列与下载线程池
 
 ```
-引擎线程（生产者）                     下载线程（消费者，按需拉起）
-  addTask({url,type}) ──► m_taskQueue ──► getTask() 取一个未 loading 的
+引擎线程（生产者）                     下载线程池（消费者，0..8 个按需拉起）
+  addTask({url,type}) ──► m_taskQueue ──► getTaskLocked() 取一个未 loading 的
         ▲                                    │ loadHtmlTask / loadCSSTask / loadImageTask / loadScriptTask
         │                                    │   └─ EWebContainer::loadURL()（可能含重定向）
  m_resultQueue ◄── pushResult({url,ok,content,image})
@@ -18,8 +18,8 @@ ewebview 的网络子系统解决三个问题：子资源怎么在**不阻塞引
 ```
 
 - **任务类型**即公共常量 `EWEB_TASK_HTML / EWEB_TASK_CSS / EWEB_TASK_IMAGE / EWEB_TASK_SCRIPT`（嵌入者经 `on_task_*` 监听器看到的就是它们；`EWEB_TASK_SCRIPT` 是外链 `<script src>` 的下载，见第 6 章）。
-- **`addTask` 按 URL 去重**（同一图片在页面上出现十次只下载一次），并在没有 worker 时 `pthread_create` + `pthread_detach` **按需拉起**下载线程；队列排空后 worker 发一次 `EUET_TASKS_END` 就**自行退出**——不养闲置线程，下次有任务再创建。
-- **worker 的纪律**：只碰互斥锁保护的 `m_taskQueue`/`m_resultQueue` 和移植表的 `net.*`/`image.decode` 回调，**永远不碰文档与 VM**；对 UI 的通知（`EUET_TASK_START/END/FAILED`）一律 `postUiEvent`，由 UI 线程在 `ewebview_tick()` 里投递——worker 从不直接调嵌入者钩子。
+- **`addTask` 按 URL 去重**（同一图片在页面上出现十次只下载一次）。线程池**默认为空**（`m_taskThreads == 0`）；每次 `addTask` 先**唤醒一个停放的 worker**（`pthread_cond_signal(m_taskCond)`），只有当所有存活 worker 都在忙（`m_taskThreads - m_taskBusy <= 0`）时才 `pthread_create` + `pthread_detach` **扩容线程池**，上限 `kTaskPoolMax = 8`。无事可做的 worker 在 `m_taskCond` 上分片停放，**空闲超过 `kTaskIdleExitMs = 4000` ms 就自行销毁**，于是一页的抓取排空后线程池回缩到零；队列排空且无 worker 在抓取中（`m_taskBusy == 0`）时发一次 `EUET_TASKS_END`。
+- **worker 的纪律**：只碰互斥锁保护的 `m_taskQueue`/`m_resultQueue` 和移植表的 `net.*`/`image.decode` 回调，**永远不碰文档与 VM**；对 UI 的通知（`EUET_TASK_START/END/FAILED`）一律 `postUiEvent`，由 UI 线程在 `ewebview_tick()` 里投递——worker 从不直接调嵌入者钩子。由于最多 8 个 worker 并发运行，它们共享的一切（两条队列、`m_taskPageUrl`、CookieJar，以及移植层的 `net.request`/`image.decode`）要么受互斥锁保护，要么逐次调用可重入。
 - **topLevel 语义**：`loadHtmlTask` 传 `topLevel=true`（顶层导航），CSS/图片传 `false`（子资源）。这个布尔与 `pageUrl`（发起文档的 URL）一起驱动 SameSite 判定（见 9.4）。
 - **图片在 worker 线程解码**：`loadImageTask` 下载完就地 `decodeImageData()`（纯堆操作），引擎线程收到结果时位图已就绪，只做 O(1) 的 `mountImage` 挂载——单张图几十毫秒的解码不会卡住排版。
 

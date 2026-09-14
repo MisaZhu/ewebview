@@ -12,7 +12,10 @@
  *                      SDL2_ttf bakes the point size into the handle while the
  *                      HAL passes size per call, so we keep a small LRU-free
  *                      per-size cache inside one eweb_font_t.
- *   image.decode    -> SDL2_image (IMG_Load_RW) + ConvertSurfaceFormat(ARGB8888)
+ *   image.decode    -> SDL2_image (IMG_Load_RW) + ConvertSurfaceFormat(ARGB8888);
+ *                      SVG instead keeps its parsed plutosvg document in the
+ *                      handle and re-rasterises at the blit dst device size,
+ *                      so scaled vector art stays smooth at any ratio
  *   HiDPI           -> eweb_port_sdl2_set_dpr(): surface_new allocates logical
  *                      size * dpr device pixels and every draw/font callback
  *                      scales logical coords up, so layout stays in CSS pixels
@@ -56,6 +59,9 @@
 #include <SDL_ttf.h>
 #include <SDL_image.h>
 
+/* ---- SVG vector decode/re-raster (libsvg: plutosvg + plutovg) ------ */
+#include <svg.h>
+
 /* ---- Network: unchanged from the EwokOS reference port ------------ */
 /* libtinyhttpsc is a portable BearSSL HTTP/HTTPS client that ships inside
  * browser/ewebview/libtinyhttpsc/; it has no OS-specific dependencies, so the
@@ -94,6 +100,16 @@ typedef struct {
      * images are natural-pixel buffers with dpr == 1. */
     int           lw, lh;
     float         dpr;
+    /* SVG vector source: the parsed document stays alive so a scaled blit
+     * can re-rasterise at the exact dst device size - resampling the fixed
+     * intrinsic raster (SDL_BlitScaled) aliases when shrinking, while the
+     * vector render is anti-aliased at whatever size is asked for.
+     * svg_cache memoises the last rendered size so steady-state repaints
+     * and scrolling never re-render. Both are engine-thread only (blits
+     * and surface_free run there; decode only creates the doc). */
+    svg_doc_t*    svg_doc;
+    SDL_Surface*  svg_cache;
+    int           svg_cache_w, svg_cache_h;
 } sdl_surf_t;
 
 #define S(h)  ((sdl_surf_t*)(h))
@@ -272,6 +288,8 @@ static void ek_surface_free(void* ud, eweb_surface_t* h) {
     if(!h) return;
     s = S(h);
     if(s->rend) SDL_DestroyRenderer(s->rend);
+    if(s->svg_cache) SDL_FreeSurface(s->svg_cache);
+    if(s->svg_doc) svg_doc_free(s->svg_doc);
     if(s->surf) SDL_FreeSurface(s->surf);
     free(s);
 }
@@ -720,6 +738,54 @@ static uint32_t ek_get_pixel(void* ud, eweb_surface_t* h, int x, int y) {
 
 /* ---- blit ---------------------------------------------------------- */
 
+/* Copy a libsvg raster (straight-alpha ARGB8888, packed rows) into a fresh
+ * SDL surface of the same size; NULL on alloc failure (caller frees img). */
+static SDL_Surface* sdl2_surface_from_svg_image(const svg_image_t* img) {
+    SDL_Surface* out;
+    int y;
+    if(!img || img->width <= 0 || img->height <= 0) return NULL;
+    out = SDL_CreateRGBSurfaceWithFormat(0, (int)img->width, (int)img->height, 32,
+                                         SDL_PIXELFORMAT_ARGB8888);
+    if(!out) return NULL;
+    for(y = 0; y < (int)img->height; y++)
+        memcpy((uint8_t*)out->pixels + (size_t)y * (size_t)out->pitch,
+               img->pixels + (size_t)y * img->width,
+               (size_t)img->width * sizeof(uint32_t));
+    return out;
+}
+
+/* Vector counterpart of SDL_BlitScaled for SVG sources: rasterise the whole
+ * document at exactly w x h device pixels so the anti-aliased edges land at
+ * the destination resolution (bitmap resampling of the intrinsic raster can
+ * never be this smooth when shrinking). Memoised per size in src->svg_cache,
+ * so repaints/scrolling at an unchanged layout cost a plain 1:1 blit.
+ * Returns the cache surface (owned by src), or NULL to fall back. */
+static SDL_Surface* sdl2_svg_surface_at(sdl_surf_t* src, int w, int h) {
+    svg_image_t* img;
+    SDL_Surface* out;
+    if(w <= 0 || h <= 0) return NULL;
+    if(src->svg_cache && src->svg_cache_w == w && src->svg_cache_h == h)
+        return src->svg_cache;
+    img = svg_doc_render(src->svg_doc, w, h);
+    if(!img) return NULL;
+    out = sdl2_surface_from_svg_image(img);
+    svg_free(img);
+    if(!out) return NULL;
+    if(src->svg_cache) SDL_FreeSurface(src->svg_cache);
+    src->svg_cache = out;
+    src->svg_cache_w = out->w;
+    src->svg_cache_h = out->h;
+    return out;
+}
+
+/* True when the src rect covers the image's whole intrinsic buffer: only
+ * then does a re-raster at the dst size represent the same content. */
+static bool sdl2_svg_full_src(const sdl_surf_t* src, const SDL_Rect* sr) {
+    return src->svg_doc && src->surf &&
+           sr->x == 0 && sr->y == 0 &&
+           sr->w == src->surf->w && sr->h == src->surf->h;
+}
+
 static void ek_blit(void* ud, eweb_surface_t* src_h, int sx, int sy, int sw, int sh,
                     eweb_surface_t* dst_h, int dx, int dy, int dw, int dh) {
     sdl_surf_t *src, *dst;
@@ -733,6 +799,18 @@ static void ek_blit(void* ud, eweb_surface_t* src_h, int sx, int sy, int sw, int
      * they were created at) and the dst rect by the destination's dpr. */
     sr.x = sdl2_sp(src, sx); sr.y = sdl2_sp(src, sy); sr.w = sdl2_sp(src, sw); sr.h = sdl2_sp(src, sh);
     dr.x = sdl2_sp(dst, dx); dr.y = sdl2_sp(dst, dy); dr.w = sdl2_sp(dst, dw); dr.h = sdl2_sp(dst, dh);
+    /* SVG scaled off its intrinsic size: re-raster the vector at the dst
+     * device size instead of resampling the intrinsic bitmap. */
+    if(sr.w != dr.w || sr.h != dr.h) {
+        if(sdl2_svg_full_src(src, &sr)) {
+            SDL_Surface* vec = sdl2_svg_surface_at(src, dr.w, dr.h);
+            if(vec) {
+                SDL_SetSurfaceBlendMode(vec, SDL_BLENDMODE_NONE);
+                SDL_BlitSurface(vec, NULL, dst->surf, &dr);
+                return;
+            }
+        }
+    }
     /* The reference graph_blt is a straight COPY, NOT a src-over composite:
      * its fast paths memcpy / copy rows and its resampling paths write the
      * sampled ARGB word verbatim (dst = src, alpha included). So blit must run
@@ -761,6 +839,19 @@ static void ek_blit_fit_alpha(void* ud, eweb_surface_t* src_h, int sx, int sy, i
      * dst rect in the destination's device pixels. */
     sr.x = sdl2_sp(src, sx); sr.y = sdl2_sp(src, sy); sr.w = sdl2_sp(src, sw); sr.h = sdl2_sp(src, sh);
     dr.x = sdl2_sp(dst, dx); dr.y = sdl2_sp(dst, dy); dr.w = sdl2_sp(dst, dw); dr.h = sdl2_sp(dst, dh);
+    /* SVG scaled off its intrinsic size: vector re-raster at the dst device
+     * size (the whole point of SVG being resolution-independent), blended
+     * src-over like the bitmap path below. */
+    if((sr.w != dr.w || sr.h != dr.h) && sdl2_svg_full_src(src, &sr)) {
+        SDL_Surface* vec = sdl2_svg_surface_at(src, dr.w, dr.h);
+        if(vec) {
+            SDL_SetSurfaceBlendMode(vec, SDL_BLENDMODE_BLEND);
+            SDL_SetSurfaceAlphaMod(vec, alpha);
+            SDL_BlitSurface(vec, NULL, dst->surf, &dr);
+            SDL_SetSurfaceAlphaMod(vec, 255);
+            return;
+        }
+    }
     /* SDL_BlitScaled does the src-rect -> dst-rect resample in one call; the
      * per-surface alpha modulation multiplies into every source pixel's own
      * alpha before the blend, which is exactly the HAL's "alpha 0..255"
@@ -1132,10 +1223,37 @@ static eweb_surface_t* ek_image_decode(void* ud, const uint8_t* data, int size) 
     if(!sdl2_ensure_libs()) return NULL;
 
     if(sdl2_looks_like_svg(data, size)) {
-        /* SVG is vector text: rasterise it ourselves at the intrinsic size so
-         * nanosvg's parser (inside SDL2_image) gets explicit dimensions even
-         * for roots that only carry a viewBox or percentage sizes. The sized
-         * loader never closes the RWops, so we own it in both outcomes. */
+        /* SVG is vector text: parse it with plutosvg and KEEP the document in
+         * the surface handle, so scaled blits re-raster at the exact dst
+         * device size (see sdl2_svg_surface_at) - the intrinsic raster below
+         * only serves surface_dims (intrinsic CSS size) and 1:1/partial-rect
+         * blits. Rasterising once and resampling that bitmap is exactly what
+         * makes shrunk SVGs look aliased next to a real browser. */
+        svg_doc_t* doc = svg_doc_load(data, (uint32_t)size);
+        if(doc) {
+            int vw = 0, vh = 0;
+            svg_doc_get_size(doc, &vw, &vh);
+            svg_image_t* ras = (vw > 0 && vh > 0) ? svg_doc_render(doc, vw, vh) : NULL;
+            argb = sdl2_surface_from_svg_image(ras);
+            svg_free(ras);
+            if(argb) {
+                s = (sdl_surf_t*)calloc(1, sizeof(*s));
+                if(!s) { SDL_FreeSurface(argb); svg_doc_free(doc); return NULL; }
+                s->surf = argb;
+                s->rend = NULL;   /* decoded images are blit sources only */
+                /* Natural-pixel buffer: intrinsic size == pixel size, no HiDPI
+                 * scaling; scaled draws re-raster the vector instead. */
+                s->lw = argb->w; s->lh = argb->h; s->dpr = 1.0f;
+                s->svg_doc = doc;
+                return SH(s);
+            }
+            svg_doc_free(doc);
+        }
+        /* plutosvg could not parse/render it: fall back to SDL_image's
+         * nanosvg backend. Rasterise at the intrinsic size so nanosvg gets
+         * explicit dimensions even for roots that only carry a viewBox or
+         * percentage sizes. The sized loader never closes the RWops, so we
+         * own it in both outcomes. */
         int vw = 0, vh = 0;
         sdl2_svg_natural_size(data, size, &vw, &vh);
         img = NULL;

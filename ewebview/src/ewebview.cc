@@ -3,7 +3,7 @@
  * This translation unit owns:
  *   - the extern "C" API from <ewebview.h> (create/destroy/load/tick/...),
  *   - the engine thread and its command/event queues,
- *   - the on-demand download worker thread,
+ *   - the download worker pool (0..kTaskPoolMax on-demand threads),
  *   - the page build state machine (BUILD_*),
  *   - the viewport frame pool and rasterization.
  *
@@ -18,7 +18,7 @@
  *     litehtml contexts, the mario VM and every surface it draws into;
  *   - the UI thread only signals (postCommand), drains events (tick) and
  *     returns adopted frames (releaseFrame);
- *   - the download worker touches only the mutex-guarded task/result queues.
+ *   - the download workers touch only the mutex-guarded task/result queues.
  */
 
 #include <ewebview.h>
@@ -243,7 +243,8 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_buildContainer(nullptr)
     , m_buildDoc(nullptr)
     , m_buildTargetContext(nullptr)
-    , m_task_running(false)
+    , m_taskThreads(0)
+    , m_taskBusy(0)
     , m_task_ended(false)
     , m_clientWidth(640)
     , m_clientHeight(480)
@@ -312,6 +313,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
 
     pthread_mutex_init(&m_cssMediaMutex, NULL);
     pthread_mutex_init(&m_taskMutex, NULL);
+    pthread_cond_init(&m_taskCond, NULL);
     pthread_mutex_init(&m_resultMutex, NULL);
     pthread_mutex_init(&m_cmdMutex, NULL);
     pthread_cond_init(&m_cmdCond, NULL);
@@ -336,18 +338,29 @@ EWebEngine::~EWebEngine()
     if(!engineWasStarted)
         engineTeardown();
 
-    /* Reap the on-demand download worker. It only touches the mutex-guarded
+    /* Reap the download worker pool. The workers only touch the mutex-guarded
      * task/result queues and the port's fetch/decode callbacks - never the
-     * documents - so stopping it AFTER the engine is safe, and doing it after
-     * means no addTask() can respawn it mid-teardown. pthread_detach is a
-     * no-op on some targets, so poll m_task_running until the worker clears
-     * it on exit. */
+     * documents - so stopping them AFTER the engine is safe, and doing it
+     * after means no addTask() can respawn a worker mid-teardown. Raise the
+     * shutdown flag and broadcast so parked workers wake at once instead of
+     * waiting out their idle timeout; pthread_detach is a no-op on some
+     * targets, so poll m_taskThreads until the last worker decrements it on
+     * exit. */
     m_task_ended = true;
-    while(m_task_running) {
+    pthread_mutex_lock(&m_taskMutex);
+    pthread_cond_broadcast(&m_taskCond);
+    pthread_mutex_unlock(&m_taskMutex);
+    for(;;) {
+        pthread_mutex_lock(&m_taskMutex);
+        int live = m_taskThreads;
+        pthread_mutex_unlock(&m_taskMutex);
+        if(live <= 0)
+            break;
         portSleepMs(10);
     }
 
     pthread_cond_destroy(&m_cmdCond);
+    pthread_cond_destroy(&m_taskCond);
     pthread_mutex_destroy(&m_cmdMutex);
     pthread_mutex_destroy(&m_uiMutex);
     pthread_mutex_destroy(&m_taskMutex);
@@ -989,10 +1002,10 @@ void EWebEngine::engineDropPendingWork()
      *   - drop the result queue, freeing any decoded image surface the worker
      *     produced but the engine never mounted, so a stop does not leak the
      *     hand-off.
-     * The ONE in-flight fetch (loading==true) cannot be cancelled
-     * mid-transfer; its result still lands and is processed, so a stopped
-     * page keeps whatever already arrived. Both queues are guarded by the
-     * mutexes shared with the worker. */
+     * The in-flight fetches (loading==true, up to one per pool worker) cannot
+     * be cancelled mid-transfer; their results still land and are processed,
+     * so a stopped page keeps whatever already arrived. Both queues are
+     * guarded by the mutexes shared with the workers. */
     pthread_mutex_lock(&m_taskMutex);
     for(size_t i = 0; i < m_taskQueue.size(); ) {
         if(!m_taskQueue[i].loading) {
@@ -2118,7 +2131,13 @@ void EWebEngine::requestBuildAbort()
 }
 
 /* ==================================================================
- * Download worker thread
+ * Download worker pool
+ *
+ * Zero workers by default. addTask() wakes a parked worker, or spawns a
+ * new one when every live worker is busy (capped at kTaskPoolMax). A
+ * worker with nothing to do parks on m_taskCond in bounded slices and
+ * tears itself down once it has been idle for kTaskIdleExitMs, so the
+ * pool shrinks back to zero after a page's fetches drain.
  * ================================================================== */
 
 static void* _ew_task_thread(void* p)
@@ -2129,19 +2148,53 @@ static void* _ew_task_thread(void* p)
     return nullptr;
 }
 
+/* Park on m_taskCond until a task is claimable, shutdown is raised or
+ * timeout_ms elapses. Called with m_taskMutex held and returns with it
+ * held. The wait is sliced (100 ms per chunk, timed with the port clock)
+ * instead of using pthread_cond_timedwait: the HAL never promises a
+ * realtime wall clock matching CLOCK_REALTIME, and the short slices keep
+ * shutdown latency low. */
+bool EWebEngine::taskWaitLocked(uint32_t timeout_ms)
+{
+    uint64_t deadline = ticMs() + timeout_ms;
+    for(;;) {
+        if(m_task_ended)
+            return false;
+        for(size_t i = 0; i < m_taskQueue.size(); i++) {
+            if(!m_taskQueue[i].loading)
+                return true;
+        }
+        uint64_t now = ticMs();
+        if(now >= deadline)
+            return false;
+        uint64_t slice = deadline - now;
+        if(slice > 100)
+            slice = 100;
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        uint64_t abs_us = (uint64_t)tv.tv_sec * 1000000ULL +
+                          (uint64_t)tv.tv_usec + slice * 1000ULL;
+        struct timespec abstime;
+        abstime.tv_sec = (time_t)(abs_us / 1000000ULL);
+        abstime.tv_nsec = (long)((abs_us % 1000000ULL) * 1000ULL);
+        pthread_cond_timedwait(&m_taskCond, &m_taskMutex, &abstime);
+    }
+}
+
 void EWebEngine::taskLoop()
 {
-    /* Download worker body (one on-demand thread, spawned by addTask and
-     * reaped when the queue drains). Only touches the mutex-guarded
-     * task/result queues and the port's fetch/decode callbacks - never the
-     * documents. */
+    /* One pool worker's body. Only touches the mutex-guarded task/result
+     * queues and the port's fetch/decode callbacks - never the documents -
+     * so several workers may run this concurrently. */
     EWebTask task;
-    bool havetask = false;
+    pthread_mutex_lock(&m_taskMutex);
     while(!m_task_ended) {
-        if(getTask(task)) {
-            havetask = true;
+        if(getTaskLocked(task)) {
+            m_taskBusy++;
+            pthread_mutex_unlock(&m_taskMutex);
+
             bool res = false;
-            {   /* Report on the UI thread: the worker must never call the
+            {   /* Report on the UI thread: a worker must never call the
                  * listener hooks itself - it posts an event the UI drains in
                  * tick(), where the hook finally fires. */
                 EWebUiEvent sev; sev.kind = EUET_TASK_START; sev.task = task;
@@ -2161,31 +2214,40 @@ void EWebEngine::taskLoop()
             EWebUiEvent sev; sev.task = task;
             sev.kind = res ? EUET_TASK_END : EUET_TASK_FAILED;
             postUiEvent(sev);
-        }
-        else {
-            // No task left: notify once, then tear down the worker.
-            // addTask() already recreates the thread on demand, so keeping
-            // an idle worker parked only exposes a fragile sleep/restore
-            // path for detached child threads.
-            if(havetask) {
-                havetask = false;
-                EWEB_LOG("[ewebview] task thread idle: queue drained\n");
-                EWebUiEvent sev; sev.kind = EUET_TASKS_END;
-                postUiEvent(sev);
-            }
-            pthread_mutex_lock(&m_taskMutex);
-            bool queue_empty = m_taskQueue.empty();
-            if(queue_empty) {
-                m_task_running = false;
-            }
-            pthread_mutex_unlock(&m_taskMutex);
-            if(queue_empty) {
-                return;
-            }
-        }
-    }
 
-    m_task_running = false;
+            pthread_mutex_lock(&m_taskMutex);
+            m_taskBusy--;
+            /* The whole pool is idle with an empty queue: this burst of
+             * downloads is done, tell the embedder once. */
+            if(m_taskQueue.empty() && m_taskBusy == 0) {
+                EWEB_LOG("[ewebview] task pool idle: queue drained\n");
+                EWebUiEvent done; done.kind = EUET_TASKS_END;
+                postUiEvent(done);
+            }
+            continue;   /* straight back to the queue before parking */
+        }
+        /* Nothing claimable: park for work, but self-destruct once this
+         * worker has been idle for kTaskIdleExitMs so the pool shrinks back
+         * toward zero. */
+        if(taskWaitLocked(kTaskIdleExitMs))
+            continue;
+        if(m_task_ended)
+            break;
+        /* Re-check under the same lock hold so a task queued (or a shutdown
+         * raised) while the wait was ending cannot be missed. */
+        bool claimable = false;
+        for(size_t i = 0; i < m_taskQueue.size(); i++) {
+            if(!m_taskQueue[i].loading) {
+                claimable = true;
+                break;
+            }
+        }
+        if(claimable)
+            continue;
+        break;   /* idle timeout: leave the pool */
+    }
+    m_taskThreads--;
+    pthread_mutex_unlock(&m_taskMutex);
 }
 
 bool EWebEngine::addTask(const EWebTask& task)
@@ -2195,8 +2257,8 @@ bool EWebEngine::addTask(const EWebTask& task)
     for(auto& t : m_taskQueue) {
         if(t.url == task.url) {
             if(task.type == EWEB_TASK_IMAGE) {
-                EWEB_LOG("[ewebview] queue image skipped: duplicate loading=%d queue=%d running=%d\n",
-                    t.loading ? 1 : 0, (int)m_taskQueue.size(), m_task_running ? 1 : 0);
+                EWEB_LOG("[ewebview] queue image skipped: duplicate loading=%d queue=%d threads=%d\n",
+                    t.loading ? 1 : 0, (int)m_taskQueue.size(), m_taskThreads);
             }
             pthread_mutex_unlock(&m_taskMutex);
             return false;
@@ -2205,16 +2267,32 @@ bool EWebEngine::addTask(const EWebTask& task)
 
     m_taskQueue.push_back(task);
     if(task.type == EWEB_TASK_IMAGE) {
-        EWEB_LOG("[ewebview] queue image added: pending=%d running=%d\n",
-            (int)m_taskQueue.size(), m_task_running ? 1 : 0);
+        EWEB_LOG("[ewebview] queue image added: pending=%d threads=%d busy=%d\n",
+            (int)m_taskQueue.size(), m_taskThreads, m_taskBusy);
+    }
+
+    /* Pool policy: prefer waking a parked worker (any live worker that is
+     * not mid-fetch is parked on m_taskCond); only when every live worker
+     * is busy grow the pool, up to kTaskPoolMax. Everything is decided
+     * under m_taskMutex, so the counts a departing worker updates on its
+     * way out cannot race this into a lost wakeup or an over-spawn. */
+    bool spawn = false;
+    if(m_taskThreads - m_taskBusy <= 0 && m_taskThreads < kTaskPoolMax) {
+        m_taskThreads++;   /* claimed here so concurrent addTask calls agree */
+        spawn = true;
+    } else {
+        pthread_cond_signal(&m_taskCond);
     }
     pthread_mutex_unlock(&m_taskMutex);
 
-    if(!m_task_running) {
+    if(spawn) {
         pthread_t tid;
-        m_task_running = true;
         if(pthread_create(&tid, NULL, _ew_task_thread, this) != 0) {
-            m_task_running = false;
+            pthread_mutex_lock(&m_taskMutex);
+            m_taskThreads--;
+            /* The queued task stays; wake whoever can still take it. */
+            pthread_cond_broadcast(&m_taskCond);
+            pthread_mutex_unlock(&m_taskMutex);
             return false;
         }
         pthread_detach(tid);
@@ -2252,13 +2330,13 @@ void EWebEngine::setTaskPageUrl(const std::string& url)
     pthread_mutex_unlock(&m_taskMutex);
 }
 
-bool EWebEngine::getTask(EWebTask& task)
+/* Claim the first not-yet-loading queue entry and mark it loading. Called
+ * with m_taskMutex held (taskLoop keeps the lock across claim/park so the
+ * pool counts and the queue are always seen together). */
+bool EWebEngine::getTaskLocked(EWebTask& task)
 {
-    pthread_mutex_lock(&m_taskMutex);
-
     // Check if we should exit
     if(m_task_ended && m_taskQueue.empty()) {
-        pthread_mutex_unlock(&m_taskMutex);
         return false;
     }
 
@@ -2271,13 +2349,19 @@ bool EWebEngine::getTask(EWebTask& task)
                 EWEB_LOG("[ewebview] take image task: queue=%d\n",
                     (int)m_taskQueue.size());
             }
-            pthread_mutex_unlock(&m_taskMutex);
             return true;
         }
     }
 
-    pthread_mutex_unlock(&m_taskMutex);
     return false;
+}
+
+bool EWebEngine::getTask(EWebTask& task)
+{
+    pthread_mutex_lock(&m_taskMutex);
+    bool got = getTaskLocked(task);
+    pthread_mutex_unlock(&m_taskMutex);
+    return got;
 }
 
 bool EWebEngine::loadHtmlTask(const std::string& url)

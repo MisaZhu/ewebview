@@ -54,6 +54,21 @@ extern "C" void reg_all_natives(vm_t* vm);
 
 namespace eweb {
 
+/* Diagnostic dump: with EWEB_DUMP_SCRIPTS=/dir set, every page script is
+ * written to <dir>/script_<i>.js (failures also get logged) so a compile or
+ * runtime error can be replayed offline through the host mario CLI. */
+static void jsDumpScript(size_t i, const std::string& src, bool failed)
+{
+    static const char* dir = getenv("EWEB_DUMP_SCRIPTS");
+    if(dir == nullptr || dir[0] == 0) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/script_%02d%s.js", dir, (int)i, failed ? "_FAIL" : "");
+    FILE* f = fopen(path, "wb");
+    if(f == nullptr) return;
+    fwrite(src.data(), 1, src.size(), f);
+    fclose(f);
+}
+
 /* ==================================================================
  * mario platform hooks
  *
@@ -343,9 +358,20 @@ bool EWebEngine::runPageScripts()
          * termination abort; window interaction stays live on its own thread
          * even through this pre-paint (document.write) script run. */
         jsVmEnter();
+        {   /* Tag uncaught VM errors with the script index so a failing
+             * minified bundle can be matched to its EWEB_DUMP_SCRIPTS file. */
+            static char s_jsDbgTag[64];
+            snprintf(s_jsDbgTag, sizeof(s_jsDbgTag), "script_%d", (int)i);
+            m_jsVm->dbg_tag = s_jsDbgTag;
+        }
         if(!vm_load_run(m_jsVm, src.c_str())) {
             EWEB_LOG("[ewebview] js: script %d failed to compile\n", (int)i);
+            jsDumpScript(i, src, true);
         }
+        else {
+            jsDumpScript(i, src, false);
+        }
+        m_jsVm->dbg_tag = nullptr;
         jsVmExit();
     }
     EWEB_LOG("[ewebview] js: ran %d script(s)\n", (int)m_jsScripts.size());
@@ -390,9 +416,19 @@ bool EWebEngine::runNextPageScript()
         m_jsProgressiveActive = true;
         jsVmEnter();
         m_jsLastFlushAt = run_start;
+        {
+            static char s_jsDbgTag[64];
+            snprintf(s_jsDbgTag, sizeof(s_jsDbgTag), "script_%d", (int)i);
+            m_jsVm->dbg_tag = s_jsDbgTag;
+        }
         if(!vm_load_run(m_jsVm, src.c_str())) {
             EWEB_LOG("[ewebview] js: script %d failed to compile\n", (int)i);
+            jsDumpScript(i, src, true);
         }
+        else {
+            jsDumpScript(i, src, false);
+        }
+        m_jsVm->dbg_tag = nullptr;
         jsVmExit();
         m_jsProgressiveActive = false;
         EWEB_LOG("[ewebview] js: script %d ran %u ms (post-swap)\n",

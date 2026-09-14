@@ -7,10 +7,11 @@ TARGET_DIR = $(BUILD_DIR)
 # Vendored from EwokOS system/gui/libs/libsvg: plutosvg (SVG document
 # parser) on top of plutovg (anti-aliased vector rasteriser, FreeType
 # smooth raster). The core uses plutovg directly for inline <svg> fills
-# (EWebContainer::draw_svg); the sdl2 port uses svg_load_from_memory()
-# for <img src="*.svg"> decode. Under OS_TYPE=ewokos this directory is
-# NOT built - the system tree already ships the same library and the
-# embedder links it there (see DIRS in ../Makefile).
+# (EWebContainer::draw_svg); the sdl2 port keeps a svg_doc_t per decoded
+# <img src="*.svg"> and re-rasterises at the blit destination size, so
+# scaled SVG stays smooth at any ratio. Under OS_TYPE=ewokos this
+# directory is NOT built - the system tree already ships the same library
+# and the embedder links it there (see DIRS in ../Makefile).
 #
 # plutovg/plutosvg are plain C99; the STBI_* defines trim the bundled
 # stb_image to the formats SVG embedded images actually use, matching

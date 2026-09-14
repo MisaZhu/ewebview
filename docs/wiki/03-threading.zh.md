@@ -21,13 +21,13 @@ ewebview 的并发设计回答了三个问题：UI 如何永不阻塞、两条�
          │ m_taskQueue / m_resultQueue（各一把 mutex）
          ▼
 ┌──────────────────────┐
-│ 下载线程（按需 1 条）    │  net.request / net.read_file / image.decode
-│  taskLoop()          │  只碰任务与结果队列，做完即退出
+│ 下载线程池（0..8 条）    │  net.request / net.read_file / image.decode
+│  taskLoop()          │  只碰任务与结果队列，每条 worker 空闲 4 秒后退出
 └──────────────────────┘
 ```
 
 - **引擎线程**在 `ewebview_create()` 时即创建（`engineStart()`），创建后停在 `m_cmdCond` 上待命，直到第一个命令到来。它**独占**一切非线程安全对象：两份 litehtml 文档（可见页 + 构建中页）、两个 litehtml context、mario VM、它正在绘制的表面。**它从不触碰嵌入者的窗口。**
-- **下载线程**按需拉起（`addTask()` 发现没有活着的 worker 就 `pthread_create` 一条 `taskLoop()`），队列取空后自行退出，下次有任务再起一条。
+- **下载线程池**默认为空、按需扩容：`addTask()` 先唤醒一条停放的 worker，只有当所有存活 worker 都在忙时才 `pthread_create` 一条新的 `taskLoop()`——上限 8（`kTaskPoolMax`）。空闲满 4 秒（`kTaskIdleExitMs`）的 worker 自行销毁，于是一页抓取排空后线程池回缩到零。
 - **UI 线程**是嵌入者自己的主循环。它与引擎之间只有两条通道：命令队列（UI→引擎）与事件队列（引擎→UI），外加帧池指针的所有权交接。
 
 ## 3.2 UI → 引擎：命令队列
@@ -145,8 +145,8 @@ EwokOS 参考 port 里用到的原语（graph/font/tinyhttpsc/kernel_tic）与 S
 ## 3.7 为什么不需要更多锁
 
 - litehtml 文档、mario VM、画布：单线程（引擎）所有权，零锁；
-- CookieJar：被下载线程（存 Set-Cookie）与引擎线程（document.cookie）共享，**自己带一把 mutex**（`EWebCookies.h`）；
-- 任务/结果队列：各一把 mutex，worker 与引擎无嵌套取锁；
+- CookieJar：被下载 worker（存 Set-Cookie）与引擎线程（document.cookie）共享，**自己带一把 mutex**（`EWebCookies.h`）；
+- 任务/结果队列 + 线程池计数（`m_taskThreads`/`m_taskBusy`）与 `m_taskPageUrl`：各一把 mutex，（最多 8 条）worker 与引擎无嵌套取锁；移植层的 `net.request`/`image.decode` 逐次调用可重入，所以并发 worker 之间不共享任何 HTTP/解码状态；
 - 帧池：只交接指针，`m_uiMutex` 一把窄锁；
 - 监听器表：UI 线程读写 + `m_uiMutex` 保护引擎侧投事件时的快照。
 
