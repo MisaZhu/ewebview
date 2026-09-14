@@ -34,6 +34,7 @@ NATIVE_OBJS = \
 	\
 	$(ARCH)/vm/lang/js/native/builtin/natives_builtin.o \
 	$(ARCH)/vm/lang/js/native/builtin/Object/native_Object.o \
+	$(ARCH)/vm/lang/js/native/builtin/Function/native_Function.o \
 	$(ARCH)/vm/lang/js/native/builtin/Error/native_Error.o \
 	$(ARCH)/vm/lang/js/native/builtin/Number/native_Number.o \
 	$(ARCH)/vm/lang/js/native/builtin/BigInt/native_BigInt.o \
