@@ -287,6 +287,14 @@ typedef struct eweb_sys_api {
      * The text is already prefixed with its source tag (e.g. "[js]"). Runs on
      * the engine thread. OPTIONAL: without it the core drops log output. */
     void (*log)(void* ud, const char* text);
+
+    /* System clipboard text, used by the engine's copy/cut/paste editing
+     * shortcuts. clipboard_get returns a malloc'd NUL-terminated UTF-8 string
+     * the core free()s (or NULL when empty/unavailable); clipboard_set copies
+     * the given text into the clipboard. Both run on the engine thread.
+     * OPTIONAL: without them the editing shortcuts are inert. */
+    char* (*clipboard_get)(void* ud);
+    void  (*clipboard_set)(void* ud, const char* text);
 } eweb_sys_api_t;
 
 /* ------------------------------------------------------------------ */

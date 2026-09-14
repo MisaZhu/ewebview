@@ -48,11 +48,78 @@ public:
     virtual void     draw_stacking_context(litehtml::uint_ptr hdc, int x, int y, const litehtml::position* clip, bool with_positioned) override;
     virtual void     parse_styles(bool is_reparse) override;
     virtual void     add_widget_part_style(const litehtml::tstring& part, const litehtml::style& st) override;
+    /* Hand the engine an opaque handle to this control so a mouse hit on the
+     * element (or any ancestor-walk from a text child) can drive focus and
+     * activation. Returns `this`. */
+    virtual void*    eweb_form_widget() override { return this; }
     virtual void     on_click();
+
+    /* ---- interaction state (driven by the engine) ---- */
+    /* True when this control currently holds keyboard focus. draw() renders
+     * the focus ring / caret off this flag. */
+    void setFocused(bool f) { m_focused = f; }
+    bool isFocused() const { return m_focused; }
+    /* True when the control can receive keyboard focus (everything except
+     * hidden and disabled). */
+    bool isFocusable();
+
+    /* ---- live value / checked state (single source of truth) ---- */
+    /* The committed-or-being-edited value. Text controls prefer the
+     * in-progress edit buffer; everything else falls back to the attribute. */
+    std::string value();
+    void setValue(const std::string& v);
+    bool isChecked();
+    void setChecked(bool c);
+
+    /* ---- text editing (engine-driven) ---- */
+    /* True for the text-like family that owns an edit buffer + caret. */
+    bool isTextEditing() const;
+    void insertText(const char* utf8);
+    void deleteSelection();
+    void deleteBack();
+    void deleteForward();
+    /* dir: -1 left, +1 right, -2 home, +2 end. extend grows the selection
+     * from the anchor instead of collapsing it. */
+    void moveCaret(int dir, bool extend);
+    void selectAll();
+    void setSelectionRange(int s, int e);
+    int  selStart() const;
+    int  selEnd() const;
+    std::string selectedText() const;
+    void selectWordAt(int localX);
+    /* Place the caret (dropping any selection) at a click point given in the
+     * control's local coordinates. */
+    void setCaretFromPoint(int localX, int localY);
+
+    /* ---- activation (engine-driven) ---- */
+    void activate(int localX, int localY);
+    void keyActivate();
+    void setRangeFromX(int localX);
+    void toggleDropdown();
+    void moveOption(int dir);
+    void chooseActiveOption();
+    bool isDropdownOpen() const { return m_dropdownOpen; }
+    int  activeOption() const { return m_activeOption; }
 
 private:
     const eweb_port_t* m_port;
     EWebInputType m_inputType;
+    bool m_focused;   /* holds keyboard focus (engine-driven) */
+
+    /* Live edit buffer for text-like controls. m_hasEdit says the buffer is
+     * authoritative (the user or script typed); otherwise the value attribute
+     * (or <textarea> text) is the source. Offsets are byte offsets. */
+    std::string m_editValue;
+    bool m_hasEdit;
+    int  m_caret;        /* caret byte offset */
+    int  m_selAnchor;    /* selection anchor byte offset */
+    bool m_selActive;    /* anchor != caret -> a real selection */
+    int  m_textScrollX;  /* horizontal pan for over-long single-line text */
+    int  m_textScrollY;  /* vertical pan for textarea (linear model: unused) */
+    bool m_checked;      /* live checkbox/radio state */
+    bool m_hasChecked;
+    bool m_dropdownOpen; /* select expanded (overlay drawn by the engine) */
+    int  m_activeOption; /* highlighted <option> index while expanded */
 
     /* Raw declaration blocks matched by widget part pseudo-element rules
      * (input[type=range]::-webkit-slider-thumb {...}), keyed by the lowercased
@@ -64,6 +131,34 @@ private:
     litehtml::element::ptr m_part_track;
 
     static uint32_t make_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255);
+
+    /* The text a text-like control shows: the edit buffer when present, else
+     * the value attribute / <textarea> text. Never the placeholder. */
+    std::string textValue() const;
+    /* textValue() with password masking applied for drawing / measuring. */
+    std::string displayText() const;
+    bool isPassword() const;
+    /* Byte offset of the codepoint boundary before / after `pos`. */
+    int utf8Prev(int pos) const;
+    int utf8Next(int pos) const;
+    int textLen() const;
+    /* Pixel width of displayText()[0:off] (mask-aware) for caret placement. */
+    int offsetToX(int off);
+    int xToOffset(int localX);
+    /* Keep the caret inside the visible text box after edits / moves. */
+    void ensureCaretVisible(int boxWidth);
+    /* Push the live text into the value attribute so getAttribute and a no-JS
+     * form submit agree with what is on screen. */
+    void syncValueAttr();
+    /* Draw text with a horizontal pan (single-line edit fields). */
+    void draw_scrolled_text(eweb_surface_t* s, const litehtml::position& box,
+                            const std::string& text, uint32_t color, int scrollX);
+
+    /* <select> option helpers (document order, <option> children only). */
+    int  optionCount();
+    litehtml::element::ptr optionAt(int i);
+    int  selectedOptionIndex();
+    void selectOptionIndex(int i);
 
     void resolve_widget_parts();
     const litehtml::element::ptr& widget_part(bool thumb) const;

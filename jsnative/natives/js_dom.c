@@ -2114,6 +2114,17 @@ static var_t* native_document_get_body(vm_t* vm, var_t* env, void* data) {
     (void)env; return doc_node_get(vm, data, 2);
 }
 
+/* document.activeElement: the focused element, or <body> when nothing is. */
+static var_t* native_document_get_activeElement(vm_t* vm, var_t* env, void* data) {
+    (void)env;
+    js_dom_state* st = state_any(vm, data);
+    if(st != NULL && st->cb.get_active_element != NULL) {
+        js_element_t el = st->cb.get_active_element(st->ctx);
+        if(el != NULL) return wrap_or_null(vm, el);
+    }
+    return doc_node_get(vm, data, 2);
+}
+
 static var_t* native_document_get_url(vm_t* vm, var_t* env, void* data) {
     (void)env;
     js_dom_state* st = state_any(vm, data);
@@ -2181,10 +2192,11 @@ int64_t js_dom_monotonic_ms(void) {
 /* Registration                                                       */
 /* ------------------------------------------------------------------ */
 
-/* blur(): the embedder keeps no focus ring of its own, so this only exists so
- * that the ubiquitous el.blur() call does not throw. */
+/* blur(): drop keyboard focus from the element when it currently holds it. */
 static var_t* native_el_blur(vm_t* vm, var_t* env, void* data) {
-    (void)vm; (void)env; (void)data;
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st != NULL && el != NULL && st->cb.el_blur != NULL) st->cb.el_blur(st->ctx, el);
     return NULL;
 }
 
@@ -2234,6 +2246,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
      * `document.body.innerHTML` resolve like a real browser. */
     reg_accessor(vm, doc_cls, "title", native_document_get_title, native_document_set_title, bridge);
     reg_accessor(vm, doc_cls, "body", native_document_get_body, NULL, bridge);
+    reg_accessor(vm, doc_cls, "activeElement", native_document_get_activeElement, NULL, bridge);
     reg_accessor(vm, doc_cls, "head", native_document_get_head, NULL, bridge);
     reg_accessor(vm, doc_cls, "documentElement", native_document_get_documentElement, NULL, bridge);
     reg_accessor(vm, doc_cls, "URL", native_document_get_url, NULL, bridge);
@@ -2345,14 +2358,22 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     js_acc_cls(vm, tok_cls, "length", native_classList_get_length, NULL, bridge);
     js_acc_cls(vm, tok_cls, "value", native_classList_get_value, native_classList_set_value, bridge);
 
-    /* window.location.href. `window` is a plain object; `location` is an
-     * instance of Location with an href getter (js_web.c fills in the rest of
-     * the Location surface: protocol/host/pathname/search/hash/assign/...). */
+    /* window.location.href. `window` is the global object itself (see below);
+     * `location` is an instance of Location with an href getter (js_web.c
+     * fills in the rest of the Location surface: protocol/host/pathname/
+     * search/hash/assign/...). */
     var_t* loc_cls = vm_new_class(vm, CLS_LOCATION);
     reg_accessor(vm, loc_cls, "href", native_location_get_href, NULL, bridge);
 
     var_t* location = new_obj(vm, CLS_LOCATION, 0);
-    var_t* window = var_new_obj_no_proto(vm, NULL, NULL);
+    /* A browser's `window` IS the global object: a UMD bundle that exports
+     * via `window.FontFaceObserver = ...` (w3.org's fontfaceobserver.js) has
+     * to be reachable as a bare global, and `window.foo = x` must be visible
+     * to every later script. mario keeps the global scope in vm->root, so
+     * alias that instead of hanging a plain object off it; the self member
+     * gives the browser-identical window.window === window. web_publish()
+     * already skips the mirror step when window == vm->root. */
+    var_t* window = vm->root;
     var_add(window, "location", location);
     var_add(vm->root, "window", window);
     /* window.document / document.defaultView: both directions of the pair

@@ -25,6 +25,7 @@
 
 #include "EWebInternal.h"
 #include "EWebLog.h"
+#include "eweb_el_input.h"
 
 #include <pthread.h>
 #include <sys/time.h>   /* gettimeofday: CLOCK_REALTIME abstime for the engine park */
@@ -286,6 +287,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_jsReparseCount(0)
     , m_jsRunBeforePaint(false)
     , m_jsNextScript(0)
+    , m_jsScriptWaitSince(0)
     , m_jsPostSwapRun(false)
     , m_jsProgressiveActive(false)
     , m_jsLastFlushAt(0)
@@ -299,6 +301,11 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_buildAbortGen(0)
     , m_jsScrollPending(false)
     , m_jsHoverElement(nullptr)
+    , m_focusElement(nullptr)
+    , m_openSelect(nullptr)
+    , m_rangeDragging(false)
+    , m_textDragging(false)
+    , m_dragWidget(nullptr)
 {
     eweb_listener_init(&m_listener);
     m_container = new EWebContainer(&m_port, this);
@@ -707,6 +714,16 @@ bool EWebEngine::engineHandleCommand(const EWebCmd& cmd)
          * taken because the dispatch may outlive `cmd`. */
         eweb_event_t ev = cmd.ev;
         bool allowed = jsDispatchMouseEvent(ev.mouse_state, ev.button, cmd.x, cmd.y);
+        /* Click-to-focus: a left press moves keyboard focus to the nearest
+         * focusable element under the pointer (a form widget or <a href>), or
+         * clears focus when the press lands on blank space. Runs AFTER the DOM
+         * mouse events so a mousedown handler sees the old focus, matching the
+         * browser order (focus changes between mousedown and click). */
+        if(ev.mouse_state == EWEB_MOUSE_DOWN &&
+                ev.button == EWEB_BUTTON_LEFT) {
+            litehtml::element* target = hitElementAt(cmd.x, cmd.y);
+            setFocus(target != nullptr ? focusableAt(target) : nullptr);
+        }
         /* Click-vs-drag bookkeeping and the anchor follow live here, NOT
          * inside jsDispatchMouseEvent: link clicking must keep working on
          * pages with no VM (or JS disabled), where the dispatch returns
@@ -726,6 +743,14 @@ bool EWebEngine::engineHandleCommand(const EWebCmd& cmd)
         }
         return true;
     }
+
+    case ECMD_KEY:
+        /* Dispatch the DOM key events and run the default action (editing,
+         * activation, focus traversal) on the engine thread, where the
+         * document and VM live. A local copy is taken because the dispatch
+         * may outlive `cmd`. */
+        handleKeyEvent(cmd.kev);
+        return true;
 
     case ECMD_SET_JS:
         /* Toggle JS execution. Disabling frees the VM; the next page load
@@ -1198,6 +1223,145 @@ void EWebEngine::postInput(const eweb_event_t& ev)
     postCommand(cmd);
 }
 
+void EWebEngine::postKey(const eweb_key_event_t& ev)
+{
+    /* Asynchronous, exactly like postInput: queue the gesture and let the
+     * engine thread dispatch the DOM key events + default action there. */
+    EWebCmd cmd;
+    cmd.kind = ECMD_KEY;
+    cmd.kev = ev;
+    postCommand(cmd);
+}
+
+void EWebEngine::handleKeyDefault(const eweb_key_event_t& kev, const char* domKey, unsigned mods)
+{
+    /* ENGINE-THREAD ONLY. The built-in response to a key the page did not
+     * cancel. Stage 1 wires up the keydown/keyup dispatch only, so there is no
+     * default action yet; the later stages fill this in with text editing on
+     * the focused field, Space/Enter control activation, Tab focus traversal
+     * and arrow-key navigation of an open <select>. */
+    (void)kev; (void)domKey; (void)mods;
+}
+
+/* Collect the focusable elements (form widgets + <a href>) under `e` in
+ * document order. Widgets are recognised through the litehtml hook so a
+ * disabled/hidden control is skipped; anchors are matched by tag + href. */
+static void collectFocusable(litehtml::element* e, std::vector<litehtml::element*>& out)
+{
+    if(e == nullptr) return;
+    void* w = e->eweb_form_widget();
+    if(w != nullptr) {
+        if(((eweb_el_input*)w)->isFocusable()) out.push_back(e);
+    } else {
+        const litehtml::tchar_t* tag = e->get_tagName();
+        const litehtml::tchar_t* href = e->get_attr("href", nullptr);
+        if(tag != nullptr && tag[0] == 'a' && tag[1] == 0 &&
+                href != nullptr && href[0] != 0)
+            out.push_back(e);
+    }
+    size_t n = e->get_children_count();
+    for(size_t i = 0; i < n; ++i) {
+        litehtml::element::ptr c = e->get_child((int)i);
+        collectFocusable(c, out);
+    }
+}
+
+void* EWebEngine::widgetAt(litehtml::element* el) const
+{
+    /* Walk the hit element and its ancestors: a click on a <button>'s text
+     * child must still resolve to the control. */
+    for(litehtml::element* e = el; e != nullptr; e = e->parent()) {
+        void* w = e->eweb_form_widget();
+        if(w != nullptr) return w;
+    }
+    return nullptr;
+}
+
+litehtml::element* EWebEngine::hitElementAt(int cx, int cy)
+{
+    /* The hit tester works in unscrolled document coordinates, so add the
+     * engine's scroll offsets; the client pair stays as-is for position:fixed. */
+    litehtml::document* doc = jsActiveDoc();
+    if(doc == nullptr) return nullptr;
+    litehtml::element::ptr root = doc->root();
+    if(root == nullptr) return nullptr;
+    litehtml::element::ptr t =
+        root->get_element_by_point(cx + m_engineScrollX, cy + m_engineScrollY, cx, cy);
+    return t;
+}
+
+litehtml::element* EWebEngine::focusableAt(litehtml::element* el) const
+{
+    for(litehtml::element* e = el; e != nullptr; e = e->parent()) {
+        void* w = e->eweb_form_widget();
+        if(w != nullptr)
+            return ((eweb_el_input*)w)->isFocusable() ? e : nullptr;
+        const litehtml::tchar_t* tag = e->get_tagName();
+        const litehtml::tchar_t* href = e->get_attr("href", nullptr);
+        if(tag != nullptr && tag[0] == 'a' && tag[1] == 0 &&
+                href != nullptr && href[0] != 0)
+            return e;
+    }
+    return nullptr;
+}
+
+void EWebEngine::setFocus(litehtml::element* el)
+{
+    /* ENGINE-THREAD ONLY. Move keyboard focus, firing blur/focusout on the old
+     * element and focus/focusin on the new one (the DOM order: the outgoing
+     * element loses focus first). focus/blur do not bubble; focusin/focusout
+     * do. The widget's own focus flag drives the caret / focus ring in draw(). */
+    litehtml::element* old = (litehtml::element*)m_focusElement;
+    if(old == el) return;
+
+    if(old != nullptr) {
+        void* w = widgetAt(old);
+        if(w != nullptr) ((eweb_el_input*)w)->setFocused(false);
+        jsDispatchSimpleEvent(old, "blur", false);
+        jsDispatchSimpleEvent(old, "focusout", true);
+    }
+    m_focusElement = (void*)el;
+    if(el != nullptr) {
+        void* w = widgetAt(el);
+        if(w != nullptr) ((eweb_el_input*)w)->setFocused(true);
+        jsDispatchSimpleEvent(el, "focus", false);
+        jsDispatchSimpleEvent(el, "focusin", true);
+    }
+    /* Repaint so the caret / focus ring appears or disappears. */
+    markContentDirty();
+}
+
+void EWebEngine::clearFocus()
+{
+    setFocus(nullptr);
+}
+
+void EWebEngine::focusNext(bool reverse)
+{
+    /* ENGINE-THREAD ONLY (Tab / Shift+Tab). Cycle through the focusable
+     * elements in document order, wrapping at the ends. With nothing focused
+     * the first (or last, when reversing) focusable takes focus. */
+    litehtml::document* doc = jsActiveDoc();
+    if(doc == nullptr) return;
+    litehtml::element::ptr root = doc->root();
+    if(root == nullptr) return;
+    std::vector<litehtml::element*> list;
+    collectFocusable(root, list);
+    if(list.empty()) { clearFocus(); return; }
+
+    litehtml::element* cur = (litehtml::element*)m_focusElement;
+    int idx = -1;
+    for(size_t i = 0; i < list.size(); ++i)
+        if(list[i] == cur) { idx = (int)i; break; }
+
+    int n = (int)list.size();
+    int next;
+    if(idx < 0)      next = reverse ? n - 1 : 0;
+    else if(reverse) next = (idx - 1 + n) % n;
+    else             next = (idx + 1) % n;
+    setFocus(list[next]);
+}
+
 void EWebEngine::cleanupBuildResources()
 {
     /* Tear down any JS VM from the previous page so its globals and the
@@ -1212,6 +1376,7 @@ void EWebEngine::cleanupBuildResources()
     m_jsReparseCount = 0;
     m_jsRunBeforePaint = false;
     m_jsNextScript = 0;
+    m_jsScriptWaitSince = 0;
     m_jsPostSwapRun = false;
     m_jsProgressiveActive = false;
     m_jsLastFlushAt = 0;
@@ -1231,6 +1396,17 @@ void EWebEngine::cleanupBuildResources()
     jsFreeDetachedNodes();
     m_jsPendingNav.clear();
     m_jsScrollPending = false;
+    /* Drop every handle that points into the page being torn down: the hover,
+     * focus and drag elements are litehtml::element* and m_openSelect /
+     * m_dragWidget are eweb_el_input* owned by that page's container, so they
+     * all dangle once the document dies. Leaving them set would hand a stale
+     * pointer to the next dispatch. */
+    m_jsHoverElement = nullptr;
+    m_focusElement = nullptr;
+    m_openSelect = nullptr;
+    m_rangeDragging = false;
+    m_textDragging = false;
+    m_dragWidget = nullptr;
     /* Drop canvas backing stores with the VM that references them (resetJsVm
      * above already freed the ctx objects holding these EWebCanvas
      * pointers). */
@@ -1886,6 +2062,7 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
         }
     }
     m_jsNextScript = 0;
+    m_jsScriptWaitSince = 0;
     m_jsPostSwapRun = false;
     m_buildHtmlUrl = m_currentHtmlUrl;
     if(!m_defaultCSSUrl.empty()) {
@@ -2383,10 +2560,17 @@ void EWebEngine::advanceBuildStep()
             m_buildPhase = BUILD_RENDER_DOC;
             return;
         }
-        runPageScripts();
+        bool scripts_done = runPageScripts();
         if(m_buildAbort) {
             /* A termination request landed during the script run: skip the
              * write-splice, the page dies at the top of the next step. */
+            return;
+        }
+        if(!scripts_done) {
+            /* Parked on an in-flight <script src> fetch (document order): stay
+             * in this phase and re-enter on the next tick or the instant
+             * processResults re-arms the step via m_deferBuildStep. */
+            m_buildPhase = BUILD_RUN_JS;
             return;
         }
         bool restart = applyJsWriteBuffer();
@@ -2774,6 +2958,12 @@ void ewebview_post_event(ewebview_t* v, const eweb_event_t* ev)
 {
     if(v != NULL && ev != NULL)
         v->engine.postInput(*ev);
+}
+
+void ewebview_post_key(ewebview_t* v, const eweb_key_event_t* ev)
+{
+    if(v != NULL && ev != NULL)
+        v->engine.postKey(*ev);
 }
 
 void ewebview_scroll(ewebview_t* v, int x, int y)

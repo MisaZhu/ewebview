@@ -49,7 +49,9 @@ LDFLAGS += -L $(TARGET_DIR)/lib
 # Link order matters: ewebview references litehtml/mario/webp/tinyhttpsc
 # symbols, and the SDL2 port inside libewebview.a references SDL2 companions.
 # libewebview.a is C++14 internally, so link with $(CXX) to pull in libstdc++.
-LIBS = -lewebview -llitehtml -lmario_jsn -lwebp -ltinyhttpsc \
+# -lsvg: the core's inline <svg> anti-aliased fill (plutovg) and the SDL2
+# port's SVG decode (plutosvg) live in libsvg.a.
+LIBS = -lewebview -lsvg -llitehtml -lmario_jsn -lwebp -ltinyhttpsc \
        $(SDL2_LIBS) -lm -lpthread
 
 # macOS appearance detection (AppleInterfaceStyle) uses CoreFoundation.
@@ -64,6 +66,7 @@ OBJS = $(ARCH)/main.o $(ARCH)/compat.o
 # sdlbrowser instead of silently keeping a stale binary. The top-level Makefile
 # builds every one of these before it descends here, so they always exist.
 PROJ_LIBS = $(TARGET_DIR)/lib/libewebview.a \
+            $(TARGET_DIR)/lib/libsvg.a \
             $(TARGET_DIR)/lib/liblitehtml.a \
             $(TARGET_DIR)/lib/libmario_jsn.a \
             $(TARGET_DIR)/lib/libwebp.a \

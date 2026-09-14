@@ -193,6 +193,12 @@ typedef struct js_dom_callbacks {
     /* Resolved (computed) value of a CSS property, mario_malloc'd or NULL. */
     char* (*el_get_style)(void* ctx, js_element_t el, const char* prop);
     void  (*el_focus)(void* ctx, js_element_t el);
+    /* Drop keyboard focus from `el` when it currently holds it (Element.blur()).
+     * OPTIONAL: without it blur() is a no-op. */
+    void  (*el_blur)(void* ctx, js_element_t el);
+    /* document.activeElement: the focused element, or <body> when nothing is
+     * focused. OPTIONAL: without it activeElement reports <body>. */
+    js_element_t (*get_active_element)(void* ctx);
     void  (*el_scroll_into_view)(void* ctx, js_element_t el);
 } js_dom_callbacks_t;
 

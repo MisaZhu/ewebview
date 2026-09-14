@@ -24,6 +24,8 @@
 #include <vector>
 #include <algorithm>
 
+#include <plutovg.h>
+
 using namespace litehtml;
 
 namespace eweb {
@@ -282,6 +284,109 @@ static void fill_polys_nz(eweb_surface_t* s, const eweb_gfx_t* gfx,
 static inline int char_width_cache_slot(uint64_t key)
 {
     return (int)(key & 8191ULL);
+}
+
+/* Anti-aliased counterpart of fill_polys_nz: rasterise the subpaths with
+ * plutovg (the same FreeType smooth raster EwokOS' libsvg renders SVGs
+ * with) into a bbox-sized offscreen surface, then composite the coverage
+ * back through gfx->fill_rect, which blends per the HAL contract and
+ * honours the current clip. The offscreen pixels are premultiplied, but
+ * the paint is one uniform colour, so a pixel's alpha byte IS its
+ * coverage and the un-premultiplied source colour for the blend is just
+ * `argb`'s rgb - consecutive equal-alpha pixels share one fill_rect. */
+static bool fill_polys_aa(eweb_surface_t* s, const eweb_gfx_t* gfx,
+                          const litehtml::position& clip,
+                          const float* pts, const int* counts, int nsubs,
+                          uint32_t argb)
+{
+    if (!s || !pts || !counts || nsubs <= 0 || !gfx->fill_rect)
+        return false;
+    uint32_t alpha = argb >> 24;
+    if (alpha == 0)
+        return true;
+
+    int total = 0;
+    for (int i = 0; i < nsubs; i++)
+        total += counts[i];
+    if (total < 3)
+        return false;
+
+    float minx = pts[0], maxx = pts[0], miny = pts[1], maxy = pts[1];
+    for (int i = 0; i < total; i++) {
+        float xx = pts[i * 2], yy = pts[i * 2 + 1];
+        if (xx < minx) minx = xx;
+        if (xx > maxx) maxx = xx;
+        if (yy < miny) miny = yy;
+        if (yy > maxy) maxy = yy;
+    }
+    int x0 = (int)floorf(minx), x1 = (int)ceilf(maxx);
+    int y0 = (int)floorf(miny), y1 = (int)ceilf(maxy);
+    if (x0 < clip.x) x0 = clip.x;
+    if (y0 < clip.y) y0 = clip.y;
+    if (x1 > clip.x + clip.width) x1 = clip.x + clip.width;
+    if (y1 > clip.y + clip.height) y1 = clip.y + clip.height;
+    int w = x1 - x0, h = y1 - y0;
+    if (w <= 0 || h <= 0)
+        return true;
+    /* A pathologically huge quad (degenerate transform) would allocate a
+     * viewport-sized bitmap per call; the aliased filler handles those. */
+    if ((int64_t)w * h > 4 * 1024 * 1024)
+        return false;
+
+    plutovg_surface_t* surf = plutovg_surface_create(w, h);
+    if (!surf)
+        return false;
+    plutovg_canvas_t* cv = plutovg_canvas_create(surf);
+    if (!cv) {
+        plutovg_surface_destroy(surf);
+        return false;
+    }
+    plutovg_canvas_set_fill_rule(cv, PLUTOVG_FILL_RULE_NON_ZERO);
+    plutovg_canvas_set_rgba(cv,
+                            (float)((argb >> 16) & 0xFF) / 255.0f,
+                            (float)((argb >> 8) & 0xFF) / 255.0f,
+                            (float)(argb & 0xFF) / 255.0f,
+                            (float)alpha / 255.0f);
+    plutovg_canvas_new_path(cv);
+    int base = 0;
+    for (int sp = 0; sp < nsubs; sp++) {
+        int n = counts[sp];
+        if (n >= 3) {
+            plutovg_canvas_move_to(cv, pts[(base) * 2] - (float)x0,
+                                   pts[(base) * 2 + 1] - (float)y0);
+            for (int i = 1; i < n; i++)
+                plutovg_canvas_line_to(cv, pts[(base + i) * 2] - (float)x0,
+                                       pts[(base + i) * 2 + 1] - (float)y0);
+            plutovg_canvas_close_path(cv);
+        }
+        base += n;
+    }
+    plutovg_canvas_fill(cv);
+
+    const uint8_t* px = plutovg_surface_get_data(surf);
+    int stride = plutovg_surface_get_stride(surf);
+    uint32_t rgb = argb & 0xFFFFFFu;
+    for (int y = 0; y < h; y++) {
+        const uint32_t* row = (const uint32_t*)(px + (size_t)y * stride);
+        int run = -1;
+        uint8_t runa = 0;
+        for (int x = 0; x <= w; x++) {
+            uint8_t a = (x < w) ? (uint8_t)(row[x] >> 24) : 0;
+            if (run >= 0 && a != runa) {
+                if (runa)
+                    gfx->fill_rect(gfx->ud, s, x0 + run, y0 + y, x - run, 1,
+                                   ((uint32_t)runa << 24) | rgb);
+                run = -1;
+            }
+            if (run < 0 && a) {
+                run = x;
+                runa = a;
+            }
+        }
+    }
+    plutovg_canvas_destroy(cv);
+    plutovg_surface_destroy(surf);
+    return true;
 }
 
 EWebContainer::EWebContainer(const eweb_port_t* port, EWebContainerHost* host)
@@ -1017,16 +1122,34 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
                                          * the logical point of the tile it is. */
                                         float kx = (float)dw / (float)tw2;
                                         float ky = (float)dh / (float)th2;
+                                        /* border-radius:50% rounds to an ELLIPSE
+                                         * on a non-square box; the clamp-to-corner
+                                         * SDF below would degenerate to a stadium
+                                         * and poke out of the border ring. */
+                                        int cside = cr.width < cr.height ? cr.width : cr.height;
+                                        bool ellipse = (crad >= cside / 2 - 1);
+                                        float ex = cr.x + cr.width * 0.5f;
+                                        float ey = cr.y + cr.height * 0.5f;
+                                        float erx = cr.width * 0.5f;
+                                        float ery = cr.height * 0.5f;
                                         for (int yy = 0; yy < th2; yy++) {
                                             float Y = dy + (yy + 0.5f) * ky;
                                             float cy = Y < cr.y + crad ? cr.y + crad :
                                                        (Y > cr.y + cr.height - crad ? cr.y + cr.height - crad : Y);
+                                            float ny = ellipse ? (Y - ey) / ery : 0.0f;
                                             for (int xx = 0; xx < tw2; xx++) {
                                                 float X = dx + (xx + 0.5f) * kx;
-                                                float cx = X < cr.x + crad ? cr.x + crad :
-                                                           (X > cr.x + cr.width - crad ? cr.x + cr.width - crad : X);
-                                                float ddx = X - cx, ddy = Y - cy;
-                                                if (ddx * ddx + ddy * ddy > (float)crad * crad)
+                                                bool out;
+                                                if (ellipse) {
+                                                    float nx = (X - ex) / erx;
+                                                    out = (nx * nx + ny * ny) > 1.0f;
+                                                } else {
+                                                    float cx = X < cr.x + crad ? cr.x + crad :
+                                                               (X > cr.x + cr.width - crad ? cr.x + cr.width - crad : X);
+                                                    float ddx = X - cx, ddy = Y - cy;
+                                                    out = (ddx * ddx + ddy * ddy) > (float)crad * crad;
+                                                }
+                                                if (out)
                                                     px[yy * tw2 + xx] = 0;
                                             }
                                         }
@@ -1123,25 +1246,48 @@ void EWebContainer::draw_borders(litehtml::uint_ptr hdc, const litehtml::borders
      * its own width/color, which also fixes border-bottom-only rules that
      * used to be drawn as a full 1px outline. */
     int minside = draw_pos.width < draw_pos.height ? draw_pos.width : draw_pos.height;
-    if (getenv("EWEB_DBG_B"))
-        fprintf(stderr, "[dbg borders] box=%d,%d %dx%d rad=%d unif=%d minside=%d t=%d r=%d b=%d l=%d xf=%d\n",
-                draw_pos.x, draw_pos.y, draw_pos.width, draw_pos.height, rad, (int)uniform_radius,
-                minside, (int)has_top, (int)has_right, (int)has_bottom, (int)has_left, (int)m_xform_on);
     /* Only a square box with radius >= half its side is a true circle (.avatar).
      * A wide pill (border-radius:999px) must NOT take this path or it collapses
      * to a ring; let it fall through to the rounded-rect stroke below. */
     bool square = (draw_pos.width - minside) <= 2 && (draw_pos.height - minside) <= 2;
-    if (square && rad > 0 && uniform_radius && minside > 0 && rad >= minside / 2 - 1 && gfx->circle) {
-        /* Fully round box (border-radius:50%): stroke a ring, not four rect
-         * edges - the w3.org .avatar circle. */
+    if (square && rad > 0 && uniform_radius && minside > 0 && rad >= minside / 2 - 1) {
+        /* Fully round box (border-radius:50%): stroke an ellipse ring, not four
+         * rect edges - the w3.org .avatar circle. The box can be a pixel or two
+         * off square (line-box rounding), so the ring follows the box ellipse
+         * exactly - a plain circle would leave the masked image poking out. */
         int bw = 0; uint32_t col = 0;
         if (has_top)         { bw = t.width; col = web_color_to_argb(t.color); }
         else if (has_right)  { bw = r.width; col = web_color_to_argb(r.color); }
         else if (has_bottom) { bw = b.width; col = web_color_to_argb(b.color); }
         else if (has_left)   { bw = l.width; col = web_color_to_argb(l.color); }
-        if (bw > 0)
-            gfx->circle(gfx->ud, s, draw_pos.x + draw_pos.width / 2, draw_pos.y + draw_pos.height / 2,
-                        minside / 2, bw, col);
+        if (bw > 0) {
+            const int N = 48;
+            float cx = draw_pos.x + draw_pos.width * 0.5f;
+            float cy = draw_pos.y + draw_pos.height * 0.5f;
+            float rx = draw_pos.width * 0.5f;
+            float ry = draw_pos.height * 0.5f;
+            std::vector<float> pts;
+            std::vector<int> counts;
+            pts.reserve(N * 4);
+            for (int i = 0; i < N; i++) {
+                float a = 6.28318530718f * (float)i / (float)N;
+                pts.push_back(cx + rx * cosf(a));
+                pts.push_back(cy + ry * sinf(a));
+            }
+            counts.push_back(N);
+            float rx2 = rx - (float)bw, ry2 = ry - (float)bw;
+            if (rx2 > 0.0f && ry2 > 0.0f) {
+                for (int i = N - 1; i >= 0; i--) {
+                    float a = 6.28318530718f * (float)i / (float)N;
+                    pts.push_back(cx + rx2 * cosf(a));
+                    pts.push_back(cy + ry2 * sinf(a));
+                }
+                counts.push_back(N);
+            }
+            litehtml::position cp = draw_pos;
+            cp.x -= 1; cp.y -= 1; cp.width += 2; cp.height += 2;
+            fill_polys_nz(s, gfx, cp, pts.data(), counts.data(), (int)counts.size(), col);
+        }
         return;
     }
 
@@ -1223,7 +1369,11 @@ void EWebContainer::draw_svg(litehtml::uint_ptr hdc, const litehtml::position& p
     if (!s || !pts || !counts || nsubs <= 0)
         return;
     const eweb_gfx_t* gfx = &m_port->gfx;
-    fill_polys_nz(s, gfx, pos, pts, counts, nsubs, web_color_to_argb(color));
+    uint32_t argb = web_color_to_argb(color);
+    /* Anti-aliased path first; the plain scanline filler stays as the
+     * fallback for the (rare) cases the offscreen raster cannot serve. */
+    if (!fill_polys_aa(s, gfx, pos, pts, counts, nsubs, argb))
+        fill_polys_nz(s, gfx, pos, pts, counts, nsubs, argb);
 }
 
 void EWebContainer::transform_text(litehtml::tstring& text, litehtml::text_transform tt)
@@ -1283,8 +1433,6 @@ void EWebContainer::set_clip(const litehtml::position& pos, const litehtml::bord
         rad = bdr_radius.top_left_x;
     }
     m_clips.push_back(clip_entry{r, rad});
-    if (getenv("EWEB_DBG_C"))
-        fprintf(stderr, "[dbg clip] r=%d,%d %dx%d rad=%d\n", r.x, r.y, r.width, r.height, rad);
     if(m_paint_surf && m_port && m_port->gfx.surface_set_clip)
     {
         m_port->gfx.surface_set_clip(m_port->gfx.ud, (eweb_surface_t*)m_paint_surf,

@@ -87,6 +87,59 @@ typedef struct eweb_event {
     int wheel;         /* EWEB_MOUSE_WHEEL only: -1 up, +1 down (lines) */
 } eweb_event_t;
 
+/* Keyboard gesture state, mapped from the platform's key events by the
+ * embedder. Text entry and key semantics travel separately: a printable
+ * character arrives as one EWEB_KEYSTATE_DOWN with key==EWEB_KEY_CHAR and the
+ * UTF-8 bytes in `text` (this is the IME-correct path), while every physical
+ * key - printable or not - also arrives as a plain EWEB_KEYSTATE_DOWN/UP
+ * carrying only `key`+`mods`, which is what the DOM keydown/keyup events and
+ * the navigation/editing shortcuts are driven from. */
+enum {
+    EWEB_KEYSTATE_DOWN = 0,
+    EWEB_KEYSTATE_UP,
+};
+
+/* Virtual key codes. EWEB_KEY_CHAR means "a printable character follows in
+ * text[]"; the rest name the non-printable keys the engine acts on. Letters
+ * and digits are their ASCII code points so the embedder can forward them
+ * verbatim. */
+enum {
+    EWEB_KEY_CHAR = 0,      /* printable: the UTF-8 char is in text[] */
+    EWEB_KEY_BACKSPACE = 8,
+    EWEB_KEY_TAB = 9,
+    EWEB_KEY_ENTER = 13,
+    EWEB_KEY_ESCAPE = 27,
+    EWEB_KEY_SPACE = 32,
+    EWEB_KEY_DELETE = 127,
+    EWEB_KEY_LEFT = 0x1000,
+    EWEB_KEY_RIGHT,
+    EWEB_KEY_UP,
+    EWEB_KEY_DOWN,
+    EWEB_KEY_HOME,
+    EWEB_KEY_END,
+    EWEB_KEY_PAGEUP,
+    EWEB_KEY_PAGEDOWN,
+    EWEB_KEY_INSERT,
+    EWEB_KEY_F1, EWEB_KEY_F2, EWEB_KEY_F3, EWEB_KEY_F4,
+    EWEB_KEY_F5, EWEB_KEY_F6, EWEB_KEY_F7, EWEB_KEY_F8,
+    EWEB_KEY_F9, EWEB_KEY_F10, EWEB_KEY_F11, EWEB_KEY_F12,
+};
+
+/* Modifier bitmask carried in eweb_key_event_t::mods. */
+enum {
+    EWEB_MOD_SHIFT = 1 << 0,
+    EWEB_MOD_CTRL  = 1 << 1,
+    EWEB_MOD_ALT   = 1 << 2,
+    EWEB_MOD_META  = 1 << 3,   /* Cmd on macOS, Win/Super elsewhere */
+};
+
+typedef struct eweb_key_event {
+    int  type;      /* EWEB_KEYSTATE_DOWN / EWEB_KEYSTATE_UP */
+    int  key;       /* one of EWEB_KEY_* */
+    int  mods;      /* EWEB_MOD_* bitwise-or */
+    char text[8];   /* UTF-8 character when key==EWEB_KEY_CHAR, else empty */
+} eweb_key_event_t;
+
 /* Sub-resource task kinds reported through the on_task_* listener hooks. */
 enum {
     EWEB_TASK_HTML = 0,
@@ -209,6 +262,14 @@ const char* ewebview_get_url(ewebview_t* v);
  * Queued to the engine, which dispatches the DOM mouse events and follows
  * <a href> clicks there. */
 void ewebview_post_event(ewebview_t* v, const eweb_event_t* ev);
+
+/* Forward one keyboard gesture to the focused page element (see
+ * eweb_key_event_t). Queued to the engine, which dispatches the DOM
+ * keydown/keypress/keyup events there and, unless a handler cancels them,
+ * runs the matching default action (text editing, control activation, focus
+ * traversal). Send printable characters via SDL_TEXTINPUT-style
+ * key==EWEB_KEY_CHAR events and every physical key via its own DOWN/UP. */
+void ewebview_post_key(ewebview_t* v, const eweb_key_event_t* ev);
 
 /* Scroll to an absolute document offset (the embedder clamps it to the last
  * known doc geometry first, moves its live offset for an immediate blit-shift,

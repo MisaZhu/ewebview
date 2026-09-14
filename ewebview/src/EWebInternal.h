@@ -115,6 +115,7 @@ enum EWebCmdKind {
     ECMD_RESIZE,
     ECMD_SCROLL,
     ECMD_INPUT,
+    ECMD_KEY,
     ECMD_SET_JS,
     ECMD_SHUTDOWN,
 };
@@ -126,7 +127,11 @@ struct EWebCmd {
     int          y;      /* RESIZE h / SCROLL y                        */
     bool         b;      /* SET_JS enabled                             */
     eweb_event_t ev;     /* INPUT: a copy of the pointer event         */
-    EWebCmd() : kind(ECMD_NAVIGATE), x(0), y(0), b(false) { memset(&ev, 0, sizeof(ev)); }
+    eweb_key_event_t kev;/* KEY: a copy of the keyboard event          */
+    EWebCmd() : kind(ECMD_NAVIGATE), x(0), y(0), b(false) {
+        memset(&ev, 0, sizeof(ev));
+        memset(&kev, 0, sizeof(kev));
+    }
 };
 
 /* Engine -> UI event kinds, drained by ewebview_tick() which fires the
@@ -177,6 +182,7 @@ public:
     void        reload();                            /* posts ECMD_RELOAD  */
     void        scrollTo(int x, int y);              /* posts ECMD_SCROLL  */
     void        postInput(const eweb_event_t& ev);   /* posts ECMD_INPUT   */
+    void        postKey(const eweb_key_event_t& ev); /* posts ECMD_KEY     */
     /* UI-thread mirror of the visible page's URL (refreshed by EUET_URL). */
     const char* currentUrlUi() const { return m_uiCurrentUrl.c_str(); }
 
@@ -261,7 +267,7 @@ public:
      * VM and the documents. */
     void initJsVm();
     void resetJsVm();
-    void runPageScripts();
+    bool runPageScripts();
     bool runNextPageScript();
     /* A <script> spliced into the tree by a DOM mutation (appendChild /
      * insertBefore / replaceChild) must fetch+run like a parser-inserted one:
@@ -299,8 +305,44 @@ public:
      * the public EWEB_MOUSE_x / EWEB_BUTTON_x values). Returns false when a
      * listener cancelled it. */
     bool jsDispatchMouseEvent(int mouseState, int button, int cx, int cy);
+    /* Fire a non-cancelable DOM event (focus/blur/focusin/focusout/...) at an
+     * element. No-op without a VM. */
+    void jsDispatchSimpleEvent(litehtml::element* el, const char* type, bool bubbles);
     /* Follow an <a href> under a left-button release. cx/cy are client coords. */
     void handleAnchorClick(int cx, int cy);
+
+    /* ---- keyboard + focus + form-control interaction (engine thread) ----
+     * One keyboard gesture: dispatch the DOM key events to the focused element
+     * and, unless cancelled, run the default action (text editing, control
+     * activation, focus traversal). */
+    void handleKeyEvent(const eweb_key_event_t& kev);
+    /* The engine's built-in response to a key that was not cancelled: text
+     * editing on the focused field, Space/Enter activation of a focused
+     * control, Tab focus traversal, arrow-key handling in an open <select>.
+     * `domKey`/`mods` are the already-mapped DOM key string and JS_EVENT_MOD_*
+     * bits computed by handleKeyEvent. */
+    void handleKeyDefault(const eweb_key_event_t& kev, const char* domKey, unsigned mods);
+    /* Move focus to `el` (NULL clears it), firing blur/focusout on the old and
+     * focus/focusin on the new element. Repaints when the caret changes. */
+    void setFocus(litehtml::element* el);
+    void clearFocus();
+    /* Focus traversal across focusable elements (form widgets + <a href>) in
+     * document order; reverse walks backwards (Shift+Tab). */
+    void focusNext(bool reverse);
+    /* Map a hit element to the form control it belongs to (walks up ancestors),
+     * or NULL. The pointer is an eweb_el_input* (see eweb_el_input.h). */
+    void* widgetAt(litehtml::element* el) const;
+    /* Nearest focusable element at/above `el` (a form widget or an <a href>). */
+    litehtml::element* focusableAt(litehtml::element* el) const;
+    /* The element under the given client coords (viewport-relative), or NULL.
+     * Same hit test jsDispatchMouseEvent uses. */
+    litehtml::element* hitElementAt(int cx, int cy);
+    /* Run a form control's click default action (toggle/activate/open/caret). */
+    void activateWidget(void* widget, int localX, int localY);
+    /* Submit the <form> enclosing `field` (GET -> action?query navigation). */
+    void submitForm(litehtml::element* field);
+    /* Draw an open <select>'s dropdown overlay onto the frame (after the page). */
+    void drawSelectPopup(eweb_surface_t* cache);
     void jsRunPendingNavigation();
     void jsInvalidateHandles();
     void jsFreeDetachedNodes();
@@ -340,6 +382,8 @@ public:
     static void  jsElGetRect(void* ctx, void* el, int* x, int* y, int* w, int* h);
     static char* jsElGetStyle(void* ctx, void* el, const char* prop);
     static void  jsElFocus(void* ctx, void* el);
+    static void  jsElBlur(void* ctx, void* el);
+    static void* jsGetActiveElement(void* ctx);
     static void  jsElScrollIntoView(void* ctx, void* el);
 
     /* Web/BOM bridge callbacks (js_web_callbacks_t signatures). */
@@ -504,6 +548,7 @@ public:
     int                         m_jsReparseCount;
     bool                        m_jsRunBeforePaint;
     size_t                      m_jsNextScript;
+    uint64_t                    m_jsScriptWaitSince;
     bool                        m_jsPostSwapRun;
     bool                        m_jsProgressiveActive;
     uint64_t                    m_jsLastFlushAt;
@@ -526,6 +571,13 @@ public:
     std::string                 m_jsPendingNav;
     bool                        m_jsScrollPending;
     void*                       m_jsHoverElement;  /* litehtml::element* */
+
+    /* ---- keyboard / focus / form-control interaction (engine thread) ---- */
+    void*                       m_focusElement;    /* focused litehtml::element* */
+    void*                       m_openSelect;      /* eweb_el_input* with its dropdown open */
+    bool                        m_rangeDragging;   /* a range slider is being dragged */
+    bool                        m_textDragging;    /* a text control selection is being dragged */
+    void*                       m_dragWidget;      /* eweb_el_input* the drag belongs to */
     /* Nodes removeChild() detached but could not free (JS may still hold
      * handles/listeners on them); freed by jsFreeDetachedNodes(). */
     std::vector<litehtml::element*> m_jsDetached;

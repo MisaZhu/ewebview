@@ -270,6 +270,12 @@ protected:
 		 * track/thumb chrome with the page colours. part is the lowercased
 		 * pseudo-element name without the :: prefix. */
 		virtual void				add_widget_part_style(const tstring& part, const litehtml::style& st);
+		/* Map an element back to the form control that owns it. Replaced controls
+		 * (eweb_el_input) return their own opaque handle so the engine can drive
+		 * focus/editing/activation; the base returns 0. The engine walks the hit
+		 * element and its ancestors, so a hit on a <button>'s text child still
+		 * resolves to the control. */
+		virtual void*				eweb_form_widget() { return 0; }
 		virtual element::ptr		get_element_by_point(int x, int y, int client_x, int client_y);
 		virtual element::ptr		get_child_by_point(int x, int y, int client_x, int client_y, draw_flag flag, int zindex);
 		virtual const background*	get_background(bool own_only = false);

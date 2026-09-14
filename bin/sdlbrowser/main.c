@@ -137,6 +137,38 @@ typedef struct {
 } ui_edit_t;
 
 /* ------------------------------------------------------------------ */
+/* Headless input-injection script (test / regression harness)         */
+/*                                                                     */
+/* `--inject "<spec>"` runs a scripted sequence of mouse and keyboard   */
+/* gestures against the content area AFTER the page settles and BEFORE  */
+/* the --shot frame is captured. Every step is delivered through the     */
+/* same public API the real frontend uses (ewebview_post_event /         */
+/* ewebview_post_key), so it exercises the genuine input pipeline.       */
+/* Spec grammar (';'-separated):                                         */
+/*   type <text>        insert each UTF-8 char as a CHAR key            */
+/*   key <name>         named key or single char, mods via ctrl+/shift+/ */
+/*                      alt+/meta+ (e.g. "ctrl+a", "shift+tab", "enter")*/
+/*   click <x>,<y>      left down+up+click at content-local coords      */
+/*   dblclick <x>,<y>   left double-click                                */
+/*   move/down/up <x>,<y>  raw mouse phases                             */
+/*   wait <ms>          pause before the next step                      */
+/* ------------------------------------------------------------------ */
+#define INJ_MAX 256
+typedef enum {
+    INJ_CLICK, INJ_DBLCLICK, INJ_MOVE, INJ_DOWN, INJ_UP,
+    INJ_TYPE, INJ_KEY, INJ_WAIT
+} inj_kind_t;
+
+typedef struct {
+    inj_kind_t kind;
+    int      x, y;        /* content-local logical coords (mouse steps) */
+    int      key;         /* EWEB_KEY_* (INJ_KEY) */
+    int      mods;        /* EWEB_MOD_* */
+    char     text[64];    /* INJ_TYPE run, or the CHAR payload for INJ_KEY */
+    uint32_t delay;       /* ms to wait after this step */
+} inj_step_t;
+
+/* ------------------------------------------------------------------ */
 /* Browser state                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -184,6 +216,10 @@ typedef struct {
     /* misc */
     bool          running;
     bool          content_dirty;  /* re-upload frame texture */
+    /* True when keyboard/IME input goes to the page (ewebview) rather than the
+     * address bar. Defaults true; focusing the address bar clears it and
+     * clicking the content area (or the bar losing focus) restores it. */
+    bool          content_focus;
     uint32_t      last_tick_ms;
 
     /* headless screenshot mode: `sdlbrowser <url> --shot out.bmp [settle_ms]`
@@ -193,6 +229,16 @@ typedef struct {
     uint32_t      shot_start_ms;
     int           shot_scroll_y;   /* -1 = capture at top; else scroll first */
     bool          shot_scrolled;
+
+    /* injected input script (see --inject). Runs after the first settle and
+     * before the capture; `inject_final_settle` is the settle used afterwards. */
+    inj_step_t    inject[INJ_MAX];
+    int           inject_count;
+    int           inject_idx;
+    bool          inject_active;
+    bool          inject_done;
+    uint32_t      inject_next_ms;
+    uint32_t      inject_final_settle;
 } browser_t;
 
 /* ------------------------------------------------------------------ */
@@ -761,6 +807,66 @@ static void browser_mouse_pos(const browser_t* b, int* dx, int* dy) {
     *dy = (int)((float)py * s);
 }
 
+/* Map an SDL modifier bitmask onto the ewebview EWEB_MOD_* bits. */
+static int sdl_mods_to_eweb(Uint16 mod) {
+    int m = 0;
+    if(mod & KMOD_SHIFT) m |= EWEB_MOD_SHIFT;
+    if(mod & KMOD_CTRL)  m |= EWEB_MOD_CTRL;
+    if(mod & KMOD_ALT)   m |= EWEB_MOD_ALT;
+    if(mod & KMOD_GUI)   m |= EWEB_MOD_META;
+    return m;
+}
+
+/* Map an SDL keycode onto an EWEB_KEY_* virtual key. The named non-printable
+ * keys map to their EWEB_KEY_* constant; a plain ASCII printable maps to its
+ * code point (the engine's key mapper folds that back into the DOM `key`);
+ * anything the engine has no use for maps to -1 and is dropped. */
+static int sdl_key_to_eweb(SDL_Keycode k) {
+    switch(k) {
+    case SDLK_BACKSPACE: return EWEB_KEY_BACKSPACE;
+    case SDLK_TAB:       return EWEB_KEY_TAB;
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER:  return EWEB_KEY_ENTER;
+    case SDLK_ESCAPE:    return EWEB_KEY_ESCAPE;
+    case SDLK_DELETE:    return EWEB_KEY_DELETE;
+    case SDLK_LEFT:      return EWEB_KEY_LEFT;
+    case SDLK_RIGHT:     return EWEB_KEY_RIGHT;
+    case SDLK_UP:        return EWEB_KEY_UP;
+    case SDLK_DOWN:      return EWEB_KEY_DOWN;
+    case SDLK_HOME:      return EWEB_KEY_HOME;
+    case SDLK_END:       return EWEB_KEY_END;
+    case SDLK_PAGEUP:    return EWEB_KEY_PAGEUP;
+    case SDLK_PAGEDOWN:  return EWEB_KEY_PAGEDOWN;
+    case SDLK_INSERT:    return EWEB_KEY_INSERT;
+    case SDLK_F1:        return EWEB_KEY_F1;
+    case SDLK_F2:        return EWEB_KEY_F2;
+    case SDLK_F3:        return EWEB_KEY_F3;
+    case SDLK_F4:        return EWEB_KEY_F4;
+    case SDLK_F5:        return EWEB_KEY_F5;
+    case SDLK_F6:        return EWEB_KEY_F6;
+    case SDLK_F7:        return EWEB_KEY_F7;
+    case SDLK_F8:        return EWEB_KEY_F8;
+    case SDLK_F9:        return EWEB_KEY_F9;
+    case SDLK_F10:       return EWEB_KEY_F10;
+    case SDLK_F11:       return EWEB_KEY_F11;
+    case SDLK_F12:       return EWEB_KEY_F12;
+    default: break;
+    }
+    /* ASCII printable (SPACE..'~'): forward the code point; SDLK_* for letters
+     * and digits already equal their lower-case ASCII values. */
+    if(k >= SDLK_SPACE && k <= 126) return (int)k;
+    return -1;
+}
+
+/* True when SDL will ALSO deliver this key as an SDL_TEXTINPUT event: a
+ * printable character with no command modifier held. Such a key must not be
+ * forwarded as a separate KEYDOWN, or the page would see two keydowns per
+ * character (the TEXTINPUT path already carries keydown+keypress). */
+static bool sdl_key_yields_text(SDL_Keycode k, Uint16 mod) {
+    if(mod & (KMOD_CTRL | KMOD_ALT | KMOD_GUI)) return false;
+    return (k >= SDLK_SPACE && k <= 126);
+}
+
 static void browser_handle_event(browser_t* b, const SDL_Event* ev) {
     switch(ev->type) {
 
@@ -814,6 +920,7 @@ static void browser_handle_event(browser_t* b, const SDL_Event* ev) {
         if(point_in_rect(mx, my, &b->address.rect)) {
             if(!b->address.focused) {
                 b->address.focused = true;
+                b->content_focus = false;   /* keyboard now goes to the bar */
                 SDL_StartTextInput();
             }
             /* click positions the caret (simplified: end of text) */
@@ -825,7 +932,10 @@ static void browser_handle_event(browser_t* b, const SDL_Event* ev) {
         } else {
             if(b->address.focused) {
                 b->address.focused = false;
-                SDL_StopTextInput();
+                /* Hand the keyboard back to the page and keep IME/text input
+                 * running so the focused field still receives SDL_TEXTINPUT. */
+                b->content_focus = true;
+                SDL_StartTextInput();
             }
         }
 
@@ -896,8 +1006,21 @@ static void browser_handle_event(browser_t* b, const SDL_Event* ev) {
     }
 
     case SDL_TEXTINPUT:
-        if(b->address.focused)
+        if(b->address.focused) {
             edit_insert_text(&b->address, ev->text.text);
+        } else if(b->content_focus && b->view) {
+            /* The page owns the keyboard: forward the composed character as a
+             * CHAR key so the engine fires keydown+keypress and (in the later
+             * stages) inserts it into the focused field. This is the IME-correct
+             * path - `text` is the final UTF-8 result of any composition. */
+            eweb_key_event_t kev;
+            memset(&kev, 0, sizeof(kev));
+            kev.type = EWEB_KEYSTATE_DOWN;
+            kev.key  = EWEB_KEY_CHAR;
+            kev.mods = sdl_mods_to_eweb(SDL_GetModState());
+            snprintf(kev.text, sizeof(kev.text), "%s", ev->text.text);
+            ewebview_post_key(b->view, &kev);
+        }
         break;
 
     case SDL_KEYDOWN: {
@@ -932,14 +1055,49 @@ static void browser_handle_event(browser_t* b, const SDL_Event* ev) {
 
         /* global shortcuts */
         if(k == SDLK_F5) { browser_refresh(b); break; }
-        if(k == SDLK_ESCAPE) { browser_stop(b); break; }
         if(k == SDLK_l && (mod & KMOD_CTRL)) {
             b->address.focused = true;
+            b->content_focus = false;
             b->address.select_all = true;
             SDL_StartTextInput();
             break;
         }
         if(k == SDLK_LEFT && (mod & KMOD_ALT)) { browser_back(b); break; }
+
+        /* Everything else (Escape, Tab, arrows, Ctrl+C/V/A, ...) belongs to the
+         * page. A printable key with no command modifier is delivered by
+         * SDL_TEXTINPUT instead, so it is skipped here to avoid a double
+         * keydown; Ctrl/Alt/Gui combinations (which suppress TEXTINPUT) still
+         * forward so the page's copy/paste shortcuts work. */
+        if(b->content_focus && b->view && !b->address.focused) {
+            int ek = sdl_key_to_eweb(k);
+            if(ek >= 0 && !sdl_key_yields_text(k, mod)) {
+                eweb_key_event_t kev;
+                memset(&kev, 0, sizeof(kev));
+                kev.type = EWEB_KEYSTATE_DOWN;
+                kev.key  = ek;
+                kev.mods = sdl_mods_to_eweb(mod);
+                ewebview_post_key(b->view, &kev);
+            }
+        }
+        break;
+    }
+
+    case SDL_KEYUP: {
+        /* Mirror the keydown so the page sees a complete key cycle. The
+         * printable keyup is NOT suppressed: SDL_TEXTINPUT carries no keyup,
+         * so this is the field's only release signal. */
+        if(b->content_focus && b->view && !b->address.focused) {
+            int ek = sdl_key_to_eweb(ev->key.keysym.sym);
+            if(ek >= 0) {
+                eweb_key_event_t kev;
+                memset(&kev, 0, sizeof(kev));
+                kev.type = EWEB_KEYSTATE_UP;
+                kev.key  = ek;
+                kev.mods = sdl_mods_to_eweb(ev->key.keysym.mod);
+                ewebview_post_key(b->view, &kev);
+            }
+        }
         break;
     }
 
@@ -1050,12 +1208,182 @@ static void browser_resize(browser_t* b, int w, int h) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Headless input injection (test / regression harness)                */
+/* ------------------------------------------------------------------ */
+
+static int utf8_clen(unsigned char c) {
+    if(c < 0x80) return 1;
+    if((c >> 5) == 0x6)  return 2;
+    if((c >> 4) == 0xE)  return 3;
+    if((c >> 3) == 0x1E) return 4;
+    return 1;
+}
+
+static char* inj_trim(char* s) {
+    while(*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    size_t n = strlen(s);
+    while(n > 0 && (s[n-1] == ' ' || s[n-1] == '\t' || s[n-1] == '\r' || s[n-1] == '\n'))
+        s[--n] = 0;
+    return s;
+}
+
+/* Resolve a key name to an EWEB_KEY_* code. A single (possibly multi-byte)
+ * printable character - and "space" - map to EWEB_KEY_CHAR with the character
+ * written to charOut; unknown names return -1. */
+static int inj_named_key(const char* n, char* charOut) {
+    charOut[0] = 0;
+    if(!strcmp(n, "enter") || !strcmp(n, "return")) return EWEB_KEY_ENTER;
+    if(!strcmp(n, "tab"))       return EWEB_KEY_TAB;
+    if(!strcmp(n, "escape") || !strcmp(n, "esc")) return EWEB_KEY_ESCAPE;
+    if(!strcmp(n, "backspace")) return EWEB_KEY_BACKSPACE;
+    if(!strcmp(n, "delete") || !strcmp(n, "del")) return EWEB_KEY_DELETE;
+    if(!strcmp(n, "left"))      return EWEB_KEY_LEFT;
+    if(!strcmp(n, "right"))     return EWEB_KEY_RIGHT;
+    if(!strcmp(n, "up"))        return EWEB_KEY_UP;
+    if(!strcmp(n, "down"))      return EWEB_KEY_DOWN;
+    if(!strcmp(n, "home"))      return EWEB_KEY_HOME;
+    if(!strcmp(n, "end"))       return EWEB_KEY_END;
+    if(!strcmp(n, "pageup"))    return EWEB_KEY_PAGEUP;
+    if(!strcmp(n, "pagedown"))  return EWEB_KEY_PAGEDOWN;
+    if(!strcmp(n, "insert"))    return EWEB_KEY_INSERT;
+    if(!strcmp(n, "space"))     { charOut[0] = ' '; charOut[1] = 0; return EWEB_KEY_CHAR; }
+    if(n[0] == 'f' && n[1] >= '1' && n[1] <= '9' && n[2] == 0)
+        return EWEB_KEY_F1 + (n[1] - '1');
+    if(n[0] == 'f' && n[1] == '1' && n[2] >= '0' && n[2] <= '2' && n[3] == 0)
+        return EWEB_KEY_F1 + 9 + (n[2] - '0');
+    /* single character (possibly multi-byte UTF-8) */
+    if((int)strlen(n) == utf8_clen((unsigned char)n[0])) {
+        snprintf(charOut, 8, "%s", n);
+        return EWEB_KEY_CHAR;
+    }
+    return -1;
+}
+
+static void inj_parse_cmd(browser_t* b, char* raw) {
+    char* cmd = inj_trim(raw);
+    if(!*cmd || b->inject_count >= INJ_MAX) return;
+    inj_step_t* s = &b->inject[b->inject_count];
+    memset(s, 0, sizeof(*s));
+    s->delay = 40;   /* default gap so the engine processes each gesture */
+
+    if(!strncmp(cmd, "type ", 5)) {
+        s->kind = INJ_TYPE;
+        snprintf(s->text, sizeof(s->text), "%s", inj_trim(cmd + 5));
+        b->inject_count++;
+        return;
+    }
+    if(!strncmp(cmd, "dblclick ", 9)) { s->kind = INJ_DBLCLICK; sscanf(cmd + 9, "%d , %d", &s->x, &s->y); b->inject_count++; return; }
+    if(!strncmp(cmd, "click ", 6))    { s->kind = INJ_CLICK;    sscanf(cmd + 6, "%d , %d", &s->x, &s->y); b->inject_count++; return; }
+    if(!strncmp(cmd, "move ", 5))     { s->kind = INJ_MOVE;     sscanf(cmd + 5, "%d , %d", &s->x, &s->y); b->inject_count++; return; }
+    if(!strncmp(cmd, "down ", 5))     { s->kind = INJ_DOWN;     sscanf(cmd + 5, "%d , %d", &s->x, &s->y); b->inject_count++; return; }
+    if(!strncmp(cmd, "up ", 3))       { s->kind = INJ_UP;       sscanf(cmd + 3, "%d , %d", &s->x, &s->y); b->inject_count++; return; }
+    if(!strncmp(cmd, "wait ", 5))     { s->kind = INJ_WAIT;     s->delay = (uint32_t)atoi(cmd + 5); b->inject_count++; return; }
+    if(!strncmp(cmd, "key ", 4)) {
+        const char* p = cmd + 4;
+        int mods = 0;
+        for(;;) {
+            if(!strncmp(p, "ctrl+", 5))  { mods |= EWEB_MOD_CTRL;  p += 5; continue; }
+            if(!strncmp(p, "shift+", 6)) { mods |= EWEB_MOD_SHIFT; p += 6; continue; }
+            if(!strncmp(p, "alt+", 4))   { mods |= EWEB_MOD_ALT;   p += 4; continue; }
+            if(!strncmp(p, "meta+", 5))  { mods |= EWEB_MOD_META;  p += 5; continue; }
+            if(!strncmp(p, "cmd+", 4))   { mods |= EWEB_MOD_META;  p += 4; continue; }
+            break;
+        }
+        char nameBuf[32];
+        snprintf(nameBuf, sizeof(nameBuf), "%s", inj_trim((char*)p));
+        char ch[8];
+        int k = inj_named_key(inj_trim(nameBuf), ch);
+        if(k >= 0) {
+            s->kind = INJ_KEY;
+            s->key = k;
+            s->mods = mods;
+            if(k == EWEB_KEY_CHAR) snprintf(s->text, sizeof(s->text), "%s", ch);
+            b->inject_count++;
+        }
+        return;
+    }
+}
+
+static void parse_inject(browser_t* b, const char* spec) {
+    b->inject_count = 0;
+    if(!spec || !*spec) return;
+    char buf[2048];
+    snprintf(buf, sizeof(buf), "%s", spec);
+    char* tok = strtok(buf, ";");
+    while(tok) { inj_parse_cmd(b, tok); tok = strtok(NULL, ";"); }
+}
+
+static void inj_post_key(browser_t* b, int type, int key, int mods, const char* text) {
+    eweb_key_event_t kev;
+    memset(&kev, 0, sizeof(kev));
+    kev.type = type; kev.key = key; kev.mods = mods;
+    if(text) snprintf(kev.text, sizeof(kev.text), "%s", text);
+    ewebview_post_key(b->view, &kev);
+}
+
+static void inj_post_mouse(browser_t* b, int state, int cx, int cy) {
+    eweb_event_t wev;
+    memset(&wev, 0, sizeof(wev));
+    wev.mouse_state = state;
+    wev.button = (state == EWEB_MOUSE_MOVE) ? EWEB_BUTTON_NONE : EWEB_BUTTON_LEFT;
+    wev.cx = cx; wev.cy = cy;
+    ewebview_post_event(b->view, &wev);
+}
+
+static void inj_exec(browser_t* b, const inj_step_t* s) {
+    if(!b->view) return;
+    switch(s->kind) {
+    case INJ_CLICK:
+        inj_post_mouse(b, EWEB_MOUSE_DOWN, s->x, s->y);
+        inj_post_mouse(b, EWEB_MOUSE_UP, s->x, s->y);
+        inj_post_mouse(b, EWEB_MOUSE_CLICK, s->x, s->y);
+        break;
+    case INJ_DBLCLICK:
+        inj_post_mouse(b, EWEB_MOUSE_DOWN, s->x, s->y);
+        inj_post_mouse(b, EWEB_MOUSE_UP, s->x, s->y);
+        inj_post_mouse(b, EWEB_MOUSE_CLICK, s->x, s->y);
+        inj_post_mouse(b, EWEB_MOUSE_DOWN, s->x, s->y);
+        inj_post_mouse(b, EWEB_MOUSE_UP, s->x, s->y);
+        inj_post_mouse(b, EWEB_MOUSE_DOUBLE_CLICK, s->x, s->y);
+        break;
+    case INJ_MOVE: inj_post_mouse(b, EWEB_MOUSE_MOVE, s->x, s->y); break;
+    case INJ_DOWN: inj_post_mouse(b, EWEB_MOUSE_DOWN, s->x, s->y); break;
+    case INJ_UP:   inj_post_mouse(b, EWEB_MOUSE_UP, s->x, s->y); break;
+    case INJ_TYPE: {
+        const char* p = s->text;
+        while(*p) {
+            int n = utf8_clen((unsigned char)*p);
+            char one[8]; int i;
+            for(i = 0; i < n && p[i]; i++) one[i] = p[i];
+            one[i] = 0;
+            inj_post_key(b, EWEB_KEYSTATE_DOWN, EWEB_KEY_CHAR, s->mods, one);
+            inj_post_key(b, EWEB_KEYSTATE_UP, EWEB_KEY_CHAR, s->mods, "");
+            p += n;
+        }
+        break;
+    }
+    case INJ_KEY:
+        if(s->key == EWEB_KEY_CHAR) {
+            inj_post_key(b, EWEB_KEYSTATE_DOWN, EWEB_KEY_CHAR, s->mods, s->text);
+            inj_post_key(b, EWEB_KEYSTATE_UP, EWEB_KEY_CHAR, s->mods, "");
+        } else {
+            inj_post_key(b, EWEB_KEYSTATE_DOWN, s->key, s->mods, "");
+            inj_post_key(b, EWEB_KEYSTATE_UP, s->key, s->mods, "");
+        }
+        break;
+    case INJ_WAIT: break;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Init / teardown                                                     */
 /* ------------------------------------------------------------------ */
 
 static bool browser_init(browser_t* b, int argc, char** argv) {
     memset(b, 0, sizeof(*b));
     b->running = true;
+    /* The page owns the keyboard until the user focuses the address bar. */
+    b->content_focus = true;
 
     if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) < 0) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
@@ -1189,6 +1517,7 @@ static bool browser_init(browser_t* b, int argc, char** argv) {
     for(int i = 1; i < argc; i++) {
         if(strcmp(argv[i], "--shot") == 0) { i++; continue; }
         if(strcmp(argv[i], "--scroll") == 0) { i++; continue; }
+        if(strcmp(argv[i], "--inject") == 0) { i++; continue; }
         url = argv[i];
         break;
     }
@@ -1215,6 +1544,20 @@ static bool browser_init(browser_t* b, int argc, char** argv) {
     b->shot_scrolled = false;
     for(int i = 1; i < argc; i++) {
         if(strcmp(argv[i], "--scroll") == 0 && i + 1 < argc) { b->shot_scroll_y = atoi(argv[i + 1]); break; }
+    }
+
+    /* --inject "<spec>": a scripted input run executed after the page settles
+     * and before the --shot frame is captured (test / regression harness). */
+    b->inject_count = 0;
+    b->inject_idx = 0;
+    b->inject_active = false;
+    b->inject_done = false;
+    b->inject_final_settle = 800;
+    for(int i = 1; i < argc; i++) {
+        if(strcmp(argv[i], "--inject") == 0 && i + 1 < argc) {
+            parse_inject(b, argv[i + 1]);
+            break;
+        }
     }
 
     /* nojs flag */
@@ -1279,18 +1622,43 @@ int main(int argc, char** argv) {
         browser_render(b);
 
         /* headless screenshot: once the page has settled, save one frame and exit */
-        if(b->shot_path && (SDL_GetTicks() - b->shot_start_ms) >= b->shot_settle_ms) {
-            if(b->shot_scroll_y >= 0 && !b->shot_scrolled) {
-                ewebview_scroll(b->view, 0, b->shot_scroll_y);
-                b->shot_scrolled = true;
-                b->shot_start_ms = SDL_GetTicks();
-                b->shot_settle_ms = 1000;   /* let the new offset render a frame */
-            } else {
-                SDL_Surface* surf = NULL;
-                if(b->frame && b->port.gfx.surface_native)
-                    surf = (SDL_Surface*)b->port.gfx.surface_native(b->port.gfx.ud, b->frame);
-                if(surf) SDL_SaveBMP(surf, b->shot_path);
-                b->running = false;
+        if(b->shot_path) {
+            uint32_t now = SDL_GetTicks();
+            /* Begin the injected input script once the page has settled. */
+            if(!b->inject_active && !b->inject_done && b->inject_count > 0 &&
+               (now - b->shot_start_ms) >= b->shot_settle_ms) {
+                b->inject_active = true;
+                b->inject_idx = 0;
+                b->inject_next_ms = now;
+            }
+            if(b->inject_active) {
+                if(b->inject_idx < b->inject_count) {
+                    if((int32_t)(now - b->inject_next_ms) >= 0) {
+                        inj_step_t* s = &b->inject[b->inject_idx++];
+                        inj_exec(b, s);
+                        b->inject_next_ms = SDL_GetTicks() + s->delay;
+                    }
+                } else {
+                    /* Script finished: settle once more so the effects render,
+                     * then fall through to the capture on the next pass. */
+                    b->inject_active = false;
+                    b->inject_done = true;
+                    b->shot_start_ms = SDL_GetTicks();
+                    b->shot_settle_ms = b->inject_final_settle;
+                }
+            } else if((now - b->shot_start_ms) >= b->shot_settle_ms) {
+                if(b->shot_scroll_y >= 0 && !b->shot_scrolled) {
+                    ewebview_scroll(b->view, 0, b->shot_scroll_y);
+                    b->shot_scrolled = true;
+                    b->shot_start_ms = SDL_GetTicks();
+                    b->shot_settle_ms = 1000;   /* let the new offset render a frame */
+                } else {
+                    SDL_Surface* surf = NULL;
+                    if(b->frame && b->port.gfx.surface_native)
+                        surf = (SDL_Surface*)b->port.gfx.surface_native(b->port.gfx.ud, b->frame);
+                    if(surf) SDL_SaveBMP(surf, b->shot_path);
+                    b->running = false;
+                }
             }
         }
 

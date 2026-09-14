@@ -8,8 +8,8 @@
  *
  * Layout note: a browser's `window` IS the global object, so everything this
  * bridge installs has to be reachable both as `window.foo` and as a bare
- * `foo`. mario keeps the two apart - `window` is an ordinary member of
- * vm->root - so singletons are created once and then linked from both, and
+ * `foo`. js_dom aliases `window` onto vm->root itself, so the two names are
+ * one object; singletons are created once and then linked from both, and
  * the value accessors are registered on both targets from one table.
  */
 
@@ -1656,13 +1656,15 @@ static var_t* native_doc_hasFocus(vm_t* vm, var_t* env, void* data) {
 
 static var_t* native_doc_get_activeElement(vm_t* vm, var_t* env, void* data) {
     (void)env; (void)data;
-    /* No focus tracking in the bridge, so <body> is reported - which is what
-     * a browser returns when nothing else has focus. */
+    /* The engine tracks focus, so ask the DOM bridge for the focused element
+     * first. Fall back to <body> - what a browser reports when nothing else
+     * has focus - then the document root. */
     const js_dom_callbacks_t* dom = js_dom_callbacks(vm);
     void* ctx = web_ctx(vm);
     js_element_t el = NULL;
     if(dom != NULL) {
-        if(dom->get_body != NULL) el = dom->get_body(ctx);
+        if(dom->get_active_element != NULL) el = dom->get_active_element(ctx);
+        if(el == NULL && dom->get_body != NULL) el = dom->get_body(ctx);
         if(el == NULL && dom->get_element_by_id != NULL) el = dom->get_element_by_id(ctx, "body");
         if(el == NULL && dom->get_root != NULL) el = dom->get_root(ctx);
     }

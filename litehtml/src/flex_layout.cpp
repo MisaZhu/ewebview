@@ -1046,6 +1046,158 @@ static void grid_parse_tracks(const tchar_t* spec, int avail, int font_size, doc
 	}
 }
 
+/* grid-column / grid-row explicit placement -------------------------------
+ * Google's Grid_column places items with grid-column-start:<line> and
+ * grid-column-end:span calc(<end> - <start> + 1); litehtml previously flowed
+ * every item into a single 1fr track, collapsing multi-column text to one
+ * word per line. These helpers recover (column, span, row) from the cascade. */
+static bool grid_place_int(const tstring& in, int& out)
+{
+	tstring s = in;
+	trim(s);
+	if(s.empty())
+	{
+		return false;
+	}
+	size_t i = 0;
+	bool neg = false;
+	if(s[0] == _t('-')) { neg = true; i = 1; }
+	else if(s[0] == _t('+')) { i = 1; }
+	int v = 0;
+	bool any = false;
+	for(; i < s.length(); i++)
+	{
+		if(s[i] < _t('0') || s[i] > _t('9'))
+		{
+			return false;
+		}
+		v = v * 10 + (s[i] - _t('0'));
+		any = true;
+	}
+	if(!any)
+	{
+		return false;
+	}
+	out = neg ? -v : v;
+	return true;
+}
+
+/* Additive integer expression, optionally wrapped in calc(): "calc(6 - 2 + 1)". */
+static bool grid_place_calc(const tstring& in, int& out)
+{
+	tstring s = in;
+	trim(s);
+	if(s.find(_t("calc(")) == 0)
+	{
+		s = s.substr(5);
+		if(!s.empty() && s[s.length() - 1] == _t(')'))
+		{
+			s = s.substr(0, s.length() - 1);
+		}
+	}
+	int total = 0, sign = 1;
+	tstring term;
+	bool any = false;
+	for(size_t i = 0; i <= s.length(); i++)
+	{
+		if(i == s.length() || s[i] == _t('+') || s[i] == _t('-'))
+		{
+			if(!term.empty())
+			{
+				int v;
+				if(!grid_place_int(term, v)) return false;
+				total += sign * v;
+				any = true;
+				term.clear();
+			}
+			if(i < s.length())
+			{
+				sign = (s[i] == _t('+')) ? 1 : -1;
+			}
+		}
+		else if(s[i] != _t(' '))
+		{
+			term += s[i];
+		}
+	}
+	if(!any)
+	{
+		return false;
+	}
+	out = total;
+	return true;
+}
+
+static void grid_item_placement(html_tag* el, int n, int& col, int& span, int& row)
+{
+	col = -1; span = 1; row = -1;
+	if(!el)
+	{
+		return;
+	}
+	tstring start_s, end_s;
+	const tchar_t* gc = el->get_style_property(_t("grid-column"), false, 0);
+	if(gc)
+	{
+		tstring g = gc;
+		size_t slash = g.find(_t('/'));
+		if(slash == tstring::npos)
+		{
+			start_s = g;
+		}
+		else
+		{
+			start_s = g.substr(0, slash);
+			end_s = g.substr(slash + 1);
+		}
+	}
+	if(const tchar_t* v = el->get_style_property(_t("grid-column-start"), false, 0)) start_s = v;
+	if(const tchar_t* v = el->get_style_property(_t("grid-column-end"), false, 0)) end_s = v;
+
+	int sl = 0, eln = 0;
+	bool has_start = false, end_is_span = false, has_end_line = false;
+	tstring st = start_s; trim(st);
+	tstring en = end_s; trim(en);
+	if(st.find(_t("span")) == 0)
+	{
+		int v; if(grid_place_calc(st.substr(4), v) && v > 0) { span = v; }
+	}
+	else if(grid_place_calc(st, sl))
+	{
+		if(sl >= 1) { col = sl - 1; has_start = true; }
+	}
+	if(en.find(_t("span")) == 0)
+	{
+		int v; if(grid_place_calc(en.substr(4), v) && v > 0) { span = v; end_is_span = true; }
+	}
+	else if(!en.empty() && grid_place_calc(en, eln))
+	{
+		has_end_line = true;
+	}
+	if(has_start)
+	{
+		if(!end_is_span && has_end_line)
+		{
+			span = (eln == -1) ? (n - col) : (eln - sl);
+		}
+		if(span < 1) span = 1;
+		if(col + span > n) span = n - col;
+	}
+	else
+	{
+		if(span > n) span = n;
+	}
+	if(const tchar_t* v = el->get_style_property(_t("grid-row-start"), false, 0))
+	{
+		tstring rs = v; trim(rs);
+		int rv;
+		if(rs.find(_t("span")) != 0 && grid_place_calc(rs, rv) && rv >= 1)
+		{
+			row = rv - 1;
+		}
+	}
+}
+
 int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pass /*= false*/ )
 {
 	int parent_width = max_width;
@@ -1154,28 +1306,100 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 		}
 	}
 
-	size_t i = 0;
-	while(i < items.size())
+	/* Explicit placement: honour grid-column-start/end + span. Google's
+	 * Grid_column puts every block on a specific track range; packing items
+	 * sequentially into one 1fr track collapsed multi-column text to a word
+	 * per line. Items with no explicit column auto-flow into the next free
+	 * cell. An occupancy map tracks filled cells so each row can be sized by
+	 * its tallest occupant. */
+	struct grid_cell { int row; int col; int span; };
+	std::vector<grid_cell> place(items.size());
+	std::vector<std::vector<char>> occ;	/* occ[row][col] */
+
+	auto fits = [&](int r, int c, int sp) -> bool {
+		if(c < 0 || c + sp > n) return false;
+		if(r >= (int)occ.size()) return true;
+		for(int cc = c; cc < c + sp; cc++)
+			if(occ[r][cc]) return false;
+		return true;
+	};
+	auto mark = [&](int r, int c, int sp) {
+		while((int)occ.size() <= r) occ.push_back(std::vector<char>(n, 0));
+		for(int cc = c; cc < c + sp; cc++) occ[r][cc] = 1;
+	};
+
+	int row_count = 0;
+	int cursor_r = 0, cursor_c = 0;
+	for(size_t k = 0; k < items.size(); k++)
 	{
-		size_t row_end = i + (size_t)n;
-		if(row_end > items.size()) row_end = items.size();
+		int col = -1, span = 1, row = -1;
+		if(items[k]->get_display() != display_inline_text)
+			grid_item_placement(static_cast<html_tag*>(items[k]), n, col, span, row);
+		if(span < 1) span = 1;
+		if(span > n) span = n;
 
-		int cur_row_h = 0;
-		for(size_t k = i; k < row_end; k++)
+		int r;
+		if(col >= 0)
 		{
-			int col = (int)(k % (size_t)n);
+			r = (row >= 0) ? row : 0;
+			while(!fits(r, col, span)) r++;
+			cursor_r = r;
+			cursor_c = col + span;
+			if(cursor_c >= n) cursor_c = 0;
+		}
+		else
+		{
+			r = cursor_r;
+			int c = cursor_c;
+			while(true)
+			{
+				if(c + span > n) { r++; c = 0; }
+				if(fits(r, c, span)) break;
+				c++;
+				if(c >= n) { r++; c = 0; }
+			}
+			col = c;
+			cursor_r = r;
+			cursor_c = c + span;
+			if(cursor_c >= n) cursor_c = 0;
+		}
+		mark(r, col, span);
+		if(r + 1 > row_count) row_count = r + 1;
+		place[k].row = r; place[k].col = col; place[k].span = span;
+	}
+	if(row_count == 0) row_count = 1;
 
-			int ix = 0;
-			for(int c = 0; c < col; c++)
-				ix += col_w[c] + col_gap;
+	auto col_x = [&](int col) -> int {
+		int ix = 0;
+		for(int c = 0; c < col; c++) ix += col_w[c] + col_gap;
+		return ix;
+	};
+	auto col_span_w = [&](int col, int span) -> int {
+		int w = 0;
+		for(int c = col; c < col + span && c < n; c++)
+		{
+			w += col_w[c];
+			if(c + 1 < col + span) w += col_gap;
+		}
+		return w;
+	};
 
-			element::ptr el = items[k];
-			int outer = col_w[col];
-			int cross = 0;
+	for(int r = 0; r < row_count; r++)
+	{
+		int cur_row_h = 0;
+		for(size_t k = 0; k < items.size(); k++)
+		{
+			if(place[k].row != r) continue;
+
 			/* Item coordinates are relative to this grid container's content-box
 			 * origin (m_pos already holds that origin). Seeding ix with m_pos.x and
 			 * y with m_pos.y double-counted the container offset during the draw
 			 * pass, shifting every tile of a non-left-aligned grid to the right. */
+			int ix = col_x(place[k].col);
+			int outer = col_span_w(place[k].col, place[k].span);
+
+			element::ptr el = items[k];
+			int cross = 0;
 			if(el->get_display() == display_inline_text)
 			{
 				litehtml::size sz;
@@ -1197,24 +1421,22 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 
 		int row_h = cur_row_h > row_min ? cur_row_h : row_min;
 		/* stretch: the default align-self fills the row height */
-		for(size_t k = i; k < row_end; k++)
+		for(size_t k = 0; k < items.size(); k++)
 		{
+			if(place[k].row != r) continue;
 			element::ptr el = items[k];
 			if(el->get_display() == display_inline_text) continue;
 			if(crossv[k] >= row_h) continue;
-			int col = (int)(k % (size_t)n);
-			int ix = 0;
-			for(int c = 0; c < col; c++)
-				ix += col_w[c] + col_gap;
+			int ix = col_x(place[k].col);
+			int outer = col_span_w(place[k].col, place[k].span);
 			css_length h;
 			h = (float)(row_h - el->margin_top() - el->margin_bottom());
 			static_cast<html_tag*>(el)->m_css_height = h;
-			el->render(ix, bottom, col_w[col], second_pass);
+			el->render(ix, bottom, outer, second_pass);
 		}
 
 		bottom += row_h;
-		if(row_end < items.size()) bottom += row_gap;
-		i = row_end;
+		if(r + 1 < row_count) bottom += row_gap;
 	}
 
 	/* Drop the forced row heights again: m_pos already carries the stretched

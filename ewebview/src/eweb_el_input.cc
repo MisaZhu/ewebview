@@ -16,6 +16,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <cctype>
 
 eweb_el_input::eweb_el_input(
     litehtml::document* doc,
@@ -23,13 +25,503 @@ eweb_el_input::eweb_el_input(
     EWebInputType inputType) :
     litehtml::html_tag(doc),
     m_port(port),
-    m_inputType(inputType)
+    m_inputType(inputType),
+    m_focused(false),
+    m_hasEdit(false),
+    m_caret(0),
+    m_selAnchor(0),
+    m_selActive(false),
+    m_textScrollX(0),
+    m_textScrollY(0),
+    m_checked(false),
+    m_hasChecked(false),
+    m_dropdownOpen(false),
+    m_activeOption(-1)
 {
     m_display = litehtml::display_inline_block;
 }
 
 eweb_el_input::~eweb_el_input()
 {
+}
+
+bool eweb_el_input::isFocusable()
+{
+    if(m_inputType == EWEB_INPUT_HIDDEN) return false;
+    /* A disabled control takes no focus and fires no events. */
+    if(get_attr("disabled", nullptr) != nullptr) return false;
+    return true;
+}
+
+/* ==================================================================
+ * Live value / checked state and text editing.
+ *
+ * The edit buffer (m_editValue) is the single source of truth once the user
+ * or a script has typed; until then the value attribute (or <textarea> text)
+ * backs value(). Caret / selection are byte offsets into that text. Every
+ * mutation re-syncs the value attribute so getAttribute() and a no-JS form
+ * submit agree with what is on screen.
+ * ================================================================== */
+
+bool eweb_el_input::isTextEditing() const
+{
+    return m_inputType == EWEB_INPUT_TEXT || m_inputType == EWEB_INPUT_TEXTAREA;
+}
+
+bool eweb_el_input::isPassword() const
+{
+    if(m_inputType != EWEB_INPUT_TEXT) return false;
+    const litehtml::tchar_t* t = const_cast<eweb_el_input*>(this)->get_attr(_t("type"));
+    return t != nullptr && !t_strcasecmp(t, _t("password"));
+}
+
+std::string eweb_el_input::textValue() const
+{
+    if(m_hasEdit) return m_editValue;
+    const litehtml::tchar_t* v = const_cast<eweb_el_input*>(this)->get_attr(_t("value"));
+    if(v && v[0]) return std::string(v);
+    if(m_inputType == EWEB_INPUT_TEXTAREA) {
+        litehtml::tstring t;
+        const_cast<eweb_el_input*>(this)->get_text(t);
+        return std::string(t.c_str());
+    }
+    return std::string();
+}
+
+std::string eweb_el_input::displayText() const
+{
+    std::string t = textValue();
+    if(!isPassword()) return t;
+    /* One bullet per codepoint, not per byte. */
+    std::string m;
+    size_t i = 0;
+    while(i < t.size()) {
+        m += "\xE2\x80\xA2";   /* U+2022 */
+        i = (size_t)utf8Next((int)i);
+    }
+    return m;
+}
+
+int eweb_el_input::utf8Prev(int pos) const
+{
+    std::string t = textValue();
+    if(pos <= 0) return 0;
+    if(pos > (int)t.size()) pos = (int)t.size();
+    int p = pos - 1;
+    while(p > 0 && (((unsigned char)t[p]) & 0xC0) == 0x80) p--;
+    return p;
+}
+
+int eweb_el_input::utf8Next(int pos) const
+{
+    std::string t = textValue();
+    if(pos < 0) pos = 0;
+    if(pos >= (int)t.size()) return (int)t.size();
+    int n = pos + 1;
+    while(n < (int)t.size() && (((unsigned char)t[n]) & 0xC0) == 0x80) n++;
+    return n;
+}
+
+int eweb_el_input::textLen() const
+{
+    return (int)textValue().size();
+}
+
+int eweb_el_input::offsetToX(int off)
+{
+    std::string raw = textValue();
+    if(off < 0) off = 0;
+    if(off > (int)raw.size()) off = (int)raw.size();
+    /* Count codepoints in raw[0:off], then measure the masked prefix so a
+     * password caret lines up with the bullets actually drawn. */
+    int cps = 0;
+    size_t i = 0;
+    while(i < (size_t)off) { i = (size_t)utf8Next((int)i); cps++; }
+    std::string prefix;
+    if(isPassword()) {
+        for(int k = 0; k < cps; k++) prefix += "\xE2\x80\xA2";
+    } else {
+        prefix = raw.substr(0, off);
+    }
+    return label_width(prefix);
+}
+
+int eweb_el_input::xToOffset(int localX)
+{
+    std::string raw = textValue();
+    if(localX <= 0 || raw.empty()) return 0;
+    int acc = 0;
+    size_t i = 0;
+    while(i < raw.size()) {
+        size_t n = (size_t)utf8Next((int)i);
+        std::string cp = isPassword() ? std::string("\xE2\x80\xA2")
+                                      : raw.substr(i, n - i);
+        int w = label_width(cp);
+        if(acc + w / 2 > localX) break;   /* nearest boundary wins */
+        acc += w;
+        i = n;
+    }
+    return (int)i;
+}
+
+void eweb_el_input::ensureCaretVisible(int boxWidth)
+{
+    int cx = offsetToX(m_caret);
+    if(cx < m_textScrollX) m_textScrollX = cx;
+    if(boxWidth > 8 && cx > m_textScrollX + boxWidth - 8)
+        m_textScrollX = cx - boxWidth + 8;
+    if(m_textScrollX < 0) m_textScrollX = 0;
+}
+
+void eweb_el_input::syncValueAttr()
+{
+    if(!isTextEditing()) return;
+    set_attr(_t("value"), m_editValue.c_str());
+}
+
+std::string eweb_el_input::value()
+{
+    switch(m_inputType) {
+    case EWEB_INPUT_TEXT:
+    case EWEB_INPUT_TEXTAREA:
+        return textValue();
+    case EWEB_INPUT_CHECKBOX:
+    case EWEB_INPUT_RADIO: {
+        const litehtml::tchar_t* v = get_attr(_t("value"));
+        return (v && v[0]) ? std::string(v) : std::string("on");
+    }
+    case EWEB_INPUT_SELECT: {
+        int idx = selectedOptionIndex();
+        litehtml::element::ptr op = optionAt(idx);
+        if(!op) return std::string();
+        const litehtml::tchar_t* v = op->get_attr(_t("value"));
+        if(v && v[0]) return std::string(v);
+        litehtml::tstring t;
+        op->get_text(t);
+        return std::string(t.c_str());
+    }
+    case EWEB_INPUT_RANGE: {
+        const litehtml::tchar_t* v = get_attr(_t("value"));
+        return v ? std::string(v) : std::string("0");
+    }
+    default: {
+        const litehtml::tchar_t* v = get_attr(_t("value"));
+        if(v && v[0]) return std::string(v);
+        litehtml::tstring t;
+        get_text(t);
+        return std::string(t.c_str());
+    }
+    }
+}
+
+void eweb_el_input::setValue(const std::string& v)
+{
+    if(isTextEditing()) {
+        m_editValue = v;
+        m_hasEdit = true;
+        int len = (int)m_editValue.size();
+        if(m_caret > len) m_caret = len;
+        if(m_selAnchor > len) m_selAnchor = len;
+        m_selActive = (m_selAnchor != m_caret);
+        syncValueAttr();
+        return;
+    }
+    if(m_inputType == EWEB_INPUT_SELECT) {
+        /* Pick the option whose value (or text) matches. */
+        for(int i = 0; i < optionCount(); i++) {
+            litehtml::element::ptr op = optionAt(i);
+            if(!op) continue;
+            const litehtml::tchar_t* ov = op->get_attr(_t("value"));
+            std::string cand = (ov && ov[0]) ? std::string(ov) : std::string();
+            if(cand.empty()) {
+                litehtml::tstring t;
+                op->get_text(t);
+                cand = std::string(t.c_str());
+            }
+            if(cand == v) { selectOptionIndex(i); return; }
+        }
+        return;
+    }
+    set_attr(_t("value"), v.c_str());
+}
+
+bool eweb_el_input::isChecked()
+{
+    if(m_hasChecked) return m_checked;
+    return get_attr(_t("checked")) != nullptr;
+}
+
+void eweb_el_input::setChecked(bool c)
+{
+    m_checked = c;
+    m_hasChecked = true;
+    if(c) set_attr(_t("checked"), _t(""));
+    else  remove_attr(_t("checked"));
+}
+
+void eweb_el_input::insertText(const char* utf8)
+{
+    if(utf8 == nullptr || utf8[0] == 0) return;
+    deleteSelection();
+    std::string t = textValue();
+    if(m_caret < 0) m_caret = 0;
+    if(m_caret > (int)t.size()) m_caret = (int)t.size();
+    m_editValue = t.substr(0, m_caret) + utf8 + t.substr(m_caret);
+    m_hasEdit = true;
+    m_caret += (int)strlen(utf8);
+    m_selAnchor = m_caret;
+    m_selActive = false;
+    syncValueAttr();
+}
+
+void eweb_el_input::deleteSelection()
+{
+    if(!m_selActive) return;
+    int s = selStart(), e = selEnd();
+    std::string t = textValue();
+    m_editValue = t.substr(0, s) + t.substr(e);
+    m_hasEdit = true;
+    m_caret = s;
+    m_selAnchor = s;
+    m_selActive = false;
+    syncValueAttr();
+}
+
+void eweb_el_input::deleteBack()
+{
+    if(m_selActive) { deleteSelection(); return; }
+    std::string t = textValue();
+    if(m_caret <= 0) return;
+    int p = utf8Prev(m_caret);
+    m_editValue = t.substr(0, p) + t.substr(m_caret);
+    m_hasEdit = true;
+    m_caret = p;
+    m_selAnchor = p;
+    syncValueAttr();
+}
+
+void eweb_el_input::deleteForward()
+{
+    if(m_selActive) { deleteSelection(); return; }
+    std::string t = textValue();
+    if(m_caret >= (int)t.size()) return;
+    int n = utf8Next(m_caret);
+    m_editValue = t.substr(0, m_caret) + t.substr(n);
+    m_hasEdit = true;
+    syncValueAttr();
+}
+
+void eweb_el_input::moveCaret(int dir, bool extend)
+{
+    int len = textLen();
+    int nc = m_caret;
+    if(dir == -1)      nc = utf8Prev(m_caret);
+    else if(dir == 1)  nc = utf8Next(m_caret);
+    else if(dir == -2) nc = 0;
+    else if(dir == 2)  nc = len;
+    if(nc < 0) nc = 0;
+    if(nc > len) nc = len;
+    if(!extend) m_selAnchor = nc;
+    m_caret = nc;
+    m_selActive = (m_selAnchor != m_caret);
+}
+
+void eweb_el_input::selectAll()
+{
+    int len = textLen();
+    m_selAnchor = 0;
+    m_caret = len;
+    m_selActive = (len != 0);
+}
+
+void eweb_el_input::setSelectionRange(int s, int e)
+{
+    int len = textLen();
+    if(s < 0) s = 0;
+    if(e < 0) e = 0;
+    if(s > len) s = len;
+    if(e > len) e = len;
+    m_selAnchor = s;
+    m_caret = e;
+    m_selActive = (s != e);
+}
+
+int eweb_el_input::selStart() const
+{
+    return m_selAnchor < m_caret ? m_selAnchor : m_caret;
+}
+
+int eweb_el_input::selEnd() const
+{
+    return m_selAnchor > m_caret ? m_selAnchor : m_caret;
+}
+
+std::string eweb_el_input::selectedText() const
+{
+    return textValue().substr(selStart(), selEnd() - selStart());
+}
+
+static bool eweb_word_char(char c)
+{
+    unsigned char u = (unsigned char)c;
+    return u >= 0x80 || isalnum(u) || c == '_';
+}
+
+void eweb_el_input::selectWordAt(int localX)
+{
+    int off = xToOffset(localX);
+    std::string t = textValue();
+    int s = off, e = off;
+    while(s > 0 && eweb_word_char(t[s - 1])) s--;
+    while(e < (int)t.size() && eweb_word_char(t[e])) e++;
+    m_selAnchor = s;
+    m_caret = e;
+    m_selActive = (s != e);
+}
+
+void eweb_el_input::setCaretFromPoint(int localX, int localY)
+{
+    (void)localY;
+    int off = xToOffset(localX);
+    m_caret = off;
+    m_selAnchor = off;
+    m_selActive = false;
+}
+
+/* ---- <select> option helpers ---- */
+
+int eweb_el_input::optionCount()
+{
+    int n = 0;
+    for(int i = 0; i < get_children_count(); i++) {
+        litehtml::element::ptr ch = get_child(i);
+        if(ch && ch->get_tagName() && !t_strcasecmp(ch->get_tagName(), _t("option"))) n++;
+    }
+    return n;
+}
+
+litehtml::element::ptr eweb_el_input::optionAt(int i)
+{
+    int n = 0;
+    for(int k = 0; k < get_children_count(); k++) {
+        litehtml::element::ptr ch = get_child(k);
+        if(ch && ch->get_tagName() && !t_strcasecmp(ch->get_tagName(), _t("option"))) {
+            if(n == i) return ch;
+            n++;
+        }
+    }
+    return nullptr;
+}
+
+int eweb_el_input::selectedOptionIndex()
+{
+    int n = 0;
+    for(int i = 0; i < get_children_count(); i++) {
+        litehtml::element::ptr ch = get_child(i);
+        if(!ch || !ch->get_tagName() || t_strcasecmp(ch->get_tagName(), _t("option"))) continue;
+        if(ch->get_attr(_t("selected"))) return n;
+        n++;
+    }
+    return 0;   /* no explicit selection: the first option */
+}
+
+void eweb_el_input::selectOptionIndex(int i)
+{
+    int n = 0;
+    for(int k = 0; k < get_children_count(); k++) {
+        litehtml::element::ptr ch = get_child(k);
+        if(!ch || !ch->get_tagName() || t_strcasecmp(ch->get_tagName(), _t("option"))) continue;
+        if(n == i) ch->set_attr(_t("selected"), _t(""));
+        else       ch->remove_attr(_t("selected"));
+        n++;
+    }
+    m_activeOption = i;
+}
+
+/* ---- activation (engine-driven) ---- */
+
+void eweb_el_input::toggleDropdown()
+{
+    if(m_inputType != EWEB_INPUT_SELECT) return;
+    m_dropdownOpen = !m_dropdownOpen;
+    if(m_dropdownOpen) m_activeOption = selectedOptionIndex();
+    else m_activeOption = -1;
+}
+
+void eweb_el_input::moveOption(int dir)
+{
+    int n = optionCount();
+    if(n <= 0) return;
+    int cur = m_activeOption < 0 ? selectedOptionIndex() : m_activeOption;
+    cur += dir;
+    if(cur < 0) cur = 0;
+    if(cur >= n) cur = n - 1;
+    m_activeOption = cur;
+}
+
+void eweb_el_input::chooseActiveOption()
+{
+    if(m_activeOption < 0) m_activeOption = selectedOptionIndex();
+    selectOptionIndex(m_activeOption);
+    m_dropdownOpen = false;
+    m_activeOption = -1;
+}
+
+void eweb_el_input::setRangeFromX(int localX)
+{
+    if(m_inputType != EWEB_INPUT_RANGE) return;
+    int w = m_pos.width;
+    if(w <= 0) return;
+    double f = (double)localX / (double)w;
+    if(f < 0.0) f = 0.0;
+    if(f > 1.0) f = 1.0;
+    const litehtml::tchar_t* mn = get_attr(_t("min"));
+    const litehtml::tchar_t* mx = get_attr(_t("max"));
+    double dmin = mn ? atof(mn) : 0.0;
+    double dmax = mx ? atof(mx) : 100.0;
+    if(dmax <= dmin) dmax = dmin + 1.0;
+    double v = dmin + f * (dmax - dmin);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%g", v);
+    set_attr(_t("value"), buf);
+}
+
+void eweb_el_input::activate(int localX, int localY)
+{
+    (void)localY;
+    switch(m_inputType) {
+    case EWEB_INPUT_CHECKBOX:
+        setChecked(!isChecked());
+        break;
+    case EWEB_INPUT_RADIO:
+        setChecked(true);   /* engine clears same-name siblings */
+        break;
+    case EWEB_INPUT_SELECT:
+        toggleDropdown();
+        break;
+    case EWEB_INPUT_RANGE:
+        setRangeFromX(localX);
+        break;
+    default:
+        break;   /* button/submit/text: engine dispatches click / focus */
+    }
+}
+
+void eweb_el_input::keyActivate()
+{
+    switch(m_inputType) {
+    case EWEB_INPUT_CHECKBOX:
+        setChecked(!isChecked());
+        break;
+    case EWEB_INPUT_RADIO:
+        setChecked(true);
+        break;
+    case EWEB_INPUT_SELECT:
+        toggleDropdown();
+        break;
+    default:
+        break;   /* button/submit: engine triggers click */
+    }
 }
 
 uint32_t eweb_el_input::make_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
@@ -140,6 +632,50 @@ void eweb_el_input::draw_text_box(eweb_surface_t* s, const litehtml::position& b
         y = box.y;
     }
 
+    const eweb_gfx_t* gfx = &m_port->gfx;
+    bool clipped = false;
+    if (gfx->surface_set_clip) {
+        gfx->surface_set_clip(gfx->ud, s, box.x, box.y, box.width, box.height);
+        clipped = true;
+    }
+    litehtml::web_color wc((litehtml::byte)((color >> 16) & 0xFF),
+                           (litehtml::byte)((color >> 8) & 0xFF),
+                           (litehtml::byte)(color & 0xFF),
+                           (litehtml::byte)((color >> 24) & 0xFF));
+    litehtml::position tp;
+    tp.x = x;
+    tp.y = y;
+    tp.width = tw;
+    tp.height = fm.height;
+    doc->container()->draw_text((litehtml::uint_ptr)s, text.c_str(), f, wc, tp);
+    if (clipped && gfx->surface_unset_clip) {
+        gfx->surface_unset_clip(gfx->ud, s);
+    }
+}
+
+void eweb_el_input::draw_scrolled_text(eweb_surface_t* s, const litehtml::position& box,
+                                       const std::string& text, uint32_t color, int scrollX)
+{
+    if (text.empty() || !s || !m_port) {
+        return;
+    }
+    litehtml::document* doc = get_document();
+    if (!doc || !doc->container()) {
+        return;
+    }
+    litehtml::font_metrics fm;
+    litehtml::uint_ptr f = get_font(&fm);
+    if (!f) {
+        return;
+    }
+    int tw = doc->container()->text_width(text.c_str(), f);
+    /* Unlike draw_text_box this may start left of the box (panned); the clip
+     * keeps the overflow from painting outside the field. */
+    int x = box.x + 4 - scrollX;
+    int y = box.y + (box.height - fm.height) / 2;
+    if (y < box.y) {
+        y = box.y;
+    }
     const eweb_gfx_t* gfx = &m_port->gfx;
     bool clipped = false;
     if (gfx->surface_set_clip) {
@@ -472,7 +1008,20 @@ void eweb_el_input::draw(litehtml::uint_ptr hdc, int x, int y, const litehtml::p
         if (tb.width < 0) tb.width = 0;
         if (tb.height < 0) tb.height = 0;
         bool placeholder = false;
-        std::string t = label(&placeholder);
+        std::string t;
+        if (isTextEditing()) {
+            /* The live edit buffer (mask-aware) is the text source once the
+             * user or a script has typed; fall back to the placeholder. */
+            t = displayText();
+            placeholder = t.empty();
+            if (placeholder) {
+                const litehtml::tchar_t* p = get_attr(_t("placeholder"));
+                if (p && p[0]) t = std::string(p);
+            }
+            ensureCaretVisible(tb.width);
+        } else {
+            t = label(&placeholder);
+        }
         uint32_t fg = widget_fg_argb(this);
         uint32_t tcol = fg;
         if (placeholder) {
@@ -490,7 +1039,25 @@ void eweb_el_input::draw(litehtml::uint_ptr hdc, int x, int y, const litehtml::p
                 tb.width -= aw;
             }
         }
-        draw_text_box(s, tb, t, tcol, false);
+        if (isTextEditing()) {
+            /* Selection highlight sits under the (panned) text. */
+            if (m_selActive && gfx->fill_rect) {
+                int base = tb.x + 4 - m_textScrollX;
+                int sx = base + offsetToX(selStart());
+                int ex = base + offsetToX(selEnd());
+                if (ex > sx) {
+                    gfx->fill_rect(gfx->ud, s, sx, tb.y, ex - sx, tb.height, 0x663390FF);
+                }
+            }
+            draw_scrolled_text(s, tb, t, tcol, m_textScrollX);
+            /* Caret: a 1px vertical bar at the caret offset while focused. */
+            if (m_focused && gfx->fill_rect) {
+                int cx = tb.x + 4 - m_textScrollX + offsetToX(m_caret);
+                gfx->fill_rect(gfx->ud, s, cx, tb.y + 2, 1, tb.height - 4, 0xFF000000);
+            }
+        } else {
+            draw_text_box(s, tb, t, tcol, false);
+        }
         if (is_number && gfx->fill_rect) {
             /* UA spinner: two small stacked triangles at the right edge */
             int sx = pos.x + pos.width - ir - 9;

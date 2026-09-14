@@ -28,6 +28,7 @@
 #include "EWebInternal.h"
 #include "EWebLog.h"
 #include "EWebCookies.h"
+#include "eweb_el_input.h"
 
 #include <mario/mario.h>
 #include <mario/js_dom.h>
@@ -41,6 +42,7 @@
 #include <string>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <ctype.h>
 #include <new>
 
@@ -275,6 +277,8 @@ void EWebEngine::initJsVm()
     cb.el_get_rect       = jsElGetRect;
     cb.el_get_style      = jsElGetStyle;
     cb.el_focus          = jsElFocus;
+    cb.el_blur           = jsElBlur;
+    cb.get_active_element = jsGetActiveElement;
     cb.el_scroll_into_view = jsElScrollIntoView;
     if(!js_register_dom_natives(m_jsVm, this, &cb)) {
         EWEB_LOG("[ewebview] js: DOM native registration failed\n");
@@ -297,7 +301,7 @@ void EWebEngine::resetJsVm()
     m_jsVm = nullptr;
 }
 
-void EWebEngine::runPageScripts()
+bool EWebEngine::runPageScripts()
 {
     /* A page whose only JavaScript lives in inline on* attributes (onload,
      * onclick, ...) still needs a VM: those handlers are compiled on demand by
@@ -305,12 +309,28 @@ void EWebEngine::runPageScripts()
      * out on an empty script list would leave them uncallable. A page with
      * neither is skipped outright - vm_init plus four bridge registrations is
      * too much memory to spend on plain markup. */
-    if(!m_jsEnabled || m_jsPageDisabled || m_buildDoc == nullptr) return;
-    if(m_jsVm == nullptr && m_jsScripts.empty() && !m_jsHasInlineHandlers) return;
+    if(!m_jsEnabled || m_jsPageDisabled || m_buildDoc == nullptr) return true;
+    if(m_jsVm == nullptr && m_jsScripts.empty() && !m_jsHasInlineHandlers) return true;
     initJsVm();
-    if(m_jsVm == nullptr) return;
+    if(m_jsVm == nullptr) return true;
 
-    for(size_t i = 0; i < m_jsScripts.size(); ++i) {
+    while(m_jsNextScript < m_jsScripts.size()) {
+        size_t i = m_jsNextScript;
+        /* Document order: an inline block after an external <script src> must
+         * see the globals that script defines (w3.org's bootstrap news
+         * FontFaceObserver from the library script ahead of it), so park the
+         * run on a still-pending slot instead of skipping it. processResults
+         * fills the slot and re-arms this phase via m_deferBuildStep; a fetch
+         * that never resolves is skipped past the deadline exactly like a
+         * 404, so the build cannot wedge. */
+        if(i < m_jsScriptDone.size() && !m_jsScriptDone[i]) {
+            if(m_jsScriptWaitSince == 0) m_jsScriptWaitSince = ticMs();
+            if(ticMs() - m_jsScriptWaitSince < 10000) return false;
+            m_jsScriptDone[i] = 1;
+            if(i < m_jsScripts.size()) m_jsScripts[i].clear();
+        }
+        m_jsScriptWaitSince = 0;
+        m_jsNextScript++;
         /* Copy by value: a script that injects another (appendChild of a
          * <script>) push_backs to m_jsScripts, which can realloc and dangle a
          * reference held across vm_load_run below. */
@@ -329,6 +349,7 @@ void EWebEngine::runPageScripts()
         jsVmExit();
     }
     EWEB_LOG("[ewebview] js: ran %d script(s)\n", (int)m_jsScripts.size());
+    return true;
 }
 
 bool EWebEngine::runNextPageScript()
@@ -1158,12 +1179,49 @@ char* EWebEngine::jsElGetStyle(void* ctx, void* el, const char* prop)
 
 void EWebEngine::jsElFocus(void* ctx, void* el)
 {
-    (void)ctx; (void)el;
-    /* litehtml has no focus model wired into this engine - el_input only draws
-     * the field (get_content_size / render / draw; it keeps no text state), so
-     * there is no caret to move - and keyboard focus belongs to the embedder's
-     * window, not to an element. Accept the call and do nothing: pages call
-     * focus() defensively and must not throw. */
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(self == nullptr || el == nullptr) return;
+    litehtml::element* e = (litehtml::element*)el;
+    /* Only focusable elements take focus: form widgets, <a href>, or anything
+     * carrying a tabindex. focus() on anything else is a no-op, exactly as in
+     * a browser (a bare <div> is not focusable). */
+    bool focusable = false;
+    void* w = e->eweb_form_widget();
+    if(w != nullptr) {
+        focusable = ((eweb_el_input*)w)->isFocusable();
+    } else {
+        const litehtml::tchar_t* tag = e->get_tagName();
+        const litehtml::tchar_t* href = e->get_attr("href", nullptr);
+        if(tag != nullptr && tag[0] == 'a' && tag[1] == 0 &&
+                href != nullptr && href[0] != 0)
+            focusable = true;
+        else if(e->get_attr("tabindex", nullptr) != nullptr)
+            focusable = true;
+    }
+    if(focusable) self->setFocus(e);
+}
+
+void EWebEngine::jsElBlur(void* ctx, void* el)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(self == nullptr || el == nullptr) return;
+    /* blur() only affects the element that currently holds focus. */
+    if((litehtml::element*)el == (litehtml::element*)self->m_focusElement)
+        self->clearFocus();
+}
+
+void* EWebEngine::jsGetActiveElement(void* ctx)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(self == nullptr) return nullptr;
+    if(self->m_focusElement != nullptr) return self->m_focusElement;
+    /* Nothing focused: activeElement is <body> (falling back to the root). */
+    litehtml::document* doc = self->jsActiveDoc();
+    if(doc == nullptr) return nullptr;
+    litehtml::element::ptr root = doc->root();
+    if(root == nullptr) return nullptr;
+    litehtml::element::ptr body = root->select_one("body");
+    return (body != nullptr) ? (void*)body : (void*)root;
 }
 
 void EWebEngine::jsElScrollIntoView(void* ctx, void* el)
@@ -1580,6 +1638,140 @@ bool EWebEngine::jsDispatchMouseEvent(int mouseState, int button, int cx, int cy
      * false when a handler called preventDefault(); the caller (ECMD_INPUT)
      * uses it to skip the default action (anchor following). */
     return allowed;
+}
+
+void EWebEngine::jsDispatchSimpleEvent(litehtml::element* el, const char* type, bool bubbles)
+{
+    if(m_jsVm == nullptr || !m_jsEnabled || m_jsPageDisabled || m_jsInScript) return;
+    if(el == nullptr || type == nullptr) return;
+    jsVmEnter();
+    js_event_dispatch_simple(m_jsVm, (void*)el, type, bubbles);
+    jsVmExit();
+}
+
+/* ==================================================================
+ * Keyboard input -> DOM key events
+ * ================================================================== */
+
+/* Map an EWEB_KEY_* code (plus the CHAR payload) onto the DOM KeyboardEvent
+ * `key` string and the legacy `keyCode`. Letters and digits reach the engine
+ * as EWEB_KEY_CHAR with their UTF-8 bytes in `text`, which is what DOM reports
+ * for a printable key; the non-printable codes get their standard names. */
+static void ewebKeyToDom(int key, const char* text,
+                         char* out, size_t outsz, int* outCode)
+{
+    out[0] = 0;
+    *outCode = 0;
+    switch(key) {
+    case EWEB_KEY_CHAR:
+        if(text != nullptr && text[0] != 0) snprintf(out, outsz, "%s", text);
+        /* Legacy keyCode for a printable char is the upper-case ASCII code
+         * point when it is a single ASCII byte; multi-byte UTF-8 leaves 0. */
+        if(text != nullptr && text[0] != 0 && text[1] == 0 &&
+                (unsigned char)text[0] < 0x80) {
+            char c = text[0];
+            *outCode = (c >= 'a' && c <= 'z') ? (int)(c - 'a' + 'A') : (int)(unsigned char)c;
+        }
+        return;
+    case EWEB_KEY_BACKSPACE: snprintf(out, outsz, "Backspace");  *outCode = 8;  return;
+    case EWEB_KEY_TAB:       snprintf(out, outsz, "Tab");        *outCode = 9;  return;
+    case EWEB_KEY_ENTER:     snprintf(out, outsz, "Enter");      *outCode = 13; return;
+    case EWEB_KEY_ESCAPE:    snprintf(out, outsz, "Escape");     *outCode = 27; return;
+    case EWEB_KEY_SPACE:     snprintf(out, outsz, " ");          *outCode = 32; return;
+    case EWEB_KEY_DELETE:    snprintf(out, outsz, "Delete");     *outCode = 46; return;
+    case EWEB_KEY_LEFT:      snprintf(out, outsz, "ArrowLeft");  *outCode = 37; return;
+    case EWEB_KEY_UP:        snprintf(out, outsz, "ArrowUp");    *outCode = 38; return;
+    case EWEB_KEY_RIGHT:     snprintf(out, outsz, "ArrowRight"); *outCode = 39; return;
+    case EWEB_KEY_DOWN:      snprintf(out, outsz, "ArrowDown");  *outCode = 40; return;
+    case EWEB_KEY_HOME:      snprintf(out, outsz, "Home");       *outCode = 36; return;
+    case EWEB_KEY_END:       snprintf(out, outsz, "End");        *outCode = 35; return;
+    case EWEB_KEY_PAGEUP:    snprintf(out, outsz, "PageUp");     *outCode = 33; return;
+    case EWEB_KEY_PAGEDOWN:  snprintf(out, outsz, "PageDown");   *outCode = 34; return;
+    case EWEB_KEY_INSERT:    snprintf(out, outsz, "Insert");     *outCode = 45; return;
+    default: break;
+    }
+    /* F1..F12 are contiguous from EWEB_KEY_F1. */
+    if(key >= EWEB_KEY_F1 && key <= EWEB_KEY_F12) {
+        snprintf(out, outsz, "F%d", key - EWEB_KEY_F1 + 1);
+        *outCode = 112 + (key - EWEB_KEY_F1);
+        return;
+    }
+    /* A bare letter/digit code (ASCII) forwarded without a CHAR payload: DOM
+     * `key` is the character itself, upper-cased when Shift is not modelled
+     * here (the embedder already folded shift into the CHAR text). */
+    if(key > 0 && key < 0x1000) {
+        out[0] = (char)key;
+        out[1] = 0;
+        *outCode = (key >= 'a' && key <= 'z') ? (int)(key - 'a' + 'A') : (int)key;
+    }
+}
+
+/* Translate the EWEB_MOD_* bitmask into the JS_EVENT_MOD_* one the event
+ * bridge reads for KeyboardEvent.altKey/ctrlKey/shiftKey/metaKey. */
+static unsigned ewebModsToDom(int mods)
+{
+    unsigned m = 0;
+    if(mods & EWEB_MOD_SHIFT) m |= JS_EVENT_MOD_SHIFT;
+    if(mods & EWEB_MOD_CTRL)  m |= JS_EVENT_MOD_CTRL;
+    if(mods & EWEB_MOD_ALT)   m |= JS_EVENT_MOD_ALT;
+    if(mods & EWEB_MOD_META)  m |= JS_EVENT_MOD_META;
+    return m;
+}
+
+void EWebEngine::handleKeyEvent(const eweb_key_event_t& kev)
+{
+    /* ENGINE-THREAD ONLY (ECMD_KEY handler). Dispatch the DOM key events to
+     * the focused element (or the document when nothing is focused) and then
+     * run the engine's default action unless a handler called preventDefault().
+     *
+     * The VM is optional: with no VM (or JS disabled) the events simply do not
+     * fire, but the default action (editing / activation / focus traversal,
+     * wired up in the later stages) still runs so a JS-free page is fully
+     * usable. A CHAR keydown also carries a keypress, matching the DOM order
+     * keydown -> keypress -> (text inserted) -> keyup.
+     *
+     * KEY UP only produces a keyup event; the default action hangs off keydown
+     * (and the CHAR text insertion off keypress), exactly as a browser does. */
+    if(kev.type == EWEB_KEYSTATE_UP) {
+        if(m_jsVm != nullptr && m_jsEnabled && !m_jsPageDisabled && !m_jsInScript) {
+            char key[16];
+            int code = 0;
+            ewebKeyToDom(kev.key, kev.text, key, sizeof(key), &code);
+            jsVmEnter();
+            js_event_dispatch_key(m_jsVm, m_focusElement, "keyup",
+                                  key, code, ewebModsToDom(kev.mods));
+            jsVmExit();
+        }
+        return;
+    }
+
+    /* EWEB_KEYSTATE_DOWN (and the CHAR text-insertion path). */
+    char key[16];
+    int code = 0;
+    ewebKeyToDom(kev.key, kev.text, key, sizeof(key), &code);
+    unsigned mods = ewebModsToDom(kev.mods);
+
+    bool allowed = true;
+    if(m_jsVm != nullptr && m_jsEnabled && !m_jsPageDisabled && !m_jsInScript) {
+        jsVmEnter();
+        allowed = js_event_dispatch_key(m_jsVm, m_focusElement, "keydown",
+                                        key, code, mods);
+        /* keypress fires only for a character-producing key, and only when the
+         * keydown was not cancelled. */
+        if(allowed && kev.key == EWEB_KEY_CHAR && kev.text[0] != 0) {
+            allowed = js_event_dispatch_key(m_jsVm, m_focusElement, "keypress",
+                                            kev.text, code, mods);
+        }
+        jsVmExit();
+    }
+
+    if(!allowed)
+        return;   /* a handler called preventDefault(): no default action */
+
+    /* Default action. The editing / activation / focus-traversal behaviour is
+     * layered in by the later implementation stages; this is the single hook
+     * point they extend. */
+    handleKeyDefault(kev, key, mods);
 }
 
 /* ==================================================================

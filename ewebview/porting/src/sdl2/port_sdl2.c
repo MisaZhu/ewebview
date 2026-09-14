@@ -1372,6 +1372,25 @@ static void ek_sys_log(void* ud, const char* text) {
     if(text) SDL_Log("%s", text);
 }
 
+/* System clipboard. SDL hands back an SDL_malloc'd string; copy it into a
+ * plain malloc'd buffer so the core can release it with the matching free(). */
+static char* ek_sys_clipboard_get(void* ud) {
+    (void)ud;
+    if(!SDL_HasClipboardText()) return NULL;
+    char* sdl = SDL_GetClipboardText();
+    if(!sdl) return NULL;
+    size_t n = strlen(sdl);
+    char* buf = (char*)malloc(n + 1);
+    if(buf) memcpy(buf, sdl, n + 1);
+    SDL_free(sdl);
+    return buf;
+}
+
+static void ek_sys_clipboard_set(void* ud, const char* text) {
+    (void)ud;
+    if(text) SDL_SetClipboardText(text);
+}
+
 /* ------------------------------------------------------------------ */
 /* Bundle                                                              */
 /* ------------------------------------------------------------------ */
@@ -1448,4 +1467,6 @@ void eweb_port_sdl2(eweb_port_t* port, void* ud) {
     port->sys.ud       = ud;
     port->sys.ptr_sane = NULL;   /* no portable heap-membership test; OPTIONAL */
     port->sys.log      = ek_sys_log;
+    port->sys.clipboard_get = ek_sys_clipboard_get;
+    port->sys.clipboard_set = ek_sys_clipboard_set;
 }
