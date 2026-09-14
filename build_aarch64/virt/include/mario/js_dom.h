@@ -177,6 +177,10 @@ typedef struct js_dom_callbacks {
     bool (*el_append_child)(void* ctx, js_element_t parent, js_element_t child);
     bool (*el_insert_before)(void* ctx, js_element_t parent, js_element_t child, js_element_t ref);
     bool (*el_remove_child)(void* ctx, js_element_t parent, js_element_t child);
+    /* cloneNode(deep): returns a freshly built, detached copy of `el` (deep:
+     * children too), or NULL. The embedder styles and lays it out when it is
+     * inserted, exactly like a create_element node. */
+    js_element_t (*el_clone_node)(void* ctx, js_element_t el, int deep);
 
     void (*el_remove_attr)(void* ctx, js_element_t el, const char* name);
 

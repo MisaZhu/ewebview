@@ -161,6 +161,48 @@ static void js_set_element_text(litehtml::element* e, const char* text,
     }
 }
 
+/* Apply an innerHTML fragment to `e`: drop its current children (parking them
+ * like js_set_element_text), parse `html` through the document's fragment
+ * parser, then append and style each resulting node. create_fragment runs the
+ * same create_node path a full parse uses, so tags become the right element
+ * subclasses (el_image for <img>, ...). style_detached_subtree matches the
+ * cascade and runs parse_attributes (so <img src> resolves); parse_styles then
+ * recurses, so a nested <img> reaches el_image::parse_styles -> load_image and
+ * its fetch is queued even while `e` is itself detached (same container/engine).
+ * ENGINE-THREAD ONLY (the exclusive doc owner). */
+static void js_apply_inner_html(litehtml::element* e, const std::string& html,
+                                std::vector<litehtml::element*>* park)
+{
+    if(e == nullptr) return;
+    litehtml::document* doc = e->get_document();
+    while(e->get_children_count() > 0) {
+        litehtml::element::ptr c = e->get_child(0);
+        if(c == nullptr) break;
+        e->removeChild(c);
+        if(park != nullptr) park->push_back(c);
+        else delete c;
+    }
+    if(doc == nullptr || html.empty()) return;
+    litehtml::elements_vector nodes;
+    doc->create_fragment(html.c_str(), nodes);
+    EWEB_LOG("[ewebview] inner_html: created %d fragment nodes for '%.40s'\n",
+             (int)nodes.size(), html.c_str());
+    for(size_t i = 0; i < nodes.size(); ++i) {
+        litehtml::element* n = nodes[i];
+        if(n == nullptr) continue;
+        if(!e->appendChild(n)) {
+            if(park != nullptr) park->push_back(n);
+            else delete n;
+            continue;
+        }
+        EWEB_LOG("[ewebview] inner_html: node %d appended, styling\n", (int)i);
+        doc->style_detached_subtree(n);
+        n->parse_styles(false);
+        EWEB_LOG("[ewebview] inner_html: node %d styled ok\n", (int)i);
+    }
+    EWEB_LOG("[ewebview] inner_html: done\n");
+}
+
 /* ==================================================================
  * VM lifecycle
  * ================================================================== */
@@ -228,6 +270,7 @@ void EWebEngine::initJsVm()
     cb.el_append_child   = jsElAppendChild;
     cb.el_insert_before  = jsElInsertBefore;
     cb.el_remove_child   = jsElRemoveChild;
+    cb.el_clone_node     = jsElCloneNode;
     cb.el_remove_attr    = jsElRemoveAttr;
     cb.el_get_rect       = jsElGetRect;
     cb.el_get_style      = jsElGetStyle;
@@ -268,7 +311,10 @@ void EWebEngine::runPageScripts()
     if(m_jsVm == nullptr) return;
 
     for(size_t i = 0; i < m_jsScripts.size(); ++i) {
-        const std::string& src = m_jsScripts[i];
+        /* Copy by value: a script that injects another (appendChild of a
+         * <script>) push_backs to m_jsScripts, which can realloc and dangle a
+         * reference held across vm_load_run below. */
+        std::string src = m_jsScripts[i];
         if(src.empty()) continue;
         /* vm_load_run appends this script's bytecode after the previous one and
          * runs it; globals persist in vm->root across scripts, matching
@@ -298,8 +344,21 @@ bool EWebEngine::runNextPageScript()
     if(m_jsVm == nullptr) return false;
 
     while(m_jsNextScript < m_jsScripts.size()) {
-        size_t i = m_jsNextScript++;
-        const std::string& src = m_jsScripts[i];
+        size_t i = m_jsNextScript;
+        /* An external <script src> slot stays empty until its EWEB_TASK_SCRIPT
+         * fetch lands (processResults fills m_jsScripts[i] and flips
+         * m_jsScriptDone[i] to 1). Report "still running" so the engine keeps
+         * BUILD_RUN_JS armed and re-enters us when the result wakes it - this
+         * preserves document order without busy-spinning (the loop parks on a
+         * 4ms tick; pushResult signals it the instant bytes arrive). A failed
+         * fetch is still marked done with an empty body, so a 404 never wedges
+         * the ordered run. */
+        if(i < m_jsScriptDone.size() && !m_jsScriptDone[i]) return true;
+        m_jsNextScript++;
+        /* Copy by value: this script may inject another (appendChild of a
+         * <script>), which push_backs to m_jsScripts and can realloc - a
+         * reference held across vm_load_run below would then dangle. */
+        std::string src = m_jsScripts[i];
         if(src.empty()) continue;
         uint64_t run_start = ticMs();
         /* Bracket vm_load_run so the DOM-bridge mutation callbacks push the
@@ -322,6 +381,65 @@ bool EWebEngine::runNextPageScript()
         break;
     }
     return m_jsNextScript < m_jsScripts.size();
+}
+
+void EWebEngine::jsDynamicScriptInserted(void* script_el)
+{
+    /* ENGINE-THREAD ONLY. Called from jsElAppendChild/jsElInsertBefore when a
+     * script splices a <script> element into the tree - the classic
+     * createElement('script'); s.src=...; body.appendChild(s) loader pattern
+     * w3.org uses for members.js. Queue its fetch (external) or body (inline)
+     * as a new ordered slot and re-arm the post-swap run so it executes once
+     * the script currently on the stack unwinds. */
+    if(script_el == nullptr) return;
+    litehtml::element* sc = (litehtml::element*)script_el;
+    const char* tn = sc->get_tagName();
+    EWEB_LOG("[ewebview] dynScript entry: el=%p tag=%s\n", script_el, tn != nullptr ? tn : "(null)");
+    if(tn == nullptr || strcmp(tn, "script") != 0) return;
+
+    std::string body;
+    std::string srcabs;
+    const char* src_attr = sc->get_attr("src", nullptr);
+    EWEB_LOG("[ewebview] dynScript src_attr=%s docurl=%s\n",
+        src_attr != nullptr ? src_attr : "(null)", jsDocumentUrl().c_str());
+    if(src_attr != nullptr && src_attr[0] != 0) {
+        /* External: resolve against the document URL and fetch it. An
+         * unresolvable src is dropped so it can never block the ordered run. */
+        srcabs = EWebContainer::getFullURL(&m_port, src_attr, jsDocumentUrl());
+        if(srcabs.empty()) return;
+    } else {
+        /* Inline: the body is the element's text; skip a blank one. */
+        sc->get_text(body);
+        if(body.empty()) return;
+    }
+
+    /* Append a new slot. m_jsScripts holds the body (empty until an external
+     * fetch fills it), m_jsScriptSrcs the absolute URL ("" for inline), and
+     * m_jsScriptDone whether the body is ready (inline: now; external: not
+     * until processResults lands the EWEB_TASK_SCRIPT result). */
+    m_jsScripts.push_back(body);
+    m_jsScriptSrcs.push_back(srcabs);
+    m_jsScriptDone.push_back(srcabs.empty() ? 1 : 0);
+
+    if(!srcabs.empty()) {
+        EWebTask task;
+        task.url = srcabs;
+        task.type = EWEB_TASK_SCRIPT;
+        task.loading = false;
+        addTask(task);
+    }
+
+    /* Re-arm only if the run already finished (BUILD_IDLE): during a normal
+     * post-swap run the loop re-reads m_jsScripts.size() and picks the new slot
+     * up on its own. A script injected later (from a timer or event) needs the
+     * phase restarted; m_deferBuildStep lets a just-queued fetch settle first. */
+    if(m_buildPhase == BUILD_IDLE && m_jsVm != nullptr) {
+        m_jsPostSwapRun = true;
+        m_buildPhase = BUILD_RUN_JS;
+        m_deferBuildStep = true;
+    }
+    EWEB_LOG("[ewebview] js: dynamic <script> queued: %s\n",
+        srcabs.empty() ? "(inline)" : srcabs.c_str());
 }
 
 void EWebEngine::jsProgressiveFlush(bool force)
@@ -642,15 +760,23 @@ void EWebEngine::jsElSetHtml(void* ctx, void* el, const char* html)
 {
     EWebEngine* self = (EWebEngine*)ctx;
     if(el == nullptr) return;
-    /* MVP: no fragment parser -> strip tags and set as text. */
-    std::string stripped = js_strip_tags(html != nullptr ? html : "");
-    js_set_element_text((litehtml::element*)el, stripped.c_str(),
-                        self != nullptr ? &self->m_jsDetached : nullptr);
-    if(self != nullptr) {
-        const char* idv = ((litehtml::element*)el)->get_attr("id", nullptr);
+    litehtml::element* e = (litehtml::element*)el;
+    std::string frag(html != nullptr ? html : "");
+    EWEB_LOG("[ewebview] jsElSetHtml ENTER el=%p tag=%s len=%d\n", el,
+             e->get_tagName() != nullptr ? e->get_tagName() : "(null)", (int)frag.size());
+    /* Real fragment parse (this used to be a tag-stripping MVP stub): markup
+     * assigned to innerHTML now builds actual elements, so an injected <img>
+     * fetches and renders instead of being flattened to text. */
+    if(self != nullptr && e->get_document() != nullptr) {
+        js_apply_inner_html(e, frag, &self->m_jsDetached);
+        const char* idv = e->get_attr("id", nullptr);
         if(idv != nullptr && idv[0] != 0)
-            self->recordJsMutation(0, idv, "", stripped);
+            self->recordJsMutation(3, idv, "", frag);   /* kind 3: innerHTML (replay re-parses) */
         self->jsMarkLayoutDirty();
+    } else {
+        /* No document to parse against: fall back to the text-only setter. */
+        js_set_element_text(e, js_strip_tags(frag).c_str(),
+                            self != nullptr ? &self->m_jsDetached : nullptr);
     }
 }
 
@@ -809,6 +935,27 @@ void* EWebEngine::jsCreateTextNode(void* ctx, const char* text)
     return (void*)t;
 }
 
+void* EWebEngine::jsElCloneNode(void* ctx, void* el, int deep)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(el == nullptr) return nullptr;
+    /* Reject a dangling handle before dereferencing (see jsElAppendChild). */
+    if(!jsElIsLive(ctx, el)) return nullptr;
+    litehtml::element* e = (litehtml::element*)el;
+    /* clone_node recreates the tag + attributes through the document factory
+     * (deep: children too) and returns an unstyled, detached node. Styles are
+     * matched again when the clone is spliced in (appendChild/insertBefore ->
+     * style_detached_subtree + parse_styles), exactly like a createElement'd
+     * node. */
+    litehtml::element::ptr cp = e->clone_node(deep != 0);
+    EWEB_LOG("[ewebview] jsElCloneNode el=%p deep=%d -> cp=%p\n", el, deep, (void*)cp);
+    if(cp == nullptr) return nullptr;
+    /* Park the clone so jsFreeDetachedNodes() reclaims it at teardown if the
+     * script never inserts it; js_unpark() drops it once it goes back in. */
+    if(self != nullptr) self->m_jsDetached.push_back(cp);
+    return (void*)cp;
+}
+
 void* EWebEngine::jsElParent(void* ctx, void* el)
 {
     (void)ctx;
@@ -868,6 +1015,7 @@ bool EWebEngine::jsElAppendChild(void* ctx, void* parent, void* child)
 {
     EWebEngine* self = (EWebEngine*)ctx;
     if(parent == nullptr || child == nullptr) return false;
+    EWEB_LOG("[ewebview] appendChild cb: parent=%p child=%p\n", parent, child);
     /* Reject a dangling handle at the boundary. A JS Element wrapper can outlive
      * the node it wrapped (freed on a document swap or innerHTML rewrite) and
      * mario recycles that memory for its own objects. element_arg() gates on
@@ -895,6 +1043,13 @@ bool EWebEngine::jsElAppendChild(void* ctx, void* parent, void* child)
     c->parse_styles(false);
     if(self != nullptr) {
         js_unpark(self->m_jsDetached, c);   /* re-inserting a removed node */
+        /* A dynamically injected <script> (appendChild of a node built by
+         * createElement) must fetch and run just like a parser-inserted one;
+         * the hook queues it and re-arms the post-swap run. */
+        const char* tn = c->get_tagName();
+        EWEB_LOG("[ewebview] appendChild cb tag=%s\n", tn != nullptr ? tn : "(null)");
+        if(tn != nullptr && strcmp(tn, "script") == 0)
+            self->jsDynamicScriptInserted(c);
         self->jsMarkLayoutDirty();
     }
     return true;
@@ -925,6 +1080,11 @@ bool EWebEngine::jsElInsertBefore(void* ctx, void* parent, void* child, void* re
     c->parse_styles(false);
     if(self != nullptr) {
         js_unpark(self->m_jsDetached, c);
+        /* See jsElAppendChild: a <script> spliced in via insertBefore fetches
+         * and runs the same way. */
+        const char* tn = c->get_tagName();
+        if(tn != nullptr && strcmp(tn, "script") == 0)
+            self->jsDynamicScriptInserted(c);
         self->jsMarkLayoutDirty();
     }
     return true;
@@ -1465,6 +1625,8 @@ void EWebEngine::replayJsMutations()
             js_set_element_text(el, m.value.c_str(), &m_jsDetached);
         } else if(m.kind == 1) {
             el->set_attr(m.name.c_str(), m.value.c_str());
+        } else if(m.kind == 3) {
+            js_apply_inner_html(el, m.value, &m_jsDetached);   /* innerHTML: re-parse */
         }
         applied++;
     }

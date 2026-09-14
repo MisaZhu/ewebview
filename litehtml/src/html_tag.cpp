@@ -384,6 +384,11 @@ const litehtml::tchar_t* litehtml::html_tag::get_tagName() const
 	return m_tag.c_str();
 }
 
+bool litehtml::html_tag::is_html_tag() const
+{
+	return true;
+}
+
 void litehtml::html_tag::set_attr( const tchar_t* name, const tchar_t* val )
 {
 	if(name && val)
@@ -964,6 +969,30 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 	litehtml::profile_apply_stylesheet((uint32_t)stylesheet.selectors().size(), apply_start);
 }
 
+void litehtml::html_tag::reapply_style_cascade( const litehtml::css& master, const litehtml::css& doc_css )
+{
+#ifdef LITEHTML_LIFETIME_DEBUG
+	/* Same backstop as apply_stylesheet_own: never match against a freed tag. */
+	if(!litehtml_tag_is_live(this))
+	{
+		return;
+	}
+#endif
+	clear_style_property_cache();
+	/* Clean slate: the old cascade was computed with a different (or no)
+	 * ancestor chain, so both the merged property bag and the matched-selector
+	 * list are stale. apply_stylesheet_own rebuilds both; the inline style=
+	 * attribute is not lost - parse_styles re-adds it after every cascade. */
+	m_style.clear();
+	m_used_styles.clear();
+	/* Cascade order mirrors document creation: master sheet, attribute-derived
+	 * properties, then document sheets, so author rules keep beating
+	 * presentation attributes. */
+	apply_stylesheet_own(master);
+	parse_attributes();
+	apply_stylesheet_own(doc_css);
+}
+
 void litehtml::html_tag::get_content_size( size& sz, int max_width )
 {
 	sz.height	= 0;
@@ -1539,7 +1568,14 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	}
 	else
 	{
-		m_display = display_inline;
+		/* No declared display: replaced elements keep their UA default of
+		 * inline-block (the el_image/el_svg constructors seed it), plain
+		 * elements are inline. Forcing inline here made restyles of
+		 * detached-built subtrees (innerHTML/cloneNode, e.g. the w3.org
+		 * member logos) collapse <img> to display:inline, which place_element
+		 * routes to render_inline - a path that never lays a replaced box
+		 * out, so the images stayed zero-sized. */
+		m_display = is_replaced() ? display_inline_block : display_inline;
 	}
 	m_box_sizing	= (box_sizing)			value_index((own_box_sizing && t_strcasecmp(own_box_sizing, _t("inherit"))) ? own_box_sizing : _t("content-box"),	box_sizing_strings,			box_sizing_content_box);
 
@@ -2748,27 +2784,30 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 
 litehtml::element::ptr litehtml::html_tag::find_ancestor(const css_selector& selector, bool apply_pseudo, bool* is_pseudo)
 {
+	/* Iterative, not recursive: a descendant-combinator selector matched against
+	 * a deep live tree used to push one find_ancestor frame per ancestor and
+	 * overflow the engine thread stack (w3.org member grid). Walking up in a
+	 * loop keeps stack O(1) in tree depth. */
 	element::ptr el_parent = parent();
-	if (!el_parent)
+	/* Iteration cap as a cycle guard: a corrupt parent chain (child link pointing
+	 * back at an ancestor) would otherwise spin here forever now that the walk is
+	 * iterative. Real documents are far shallower than this; a tight cap also
+	 * bounds the per-selector ancestor cost on large pages (w3.org). */
+	int guard = 0;
+	while(el_parent && guard++ < 48)
 	{
-		return nullptr;
-	}
-	int res = el_parent->select(selector, apply_pseudo);
-	if(res != select_no_match)
-	{
-		if(is_pseudo)
+		int res = el_parent->select(selector, apply_pseudo);
+		if(res != select_no_match)
 		{
-			if(res & select_match_pseudo_class)
+			if(is_pseudo)
 			{
-				*is_pseudo = true;
-			} else
-			{
-				*is_pseudo = false;
+				*is_pseudo = (res & select_match_pseudo_class) != 0;
 			}
+			return el_parent;
 		}
-		return el_parent;
+		el_parent = el_parent->parent();
 	}
-	return el_parent->find_ancestor(selector, apply_pseudo, is_pseudo);
+	return nullptr;
 }
 
 int litehtml::html_tag::get_floats_height(element_float el_float) const

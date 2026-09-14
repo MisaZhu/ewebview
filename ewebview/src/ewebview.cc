@@ -55,7 +55,42 @@ namespace eweb {
  * is needed at all (see runPageScripts). */
 static bool html_has_inline_handlers(const std::string& lower);
 
+/* Read an attribute's value out of a <script> open tag. `lower_tag` is the
+ * lower-cased tag (case-insensitive name match), `orig_tag` the same span in
+ * original case (URLs are case-sensitive); both start at the same offset, so an
+ * offset found in one indexes the other. Matches only a whole attribute name -
+ * preceded by start/whitespace and followed by optional space then '=' - so
+ * data-src= / srcset= never false-match. Returns "" when absent or empty. */
+static std::string script_attr_value(const std::string& lower_tag,
+                                     const std::string& orig_tag, const char* name)
+{
+    size_t nlen = strlen(name);
+    size_t pos = 0;
+    while(pos < lower_tag.size()) {
+        size_t f = lower_tag.find(name, pos);
+        if(f == std::string::npos) break;
+        bool left_ok = (f == 0) || ::isspace((unsigned char)lower_tag[f - 1]) || lower_tag[f - 1] == '<';
+        size_t after = f + nlen;
+        while(after < lower_tag.size() && ::isspace((unsigned char)lower_tag[after])) after++;
+        if(left_ok && after < lower_tag.size() && lower_tag[after] == '=') {
+            size_t v = after + 1;
+            while(v < orig_tag.size() && ::isspace((unsigned char)orig_tag[v])) v++;
+            std::string val;
+            if(v < orig_tag.size() && (orig_tag[v] == '"' || orig_tag[v] == '\'')) {
+                char q = orig_tag[v++];
+                while(v < orig_tag.size() && orig_tag[v] != q) val += orig_tag[v++];
+            } else {
+                while(v < orig_tag.size() && !::isspace((unsigned char)orig_tag[v]) && orig_tag[v] != '>') val += orig_tag[v++];
+            }
+            return val;
+        }
+        pos = f + 1;
+    }
+    return std::string();
+}
+
 static std::string extract_scripts(const std::string& html, std::vector<std::string>* scripts,
+                                   std::vector<std::string>* script_srcs,
                                    bool* has_inline_handlers)
 {
     if(has_inline_handlers != nullptr) *has_inline_handlers = false;
@@ -94,6 +129,7 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
             break;
         }
         std::string open_tag = lower.substr(script_open, tag_end - script_open + 1);
+        std::string open_tag_orig = html.substr(script_open, tag_end - script_open + 1);
 
         out.append(html, pos, script_open - pos);
         size_t script_close = lower.find("</script>", tag_end);
@@ -106,21 +142,32 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
         size_t body_start = tag_end + 1;
         std::string body = html.substr(body_start, script_close - body_start);
 
-        bool external = (open_tag.find("src=") != std::string::npos);
+        std::string src_val = script_attr_value(open_tag, open_tag_orig, "src");
+        bool external = !src_val.empty();
         /* A type= that is present and not a JS mime means "do not execute". */
         bool non_js = false;
         size_t tp = open_tag.find("type=");
         if(tp != std::string::npos) {
             non_js = (open_tag.find("javascript", tp) == std::string::npos);
         }
-        if(scripts != nullptr && !external && !non_js) {
-            /* Skip blank/whitespace-only bodies to avoid empty vm_load calls. */
-            bool blank = true;
-            for(size_t i = 0; i < body.size(); ++i) {
-                if(!::isspace((unsigned char)body[i])) { blank = false; break; }
-            }
-            if(!blank) {
-                scripts->push_back(body);
+        if(scripts != nullptr && !non_js) {
+            if(external) {
+                /* External <script src>: reserve an ordered slot with an empty
+                 * body (filled when the EWEB_TASK_SCRIPT fetch lands) and record
+                 * the src so the caller resolves + queues it. scripts and
+                 * script_srcs stay the same length. */
+                scripts->push_back(std::string());
+                if(script_srcs != nullptr) script_srcs->push_back(src_val);
+            } else {
+                /* Skip blank/whitespace-only bodies to avoid empty vm_load calls. */
+                bool blank = true;
+                for(size_t i = 0; i < body.size(); ++i) {
+                    if(!::isspace((unsigned char)body[i])) { blank = false; break; }
+                }
+                if(!blank) {
+                    scripts->push_back(body);
+                    if(script_srcs != nullptr) script_srcs->push_back(std::string());
+                }
             }
         }
 
@@ -1159,6 +1206,8 @@ void EWebEngine::cleanupBuildResources()
      * the extracted scripts and reset the document.write reparse guard. */
     resetJsVm();
     m_jsScripts.clear();
+    m_jsScriptSrcs.clear();
+    m_jsScriptDone.clear();
     m_jsHasInlineHandlers = false;
     m_jsReparseCount = 0;
     m_jsRunBeforePaint = false;
@@ -1417,6 +1466,8 @@ void EWebEngine::taskLoop()
                 res = loadCSSTask(task.url);
             } else if(task.type == EWEB_TASK_IMAGE) {
                 res = loadImageTask(task.url);
+            } else if(task.type == EWEB_TASK_SCRIPT) {
+                res = loadScriptTask(task.url);
             }
 
             EWebUiEvent sev; sev.task = task;
@@ -1584,6 +1635,29 @@ bool EWebEngine::loadCSSTask(const std::string& url)
     pushResult(result);
     removeTask(url);
     EWEB_LOG("[ewebview] fetched css: url=%s ok=%d size=%d cost=%u ms\n",
+        url.c_str(), result.ok ? 1 : 0, sz, (uint32_t)(ticMs() - fetch_start));
+    return result.ok;
+}
+
+bool EWebEngine::loadScriptTask(const std::string& url)
+{
+    EWebResult result = {url, EWEB_TASK_SCRIPT, false, "", nullptr};
+    int sz = 0;
+    uint64_t fetch_start = ticMs();
+    /* Subresource of the document being built (a classic <script src>): not a
+     * top-level navigation, so Lax/Strict cookies both stay home cross-site. */
+    uint8_t* content = EWebContainer::loadURL(&m_port, url, &sz, taskPageUrl(), false);
+    if(content != NULL) {
+        if(sz > 0)
+            result.content.assign((char*)content, sz);
+        else
+            result.content = (char*)content;
+        free(content);
+        result.ok = true;
+    }
+    pushResult(result);
+    removeTask(url);
+    EWEB_LOG("[ewebview] fetched script: url=%s ok=%d size=%d cost=%u ms\n",
         url.c_str(), result.ok ? 1 : 0, sz, (uint32_t)(ticMs() - fetch_start));
     return result.ok;
 }
@@ -1781,9 +1855,19 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     int stripped_scripts = 0;
     /* extract_scripts and the m_js* fields are engine-owned; no locking. */
     m_jsScripts.clear();
+    m_jsScriptSrcs.clear();
+    m_jsScriptDone.clear();
     m_jsHasInlineHandlers = false;
     m_buildHtmlContent = extract_scripts(content, m_jsEnabled ? &m_jsScripts : nullptr,
+                                         m_jsEnabled ? &m_jsScriptSrcs : nullptr,
                                          m_jsEnabled ? &m_jsHasInlineHandlers : nullptr);
+    /* Mark each slot ready/pending: an external <script src> starts pending and
+     * is filled when its EWEB_TASK_SCRIPT fetch lands; inline bodies are ready
+     * now. extract_scripts keeps m_jsScriptSrcs the same length as m_jsScripts. */
+    m_jsScriptDone.assign(m_jsScripts.size(), 1);
+    for(size_t i = 0; i < m_jsScriptSrcs.size() && i < m_jsScriptDone.size(); ++i) {
+        if(!m_jsScriptSrcs[i].empty()) m_jsScriptDone[i] = 0;
+    }
     stripped_scripts = (int)m_jsScripts.size();
     if(stripped_scripts > 0) {
         EWEB_LOG("[ewebview] extracted scripts: count=%d html_size=%d -> %d\n",
@@ -1840,6 +1924,25 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
                 }
             }
         }
+    }
+
+    /* Queue external <script src> fetches in document order. Each resolves
+     * against the page URL; the result fills the matching slot(s) and re-arms
+     * the RUN_JS step so runNextPageScript proceeds past it. m_taskPageUrl was
+     * just set to this document, so the fetch is a same-site subresource. */
+    for(size_t i = 0; i < m_jsScriptSrcs.size(); ++i) {
+        if(m_jsScriptSrcs[i].empty()) continue;
+        std::string abs = EWebContainer::getFullURL(&m_port, m_jsScriptSrcs[i], m_currentHtmlUrl);
+        if(abs.empty()) {
+            if(i < m_jsScriptDone.size()) m_jsScriptDone[i] = 1;   /* unresolvable: skip, never block */
+            continue;
+        }
+        m_jsScriptSrcs[i] = abs;   /* results are matched by this absolute URL */
+        EWebTask task;
+        task.url = abs;
+        task.type = EWEB_TASK_SCRIPT;
+        task.loading = false;
+        addTask(task);
     }
 
     setBuildStatus("preparing document", 5);
@@ -1915,6 +2018,27 @@ bool EWebEngine::processResults()
     uint64_t process_start = ticMs();
     EWEB_LOG("[ewebview] process result: type=%d ok=%d size=%d\n",
         result.type, result.ok ? 1 : 0, (int)result.content.size());
+    if(result.type == EWEB_TASK_SCRIPT) {
+        /* Fill every still-pending slot whose resolved src matches this URL
+         * (addTask dedups by URL, so one fetch serves duplicate includes). A
+         * failed fetch still marks the slot done with an empty body, so a
+         * classic-script run never wedges behind a script that 404'd. Handled
+         * before the ok/!ok split so both outcomes reach it. */
+        for(size_t i = 0; i < m_jsScriptSrcs.size(); ++i) {
+            if(i < m_jsScriptDone.size() && !m_jsScriptDone[i] && m_jsScriptSrcs[i] == result.url) {
+                if(i < m_jsScripts.size())
+                    m_jsScripts[i] = result.ok ? result.content : std::string();
+                m_jsScriptDone[i] = 1;
+            }
+        }
+        EWEB_LOG("[ewebview] script result: url=%s ok=%d size=%d\n",
+            result.url.c_str(), result.ok ? 1 : 0, (int)result.content.size());
+        m_deferBuildStep = true;   /* resume BUILD_RUN_JS past the filled slot */
+        pthread_mutex_lock(&m_resultMutex);
+        bool has_more_scripts = !m_resultQueue.empty();
+        pthread_mutex_unlock(&m_resultMutex);
+        return has_more_scripts;
+    }
     if(!result.ok) {
         if(result.type == EWEB_TASK_IMAGE) {
             EWEB_LOG("[ewebview] image load failed\n");

@@ -129,6 +129,13 @@ public:
     /* Resolve a possibly-relative src to the absolute URL key the cache uses.
      * Mirrors getFullURL but exposed publicly for the canvas bridge. */
     std::string                        resolveUrl(const std::string& src) const;
+    /* Resolve `src` against an explicit `baseurl` with no container instance -
+     * a pure function of (port, src, baseurl). Public so the engine can resolve
+     * a static <script src> while the build container is not yet alive, and a
+     * dynamically injected <script src> against the document URL. */
+    static const std::string           getFullURL(const eweb_port_t* port,
+                                                  const std::string& src,
+                                                  const std::string& baseurl);
 
     /* Build abort: once set, the hottest litehtml callbacks (text_width,
      * create_element, load_image) short-circuit so an in-flight
@@ -173,9 +180,6 @@ private:
     std::vector<eweb_el_input*> m_vecInput;
 
     static uint32_t web_color_to_argb(const litehtml::web_color& c);
-    static const std::string getFullURL(const eweb_port_t* port,
-                                        const std::string& src,
-                                        const std::string& baseurl);
 };
 
 }

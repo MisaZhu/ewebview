@@ -129,6 +129,7 @@ namespace litehtml
 		virtual element::ptr		clone_node(bool deep) override;
 		virtual void				clearRecursive() override;
 		virtual const tchar_t*		get_tagName() const override;
+		virtual bool				is_html_tag() const override;
 		virtual void				set_tagName(const tchar_t* tag) override;
 		virtual void				set_data(const tchar_t* data) override;
 		virtual element_float		get_float() const override;
@@ -155,6 +156,13 @@ namespace litehtml
 		/* Own-element stylesheet matching without the children walk; used by
 		 * apply_stylesheet to make the chunked style update resumable. */
 		void						apply_stylesheet_own(const litehtml::css& stylesheet);
+		/* Full own-element re-cascade (master sheet, presentation attributes,
+		 * document sheet) from a clean slate: clears m_style and the used-style
+		 * list, drops pseudo elements so the new pass recreates them, then
+		 * re-matches. Used by document::style_detached_subtree for nodes that
+		 * were styled while detached - ancestor-dependent selectors could not
+		 * match then, so re-attachment must re-run the cascade. */
+		void						reapply_style_cascade(const litehtml::css& master, const litehtml::css& doc_css);
 		virtual void				refresh_styles() override;
 
 		virtual bool				is_white_space() const override;

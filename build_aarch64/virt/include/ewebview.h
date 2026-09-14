@@ -92,6 +92,7 @@ enum {
     EWEB_TASK_HTML = 0,
     EWEB_TASK_CSS,
     EWEB_TASK_IMAGE,
+    EWEB_TASK_SCRIPT,
 };
 
 /* ------------------------------------------------------------------ */

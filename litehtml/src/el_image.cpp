@@ -182,7 +182,12 @@ int litehtml::el_image::render( int x, int y, int max_width, bool second_pass )
 		if(!m_css_max_width.is_predefined() && doc)
 		{
 			int max_width = doc->cvt_units(m_css_max_width, m_font_size, parent_width);
-			if(m_pos.width > max_width)
+			/* A percentage max-width against an indefinite available width (the
+			 * flex base-size pass hands in 0) resolves to 0; per CSS it then
+			 * behaves as 'none', so never clamp the intrinsic size down to 0.
+			 * Without this, core.css's global img{max-width:100%} collapsed the
+			 * w3.org member logos to zero-width boxes. */
+			if(max_width > 0 && m_pos.width > max_width)
 			{
 				m_pos.width = max_width;
 			}
@@ -243,7 +248,12 @@ int litehtml::el_image::render( int x, int y, int max_width, bool second_pass )
 		if(!m_css_max_width.is_predefined() && doc)
 		{
 			int max_width = doc->cvt_units(m_css_max_width, m_font_size, parent_width);
-			if(m_pos.width > max_width)
+			/* A percentage max-width against an indefinite available width (the
+			 * flex base-size pass hands in 0) resolves to 0; per CSS it then
+			 * behaves as 'none', so never clamp the intrinsic size down to 0.
+			 * Without this, core.css's global img{max-width:100%} collapsed the
+			 * w3.org member logos to zero-width boxes. */
+			if(max_width > 0 && m_pos.width > max_width)
 			{
 				m_pos.width = max_width;
 			}
@@ -279,7 +289,12 @@ int litehtml::el_image::render( int x, int y, int max_width, bool second_pass )
 		if(!m_css_max_width.is_predefined() && doc)
 		{
 			int max_width = doc->cvt_units(m_css_max_width, m_font_size, parent_width);
-			if(m_pos.width > max_width)
+			/* A percentage max-width against an indefinite available width (the
+			 * flex base-size pass hands in 0) resolves to 0; per CSS it then
+			 * behaves as 'none', so never clamp the intrinsic size down to 0.
+			 * Without this, core.css's global img{max-width:100%} collapsed the
+			 * w3.org member logos to zero-width boxes. */
+			if(max_width > 0 && m_pos.width > max_width)
 			{
 				m_pos.width = max_width;
 			}

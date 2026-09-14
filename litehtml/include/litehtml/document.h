@@ -123,8 +123,11 @@ namespace litehtml
 		litehtml::element::ptr			create_element(const tchar_t* tag_name, const string_map& attributes);
 		/* Match the master sheet, attribute styles and the document sheets against
 		 * a subtree that was built after document creation (createElement + appendChild).
-		 * Nodes already styled at creation or by an earlier call are skipped via
-		 * element::sheets_applied(), so moving an existing subtree is a no-op. */
+		 * Nodes styled by an earlier pass (at creation, innerHTML, or a previous
+		 * call) are re-cascaded from a clean slate via
+		 * html_tag::reapply_style_cascade, because they may have been styled while
+		 * detached, where ancestor-dependent selectors could not match. A work
+		 * budget bounds each call. */
 		void style_detached_subtree(element* el);
 		/* display:contents: elements whose children must be lifted into
 		 * the parent's child list before the next layout. Filled by
@@ -171,6 +174,13 @@ namespace litehtml
 
 		static litehtml::document::ptr createFromString(const tchar_t* str, litehtml::document_container* objPainter, litehtml::context* ctx, litehtml::css* user_styles = 0);
 		static litehtml::document::ptr createFromUTF8(const char* str, litehtml::document_container* objPainter, litehtml::context* ctx, litehtml::css* user_styles = 0);
+		/* Parse an HTML fragment (innerHTML semantics) into detached elements
+		 * owned by THIS document, appended to `out`. gumbo wraps the fragment in
+		 * a body; the same create_node path a full parse uses builds the nodes,
+		 * so attributes/images behave identically. The caller parents and styles
+		 * them (style_detached_subtree + parse_styles), which runs parse_attributes
+		 * so an <img> resolves its src and queues a fetch. */
+		void create_fragment(const tchar_t* html, elements_vector& out);
 	
 	private:
 		litehtml::uint_ptr	add_font(const tchar_t* name, int size, const tchar_t* weight, const tchar_t* style, const tchar_t* decoration, font_metrics* fm);

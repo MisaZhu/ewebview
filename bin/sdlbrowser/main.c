@@ -186,6 +186,8 @@ typedef struct {
     const char*   shot_path;
     uint32_t      shot_settle_ms;
     uint32_t      shot_start_ms;
+    int           shot_scroll_y;   /* -1 = capture at top; else scroll first */
+    bool          shot_scrolled;
 } browser_t;
 
 /* ------------------------------------------------------------------ */
@@ -1167,6 +1169,7 @@ static bool browser_init(browser_t* b, int argc, char** argv) {
     const char* url = "res://html/default.html";
     for(int i = 1; i < argc; i++) {
         if(strcmp(argv[i], "--shot") == 0) { i++; continue; }
+        if(strcmp(argv[i], "--scroll") == 0) { i++; continue; }
         url = argv[i];
         break;
     }
@@ -1185,6 +1188,14 @@ static bool browser_init(browser_t* b, int argc, char** argv) {
             if(i + 2 < argc) b->shot_settle_ms = (uint32_t)atoi(argv[i + 2]);
             break;
         }
+    }
+
+    /* --scroll <y>: jump the viewport to a document offset before capturing,
+     * so below-the-fold regions (e.g. the w3.org member grid) can be shot. */
+    b->shot_scroll_y = -1;
+    b->shot_scrolled = false;
+    for(int i = 1; i < argc; i++) {
+        if(strcmp(argv[i], "--scroll") == 0 && i + 1 < argc) { b->shot_scroll_y = atoi(argv[i + 1]); break; }
     }
 
     /* nojs flag */
@@ -1246,11 +1257,18 @@ int main(int argc, char** argv) {
 
         /* headless screenshot: once the page has settled, save one frame and exit */
         if(b->shot_path && (SDL_GetTicks() - b->shot_start_ms) >= b->shot_settle_ms) {
-            SDL_Surface* surf = NULL;
-            if(b->frame && b->port.gfx.surface_native)
-                surf = (SDL_Surface*)b->port.gfx.surface_native(b->port.gfx.ud, b->frame);
-            if(surf) SDL_SaveBMP(surf, b->shot_path);
-            b->running = false;
+            if(b->shot_scroll_y >= 0 && !b->shot_scrolled) {
+                ewebview_scroll(b->view, 0, b->shot_scroll_y);
+                b->shot_scrolled = true;
+                b->shot_start_ms = SDL_GetTicks();
+                b->shot_settle_ms = 1000;   /* let the new offset render a frame */
+            } else {
+                SDL_Surface* surf = NULL;
+                if(b->frame && b->port.gfx.surface_native)
+                    surf = (SDL_Surface*)b->port.gfx.surface_native(b->port.gfx.ud, b->frame);
+                if(surf) SDL_SaveBMP(surf, b->shot_path);
+                b->running = false;
+            }
         }
 
         /* frame pacing */

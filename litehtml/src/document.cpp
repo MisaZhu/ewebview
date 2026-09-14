@@ -383,6 +383,53 @@ litehtml::document::ptr litehtml::document::createFromUTF8(const char* str, lite
 	return doc;
 }
 
+void litehtml::document::create_fragment(const tchar_t* html, elements_vector& out)
+{
+	if(!html || !html[0])
+	{
+		return;
+	}
+	/* innerHTML semantics: parse `html` as body content. gumbo is a whole-
+	 * document parser, so it wraps the fragment in <html><head><body>; walk to
+	 * the body and build each of its children through the same create_node path
+	 * a full parse uses. The nodes are owned by THIS document (create_element /
+	 * litehtml_alloc take `this`), so the caller can parent + style them exactly
+	 * like a parser-built subtree. */
+	std::string utf(html);
+	GumboOutput* output = gumbo_parse_with_options(&kGumboDefaultOptions,
+								utf.c_str(), (uint32_t)utf.length());
+	if(!output)
+	{
+		return;
+	}
+	GumboNode* body = nullptr;
+	GumboNode* root = output->root;
+	if(root && root->type == GUMBO_NODE_ELEMENT)
+	{
+		GumboVector* kids = &root->v.element.children;
+		for(unsigned int i = 0; i < kids->length; i++)
+		{
+			GumboNode* c = static_cast<GumboNode*>(kids->data[i]);
+			if(c && c->type == GUMBO_NODE_ELEMENT && c->v.element.tag == GUMBO_TAG_BODY)
+			{
+				body = c;
+				break;
+			}
+		}
+	}
+	if(body)
+	{
+		GumboVector* kids = &body->v.element.children;
+		for(unsigned int i = 0; i < kids->length; i++)
+		{
+			GumboNode* c = static_cast<GumboNode*>(kids->data[i]);
+			if(!c) continue;
+			create_node(c, out, 0);
+		}
+	}
+	gumbo_destroy_output(&kGumboDefaultOptions, output);
+}
+
 litehtml::uint_ptr litehtml::document::add_font( const tchar_t* name, int size, const tchar_t* weight, const tchar_t* style, const tchar_t* decoration, font_metrics* fm )
 {
 	uint_ptr ret = 0;
@@ -850,11 +897,16 @@ bool litehtml::document::on_lbutton_up( int x, int y, int client_x, int client_y
 namespace {
 /* Per-node cascade order mirrors document creation: master sheet, then
  * attribute-derived properties, then the document sheets, so presentation
- * attributes keep losing to author rules. The walk stops at nodes that are
- * already styled, which keeps re-parenting an existing subtree free. */
+ * attributes keep losing to author rules. Nodes styled by an earlier pass
+ * are re-cascaded from a clean slate: they may have been styled while
+ * detached (innerHTML/cloneNode), where ancestor-dependent selectors could
+ * not match, so re-attachment must re-run the full match. The budget below
+ * bounds the extra work. */
 void style_detached_subtree_walk(litehtml::element* el,
                                  const litehtml::css& master,
-                                 const litehtml::css& doc_css)
+                                 const litehtml::css& doc_css,
+                                 int depth,
+                                 int& budget)
 {
 	/* The walk is entered from a live root (the node handed to
 	 * appendChild/insertBefore) but recurses through every descendant, and a
@@ -865,6 +917,38 @@ void style_detached_subtree_walk(litehtml::element* el,
 	if(!el)
 	{
 		return;
+	}
+	/* Bound the recursion: a corrupt or pathologically deep child chain must not
+	 * overflow the engine thread stack (w3.org member grid hit this). Nodes
+	 * below the limit stay unstyled here and pick up styles on a later pass. */
+	if(depth > 32)
+	{
+		return;
+	}
+	/* Hard work budget: a single style_detached_subtree call must not monopolize
+	 * the engine thread. Matching a scripted insert against a large site CSS
+	 * (w3.org member grid) could otherwise grind for tens of seconds, keeping
+	 * the engine busy so load never completes and teardown's join blocks. Nodes
+	 * past the budget stay unstyled here and are picked up by a later pass. */
+	if(budget <= 0)
+	{
+		return;
+	}
+	--budget;
+	/* Pseudo-elements (::before/::after) are not independent style roots: they
+	 * are created and styled by their originating element's selector match
+	 * (apply_stylesheet_own -> get_element_before/after). Cascading them as if
+	 * they were real elements both double-applies their styles and, when the
+	 * sheet carries a universal pseudo reset ("*, *::before, *::after"), makes
+	 * apply_stylesheet_own spawn a nested pseudo on the pseudo - an unbounded
+	 * chain that ate the whole budget here and starved the real content. Skip
+	 * them; the owning element's own cascade already styled them. */
+	{
+		const litehtml::tchar_t* pseudo_tag = el->get_tagName();
+		if(pseudo_tag && pseudo_tag[0] == _t(':') && pseudo_tag[1] == _t(':'))
+		{
+			return;
+		}
 	}
 #ifdef LITEHTML_LIFETIME_DEBUG
 	/* Gate on the lifetime registry BEFORE touching any member of el. The
@@ -892,23 +976,45 @@ void style_detached_subtree_walk(litehtml::element* el,
 		return;
 	}
 #endif
+	bool restyled = false;
 	if(el->sheets_applied())
+	{
+		/* Already styled - but possibly in a detached context where
+		 * descendant/child selectors (e.g. ".grid .l-box{max-width:...}")
+		 * could not match. Re-run the own-element cascade instead of
+		 * pruning, otherwise a re-attached subtree (w3.org member logos)
+		 * keeps its ancestor-blind styles forever and overflows its tile.
+		 * The walk must continue into the children: they carry the same
+		 * stale-context styles and are bounded by the same budget. */
+		if(el->is_html_tag())
+		{
+			static_cast<litehtml::html_tag*>(el)->reapply_style_cascade(master, doc_css);
+		}
+		restyled = true;
+	}
+	if(!restyled)
+	{
+		el->set_sheets_applied(true);
+		const litehtml::tchar_t* tag = el->get_tagName();
+		if(tag && tag[0] && el->is_html_tag())
+		{
+			litehtml::html_tag* t = static_cast<litehtml::html_tag*>(el);
+			t->apply_stylesheet_own(master);
+			t->parse_attributes();
+			t->apply_stylesheet_own(doc_css);
+		}
+	}
+	int count = el->get_children_count();
+	/* Sanity cap: a smashed m_children (heap written through a dangling handle)
+	 * reads back as an astronomical count and the loop below would spin on
+	 * garbage children forever. No real node in a rendered page exceeds this. */
+	if(count < 0 || count > 200000)
 	{
 		return;
 	}
-	el->set_sheets_applied(true);
-	const litehtml::tchar_t* tag = el->get_tagName();
-	if(tag && tag[0])
-	{
-		litehtml::html_tag* t = static_cast<litehtml::html_tag*>(el);
-		t->apply_stylesheet_own(master);
-		t->parse_attributes();
-		t->apply_stylesheet_own(doc_css);
-	}
-	int count = el->get_children_count();
 	for(int i = 0; i < count; i++)
 	{
-		style_detached_subtree_walk(el->get_child(i), master, doc_css);
+		style_detached_subtree_walk(el->get_child(i), master, doc_css, depth + 1, budget);
 	}
 }
 } // namespace
@@ -924,7 +1030,8 @@ void litehtml::document::style_detached_subtree(element* el)
 	{
 		return;
 	}
-	style_detached_subtree_walk(el, m_context->master_css(), m_styles);
+	int budget = 400;
+	style_detached_subtree_walk(el, m_context->master_css(), m_styles, 0, budget);
 }
 
 litehtml::element::ptr litehtml::document::create_element(const tchar_t* tag_name, const string_map& attributes)

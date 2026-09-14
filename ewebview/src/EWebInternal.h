@@ -247,6 +247,7 @@ public:
     bool loadHtmlTask(const std::string& url);
     bool loadCSSTask(const std::string& url);
     bool loadImageTask(const std::string& url);
+    bool loadScriptTask(const std::string& url);
     void pushResult(const EWebResult& result);
     bool getResult(EWebResult& result);
     bool processResults();
@@ -262,6 +263,11 @@ public:
     void resetJsVm();
     void runPageScripts();
     bool runNextPageScript();
+    /* A <script> spliced into the tree by a DOM mutation (appendChild /
+     * insertBefore / replaceChild) must fetch+run like a parser-inserted one:
+     * append an ordered slot (external src fetched async, inline body ready)
+     * and re-arm BUILD_RUN_JS if the page had already gone idle. */
+    void jsDynamicScriptInserted(void* script_el);
     void jsProgressiveFlush(bool force);
     bool applyJsWriteBuffer();
     void jsVmEnter();
@@ -328,6 +334,7 @@ public:
     static bool  jsElIsLive(void* ctx, void* el);
     static bool  jsElAppendChild(void* ctx, void* parent, void* child);
     static bool  jsElInsertBefore(void* ctx, void* parent, void* child, void* ref);
+    static void* jsElCloneNode(void* ctx, void* el, int deep);
     static bool  jsElRemoveChild(void* ctx, void* parent, void* child);
     static void  jsElRemoveAttr(void* ctx, void* el, const char* name);
     static void  jsElGetRect(void* ctx, void* el, int* x, int* y, int* w, int* h);
@@ -486,6 +493,12 @@ public:
     /* ---- JavaScript (mario VM) state ---- */
     struct st_vm*               m_jsVm;
     std::vector<std::string>    m_jsScripts;
+    /* Parallel to m_jsScripts: the resolved absolute src of an external
+     * <script src> ("" for an inline body) and whether its body is ready
+     * (1) or still awaiting its EWEB_TASK_SCRIPT fetch (0). runNextPageScript
+     * blocks on a pending slot so classic scripts run in document order. */
+    std::vector<std::string>    m_jsScriptSrcs;
+    std::vector<char>           m_jsScriptDone;
     bool                        m_jsHasInlineHandlers;
     bool                        m_jsEnabled;
     int                         m_jsReparseCount;

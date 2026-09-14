@@ -149,6 +149,11 @@ protected:
 		void						splice_contents_children();
 
 		virtual const tchar_t*		get_tagName() const;
+		/* True only for html_tag and subclasses. Several element subclasses
+		 * (el_script, el_text, ...) carry a tag name but are NOT html_tags, so
+		 * code that needs html_tag-only members (stylesheets, attributes map)
+		 * must check this before static_cast'ing - RTTI is compiled out. */
+		virtual bool				is_html_tag() const;
 		virtual void				set_tagName(const tchar_t* tag);
 		virtual void				set_data(const tchar_t* data);
 		virtual element_float		get_float() const;

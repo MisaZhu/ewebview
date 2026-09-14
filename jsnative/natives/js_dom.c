@@ -1848,6 +1848,19 @@ static var_t* native_el_replaceChild(vm_t* vm, var_t* env, void* data) {
     return wrap_or_null(vm, old);
 }
 
+static var_t* native_el_cloneNode(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL || st->cb.el_clone_node == NULL)
+        return var_new_null(vm);
+    /* cloneNode(deep): `deep` defaults to false per the DOM spec, so only an
+     * explicitly truthy first argument copies the subtree. */
+    int deep = js_truthy(js_arg(env, 0)) ? 1 : 0;
+    js_element_t cp = st->cb.el_clone_node(st->ctx, el, deep);
+    if(cp == NULL) return var_new_null(vm);
+    return wrap_element(vm, cp);
+}
+
 static var_t* native_el_remove(vm_t* vm, var_t* env, void* data) {
     js_dom_state* st = state_any(vm, data);
     js_element_t el = this_handle(env);
@@ -2280,6 +2293,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     vm_reg_native(vm, el_cls, "insertBefore(node, ref)", native_el_insertBefore, bridge);
     vm_reg_native(vm, el_cls, "removeChild(node)", native_el_removeChild, bridge);
     vm_reg_native(vm, el_cls, "replaceChild(node, old)", native_el_replaceChild, bridge);
+    vm_reg_native(vm, el_cls, "cloneNode(deep)", native_el_cloneNode, bridge);
     vm_reg_native(vm, el_cls, "remove()", native_el_remove, bridge);
     vm_reg_native(vm, el_cls, "contains(node)", native_el_contains, bridge);
 
