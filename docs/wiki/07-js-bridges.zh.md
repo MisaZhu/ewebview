@@ -1,5 +1,7 @@
 # 第 7 章 · JS 桥接层：DOM / Event / Web
 
+> 语言: [English](07-js-bridges.md) | **中文**
+
 `jsnative/natives/` 下的四个文件是 mario VM 与引擎之间的**桥**（bridge）。它们纯 C、平台无关、不认识 litehtml——每个桥定义一张回调表（`js_*_callbacks_t`），由引擎（`EWebJs.cc` / `EWebCanvasGlue.cc` 里的静态成员）实现。JS 调 DOM 方法 → 桥翻译成回调 → 引擎操作 litehtml 文档，这条路是 HTML/CSS/JS 协同的主干道。
 
 ```

@@ -1,5 +1,7 @@
 # 第 10 章 · 平台移植指南
 
+> 语言: [English](10-porting.md) | **中文**
+
 ewebview 核心不认识任何操作系统：它只把页面渲染进一块抽象的 ARGB8888 内存画布（`eweb_surface_t`），一切平台能力经 **`eweb_port_t`**（`porting/include/ewebview_port.h`）注入。移植一个平台 = 填六张回调表。本章逐表讲契约，再对照参考移植 `porting/src/ewokos/port_ewokos.c` 给出落地步骤。
 
 ## 10.1 移植层的设计规则
@@ -58,24 +60,30 @@ ewebview 核心不认识任何操作系统：它只把页面渲染进一块抽�
 
 **sys 表**：`ptr_sane` 是**不解引用**的指针堆内合理性检查，JS 桥在读元素活性标记之前先过它（挡伪造句柄，见 6.6）；`log` 输出核心日志行（文本已带 `[js]` 等来源前缀）。
 
-## 10.6 参考移植对照：port_ewokos.c
+## 10.6 参考移植对照：port_ewokos.c 与 port_sdl2.c
 
-EwokOS 移植是纯 C99、不足 400 行，结构就是"一组 `ek_*` 静态函数 + `eweb_port_ewokos()` 填表"：
+仓库内置两份完整的参考移植，都是纯 C99、结构都是"一组 `ek_*` 静态函数 + `eweb_port_*()` 填表"：
 
-| HAL 成员 | EwokOS 实现 |
-| --- | --- |
-| gfx.* | `graph_*` 族一一对应（`G(s)`/`SG(g)` 宏做句柄强转；`surface_native` 直接返回 `graph_t*`） |
-| font.* | `font_new("system-cn")` + `font_metrics`/`font_char_width`/`font_draw_text` |
-| image.decode | SVG 嗅探（`ek_looks_like_svg`）→ `graph_image_new_from_data(AUTO)` → WebP 走 `libwebp` 兜底 |
-| net.request | tinyhttpsc/BearSSL；`SetTimeout(10000)` + **`SetMaxRedirections(0)`**（重定向交给核心） |
-| net.read_file | `vfs_readfile` |
-| net.resolve_resource | `x_get_res_name`（`res://`） |
-| clock | `sys_tic_ms(0)` / `proc_usleep` |
-| sys | `ewok_ptr_in_heap` / `klog` |
+- **`porting/src/ewokos/port_ewokos.c`**（约 400 行）：EwokOS 原生图形栈；
+- **`porting/src/sdl2/port_sdl2.c`**（约 1400 行）：桌面端 SDL2，是**默认**构建的 port，比 EwokOS port 多填了全部 OPTIONAL 钩子（`surface_pixels`、`flatten_quadratic/cubic`、`text_size` 等）并支持 HiDPI。
 
-**按需链接**：`port_ewokos.o` 编进 `libewebview.a`，但只有嵌入者真的调用了 `eweb_port_ewokos()` 才会被链接器拉入——外部平台链接 `libewebview.a` 并提供自己的移植时，**完全不会引入** graph/font/tinyhttpsc 符号（Makefile 头部注释即此设计）。
+| HAL 成员 | EwokOS 实现 | SDL2 实现 |
+| --- | --- | --- |
+| `eweb_surface_t` | `graph_t*`（plain cast） | `sdl_surf_t{ SDL_Surface(ARGB8888) + SDL_Renderer }` |
+| `eweb_font_t` | `font_t*` | `sdl_font_t{ family + 按字号缓存的 TTF_Font* }` |
+| gfx.* | `graph_*` 族一一对应（`G(s)`/`SG(g)` 宏强转；`surface_native` 返回 `graph_t*`） | `SDL_FillRect`/`SDL_BlitSurface`/`SDL_BlitScaled` + SDL2_gfx 图元（line/box/circle/arc/pie/rounded/bezier） |
+| font.* | `font_new("system-cn")` + `font_metrics`/`font_char_width`/`font_draw_text` | SDL2_ttf（句柄不含字号，每字号缓存一个 `TTF_Font*`） |
+| image.decode | SVG 嗅探 → `graph_image_new_from_data(AUTO)` → WebP 走 `libwebp` 兜底 | `IMG_Load_RW`(SDL2_image) + `ConvertSurfaceFormat(ARGB8888)`，WebP 走 `libwebp` |
+| net.request | tinyhttpsc/BearSSL；`SetTimeout(10000)` + **`SetMaxRedirections(0)`** | 同一份 tinyhttpsc/BearSSL；同样 **`SetMaxRedirections(0)`** |
+| net.read_file | `vfs_readfile` | 标准 C `fopen`/`fread` |
+| net.resolve_resource | `x_get_res_name`（`res://`） | `<program-dir>/res/<name>`（经 `SDL_GetBasePath`） |
+| clock | `sys_tic_ms(0)` / `proc_usleep` | `clock_gettime(CLOCK_MONOTONIC)` / `SDL_Delay` |
+| sys.log | `klog` | `SDL_Log` |
+| sys.ptr_sane | `ewok_ptr_in_heap` | 非 NULL 启发式（桌面无廉价堆归属检查，OPTIONAL，核心退化为只信活性标记） |
 
-`porting/src/sdl2/` 目录目前是 EwokOS 移植的**拷贝脚手架**（内容与 `port_ewokos.c` 相同，Makefile 中对应行被注释），是留给桌面 SDL2 移植的占位。
+**HiDPI**：`eweb_port_sdl2_set_dpr(float)` 让 `surface_new` 按 `逻辑尺寸 × dpr` 分配设备像素，每个 draw/font 回调把逻辑坐标放大——布局留在 CSS 像素，光栅化跑在原生设备分辨率。嵌入者需在 `ewebview_create()` 前、UI 线程上调它（sdlbrowser 从 `SDL_GetBasePath` 侧探测）。
+
+**按需链接**：两份 port 对象都编进 `libewebview.a`（由 `PORTING` 决定编哪份），但只有嵌入者真的调用了 `eweb_port_ewokos()` / `eweb_port_sdl2()` 才会被链接器拉入——外部平台链接 `libewebview.a` 并提供自己的移植时，**完全不会引入** graph/font/SDL2/tinyhttpsc 符号（Makefile 头部注释即此设计）。注意 `eweb_port_sdl2()` **未在 `ewebview_port.h` 里声明**（公开头只声明了 `eweb_port_ewokos()`），sdl2 嵌入者需自行 `extern` 声明。
 
 ## 10.7 新平台落地顺序
 
@@ -92,9 +100,11 @@ EwokOS 移植是纯 C99、不足 400 行，结构就是"一组 `ek_*` 静态函�
 
 每一步缺失时的降级行为都写在 `ewebview_port.h` 对应成员的注释里——HAL 的注释就是契约。
 
-## 10.8 宿主机预验证：litehtml/hosttest
+## 10.8 宿主机预验证：sdl2 port + sdlbrowser
 
-移植出问题时要先分清"litehtml 集成问题"还是"平台问题"。`litehtml/hosttest/build.sh` 用宿主机编译器（macOS clang）把 litehtml + gumbo + 一个 stub 容器编成 `lhtest`，**不依赖任何移植层**——排版疑问先在宿主机上复现，再决定查哪一层。
+移植出问题时要先分清"litehtml 集成问题"还是"平台问题"。默认的 `PORTING=sdl2` 宿主机构建（`make`，见第 2 章）用原生编译器把引擎 + `port_sdl2` + `bin/sdlbrowser` 编成一个桌面可执行——**不需 QEMU / 目标硬件**就能跑真实页面。排版/脚本/网络疑问先在宿主机 sdlbrowser 上复现（它走的是同一份平台无关核心），再决定查移植层还是核心：若宿主机正常而目标平台异常，问题几乎总在目标 port 的某张表里。
+
+> 旧版的 `litehtml/hosttest` 诊断 harness 已移除；它的“宿主机复现排版”职责现在由 sdl2 port + sdlbrowser 承担，且覆盖面更完整（含 JS/网络/Canvas，不只是排版）。
 
 ## 10.9 移植检查清单
 
@@ -106,4 +116,4 @@ EwokOS 移植是纯 C99、不足 400 行，结构就是"一组 `ek_*` 静态函�
 - [ ] `net.request` **不自动跟随重定向**；响应内存活到 `free_response`
 - [ ] `image.decode` 不触碰引擎线程状态（跑在下载线程）
 - [ ] 句柄强转宏集中定义（参考移植的 `G/SG/FT/EF` 模式），不散落 cast
-- [ ] 全程在真机跑 `data/test/html/` 下的用例页（见第 11 章嵌入侧）
+- [ ] 全程在真机（或宿主机 sdlbrowser）跑测试页：sdlbrowser 内置 `res://html/` 起步页，EwokOS 仓的 `browser/data/test/html/` 有更全的 DOM/事件/表单/定时器/canvas/storage 用例（见第 11 章嵌入侧）

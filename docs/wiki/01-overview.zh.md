@@ -1,5 +1,7 @@
 # 第 1 章 · 总体架构
 
+> 语言: [English](01-overview.md) | **中文**
+
 ## 1.1 ewebview 是什么
 
 ewebview 是一个**自包含（self-contained）的嵌入式 Web 引擎**：给它一个 URL，它在后台线程里完成下载、解析、排版、脚本执行与光栅化，把结果以一块 ARGB8888 内存画布（`eweb_surface_t`）的形式交给嵌入者。嵌入者只需要把这块画布 blit 进自己的窗口。
@@ -13,25 +15,25 @@ ewebview：  引擎 -> eweb_port_t 回调表 -> 由"移植层"决定调用什么
 
 核心代码（`ewebview/src/`）**不出现任何平台符号**——没有 `graph_t`、没有 socket、没有文件系统调用。它只认识：
 
-- `eweb_surface_t*`：不透明画布句柄（EwokOS 上恰好是 `graph_t*`）；
-- `eweb_font_t*`：不透明字体句柄（EwokOS 上是 `font_t*`）；
+- `eweb_surface_t*`：不透明画布句柄（EwokOS 上恰好是 `graph_t*`，SDL2 上是包了 `SDL_Surface` 的 `sdl_surf_t*`）；
+- `eweb_font_t*`：不透明字体句柄（EwokOS 上是 `font_t*`，SDL2 上是按字号缓存 `TTF_Font*` 的 `sdl_font_t*`）；
 - `eweb_port_t` 里的六张函数表：gfx / font / image / net / clock / sys。
 
 这一契约声明在 [`ewebview/porting/include/ewebview_port.h`](../../ewebview/porting/include/ewebview_port.h)，公开 API 在 [`ewebview/include/ewebview.h`](../../ewebview/include/ewebview.h)。
 
 ## 1.2 设计目标
 
-1. **可移植**：换平台 = 新写一份 port（填六张表），核心零改动。参考实现 `port_ewokos.c` 约 400 行。
+1. **可移植**：换平台 = 新写一份 port（填六张表），核心零改动。仓库同时提供两份参考实现：`port_ewokos.c`（约 400 行，EwokOS 原生图形栈）与 `port_sdl2.c`（约 1400 行，桌面端 SDL2 / SDL2_ttf / SDL2_image / SDL2_gfx + libtinyhttpsc，含 HiDPI）。
 2. **可增量**：除 gfx/font/clock 外的每张表都是 OPTIONAL，留空则对应能力降级而不是崩溃——可以先点亮排版，再补网络，再补图片。
 3. **UI 永不阻塞**：下载、解析、排版、脚本都在引擎线程与下载线程上；UI 线程只投递命令、收事件、blit 帧。
-4. **零拷贝帧交付**：帧表面以所有权转移的方式跨线程移交，嵌入者甚至可以把表面强转回平台原生类型直接 blit（EwokOS 上就是这么做的）。
+4. **零拷贝帧交付**：帧表面以所有权转移的方式跨线程移交，嵌入者甚至可以把表面强转回平台原生类型直接 blit（EwokOS 上 `graph_t*`、SDL2 上 `SDL_Surface*`）。
 5. **面向受限环境**：全部静态链接、无 C++ 异常/RTTI 依赖（litehtml 以 `-fno-rtti` 构建）、脚本运行带看门狗，恶意死循环无法锁死引擎。
 
 ## 1.3 分层结构
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│ 嵌入者（Embedder）：xBrowser / WidgetWebview / 你的应用       │  UI 线程
+│ 嵌入者（Embedder）：sdlbrowser / xBrowser / WidgetWebview     │  UI 线程
 ├────────────────────────────────────────────────────────────┤
 │ 公开 C API：ewebview.h                                      │
 │   create/load/stop/reload/set_viewport/post_event/scroll/   │
@@ -45,17 +47,20 @@ ewebview：  引擎 -> eweb_port_t 回调表 -> 由"移植层"决定调用什么
 │   EWebCookies.cc     进程级 CookieJar                        │
 ├───────────────┬──────────────────────────┬─────────────────┤
 │ litehtml+gumbo│ mario VM + jsnative 桥    │ libwebp          │
-│ (liblitehtml.a│ (libmario.a)             │ (libwebp.a)      │
+│ (liblitehtml.a│ (libmario_jsn.a)         │ (libwebp.a)      │
 ├───────────────┴──────────────────────────┴─────────────────┤
 │ 移植层 HAL：eweb_port_t（gfx/font/image/net/clock/sys）       │  平台
-│   参考实现：port_ewokos.c = graph/font/tinyhttpsc/vfs/...    │
+│   参考实现：port_sdl2.c   = SDL2/SDL2_ttf/SDL2_image/SDL2_gfx │
+│             port_ewokos.c = graph/font/x/vfs                  │
+│   两者共用 libtinyhttpsc（BearSSL HTTP/HTTPS）作为 net 表后端    │
 └────────────────────────────────────────────────────────────┘
 ```
 
 - **litehtml + gumbo**（vendored 于 `litehtml/`）：HTML 解析与 CSS 排版引擎。gumbo 是 HTML5 解析器（C），litehtml 在其上构建元素树并执行样式计算与布局（C++）。
 - **mario VM**（`mario_js/` 子模块）：字节码虚拟机 + JavaScript 前端，纯 C、无依赖，内存分配与输出都由宿主注入。
-- **jsnative**（`jsnative/natives/`）：四套浏览器桥——`js_dom`（Document/Element）、`js_event`（Event/EventTarget）、`js_web`（window/location/storage/XHR/fetch）、`js_canvas`（Canvas 2D），同样纯 C、平台无关。
-- **libwebp**：WebP 解码；其余图片格式（png/jpeg/gif/tga/svg）由移植层自行接入（EwokOS 走 graph_image/plutosvg）。
+- **jsnative**（`jsnative/natives/`）：四套浏览器桥——`js_dom`（Document/Element）、`js_event`（Event/EventTarget）、`js_web`（window/location/storage/XHR/fetch）、`js_canvas`（Canvas 2D），同样纯 C、平台无关。与 VM 一起归档为 `libmario_jsn.a`。
+- **libtinyhttpsc**（`libtinyhttpsc/`）：独立的 BearSSL HTTP/HTTPS 客户端（纯 C，无 OS 依赖），两份参考移植的 `net.request` 都接它。归档 `libtinyhttpsc.a`。
+- **libwebp**：WebP 解码；其余图片格式（png/jpeg/gif/tga/svg）由移植层自行接入（EwokOS 走 graph_image/plutosvg，SDL2 走 SDL2_image）。
 
 ## 1.4 核心内部模块地图
 
@@ -70,7 +75,7 @@ ewebview：  引擎 -> eweb_port_t 回调表 -> 由"移植层"决定调用什么
 | `m_cmdQueue` / `m_uiQueue` | UI→引擎命令队列、引擎→UI 事件队列 |
 | `m_taskQueue` / `m_resultQueue` | 子资源下载任务与结果队列（下载线程） |
 | `m_freeFrames` / `m_pendingFrame` | 视口帧池（双缓冲）与待认领帧 |
-| `m_jsVm` + JS 状态 | mario VM、脚本列表、运行预算、mutation 日志 |
+| `m_jsVm` + JS 状态 | mario VM、脚本列表（`m_jsScripts` / 外链 `m_jsScriptSrcs`）、运行预算、mutation 日志 |
 | `m_jsCanvases` | 每个 `<canvas>` 的离屏画布注册表 |
 | `EWebCookieJar`（进程单例） | HTTP 与 document.cookie 共享的 Cookie 仓库 |
 
@@ -92,7 +97,8 @@ taskLoop() 取任务                        [下载线程]
    │  net.request() 拉取字节，Cookie 逐跳处理，图片顺带解码
    ▼
 pushResult() → 引擎 processResults()
-   │  HTML 到手：extract_scripts() 剥离 <script>
+   │  HTML 到手：extract_scripts() 剥出内联脚本体，
+   │            外链 <script src> 按文档序排队 EWEB_TASK_SCRIPT 下载
    ▼
 build 状态机（第 4 章详述）：
    PRELOAD_CSS → CREATE_DOC(gumbo+litehtml 解析) → RUN_JS(可选)
@@ -120,7 +126,9 @@ ewebview_tick() → listener.on_frame(frame)   [UI 线程]
 
 ## 1.7 与其他组件的关系
 
-- **WidgetWebview**（`browser/libs/widget++/src/WidgetWebview/`）：把 ewebview 包成 widget++ 控件的参考嵌入者，约 500 行——证明核心之外不再需要任何 Web 逻辑。
-- **xBrowser**（`browser/apps/xBrowser/`）：完整浏览器应用 = WidgetWebview + 地址栏/状态栏/历史。
-- **Qt 侧**（`projects/qt/apps/qbrowser` 等）：同一份 SDK 头文件与库也可被 Qt 应用复用（litehtml 直接渲染到 `graph_t`）。
-- 测试页：`browser/data/test/html/*.html`（DOM、事件、表单、定时器、canvas、storage 等）。
+本仓库是**独立**的引擎仓库，产物（静态库 + 公开头）装进 SDK 目录（`build_$(ARCH)/$(HW)/` 或 EwokOS 的 `system/build_$(ARCH)/$(HW)/`）后被下游应用消费：
+
+- **`bin/sdlbrowser`**（本仓库内）：SDL2 桌面浏览器壳，是引擎 + `port_sdl2` 的最小完整嵌入者，含地址栏 / 状态栏 / 历史 / 滚轮 / HiDPI，是移植与嵌入的活参考（第 11 章）。
+- **WidgetWebview**（EwokOS 仓库 `browser/libs/widget++/src/WidgetWebview/`）：把 ewebview 包成 widget++ 控件的参考嵌入者，约 500 行——证明核心之外不再需要任何 Web 逻辑。
+- **xBrowser**（EwokOS 仓库 `browser/apps/xBrowser/`）：完整浏览器应用 = WidgetWebview + 地址栏/状态栏/历史，走 `port_ewokos`。
+- 测试页：`bin/sdlbrowser/res/html/` 内置起步页与 `master.css`；更完整的 DOM / 事件 / 表单 / 定时器 / canvas / storage 用例页在 EwokOS 仓库的 `browser/data/test/html/`。

@@ -1,5 +1,7 @@
 # 第 4 章 · 页面加载流水线（build 状态机）
 
+> 语言: [English](04-page-pipeline.md) | **中文**
+
 从 `ewebview_load(url)` 到新页上屏，中间隔着下载、解析、样式、脚本、布局多个阶段。ewebview 把它们组织成一台**非阻塞状态机**：`m_buildPhase` 驱动，引擎主循环每轮推进一步（`advanceBuildStep()`），期间 UI 随时可中止。本章逐阶段拆解。
 
 ## 4.1 状态总览
@@ -70,6 +72,8 @@ engineNavigate() 排队 HTML 任务
 **B. 渐进跑脚本（post-swap）**
 普通页面**先上屏再跑脚本**：SWAP 之后每轮引擎循环跑一个脚本（`runNextPageScript()`），脚本里的 DOM 修改经 `jsMarkLayoutDirty() → jsProgressiveFlush()` 在**脚本运行中途**就把阶段性结果绘制出去——测试页的结果是一条条冒出来的，而不是白屏等到底。渐进重排的间隔自适应：上一次的 flush 成本 ×3，夹在 `kJsFlushMinGapMs = 200` 与 `kJsFlushMaxGapMs = 1500` 之间。
 
+**外链与动态脚本**：`<script src="...">` 不再被丢弃——`extract_scripts()` 给它留一个**空体的有序槽**（`m_jsScripts[i]` + `m_jsScriptSrcs[i]`，`m_jsScriptDone[i]=0`）并按文档序排队 `EWEB_TASK_SCRIPT` 下载。`runNextPageScript()` 跑到一个未就绪的槽时**返回“仍在运行”但不忙等**：保持 `BUILD_RUN_JS` 武装，引擎循环停在 4ms 拍上，直到 `processResults()` 填好该槽（下载失败也标 done + 空体，404 不会卡死有序运行）并置 `m_deferBuildStep` 唤醒。脚本运行时动态插入的 `<script>`（`createElement('script'); s.src=...; appendChild`，w3.org 的 members.js 就是这么加的）经 `jsDynamicScriptInserted()` 同样追加一个有序槽并重武装运行。于是内联/外链/动态脚本共享同一个严格按文档序的执行流。
+
 两种模式收口处都会 `jsFireLoadEvents()`：先 `DOMContentLoaded`，再 document/window 的 `load`，再 `<body onload>`——**只在页面脚本跑完之后**，与每个页面假设的顺序一致。
 
 ## 4.6 SWAP_DOC：新旧页交接
@@ -111,6 +115,7 @@ m_flushDeferredImages = true;              // 构建期压下的图片现在发�
 | `kLayoutDebounceMs` | 30 ms | 标脏后至少等这么久，合并连续变更 |
 | `kLayoutMaxWaitMs` | 200 ms | 脏标记最长挂起时间，到点强制重排 |
 | `kLayoutBehindStyleMs` | 500 ms | 样式积压超过它说明落后太多，走补偿路径 |
+| `kStyleMaxWaitMs` | 1500 ms | master 样式遍历等剩余 `<link>` 表（`m_pendingCss`）的上限，超时就先开始（新表到达会从头重启遍历） |
 | `kStyleBudgetIdleMs` | 25 ms | 单次样式分片的墙钟预算 |
 | `kJsMaxReparse` | 8 | document.write 重解析上限 |
 | `kJsRunBudgetMs` | 10000 ms | 单次 VM 运行预算（第 6 章） |

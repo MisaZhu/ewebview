@@ -1,5 +1,7 @@
 # 第 3 章 · 线程模型与帧交付
 
+> 语言: [English](03-threading.md) | **中文**
+
 ewebview 的并发设计回答了三个问题：UI 如何永不阻塞、两条后台线程如何分工、渲染结果如何零拷贝地跨线程上屏。所有规则都写在 `ewebview.h` 与 `ewebview_port.h` 的注释契约里，本章展开实现侧。
 
 ## 3.1 三类线程
@@ -138,7 +140,7 @@ ewebview 的并发设计回答了三个问题：UI 如何永不阻塞、两条�
 | `sys.log` | 引擎线程 | — |
 | `sys.ptr_sane` | 引擎线程 | 廉价、不解引用 |
 
-EwokOS 参考 port 里用到的原语（graph/font/tinyhttpsc/kernel_tic）都不保存跨调用状态，天然满足上述约束。
+EwokOS 参考 port 里用到的原语（graph/font/tinyhttpsc/kernel_tic）与 SDL2 参考 port 里用到的（SDL2/SDL2_ttf/SDL2_image/SDL2_gfx + 同一份 tinyhttpsc）都不保存跨调用状态；SDL2 表面/渲染器本身非线程安全，但每块表面只被创建它的线程触碰，天然满足上述约束。
 
 ## 3.7 为什么不需要更多锁
 

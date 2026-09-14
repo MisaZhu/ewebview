@@ -1,5 +1,7 @@
 # 第 9 章 · 网络、Cookie 与存储
 
+> 语言: [English](09-network-cookies.md) | **中文**
+
 ewebview 的网络子系统解决三个问题：子资源怎么在**不阻塞引擎线程**的前提下进来；重定向与 Cookie 怎么在**跨站**时仍然安全；JS 的 `document.cookie` 与 `localStorage` 怎么跟 HTTP 侧共享状态。核心结构只有两条队列、一个下载线程和一个进程级 CookieJar。
 
 ## 9.1 子资源任务队列与下载线程
@@ -7,15 +9,15 @@ ewebview 的网络子系统解决三个问题：子资源怎么在**不阻塞引
 ```
 引擎线程（生产者）                     下载线程（消费者，按需拉起）
   addTask({url,type}) ──► m_taskQueue ──► getTask() 取一个未 loading 的
-        ▲                                    │ loadHtmlTask / loadCSSTask / loadImageTask
+        ▲                                    │ loadHtmlTask / loadCSSTask / loadImageTask / loadScriptTask
         │                                    │   └─ EWebContainer::loadURL()（可能含重定向）
  m_resultQueue ◄── pushResult({url,ok,content,image})
         │
         ▼ 引擎循环第 2/3 步 processResults()（见第 3 章）
-   HTML→启动 build 状态机 / CSS→loadCSSContent / 图片→mountDecodedImage
+   HTML→启动 build 状态机 / CSS→loadCSSContent / 图片→mountDecodedImage / SCRIPT→填回有序脚本槽
 ```
 
-- **任务类型**即公共常量 `EWEB_TASK_HTML / EWEB_TASK_CSS / EWEB_TASK_IMAGE`（嵌入者经 `on_task_*` 监听器看到的就是它们）。
+- **任务类型**即公共常量 `EWEB_TASK_HTML / EWEB_TASK_CSS / EWEB_TASK_IMAGE / EWEB_TASK_SCRIPT`（嵌入者经 `on_task_*` 监听器看到的就是它们；`EWEB_TASK_SCRIPT` 是外链 `<script src>` 的下载，见第 6 章）。
 - **`addTask` 按 URL 去重**（同一图片在页面上出现十次只下载一次），并在没有 worker 时 `pthread_create` + `pthread_detach` **按需拉起**下载线程；队列排空后 worker 发一次 `EUET_TASKS_END` 就**自行退出**——不养闲置线程，下次有任务再创建。
 - **worker 的纪律**：只碰互斥锁保护的 `m_taskQueue`/`m_resultQueue` 和移植表的 `net.*`/`image.decode` 回调，**永远不碰文档与 VM**；对 UI 的通知（`EUET_TASK_START/END/FAILED`）一律 `postUiEvent`，由 UI 线程在 `ewebview_tick()` 里投递——worker 从不直接调嵌入者钩子。
 - **topLevel 语义**：`loadHtmlTask` 传 `topLevel=true`（顶层导航），CSS/图片传 `false`（子资源）。这个布尔与 `pageUrl`（发起文档的 URL）一起驱动 SameSite 判定（见 9.4）。
@@ -31,7 +33,7 @@ ewebview 的网络子系统解决三个问题：子资源怎么在**不阻塞引
 
 落地规则：请求失败、`resp.error`、非 200 状态、空 body 一律返回 NULL（失败结果同样进 `m_resultQueue`，由引擎按类型降级——CSS 失败就 `forgetCSS`，图片失败就保持 0×0 布局）。
 
-**移植层配合**：参考移植 `port_ewokos.c` 显式 `HttpsRequestSetMaxRedirections(request, 0)`——HTTP 库不跟随任何重定向，把每一跳暴露给引擎。新平台若使用会自动跟随的 HTTP 库，**必须关掉它的自动重定向**，否则上述 Cookie 语义全部失效。
+**移植层配合**：两份参考移植（`port_ewokos.c` 与 `port_sdl2.c`）都显式 `HttpsRequestSetMaxRedirections(request, 0)`——HTTP 库不跟随任何重定向，把每一跳暴露给引擎。新平台若使用会自动跟随的 HTTP 库，**必须关掉它的自动重定向**，否则上述 Cookie 语义全部失效。
 
 ## 9.3 processResults：构建期的回压
 

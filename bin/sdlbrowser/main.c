@@ -155,6 +155,11 @@ typedef struct {
     ewebview_t*   view;
     eweb_port_t   port;             /* kept so we can call surface_native() */
     eweb_surface_t* frame;        /* adopted frame (owned until released) */
+    eweb_surface_t* frame_prev;   /* previous frame, released only AFTER its
+                                   * replacement has been uploaded: the engine
+                                   * recycles a released buffer immediately and
+                                   * would overwrite it mid-upload (torn rows /
+                                   * ghost text / half-drawn images). */
     SDL_Texture*  frame_tex;      /* streaming texture, viewport-sized */
     int           frame_sx, frame_sy;   /* scroll the frame was rendered at */
     int           doc_w, doc_h;         /* full document size */
@@ -219,8 +224,15 @@ static void cb_frame(void* ud, eweb_surface_t* frame,
     b->doc_h    = dh;
     b->content_dirty = true;
 
-    if(old && b->view)
-        ewebview_release_frame(b->view, old);
+    /* Do NOT release the outgoing frame here: upload_frame() still has to
+     * copy its pixels this tick, and a released buffer goes straight back
+     * into the engine's pool where the next render overwrites it - racing
+     * the upload and tearing the picture. Park it in frame_prev instead;
+     * upload_frame() releases it once the new frame is safely in the
+     * texture (and browser_destroy releases it at shutdown). */
+    if(b->frame_prev && b->view)
+        ewebview_release_frame(b->view, b->frame_prev);
+    b->frame_prev = old;
 }
 
 static void cb_scroll(void* ud, int x, int y, int dw, int dh) {
@@ -462,6 +474,13 @@ static void upload_frame(browser_t* b) {
 
     SDL_UnlockTexture(b->frame_tex);
     b->content_dirty = false;
+
+    /* The new frame's pixels are now in the texture; the parked previous
+     * frame is no longer referenced anywhere and can go back to the pool. */
+    if(b->frame_prev && b->view) {
+        ewebview_release_frame(b->view, b->frame_prev);
+        b->frame_prev = NULL;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1210,6 +1229,10 @@ static bool browser_init(browser_t* b, int argc, char** argv) {
 
 static void browser_destroy(browser_t* b) {
     if(b->view) {
+        if(b->frame_prev) {
+            ewebview_release_frame(b->view, b->frame_prev);
+            b->frame_prev = NULL;
+        }
         if(b->frame) {
             ewebview_release_frame(b->view, b->frame);
             b->frame = NULL;

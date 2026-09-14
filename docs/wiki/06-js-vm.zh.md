@@ -1,20 +1,23 @@
 # 第 6 章 · JavaScript：mario VM 集成与脚本调度
 
+> 语言: [English](06-js-vm.md) | **中文**
+
 ewebview 的 JS 由 **mario VM**（`mario_js/` 子模块，纯 C 字节码虚拟机 + JS 前端）执行。litehtml 本身没有脚本能力，所以引擎在 HTML 进解析器之前先把 `<script>` 剥出来，再按页面生命周期分阶段喂给 VM。本章讲 VM 的生命周期、脚本调度时机、看门狗与 document.write 重解析。
 
 mario VM 自身的内部设计（字节码、编译器、GC）有独立文档：[mario_js/docs/wiki/](../../mario_js/docs/wiki/README.md)，本章只讲"引擎怎么用它"。
 
 ## 6.1 脚本抽取：解析前剥离 `<script>`
 
-`ewebview.cc` 的 `extract_scripts(html, &scripts, &has_inline_handlers)`：
+`ewebview.cc` 的 `extract_scripts(html, &scripts, &script_srcs, &has_inline_handlers)`：
 
-- 扫描全文，把每个 `<script>...</script>` 块从 HTML 里**删掉**，内联脚本体按文档序追加到 `scripts` 列表；
-- `<script src="...">` **外链脚本直接丢弃**（当前不支持外部脚本的下载执行）；
+- 扫描全文，把每个 `<script>...</script>` 块从 HTML 里**删掉**（litehtml 不认识 JS，`el_script` 会留下一段什么都不渲染的文本）；
+- **内联脚本**：非空脚本体按文档序追加到 `scripts`，`script_srcs` 对应位置留空串；
+- **外链脚本** `<script src="...">`：**现已支持**——给 `scripts` 追加一个空体槽、给 `script_srcs` 追加它的 `src`（两数组等长），由调用者解析成绝对 URL 后排队 `EWEB_TASK_SCRIPT` 下载，到手再填回该槽（见 6.3）；
 - `type` 存在且不含 `javascript`（如 `application/json`、`module`）的块跳过，不执行；
-- 标签匹配大小写不敏感；
+- 属性名大小写不敏感、值大小写敏感（URL 区分大小写）；`src=` 只匹配完整属性名，`data-src=`/`srcset=` 不会误匹配；
 - 同时报告页面是否带**内联事件属性**（`onclick="..."` 等）——即使没有 `<script>` 块，带内联事件的页面也需要 VM。
 
-为什么解析前剥离：litehtml 不认识 JS，`el_script` 会留下一段什么都不渲染的文本；而脚本的执行时机（文档建成后）与解析时机必须分开。
+为什么解析前剥离：脚本的执行时机（文档建成后）与解析时机必须分开。
 
 ## 6.2 VM 生命周期
 
@@ -48,6 +51,7 @@ CREATE_DOC ──► (可能 document.write?) ──是──► RUN_JS（先跑
 ```
 
 - **多脚本共享全局**：`vm_load_run()` 把当前脚本的字节码接在前一个之后执行，全局量存于 `vm->root`——与浏览器里多个 `<script>` 块共享一个全局作用域一致；
+- **外链/动态脚本同序**：`m_jsScripts` / `m_jsScriptSrcs` / `m_jsScriptDone` 三个等长数组描述有序脚本槽。外链槽在 `EWEB_TASK_SCRIPT` 结果到达前 `done=0`，`runNextPageScript()` 遇到它就返回“仍在运行”而不忙等（引擎停 4ms 拍，`pushResult` 一到立即唤醒），因此严格按文档序执行；脚本运行时 `createElement('script')+appendChild` 动态插入的脚本经 `jsDynamicScriptInserted()` 追加新槽（外链同样走 `EWEB_TASK_SCRIPT`）并重武装运行；
 - **渐进可见**：post-swap 模式下脚本的 DOM 修改经 `jsProgressiveFlush()` 中途重排重绘（间隔自适应：上次 flush 耗时 ×3，夹在 200~1500ms）；
 - **load 事件最后发**：`DOMContentLoaded` → document/window `load` → `<body onload>`，保证监听器看到的是布局完毕、已上屏的文档；
 - **存活期**：之后脚本的入口只剩两类——定时器（引擎循环第 7 步 `jsPollTimers()` → `js_dom_poll_timers(vm, ticMs())`）与输入事件（`jsDispatchMouseEvent()`，第 7 章）。

@@ -1,5 +1,7 @@
 # 第 5 章 · HTML 与 CSS：解析、排版与容器
 
+> 语言: [English](05-html-css.md) | **中文**
+
 HTML 与 CSS 子系统完全建立在 vendored 的 **litehtml + gumbo** 之上（`litehtml/`）。本章讲三件事：litehtml 的"容器"倒置依赖模型、ewebview 的容器实现 `EWebContainer` 如何把每个回调映射到移植层、以及样式从加载到绘制的完整链路。
 
 ## 5.1 litehtml 的倒置依赖：document_container
@@ -45,7 +47,7 @@ class EWebContainerHost {
 };
 ```
 
-引擎（`EWebEngine`）实现它。容器因此可以独立测试（见 2.6 的 hosttest 用了一个更简的容器）。
+引擎（`EWebEngine`）实现它。容器因此不直接引用引擎类型，可独立于引擎测试与替换。
 
 ## 5.3 字体管线与缓存
 
@@ -62,7 +64,7 @@ class EWebContainerHost {
 
 一份文档的样式来自：
 
-1. **UA 默认样式表** `master.css`（`litehtml/include/master.css`，编译进 litehtml）：`<div>` 是块级、`<b>` 加粗这类浏览器缺省行为。引擎另支持 `ewebview_set_default_css(url)` 在首个页面前换装。
+1. **UA 默认样式表** `master.css`：**不再编译进 litehtml**，而是由嵌入者在首个页面加载前经 `ewebview_set_default_css(url)` 指定（例如 sdlbrowser 用 `res://html/default.css`）。引擎把它当作一个普通 `EWEB_TASK_CSS` 任务在 `BUILD_PRELOAD_CSS` 阶段下载，到手后经 `loadCSSContent()` 灌进 context 的 master 样式集。它提供 `<div>` 是块级、`<b>` 加粗这类浏览器缺省行为。**若未设置默认 CSS，`BUILD_PRELOAD_CSS` 整个跳过**（直接进 `CREATE_DOC`，无 UA 样式表）。
 2. **外链样式表** `<link rel="stylesheet">`：解析到 `el_link` 时走 `link()` + `import_css()` 回调 → 容器解析成绝对 URL 后 `host->loadCSS(url)` 排队下载。`link()` 还会把 `media` 属性记给引擎（`setCSSMedia`）——`media="print"` 这类永不匹配的表在落地时被丢弃，避免打印样式污染屏幕渲染。
 3. **内嵌样式块** `<style>`：litehtml 自己处理。
 4. **内联样式** `style="..."` 属性：同上。
@@ -102,7 +104,7 @@ litehtml 对 `<input>` 只有通用元素。`create_element` 钩子拦截 `type=
 
 ## 5.8 HTML/CSS 的已知边界
 
-- `<script src="...">` **外链脚本不加载**（`extract_scripts` 直接丢弃，见第 6 章）；
+- `<script src="...">` 外链脚本**现已支持**（作为 `EWEB_TASK_SCRIPT` 下载并按文档序执行，见第 6 章）；
 - litehtml 本身是 CSS2.1 + 部分 CSS3（flex 有 `flex_layout`，无 grid）；
 - `position:fixed` 参与命中测试（`get_element_by_point` 的 client 坐标对），其余行为从简；
 - 表单仅 `text`/`button` 两种 `<input>` 是替换元素，其余按普通标签渲染；

@@ -1,5 +1,7 @@
 # 第 11 章 · 嵌入指南
 
+> 语言: [English](11-embedding.md) | **中文**
+
 本章面向把 ewebview 装进自己应用的读者：C API 的调用次序、帧与滚动的所有权契约、每个监听器钩子的语义，最后解剖参考实例 `WidgetWebview` + `xBrowser`。全部 API 在 `ewebview/include/ewebview.h`。
 
 ## 11.1 最小嵌入序列
@@ -12,6 +14,9 @@
 eweb_port_t port;
 eweb_port_init(&port);
 eweb_port_ewokos(&port, NULL);          /* EwokOS 参考移植 */
+/* 或桌面端（默认构建的 port，需自行 extern 声明）：
+   extern void eweb_port_sdl2(eweb_port_t*, void*);
+   eweb_port_sdl2(&port, NULL);          // 先 SDL_Init(VIDEO)，可选 _set_dpr() */
 
 /* 2. 建引擎（引擎线程立即启动并驻车）；gfx/font/clock 缺失会返回 NULL */
 ewebview_t* v = ewebview_create(&port);
@@ -53,8 +58,9 @@ void my_on_frame(void* ud, eweb_surface_t* frame,
 ```
 
 - **所有权随回调转移**：嵌入者收养这帧（通常当作显示缓存，在自己的 repaint 里 blit 它），用完后经 `ewebview_release_frame()` 归还——一般在收养下一帧之前还上一帧；
+- **归还前确保不再读它的像素**：`ewebview_release_frame()` 一调，表面立即回到引擎帧池，下一次渲染可能马上覆写它。若你还需要拷贝它的像素（如 sdlbrowser 把 `SDL_Surface` 上传进 streaming `SDL_Texture`），必须**先拷完再归还**：sdlbrowser 把旧帧泊在 `frame_prev`，等新帧上传进纹理后才在 `upload_frame()` 里释放它（否则会撕裂行/鬼影文字/半画图）；
 - **背压**：帧未归还期间引擎不会再往这块表面画——天然限制在帧数，无跨线程像素拷贝、无每帧分配；
-- **零拷贝**：嵌入者与移植同平台时，帧句柄就是平台原生表面。EwokOS 上 `frameGraph()` 直接把 `eweb_surface_t*` 强转回 `graph_t*` blit 进窗口（等价于 `surface_native()` 的快捷方式）；
+- **零拷贝**：嵌入者与移植同平台时，帧句柄就是平台原生表面。EwokOS 上 `frameGraph()` 直接把 `eweb_surface_t*` 强转回 `graph_t*` blit 进窗口（等价于 `surface_native()` 的快捷方式）；SDL2 上 `eweb_surface_t*` 里包着 `SDL_Surface*`，sdlbrowser 把它上传进一块 streaming `SDL_Texture` 再 `SDL_RenderCopy` 进内容区；
 - `doc_w/doc_h` 是文档完整尺寸，用来给滚动条定比例。
 
 ## 11.4 滚动模型：位移 blit + 权威回执
@@ -82,6 +88,13 @@ int dx = r.x + (m_frameScrollX - m_scrollX);
 int dy = r.y + (m_frameScrollY - m_scrollY);
 ```
 
+sdlbrowser 的同一条公式多了 HiDPI 缩放（滚动偏移是逻辑 CSS px，blit 跑在设备 px，`bin/sdlbrowser/main.c`）：
+
+```c
+int dx = cr.x + lroundf((b->frame_sx - b->scroll_x) * b->ui_scale);
+int dy = cr.y + lroundf((b->frame_sy - b->scroll_y) * b->ui_scale);
+```
+
 注意 **`EWEB_MOUSE_WHEEL` 引擎直接忽略**——滚轮手势由嵌入者自己换算成 `ewebview_scroll()`（文档坐标由引擎换算，见 7.3 的命中测试）。
 
 ## 11.5 监听器钩子逐个看
@@ -96,7 +109,7 @@ int dy = r.y + (m_frameScrollY - m_scrollY);
 | `on_build_status` | 构建遮罩：`overlay=true` 仅在**真实构建**进行中（post-swap 脚本运行不算）——可以罩住页面显示 `text` + 0..100 进度条 |
 | `on_cursor` | 悬停链接时请求光标形状（如 `"pointer"`）；可能为 NULL/`"default"` |
 | `on_dialog` | `alert/confirm/prompt` 文本，**非阻塞**呈现（引擎永不等待模态；confirm 按 cancel、prompt 按 null 应答） |
-| `on_task_start/end/failed` | 子资源任务生命周期（类型为 `EWEB_TASK_HTML/CSS/IMAGE`），驱动进度指示 |
+| `on_task_start/end/failed` | 子资源任务生命周期（类型为 `EWEB_TASK_HTML/CSS/IMAGE/SCRIPT`），驱动进度指示 |
 | `on_tasks_end` | 任务队列排空——熄灭加载指示的时机 |
 
 ## 11.6 输入映射
@@ -115,13 +128,36 @@ typedef struct eweb_event {
 ## 11.7 配置面
 
 - `ewebview_set_viewport(w, h)`：重排 + 重绘 + 派发 `window.onresize`；
-- `ewebview_set_default_css(url)`：换 UA 默认样式表（首个页面加载前调，见 5.4）；
+- `ewebview_set_default_css(url)`：设 UA 默认样式表（首个页面加载前调，见 5.4）。master.css **不再内置于 litehtml**，不调则页面无 UA 缺省样式（`<div>` 不自动块级等）；sdlbrowser 用 `res://html/default.css`；
 - `ewebview_set_js_enabled(bool)`：默认开。关闭会释放 VM，下一次加载剥掉 `<script>`；
 - `ewebview_stop()`：中止在途加载，保留屏幕上已有内容；`ewebview_reload()`：重载当前页；`ewebview_get_url()`：当前可见页 URL（引擎持有，下次导航前有效）。
 
-## 11.8 参考实例：WidgetWebview 与 xBrowser
+## 11.8 参考实例
 
-**WidgetWebview**（`browser/libs/widget++/src/WidgetWebview/`）是标准嵌入范式，映射关系一目了然：
+### sdlbrowser（本仓库 `bin/sdlbrowser/`，首选参考）
+
+随仓库构建的 SDL2 桌面浏览器壳（`main.c` 约 1300 行，纯 C99），是引擎 + `port_sdl2` 的**最小完整嵌入者**，也是宿主机上直接可跑的活参考。映射关系：
+
+| sdlbrowser | ewebview 调用 |
+| --- | --- |
+| 初始化 | `SDL_Init(VIDEO)` → `eweb_port_sdl2_set_dpr()` → `eweb_port_sdl2()` → `ewebview_create()` |
+| 装监听器 | `cb_frame`/`cb_scroll`/`cb_url`/`cb_status`/`cb_build_status`/`cb_dialog`/`cb_task_*` |
+| 首屏 | `ewebview_set_viewport()` + `ewebview_set_default_css("res://html/default.css")` + `ewebview_load("res://html/default.html")` |
+| 主循环 | 每拍 `ewebview_tick()`；`cb_frame` 收养新帧并把旧帧泊入 `frame_prev`，`upload_frame()` 把新帧拷进纹理后才 `ewebview_release_frame()` 释旧帧 |
+| 重绘 | 帧 `SDL_Surface` 上传 streaming `SDL_Texture` → 按 11.4 位移公式（含 dpr）`SDL_RenderCopy` 进内容区 |
+| 输入 | SDL 鼠标/键盘事件 → 换算 client 坐标 → `ewebview_post_event()`；滚轮 → `browser_ui_scroll()` clamp + 移动 live offset + `ewebview_scroll()` |
+| 地址栏/历史 | `on_url` 记录历史、刷地址栏；前进/后退/停止/刷新按钮走 `ewebview_load/stop/reload` |
+
+链接顺序（`bin/sdlbrowser/Makefile`，用 `$(CXX)` 链以带进 libstdc++）：
+
+```
+-lewebview -llitehtml -lmario_jsn -lwebp -ltinyhttpsc $(SDL2_LIBS) -lm -lpthread
+# macOS 额外：-framework CoreFoundation（外观探测 AppleInterfaceStyle）
+```
+
+### WidgetWebview 与 xBrowser（EwokOS 仓库侧）
+
+**WidgetWebview**（`browser/libs/widget++/src/WidgetWebview/`）把引擎包成 widget++ 控件，走 `port_ewokos`：
 
 | widget++ 虚函数 | ewebview 调用 |
 | --- | --- |
@@ -132,12 +168,10 @@ typedef struct eweb_event {
 | `onMouseEvent` | 换算 client 坐标 → `ewebview_post_event()` |
 | `onScroll` | `uiLocalScroll()`：clamp → 移动 live offset → `ewebview_scroll()` |
 
-**xBrowser**（`browser/apps/xBrowser/`）在 WidgetWebview 之上加应用逻辑：`BrowserWidget` 覆写 `onTaskFailed`——`TASK_HTML` 失败且重试未满 6 次时记下 URL、按 30Hz 定时器约 1.5 秒后自动 `reload()`；`onTasksEnd` 归零重试计数。状态栏、标题栏、地址栏分别消费 `on_status/on_title/on_url`。
-
-链接顺序（`apps/xBrowser/Makefile`，静态库按依赖序）：
+**xBrowser**（`browser/apps/xBrowser/`）在 WidgetWebview 之上加应用逻辑：`BrowserWidget` 覆写 `onTaskFailed`——`TASK_HTML` 失败且重试未满 6 次时记下 URL、按 30Hz 定时器约 1.5 秒后自动 `reload()`；`onTasksEnd` 归零重试计数。状态栏、标题栏、地址栏分别消费 `on_status/on_title/on_url`。链接顺序（静态库按依赖序）：
 
 ```
-$(EWOK_LIB_X) -lWidgetWebview -lewebview -lmario -lwebp -llitehtml \
+$(EWOK_LIB_X) -lWidgetWebview -lewebview -lmario_jsn -lwebp -llitehtml \
               -ltinyhttpsc -lsocket $(EWOK_LIB_GRAPH) $(EWOK_LIBC) -lcxx
 ```
 
