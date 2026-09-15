@@ -92,9 +92,11 @@ static std::string script_attr_value(const std::string& lower_tag,
 
 static std::string extract_scripts(const std::string& html, std::vector<std::string>* scripts,
                                    std::vector<std::string>* script_srcs,
-                                   bool* has_inline_handlers)
+                                   bool* has_inline_handlers,
+                                   bool* has_module_scripts)
 {
     if(has_inline_handlers != nullptr) *has_inline_handlers = false;
+    if(has_module_scripts != nullptr) *has_module_scripts = false;
     if(html.empty()) {
         return html;
     }
@@ -114,7 +116,24 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
     size_t pos = 0;
     int removed = 0;
     while(pos < html.size()) {
+        /* An HTML comment swallows everything up to its '-->', including any
+         * <script> tag inside it. IE conditional comments rely on exactly
+         * that (<!--[if lte IE 6]><script src=ie6tip.js></script><![endif]-->):
+         * running such a script would navigate away from pages whose real
+         * content targets modern browsers, so copy the comment verbatim and
+         * resume scanning after it. A '<!--' inside a script body cannot
+         * reach this branch: the script span is consumed in one step below. */
+        size_t comment_open = lower.find("<!--", pos);
         size_t script_open = lower.find("<script", pos);
+        if(comment_open != std::string::npos &&
+           (script_open == std::string::npos || comment_open < script_open)) {
+            size_t comment_close = lower.find("-->", comment_open + 4);
+            size_t end = (comment_close == std::string::npos)
+                             ? html.size() : comment_close + 3;
+            out.append(html, pos, end - pos);
+            pos = end;
+            continue;
+        }
         if(script_open == std::string::npos) {
             out.append(html, pos, html.size() - pos);
             break;
@@ -150,6 +169,14 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
         size_t tp = open_tag.find("type=");
         if(tp != std::string::npos) {
             non_js = (open_tag.find("javascript", tp) == std::string::npos);
+        }
+        /* Remember a skipped type="module": the VM cannot parse ES2020 module
+         * bundles, so a page whose content lives in one renders blank; the
+         * engine arms a plain notice for that case (decideModuleNotice). */
+        if(has_module_scripts != nullptr && !*has_module_scripts) {
+            std::string type_val = script_attr_value(open_tag, open_tag_orig, "type");
+            for(char& ch : type_val) ch = (char)::tolower((unsigned char)ch);
+            if(type_val == "module") *has_module_scripts = true;
         }
         if(scripts != nullptr && !non_js) {
             if(external) {
@@ -290,11 +317,23 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_jsNextScript(0)
     , m_jsScriptWaitSince(0)
     , m_jsPostSwapRun(false)
+    , m_jsPostSwapAt(0)
+    , m_jsBuildHasModules(false)
+    , m_jsPageHasModules(false)
+    , m_moduleNoticeDecided(false)
+    , m_showModuleNotice(false)
+    , m_swapAtMs(0)
+    , m_noticeFont(nullptr)
     , m_jsProgressiveActive(false)
     , m_jsLastFlushAt(0)
     , m_jsFlushCostMs(0)
     , m_jsInScript(false)
     , m_jsEnterAt(0)
+    , m_jsRunDeadline(0)
+    , m_jsPrePaintAt(0)
+    , m_jsAbortPrePaint(false)
+    , m_jsPrePaintCut(false)
+    , m_jsCurScriptSrc(nullptr)
     , m_jsEnterGen(0)
     , m_jsAbortCount(0)
     , m_jsPageDisabled(false)
@@ -357,6 +396,11 @@ EWebEngine::~EWebEngine()
         if(live <= 0)
             break;
         portSleepMs(10);
+    }
+
+    if(m_noticeFont != nullptr && m_port.font.destroy != nullptr) {
+        m_port.font.destroy(m_port.font.ud, m_noticeFont);
+        m_noticeFont = nullptr;
     }
 
     pthread_cond_destroy(&m_cmdCond);
@@ -572,6 +616,13 @@ void EWebEngine::engineLoop()
             } else {
                 advanceBuildStep();
             }
+        } else if(m_jsPageHasModules && !m_moduleNoticeDecided && !m_jsPostSwapRun &&
+                  (ticMs() - m_swapAtMs) > 2500) {
+            /* A page whose content is entirely produced by skipped ES module
+             * scripts paints blank: once classic scripts had their chance and
+             * the body still holds no text, say so on the page instead of
+             * leaving an unexplained white viewport. */
+            decideModuleNotice();
         }
 
         /* 6. a navigation/scroll a script or an anchor click asked for. Runs
@@ -833,10 +884,16 @@ bool EWebEngine::engineHandleCommand(const EWebCmd& cmd)
                 int lx, ly;
                 widgetLocalCoords(w, cx, cy, m_engineScrollX, m_engineScrollY, lx, ly);
                 if(w->isTextEditing()) {
-                    w->placeCaretAt(lx, ly);
-                    m_textDragging = true;
-                    m_dragWidget = wv;
-                    markContentDirty();
+                    int sdir = 0;
+                    if(w->spinnerHit(lx, ly, &sdir)) {
+                        /* Spinner press: leave the caret/selection alone; the
+                         * matching click steps the value (activateWidget). */
+                    } else {
+                        w->placeCaretAt(lx, ly);
+                        m_textDragging = true;
+                        m_dragWidget = wv;
+                        markContentDirty();
+                    }
                 } else if(w->inputType() == EWEB_INPUT_RANGE) {
                     w->setRangeFromX(lx);
                     m_rangeDragging = true;
@@ -1778,6 +1835,17 @@ void EWebEngine::activateWidget(void* widget, int localX, int localY)
         w->setRangeFromX(localX);
         fireWidgetEvent(el, "input");
         break;
+    case EWEB_INPUT_TEXT: {
+        /* number input: a click on the UA spinner arrows steps the value
+         * (clamped to min/max) and reports input+change, like a browser. */
+        int dir = 0;
+        if(w->spinnerHit(localX, localY, &dir)) {
+            w->stepNumber(dir);
+            fireWidgetEvent(el, "input");
+            fireWidgetEvent(el, "change");
+        }
+        break;
+    }
     case EWEB_INPUT_BUTTON: {
         /* <input type=submit> and a <button> with no type submit their form;
          * type=button/reset have no native navigation here. */
@@ -1903,11 +1971,18 @@ void EWebEngine::cleanupBuildResources()
     m_jsNextScript = 0;
     m_jsScriptWaitSince = 0;
     m_jsPostSwapRun = false;
+    m_jsPostSwapAt = 0;
     m_jsProgressiveActive = false;
     m_jsLastFlushAt = 0;
     m_jsFlushCostMs = 0;
     m_jsInScript = false;
     m_jsEnterAt = 0;
+    m_jsRunDeadline = 0;
+    m_jsPrePaintAt = 0;
+    m_jsAbortPrePaint = false;
+    m_jsPrePaintCut = false;
+    m_jsCurScriptSrc = nullptr;
+    m_jsRunawaySrcs.clear();
     m_jsAbortCount = 0;
     m_jsPageDisabled = false;
     m_jsMutations.clear();
@@ -2371,7 +2446,9 @@ bool EWebEngine::loadHtmlTask(const std::string& url)
     uint64_t fetch_start = ticMs();
     /* Top-level navigation: SameSite=Lax cookies may ride along even when the
      * initiator is another site, Strict ones may not. */
-    uint8_t* content = EWebContainer::loadURL(&m_port, url, &sz, taskPageUrl(), true);
+    std::string final_url;
+    uint8_t* content = EWebContainer::loadURL(&m_port, url, &sz, taskPageUrl(), true,
+                                              &final_url);
     if(content != NULL) {
         if(sz > 0)
             result.content.assign((char*)content, sz);
@@ -2379,6 +2456,12 @@ bool EWebEngine::loadHtmlTask(const std::string& url)
             result.content = (char*)content;
         free(content);
         result.ok = true;
+        /* A redirect chain ends at final_url: publish IT as the page url so
+         * the address bar, session history and the base for relative
+         * resources match the document actually fetched (removeTask below
+         * still keys the queue by the requested url). */
+        if(!final_url.empty())
+            result.url = final_url;
     }
     EWEB_LOG("[ewebview] fetched html: url=%s ok=%d size=%d cost=%u ms\n",
         url.c_str(), result.ok ? 1 : 0, sz, (uint32_t)(ticMs() - fetch_start));
@@ -2630,9 +2713,11 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     m_jsScriptSrcs.clear();
     m_jsScriptDone.clear();
     m_jsHasInlineHandlers = false;
+    m_jsBuildHasModules = false;
     m_buildHtmlContent = extract_scripts(content, m_jsEnabled ? &m_jsScripts : nullptr,
                                          m_jsEnabled ? &m_jsScriptSrcs : nullptr,
-                                         m_jsEnabled ? &m_jsHasInlineHandlers : nullptr);
+                                         m_jsEnabled ? &m_jsHasInlineHandlers : nullptr,
+                                         &m_jsBuildHasModules);
     /* Mark each slot ready/pending: an external <script src> starts pending and
      * is filled when its EWEB_TASK_SCRIPT fetch lands; inline bodies are ready
      * now. extract_scripts keeps m_jsScriptSrcs the same length as m_jsScripts. */
@@ -2651,15 +2736,23 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
      * page defers its scripts to after BUILD_SWAP_DOC: the content paints
      * first and script results appear progressively (see BUILD_RUN_JS). */
     m_jsRunBeforePaint = false;
+    /* Arm the pre-paint wall clock only for the pages that actually take the
+     * run-before-paint path; it is what bounds the first paint (see
+     * kJsPrePaintBudgetMs). Reset by the next navigation. */
     for(size_t i = 0; i < m_jsScripts.size(); ++i) {
         if(m_jsScripts[i].find("document.write") != std::string::npos) {
             m_jsRunBeforePaint = true;
             break;
         }
     }
+    m_jsPrePaintAt = m_jsRunBeforePaint ? ticMs() : 0;
+    m_jsAbortPrePaint = false;
+    m_jsPrePaintCut = false;
+    m_jsRunawaySrcs.clear();
     m_jsNextScript = 0;
     m_jsScriptWaitSince = 0;
     m_jsPostSwapRun = false;
+    m_jsPostSwapAt = 0;
     m_buildHtmlUrl = m_currentHtmlUrl;
     if(!m_defaultCSSUrl.empty()) {
         m_buildPhase = BUILD_PRELOAD_CSS;
@@ -3169,7 +3262,17 @@ void EWebEngine::advanceBuildStep()
             m_buildPhase = BUILD_RUN_JS;
             return;
         }
-        bool restart = applyJsWriteBuffer();
+        bool restart = false;
+        if(m_jsPrePaintCut) {
+            /* The phase ended on its wall clock, not on completion: splicing
+             * the partial document.write() would restart the build with a
+             * cleared script list and lose every script that still has to run
+             * against the visible page. Drop the write and paint instead. */
+            jsDropWriteBuffer();
+            m_jsPrePaintCut = false;
+        } else {
+            restart = applyJsWriteBuffer();
+        }
         /* applyJsWriteBuffer() already tore down buildDoc/buildContainer and
          * updated m_buildHtmlContent when it returns true; rebuild from
          * it. */
@@ -3300,7 +3403,14 @@ void EWebEngine::advanceBuildStep()
             m_buildHtmlUrl.clear();
         }
         m_jsPostSwapRun = run_after;
+        m_jsPostSwapAt = run_after ? ticMs() : 0;
         m_buildPhase = run_after ? BUILD_RUN_JS : BUILD_IDLE;
+        /* The page on screen changed: re-arm the blank-SPA notice decision
+         * for whatever just swapped in. */
+        m_jsPageHasModules = m_jsBuildHasModules;
+        m_swapAtMs = ticMs();
+        m_moduleNoticeDecided = false;
+        m_showModuleNotice = false;
         m_defaultCssPrepared = false;
         m_defaultCssLoading = false;
         m_buildTargetContext = nullptr;
@@ -3379,6 +3489,10 @@ void EWebEngine::drawPageToCacheLocked(int stripY, int stripH)
     /* An open <select> dropdown floats above the page: draw it last so it is
      * never covered by the laid-out document. No-op unless one is open. */
     drawSelectPopup(cache);
+    /* Blank-SPA explanation, above everything else on the page. No-op unless
+     * decideModuleNotice() armed it. */
+    if(m_showModuleNotice)
+        drawModuleNotice(cache, cacheW, cacheH);
     if(m_port.gfx.surface_unset_clip != nullptr)
         m_port.gfx.surface_unset_clip(m_port.gfx.ud, cache);
     uint32_t draw_ms = (uint32_t)(ticMs() - draw_start);
@@ -3395,6 +3509,85 @@ void EWebEngine::drawPageToCacheLocked(int stripY, int stripH)
             stripY, stripH, draw_ms, text_width_calls, text_width_ms, text_width_hits, text_width_misses,
             char_width_hits, char_width_misses,
             draw_text_calls, draw_text_ms, create_font_calls, create_font_ms);
+    }
+}
+
+/* Collect the text a laid-out page SHOWS: walk the tree from <body>, skip
+ * <style> and <script> subtrees (their source is not visible content) and
+ * append leaf text. <head> is skipped whole: <title> text is chrome, not
+ * page content. Tells a blank client-rendered shell apart from server
+ * content. */
+static void collectVisibleText(litehtml::element* el, std::string& out)
+{
+    if(el == nullptr)
+        return;
+    const litehtml::tchar_t* tag = el->get_tagName();
+    if(tag != nullptr &&
+       (t_strcasecmp(tag, _t("style")) == 0 ||
+        t_strcasecmp(tag, _t("script")) == 0 ||
+        t_strcasecmp(tag, _t("head")) == 0))
+        return;
+    size_t n = el->get_children_count();
+    if(n == 0) {
+        el->get_text(out);
+        return;
+    }
+    for(size_t i = 0; i < n; ++i)
+        collectVisibleText(el->get_child((int)i), out);
+}
+
+void EWebEngine::decideModuleNotice()
+{
+    /* ENGINE-THREAD ONLY. The page on screen skipped ES module scripts and
+     * nothing has painted text since the swap: such a page is a client-
+     * rendered SPA shell (<div id="app">) whose content the VM can never
+     * produce. Arm the frame-level notice and repaint. A body that DOES hold
+     * text (server-rendered content plus module enhancement) stays silent. */
+    m_moduleNoticeDecided = true;
+    if(m_doc == nullptr)
+        return;
+    litehtml::element::ptr root = m_doc->root();
+    if(root == nullptr)
+        return;
+    std::string text;
+    collectVisibleText(root, text);
+    for(size_t i = 0; i < text.size(); ++i) {
+        if(!::isspace((unsigned char)text[i]))
+            return;   /* real content on screen: nothing to explain */
+    }
+    m_showModuleNotice = true;
+    EWEB_LOG("[ewebview] module-only page paints blank: notice armed url=%s\n",
+        m_currentHtmlUrl.c_str());
+    markContentDirty();
+}
+
+void EWebEngine::drawModuleNotice(eweb_surface_t* cache, int cacheW, int cacheH)
+{
+    /* ENGINE-THREAD ONLY (drawPageToCacheLocked). Two centred lines over the
+     * blank viewport, inside the active strip clip so partial repaints tile
+     * correctly. Plain port font calls: the notice is engine chrome, not
+     * page content, so it bypasses litehtml and the DOM bridges. */
+    if(m_port.font.create == nullptr || m_port.font.draw_text == nullptr ||
+       m_port.font.metrics == nullptr || m_port.font.text_size == nullptr)
+        return;
+    if(m_noticeFont == nullptr)
+        m_noticeFont = m_port.font.create(m_port.font.ud, "sans-serif");
+    if(m_noticeFont == nullptr)
+        return;
+    static const char* LINES[2] = {
+        "\xe6\x9c\xac\xe9\xa1\xb5\xe9\x9d\xa2\xe5\x86\x85\xe5\xae\xb9\xe5\xae\x8c\xe5\x85\xa8\xe7\x94\xb1 ES \xe6\xa8\xa1\xe5\x9d\x97\xe8\x84\x9a\xe6\x9c\xac (type=\"module\") \xe7\x94\x9f\xe6\x88\x90",
+        "\xe5\xb5\x8c\xe5\x85\xa5\xe5\xbc\x8f JS \xe5\xbc\x95\xe6\x93\x8e\xe4\xb8\x8d\xe6\x94\xaf\xe6\x8c\x81 ES \xe6\xa8\xa1\xe5\x9d\x97\xef\xbc\x8c\xe5\x86\x85\xe5\xae\xb9\xe6\x97\xa0\xe6\xb3\x95\xe6\x98\xbe\xe7\xa4\xba"
+    };
+    const int size = 16;
+    eweb_font_metrics_t fm;
+    m_port.font.metrics(m_port.font.ud, m_noticeFont, size, &fm);
+    int y = cacheH / 2 - (fm.height + 4);
+    for(int i = 0; i < 2; i++) {
+        int w = 0, h = 0;
+        m_port.font.text_size(m_port.font.ud, m_noticeFont, size, LINES[i], &w, &h);
+        m_port.font.draw_text(m_port.font.ud, cache, (cacheW - w) / 2, y,
+                              LINES[i], m_noticeFont, size, 0xFF606060u);
+        y += fm.height + 8;
     }
 }
 

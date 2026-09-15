@@ -23,7 +23,7 @@
 #ifndef PLUTOSVG_H
 #define PLUTOSVG_H
 
-#include "plutovg/plutovg.h"
+#include <plutovg.h>
 
 #if defined(PLUTOSVG_BUILD_STATIC)
 #define PLUTOSVG_EXPORT

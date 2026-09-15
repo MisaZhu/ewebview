@@ -1576,7 +1576,14 @@ static var_t* native_matchMedia(vm_t* vm, var_t* env, void* data) {
     var_add(mql, "matches", var_new_bool(vm, matches));
     /* The viewport can change after this returns, but there is no re-layout
      * hook to observe, so the listener slots exist only to keep
-     * addListener()/addEventListener() from throwing. */
+     * addListener()/addEventListener() from throwing. w3.org's navigation
+     * module registers its breakpoint watcher through the legacy
+     * addListener(), so the methods must exist or main.js dies mid-init. */
+    var_add(mql, "addListener",           var_new_native_func(vm, perf_noop, NULL));
+    var_add(mql, "removeListener",        var_new_native_func(vm, perf_noop, NULL));
+    var_add(mql, "addEventListener",       var_new_native_func(vm, perf_noop, NULL));
+    var_add(mql, "removeEventListener",    var_new_native_func(vm, perf_noop, NULL));
+    var_add(mql, "onchange",               var_new_null(vm));
     mstr_free(s);
     vm->gc.gc_defer--;
     return mql;

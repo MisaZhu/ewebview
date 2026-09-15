@@ -199,6 +199,23 @@ typedef struct js_dom_callbacks {
     /* document.activeElement: the focused element, or <body> when nothing is
      * focused. OPTIONAL: without it activeElement reports <body>. */
     js_element_t (*get_active_element)(void* ctx);
+    /* Live selection of a text form control (input/textarea) in codepoint
+     * offsets. el_get_sel returns false when the element carries no editable
+     * selection, so selectionStart/End report 0 and setSelectionRange()/
+     * select() no-op. OPTIONAL. */
+    bool (*el_get_sel)(void* ctx, js_element_t el, int* s, int* e);
+    void (*el_set_sel)(void* ctx, js_element_t el, int s, int e);
+    /* Snapshot of the element's data-* attributes as camelCase key/value
+     * pairs packed "key\x1fvalue\x1e...", malloc'd with mario_malloc (the
+     * bridge frees with mario_free). NULL when the element has none. Backs
+     * Element.dataset. OPTIONAL. */
+    char* (*el_get_dataset)(void* ctx, js_element_t el);
+    /* Snapshot of ALL attributes as "name\x1fvalue\x1e..." pairs, malloc'd
+     * with mario_malloc (the bridge frees with mario_free). Backs
+     * Element.attributes (NamedNodeMap: length + indexed {name, value}
+     * nodes); w3.org's nav enhancement copies every non-href attribute of
+     * the top-level link onto the button it creates. OPTIONAL. */
+    char* (*el_attr_snapshot)(void* ctx, js_element_t el);
     void  (*el_scroll_into_view)(void* ctx, js_element_t el);
 } js_dom_callbacks_t;
 

@@ -123,6 +123,13 @@ public:
     void stepSelectedOption(int dir);
     /* Nudge a range slider's value by `dir` (arrow keys on a focused slider). */
     void stepRange(int dir);
+    /* number inputs: the UA spinner arrows at the right edge. spinnerHit()
+     * reports whether a border-box-local point lands on an arrow and which
+     * way it steps (+1 up / -1 down); stepNumber() applies it clamped to
+     * min/max and re-syncs the edit buffer. */
+    bool isNumberInput();
+    bool spinnerHit(int localX, int localY, int* dir);
+    void stepNumber(int dir);
     /* Row height (logical px) of the dropdown overlay, from the control font. */
     int  popupRowHeight();
     /* Paint the expanded option list at (x,y) in the target surface, `width`

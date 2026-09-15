@@ -65,6 +65,33 @@ static const uint32_t kJsFlushMaxGapMs   = 1500;
  * navigation, so no script - broken or hostile - can pin the engine. */
 static const uint32_t kJsRunBudgetMs     = 10000;
 static const int      kJsRunAbortMax     = 3;
+/* Per-run budget OUTSIDE the pre-paint phase (post-swap scripts, timer
+ * callbacks, event handlers): those run against a live page whose input queue
+ * the engine thread cannot drain while a VM run is in flight, so a runaway
+ * body freezes clicks and scrolls for the whole budget. The pre-paint phase
+ * keeps kJsRunBudgetMs because its own wall clock (kJsPrePaintBudgetMs) cuts
+ * the run long before this one would. */
+static const uint32_t kJsRunBudgetLiveMs = 3000;
+
+/* Wall-clock budget for the WHOLE pre-paint script phase (the document.write()
+ * pages that must run their scripts before the first paint). Past it the build
+ * stops running scripts, splices whatever was written and paints; the scripts
+ * that did not run move to the post-swap phase, where they execute one per
+ * engine step against the visible page. Without this a page carrying a slow or
+ * hanging script shows nothing for a run budget per script - minutes on an
+ * ad-heavy portal - because nothing paints before the phase completes. */
+static const uint32_t kJsPrePaintBudgetMs = 4000;
+
+/* Wall-clock budget for the WHOLE post-swap script phase (BUILD_RUN_JS, one
+ * script per engine step against the visible page). Each script already caps
+ * at kJsRunBudgetLiveMs, but an ad-heavy portal carries dozens of them, so
+ * without a phase cap the engine spends run-budget after run-budget on ad SDKs
+ * and never returns to serving input, a queued navigation, or the blank-SPA
+ * notice decision - the page looks frozen for tens of seconds. Past this the
+ * phase stops STARTING new scripts (one already in flight still unwinds under
+ * its own per-run budget), fires the load events and goes idle, exactly like
+ * the pre-paint budget paints first and defers the rest. */
+static const uint32_t kJsPostSwapBudgetMs = 8000;
 
 /* Layout debounce / force caps (see applyPendingLayoutUpdates). */
 static const uint32_t kLayoutDebounceMs    = 30;
@@ -248,6 +275,8 @@ public:
     void markLayoutDirty(bool build);
     void markContentDirty();
     void drawPageToCacheLocked(int stripY, int stripH);
+    void decideModuleNotice();
+    void drawModuleNotice(eweb_surface_t* cache, int cacheW, int cacheH);
     void clampScrollLocked(int docWidth, int docHeight);
     void postScrollClamp();
     void requestBuildAbort();
@@ -288,6 +317,8 @@ public:
     void jsDynamicScriptInserted(void* script_el);
     void jsProgressiveFlush(bool force);
     bool applyJsWriteBuffer();
+    void jsDropWriteBuffer();
+    bool jsIsRunaway(const std::string& src) const;
     void jsVmEnter();
     bool jsVmExit();
     void jsOnVmStep(struct st_vm* vm);
@@ -410,6 +441,14 @@ public:
     static void  jsElFocus(void* ctx, void* el);
     static void  jsElBlur(void* ctx, void* el);
     static void* jsGetActiveElement(void* ctx);
+    /* selectionStart/End + setSelectionRange()/select() backends: codepoint
+     * offsets into the focused text control's live value. */
+    static bool  jsElGetSel(void* ctx, void* el, int* s, int* e);
+    static void  jsElSetSel(void* ctx, void* el, int s, int e);
+    /* Element.dataset seed: packs the element's data-* attributes (keys
+     * camelCased) as "key\x1fvalue\x1e" in a mario_malloc'd buffer. */
+    static char* jsElGetDataset(void* ctx, void* el);
+    static char* jsElAttrSnapshot(void* ctx, void* el);
     static void  jsElScrollIntoView(void* ctx, void* el);
 
     /* Web/BOM bridge callbacks (js_web_callbacks_t signatures). */
@@ -425,6 +464,13 @@ public:
     static void  jsWebSetCookie(void* ctx, const char* cookie);
     static char* jsWebStorageLoad(void* ctx, bool session);
     static void  jsWebStorageSave(void* ctx, bool session, const char* blob);
+    /* Synchronous XHR/fetch backend: performs one blocking request on the
+     * engine thread (direct port->net.request call, never the download task
+     * queue). out_body/out_headers are mario_malloc'd; false = network
+     * error. Redirects are followed here, cookies scoped per hop. */
+    static bool  jsWebRequest(void* ctx, const char* method, const char* url,
+                              const char* headers, const char* body,
+                              int* status, char** out_body, char** out_headers);
 
     /* ---- Canvas 2D (EWebCanvasGlue.cc) ---- */
     void registerCanvasNatives(struct st_vm* vm);
@@ -581,11 +627,33 @@ public:
     size_t                      m_jsNextScript;
     uint64_t                    m_jsScriptWaitSince;
     bool                        m_jsPostSwapRun;
+    /* Wall-clock anchor for the post-swap script phase (kJsPostSwapBudgetMs).
+     * Set when the phase is armed - at BUILD_SWAP_DOC and again when a
+     * dynamically injected <script> re-arms it - so a late lazy-load gets its
+     * own budget instead of inheriting a stale one. */
+    uint64_t                    m_jsPostSwapAt;
+    /* ES-module awareness: extract_scripts flags a build whose scripts were
+     * skipped as type="module". When such a page is on screen and its body
+     * still holds no text a few seconds after the swap, the engine draws a
+     * plain notice instead of leaving an unexplained blank viewport (the VM
+     * cannot parse ES2020 module bundles, so SPAs render nothing). */
+    bool                        m_jsBuildHasModules;
+    bool                        m_jsPageHasModules;
+    bool                        m_moduleNoticeDecided;
+    bool                        m_showModuleNotice;
+    uint64_t                    m_swapAtMs;
+    eweb_font_t*                m_noticeFont;
     bool                        m_jsProgressiveActive;
     uint64_t                    m_jsLastFlushAt;
     uint32_t                    m_jsFlushCostMs;
     bool                        m_jsInScript;
     uint64_t                    m_jsEnterAt;
+    uint64_t                    m_jsRunDeadline;  /* wall clock at which the step hook cuts this run */
+    uint64_t                    m_jsPrePaintAt;   /* pre-paint phase start (0 = not in it) */
+    bool                        m_jsAbortPrePaint; /* last termination was the pre-paint budget */
+    bool                        m_jsPrePaintCut;  /* pre-paint phase ended on the budget, not on completion */
+    const std::string*          m_jsCurScriptSrc; /* body in flight, for runaway bookkeeping */
+    std::vector<std::string>    m_jsRunawaySrcs;  /* bodies the run budget terminated: never re-run */
     uint32_t                    m_jsEnterGen;
     int                         m_jsAbortCount;
     bool                        m_jsPageDisabled;

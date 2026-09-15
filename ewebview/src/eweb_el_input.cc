@@ -13,6 +13,7 @@
 // selected <option>, or the element text, so controls are never blank boxes.
 
 #include "eweb_el_input.h"
+#include "EWebContainer.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -211,11 +212,10 @@ std::string eweb_el_input::value()
         return v ? std::string(v) : std::string("0");
     }
     default: {
+        /* <button>/.value is the value attribute alone (never the label);
+         * hidden and friends are plain attribute reflections. */
         const litehtml::tchar_t* v = get_attr(_t("value"));
-        if(v && v[0]) return std::string(v);
-        litehtml::tstring t;
-        get_text(t);
-        return std::string(t.c_str());
+        return v ? std::string(v) : std::string();
     }
     }
 }
@@ -596,6 +596,48 @@ void eweb_el_input::stepRange(int dir)
     set_attr(_t("value"), buf);
 }
 
+bool eweb_el_input::isNumberInput()
+{
+    const litehtml::tchar_t* ty = get_attr(_t("type"));
+    return (m_inputType == EWEB_INPUT_TEXT && ty != nullptr &&
+            !t_strcasecmp(ty, _t("number")));
+}
+
+bool eweb_el_input::spinnerHit(int localX, int localY, int* dir)
+{
+    if(!isNumberInput()) return false;
+    /* Mirror the geometry draw() uses for the UA spinner column so hit-test
+     * and paint can never disagree. localX/localY are border-box local. */
+    litehtml::position pos = ((litehtml::element*)this)->get_placement();
+    int ir = m_padding.right + m_borders.right;
+    int sx = pos.width - ir - 9;
+    if(localX < sx || localX > sx + 7) return false;
+    int cy = pos.height / 2;
+    if(localY >= cy - 6 && localY <= cy - 3) { if(dir) *dir = +1; return true; }
+    if(localY >= cy + 2 && localY <= cy + 5) { if(dir) *dir = -1; return true; }
+    return false;
+}
+
+void eweb_el_input::stepNumber(int dir)
+{
+    if(!isNumberInput()) return;
+    const litehtml::tchar_t* mn = get_attr(_t("min"));
+    const litehtml::tchar_t* mx = get_attr(_t("max"));
+    const litehtml::tchar_t* st = get_attr(_t("step"));
+    double dmin = mn ? atof(mn) : -1e300;
+    double dmax = mx ? atof(mx) :  1e300;
+    double step = st ? atof(st) : 1.0;
+    if(step <= 0.0) step = 1.0;
+    double v = atof(value().c_str());
+    v += dir * step;
+    if(v < dmin) v = dmin;
+    if(v > dmax) v = dmax;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%g", v);
+    /* setValue() keeps the edit buffer and the value attribute in sync. */
+    setValue(buf);
+}
+
 int eweb_el_input::popupRowHeight()
 {
     litehtml::font_metrics fm;
@@ -915,14 +957,14 @@ litehtml::style_display eweb_el_input::get_display() const
     if (m_inputType == EWEB_INPUT_HIDDEN) {
         return litehtml::display_none;
     }
-    /* Honour a CSS display:none resolved by parse_styles (m_display), e.g.
-     * Google's hidden password twin .Hvu6D{display:none}. The old override
-     * hard-coded inline-block for every non-hidden control, so a field the
-     * page explicitly hid still painted as an empty box. */
-    if (m_display == litehtml::display_none) {
-        return litehtml::display_none;
+    /* Honour the page's resolved display (a field the page sets to
+     * display:none must not paint; display:block must stack it like any
+     * other block box). Only the UA default 'inline' is upgraded to
+     * inline-block so a bare control still sizes as one atomic box. */
+    if (m_display == litehtml::display_inline) {
+        return litehtml::display_inline_block;
     }
-    return litehtml::display_inline_block;
+    return m_display;
 }
 
 bool eweb_el_input::page_styled_box() const
@@ -1083,7 +1125,51 @@ void eweb_el_input::draw_page_box(litehtml::uint_ptr hdc, int x, int y, const li
         if (content.height < 0) content.height = 0;
         litehtml::background_paint bg_paint;
         init_background_paint(content, bg_paint, bg);
-        doc->container()->draw_background(hdc, bg_paint);
+        /* A rounded overflow clip (.segmented{border-radius;overflow:hidden})
+         * must round the corners of a child background that touch the clip's
+         * corners: the HAL clip is rectangular, so without this the active
+         * segment's square fill pokes out of the container's curve. */
+        bool filled = false;
+        eweb::EWebContainer* ec = static_cast<eweb::EWebContainer*>(doc->container());
+        int crad = ec->top_clip_radius();
+        if (crad > 0 && bg_paint.image.empty() && bg_paint.color.alpha > 0) {
+            litehtml::position cr = ec->top_clip_rect();
+            /* Only a control that spans the clip's full height and touches a
+             * rounded side is a segment of that clip; a small chip centred
+             * inside a rounded card must keep its own square fill. */
+            bool spans_v = (pos.height >= cr.height - 2);
+            bool round_l = spans_v && (pos.x <= cr.x + 1);
+            bool round_r = spans_v && (pos.right() >= cr.right() - 1);
+            bool tl = round_l, bl = round_l, tr = round_r, br = round_r;
+            if (tl || tr || bl || br) {
+                int r = crad;
+                int half = (pos.width < cr.height ? pos.width : cr.height) / 2;
+                if (r > half) r = half;
+                uint32_t col = ((uint32_t)bg_paint.color.alpha << 24) |
+                               ((uint32_t)bg_paint.color.red << 16) |
+                               ((uint32_t)bg_paint.color.green << 8) |
+                               (uint32_t)bg_paint.color.blue;
+                eweb_surface_t* s = (eweb_surface_t*)hdc;
+                const eweb_gfx_t* gfx = &m_port->gfx;
+                /* Fill the clip's full height in this column so the segment
+                 * hugs the container's top/bottom edges even when the grid row
+                 * sits a few px inside the clip; fill_round rounds all four
+                 * corners and the r x r square added back at a corner restores
+                 * a square corner there. */
+                if (gfx->fill_round)
+                    gfx->fill_round(gfx->ud, s, pos.x, cr.y, pos.width, cr.height, r, col);
+                else if (gfx->fill_rect)
+                    gfx->fill_rect(gfx->ud, s, pos.x, cr.y, pos.width, cr.height, col);
+                if (gfx->fill_rect) {
+                    if (!tl) gfx->fill_rect(gfx->ud, s, pos.x, cr.y, r, r, col);
+                    if (!tr) gfx->fill_rect(gfx->ud, s, pos.x + pos.width - r, cr.y, r, r, col);
+                    if (!bl) gfx->fill_rect(gfx->ud, s, pos.x, cr.y + cr.height - r, r, r, col);
+                    if (!br) gfx->fill_rect(gfx->ud, s, pos.x + pos.width - r, cr.y + cr.height - r, r, r, col);
+                }
+                filled = true;
+            }
+        }
+        if (!filled) doc->container()->draw_background(hdc, bg_paint);
     }
     litehtml::borders bdr = m_css_borders;
     bdr.radius = m_css_borders.radius.calc_percents(pos.width, pos.height);
@@ -1207,14 +1293,15 @@ void eweb_el_input::draw(litehtml::uint_ptr hdc, int x, int y, const litehtml::p
             draw_text_box(s, tb, t, tcol, false);
         }
         if (is_number && gfx->fill_rect) {
-            /* UA spinner: two small stacked triangles at the right edge */
+            /* UA spinner: up-triangle on top (increment), down-triangle below
+             * (decrement), matching spinnerHit()'s +1/-1 mapping. */
             int sx = pos.x + pos.width - ir - 9;
             int cy = pos.y + pos.height / 2;
             for (int i = 0; i < 4; i++) {
-                gfx->fill_rect(gfx->ud, s, sx + i, cy - 6 + i, 7 - 2 * i, 1, fg);
+                gfx->fill_rect(gfx->ud, s, sx + 3 - i, cy - 6 + i, 1 + 2 * i, 1, fg);
             }
             for (int i = 0; i < 4; i++) {
-                gfx->fill_rect(gfx->ud, s, sx + i, cy + 5 - i, 7 - 2 * i, 1, fg);
+                gfx->fill_rect(gfx->ud, s, sx + i, cy + 2 + i, 7 - 2 * i, 1, fg);
             }
         }
         break;
@@ -1239,6 +1326,42 @@ void eweb_el_input::draw(litehtml::uint_ptr hdc, int x, int y, const litehtml::p
             }
         }
         draw_text_box(s, pos, label(), widget_fg_argb(this), true);
+        /* Generated content (::before/::after) is real laid-out content, not the
+         * label: w3.org draws its nav dropdown caret as button.nav-link::after
+         * (a border-trick chevron). The replaced-widget draw() bypasses
+         * html_tag::draw(), so without this the caret never paints. */
+        for (int i = 0; i < (int)get_children_count(); i++) {
+            litehtml::element::ptr ch = get_child(i);
+            if (!ch || !ch->get_tagName()) continue;
+            const char* tn = (const char*)ch->get_tagName();
+            if (tn[0] != ':' || tn[1] != ':') continue;
+            /* Generated content kept display:none (the hover underline bar
+             * .top-nav-item>*:first-child::before) must not paint; only the
+             * visible caret/label pseudos get the widget placement. */
+            if (!ch->is_visible()) continue;
+            /* The replaced widget does not run flex layout for its generated
+             * content, so place the caret where an inline-flex row would put
+             * it: ::before just left of the label, ::after just right of it,
+             * both centred on the label line. */
+            int lw = label_width(label());
+            int cx = pos.x + (pos.width - lw) / 2;
+            litehtml::position cp = ch->get_placement();
+            int cw = cp.width;
+            int gap = 8;
+            int target_x = (tn[2] == 'a') ? (cx + lw + gap)   /* ::after */
+                                          : (cx - gap - cw); /* ::before */
+            int target_y = pos.y + (pos.height - cp.height) / 2;
+            /* The replaced widget never runs layout on its generated content,
+             * so m_pos is still 0x0: lay the caret out at its target spot so its
+             * CSS inline-size/block-size and borders take effect, then paint. */
+            ch->render(target_x, target_y, pos.width);
+            litehtml::position np = ch->get_placement();
+            if (np.height > 0) {
+                int fy = pos.y + (pos.height - np.height) / 2;
+                if (fy != target_y) ch->render(target_x, fy, pos.width);
+            }
+            ch->draw(hdc, 0, 0, clip);
+        }
         break;
     }
     case EWEB_INPUT_CHECKBOX: {
@@ -1353,12 +1476,15 @@ void eweb_el_input::draw_stacking_context(litehtml::uint_ptr hdc, int x, int y, 
     /* Replaced control: draw() paints the whole widget, label included. A
      * <button>'s text child is the label SOURCE, not inline content - letting
      * html_tag recurse into it painted the label a second time (in the page
-     * colour, uncentred) on top of the widget face. */
-    (void) hdc;
-    (void) x;
-    (void) y;
-    (void) clip;
-    (void) with_positioned;
+     * colour, uncentred) on top of the widget face. Element children (an
+     * inline <svg> glyph) are real content and must paint. */
+    if (m_inputType == EWEB_INPUT_BUTTON) {
+        for (int i = 0; i < (int)get_children_count(); i++) {
+            litehtml::element::ptr ch = get_child(i);
+            if (!ch || !ch->get_tagName() || t_strcasecmp(ch->get_tagName(), _t("svg"))) continue;
+            ch->draw_stacking_context(hdc, x, y, clip, with_positioned);
+        }
+    }
 }
 
 int eweb_el_input::line_height() const
@@ -1483,10 +1609,47 @@ int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
 
     calc_auto_margins(parent_width);
 
-    m_pos.x += content_margins_left();
-    m_pos.y += content_margins_top();
+    /* m_pos is the BORDER box: draw() paints the widget face straight from it
+     * and draw_page_box shrinks it back to the content box for backgrounds.
+     * Offsetting by content_margins (margin+padding+border) instead of the
+     * margins alone shifted every control right/down by its own padding and
+     * broke alignment with non-replaced flex siblings (seed-row dice). */
+    m_pos.x += margin_left();
+    m_pos.y += margin_top();
 
-    return m_pos.width + content_margins_left() + content_margins_right();
+    /* content-box sizing: a specified width/height names the content edge,
+     * so the border box (m_pos) must add the chrome back. border-box (the
+     * common page default) and intrinsic sizes already include it. */
+    if (m_box_sizing == litehtml::box_sizing_content_box) {
+        if (!m_css_width.is_predefined()) {
+            m_pos.width += m_padding.width() + m_borders.width();
+        }
+        if (!m_css_height.is_predefined()) {
+            m_pos.height += m_padding.height() + m_borders.height();
+        }
+    }
+
+    /* Icon-only buttons (.icon-btn > svg): draw() paints the widget face and
+     * centres the text label, but an element child such as an inline <svg>
+     * glyph is real content that needs its own box or it never appears. Give
+     * each non-text child a box centred in the content box, honouring its own
+     * CSS width/height (the 16px dice glyph). */
+    if (m_inputType == EWEB_INPUT_BUTTON) {
+        int bx = m_pos.x + m_padding.left + m_borders.left;
+        int by = m_pos.y + m_padding.top + m_borders.top;
+        int bw = m_pos.width - m_padding.width() - m_borders.width();
+        int bh = m_pos.height - m_padding.height() - m_borders.height();
+        for (int i = 0; i < (int)get_children_count(); i++) {
+            litehtml::element::ptr ch = get_child(i);
+            if (!ch || !ch->get_tagName() || t_strcasecmp(ch->get_tagName(), _t("svg"))) continue;
+            ch->render(0, 0, bw, second_pass);
+            litehtml::position& cp = ch->get_position();
+            cp.x = bx + (bw - cp.width) / 2;
+            cp.y = by + (bh - cp.height) / 2;
+        }
+    }
+
+    return m_pos.width + margin_left() + margin_right();
 }
 
 void eweb_el_input::parse_styles(bool is_reparse)

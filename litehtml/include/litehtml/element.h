@@ -276,6 +276,9 @@ protected:
 		 * element and its ancestors, so a hit on a <button>'s text child still
 		 * resolves to the control. */
 		virtual void*				eweb_form_widget() { return 0; }
+				/* Raw attribute table for the DOM dataset bridge (camelCased data-*
+				 * keys); the base has no attributes and returns 0. */
+				virtual const string_map*	eweb_attrs() { return 0; }
 		virtual element::ptr		get_element_by_point(int x, int y, int client_x, int client_y);
 		virtual element::ptr		get_child_by_point(int x, int y, int client_x, int client_y, draw_flag flag, int zindex);
 		virtual const background*	get_background(bool own_only = false);

@@ -1,54 +1,32 @@
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>eweb interaction test</title>
-<style>
-  body { font-family: sans-serif; font-size: 20px; margin: 0; color: #111; }
-  .box { border: 2px solid #88a; background: #eef; padding: 6px; min-height: 26px; }
-  #log, #flog { font-size: 22px; }
-  #t1 { width: 200px; height: 30px; }
-</style>
-</head>
-<body>
-<input id="t1" type="text" value="field"><br>
-<a id="a1" href="#">link</a>
-<div id="log" class="box">(keys)</div>
-<div id="flog" class="box">(focus)</div>
-
+<html><head><style>
+body{font:16px sans-serif;margin:8px}
+input,select,textarea,button{display:block;margin:4px 0}
+#log{white-space:pre-wrap;background:#eef;padding:4px;margin-top:8px}
+</style></head><body>
+<input id="t1" value="field">
+<input id="pw" type="password" value="secret">
+<textarea id="ta">line</textarea>
+<input id="cb" type="checkbox">
+<input id="r1" type="radio" name="g" checked>
+<input id="r2" type="radio" name="g">
+<select id="sel"><option value="a">Alpha</option><option value="b">Beta</option><option value="c">Gamma</option></select>
+<input id="rg" type="range" min="0" max="100" value="20">
+<button id="btn">Go</button>
+<div id="log">-</div>
 <script>
-  var log = document.getElementById('log');
-  var flog = document.getElementById('flog');
-  var t1 = document.getElementById('t1');
-  log.textContent = '';
-  flog.textContent = '';
-
-  document.addEventListener('keydown', function (e) {
-    var s = e.key;
-    if (e.ctrlKey) s = 'ctrl+' + s;
-    if (e.shiftKey) s = 'shift+' + s;
-    log.textContent = log.textContent + '[' + s + ']';
-  });
-  document.addEventListener('keyup', function (e) {
-    log.textContent = log.textContent + '^';
-  });
-
-  function act(tag) {
-    var a = document.activeElement;
-    flog.textContent = flog.textContent + tag +
-        '(active=' + (a ? (a.id || a.tagName) : 'null') + ') ';
-  }
-  t1.addEventListener('focus', function () { act('F:t1'); });
-  t1.addEventListener('blur',  function () { act('B:t1'); });
-  document.getElementById('a1').addEventListener('focus', function () { act('F:a1'); });
-  document.addEventListener('focusin',  function (e) { act('in:' + (e.target.id || e.target.tagName)); });
-  document.addEventListener('focusout', function (e) { act('out:' + (e.target.id || e.target.tagName)); });
-
-  /* JS-driven probe (needs no coordinates): focus()/blur()/activeElement. */
-  t1.focus();
-  flog.textContent += 'jsfocus=' + (document.activeElement ? (document.activeElement.id || document.activeElement.tagName) : 'null') + ' ';
-  t1.blur();
-  flog.textContent += 'jsblur=' + (document.activeElement ? (document.activeElement.id || document.activeElement.tagName) : 'null') + ' ';
+var ev=[];
+function L(m){ev.push(m);if(ev.length>6)ev.shift();}
+['input','change','click'].forEach(function(t){
+  document.addEventListener(t,function(e){L(t+':'+(e.target.id||e.target.tagName));},true);
+});
+setInterval(function(){
+  var g=function(id){return document.getElementById(id);};
+  document.getElementById('log').textContent=
+    't1="'+g('t1').value+'" pw="'+g('pw').value+'" cb='+g('cb').checked+
+    ' r2='+g('r2').checked+' sel='+g('sel').value+' rg='+g('rg').value+
+    ' sel0='+g('t1').selectionStart+'..'+g('t1').selectionEnd+
+    ' act='+(document.activeElement&&document.activeElement.id||'?')+
+    ' ev=['+ev.join(' ')+']';
+},150);
 </script>
-</body>
-</html>
+</body></html>

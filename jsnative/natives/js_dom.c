@@ -1579,8 +1579,12 @@ static var_t* native_classList_toggle(vm_t* vm, var_t* env, void* data) {
     char* cur = class_attr(st, el);
     bool has = token_has(cur, tok);
     bool want;
-    if(js_arg_count(env) > 1) want = js_truthy(js_arg(env, 1));
-    else                      want = !has;
+    var_t* force_v = js_arg(env, 1);
+    /* WebIDL: an optional argument passed as undefined counts as absent. This
+     * also absorbs the phantom trailing undefined argument that nested native
+     * calls inside event callbacks observe from the VM call convention. */
+    if(force_v != NULL && force_v->type != V_UNDEF) want = js_truthy(force_v);
+    else                                            want = !has;
     if(want != has) {
         char* next = token_set(cur, tok, want);
         set_class_attr(st, el, next);
@@ -1900,6 +1904,32 @@ static var_t* native_el_appendChild(vm_t* vm, var_t* env, void* data) {
         return var_new_null(vm);
     if(!st->cb.el_append_child(st->ctx, el, ch)) return var_new_null(vm);
     return (child != NULL) ? child : var_new_null(vm);
+}
+
+/* ParentNode.append(...nodes): appendChild per argument, variadic. The VM
+ * keeps every caller argument in the env's arg array even past the single
+ * declared parameter, so js_arg(env, i) reaches them all. String arguments
+ * become text nodes per the DOM spec; unknown arguments are skipped. Returns
+ * undefined, unlike appendChild which hands the child back. */
+static var_t* native_el_append(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL || st->cb.el_append_child == NULL)
+        return var_new_null(vm);
+    uint32_t n = get_func_args_num(env);
+    for(uint32_t i = 0; i < n; i++) {
+        var_t* a = js_arg(env, (int)i);
+        js_element_t ch = element_arg(vm, a);
+        if(ch == NULL && a != NULL && a->type == V_STRING &&
+           st->cb.create_text_node != NULL) {
+            mstr_t* tmp = mstr_new("");
+            ch = st->cb.create_text_node(st->ctx, js_cstr(a, tmp));
+            mstr_free(tmp);
+        }
+        if(ch == NULL) continue;
+        st->cb.el_append_child(st->ctx, el, ch);
+    }
+    return var_new_null(vm);
 }
 
 static var_t* native_el_insertBefore(vm_t* vm, var_t* env, void* data) {
@@ -2291,6 +2321,153 @@ static var_t* native_el_blur(vm_t* vm, var_t* env, void* data) {
     return NULL;
 }
 
+/* ------------------------------------------------------------------ */
+/* Element: text-control selection (selectionStart/End, select(),      */
+/* setSelectionRange()). Offsets are codepoints, as in the DOM.        */
+/* ------------------------------------------------------------------ */
+
+static var_t* sel_pos_get(vm_t* vm, var_t* env, void* data, int which) {
+    (void)env;
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    int s = 0, e = 0;
+    if(st != NULL && el != NULL && st->cb.el_get_sel != NULL &&
+       st->cb.el_get_sel(st->ctx, el, &s, &e))
+        return var_new_int(vm, which ? e : s);
+    return var_new_int(vm, 0);   /* no editable selection here */
+}
+static var_t* native_el_get_selectionStart(vm_t* vm, var_t* env, void* data) {
+    return sel_pos_get(vm, env, data, 0);
+}
+static var_t* native_el_get_selectionEnd(vm_t* vm, var_t* env, void* data) {
+    return sel_pos_get(vm, env, data, 1);
+}
+
+/* Assigning one end keeps the range coherent: the other end collapses to it
+ * when the new value crosses it (the caret-move behaviour browsers show). */
+static var_t* sel_pos_set(vm_t* vm, var_t* env, void* data, int which) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL || st->cb.el_get_sel == NULL ||
+       st->cb.el_set_sel == NULL)
+        return NULL;
+    int s = 0, e = 0;
+    if(!st->cb.el_get_sel(st->ctx, el, &s, &e)) return NULL;
+    int v = js_arg_int(env, 0);
+    if(v < 0) v = 0;
+    if(which) { e = v; if(s > e) s = e; }
+    else      { s = v; if(e < s) e = s; }
+    st->cb.el_set_sel(st->ctx, el, s, e);
+    return NULL;
+}
+static var_t* native_el_set_selectionStart(vm_t* vm, var_t* env, void* data) {
+    return sel_pos_set(vm, env, data, 0);
+}
+static var_t* native_el_set_selectionEnd(vm_t* vm, var_t* env, void* data) {
+    return sel_pos_set(vm, env, data, 1);
+}
+
+static var_t* native_el_setSelectionRange(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL || st->cb.el_set_sel == NULL) return NULL;
+    st->cb.el_set_sel(st->ctx, el, js_arg_int(env, 0), js_arg_int(env, 1));
+    return NULL;
+}
+
+/* select(): the whole text. The embedder clamps, so an open-ended range is
+ * safe to pass straight through. */
+static var_t* native_el_select(vm_t* vm, var_t* env, void* data) {
+    (void)env;
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL || st->cb.el_set_sel == NULL) return NULL;
+    st->cb.el_set_sel(st->ctx, el, 0, 0x7FFFFFFF);
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Element.dataset: a per-element DOMStringMap stand-in.               */
+/*                                                                     */
+/* The map object is cached on the bridge (keyed by the element handle */
+/* so re-wrapped elements share it) and seeded once from the data-*    */
+/* attributes; later script writes (card.dataset.id = ...) land on the */
+/* cached object and stay visible to future reads.                    */
+/* ------------------------------------------------------------------ */
+
+static var_t* native_el_get_dataset(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL) return var_new_null(vm);
+    var_t* bridge = (var_t*)data;
+    var_t* bag = var_find_own_member_var(bridge, "@@datasets");
+    if(bag == NULL) {
+        bag = var_new_obj_no_proto(vm, NULL, NULL);
+        var_add(bridge, "@@datasets", bag);
+    }
+    char key[32];
+    snprintf(key, sizeof(key), "%p", el);
+    var_t* ds = var_find_own_member_var(bag, key);
+    if(ds != NULL) return var_ref(ds);
+    ds = var_new_obj_no_proto(vm, NULL, NULL);
+    var_add(bag, key, ds);
+    if(st->cb.el_get_dataset != NULL) {
+        char* raw = st->cb.el_get_dataset(st->ctx, el);
+        if(raw != NULL) {
+            char* p = raw;
+            while(*p != 0) {
+                char* sep = strchr(p, '\x1f');
+                char* end = strchr(p, '\x1e');
+                if(sep == NULL || end == NULL || sep > end) break;
+                *sep = 0;
+                *end = 0;
+                var_add(ds, p, var_new_str(vm, sep + 1));
+                p = end + 1;
+            }
+            mario_free(raw);
+        }
+    }
+    return var_ref(ds);
+}
+
+/* Element.attributes: a snapshot NamedNodeMap - length plus indexed
+ * {name, value} attribute nodes. w3.org's convertLinkToButton() copies every
+ * non-href attribute of the top-level nav link onto the button it creates,
+ * so without this the nav enhancement dies mid-loop. */
+static var_t* native_el_get_attributes(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL) return var_new_null(vm);
+    var_t* map = var_new_obj_no_proto(vm, NULL, NULL);
+    vm->gc.gc_defer++;
+    int n = 0;
+    if(st->cb.el_attr_snapshot != NULL) {
+        char* raw = st->cb.el_attr_snapshot(st->ctx, el);
+        if(raw != NULL) {
+            char* p = raw;
+            while(*p != 0) {
+                char* sep = strchr(p, '\x1f');
+                char* end = strchr(p, '\x1e');
+                if(sep == NULL || end == NULL || sep > end) break;
+                *sep = 0;
+                *end = 0;
+                var_t* a = var_new_obj_no_proto(vm, NULL, NULL);
+                var_add(a, "name", var_new_str(vm, p));
+                var_add(a, "value", var_new_str(vm, sep + 1));
+                char idx[16];
+                snprintf(idx, sizeof(idx), "%d", n);
+                var_add(map, idx, a);
+                n++;
+                p = end + 1;
+            }
+            mario_free(raw);
+        }
+    }
+    var_add(map, "length", var_new_int(vm, n));
+    vm->gc.gc_defer--;
+    return map;
+}
+
 /* `new Image()` is the classic preloader idiom; per the constructor-override
  * rule (an object returned from a constructor replaces `this`), returning the
  * createElement('img') wrapper makes the result a fully usable element, so
@@ -2409,6 +2586,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
 
     /* Mutation. */
     vm_reg_native(vm, el_cls, "appendChild(node)", native_el_appendChild, bridge);
+    vm_reg_native(vm, el_cls, "append(node)", native_el_append, bridge);
     vm_reg_native(vm, el_cls, "insertBefore(node, ref)", native_el_insertBefore, bridge);
     vm_reg_native(vm, el_cls, "removeChild(node)", native_el_removeChild, bridge);
     vm_reg_native(vm, el_cls, "replaceChild(node, old)", native_el_replaceChild, bridge);
@@ -2428,6 +2606,13 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     vm_reg_native(vm, el_cls, "getBoundingClientRect()", native_el_getBoundingClientRect, bridge);
     vm_reg_native(vm, el_cls, "focus()", native_el_focus, bridge);
     vm_reg_native(vm, el_cls, "blur()", native_el_blur, bridge);
+    /* Text-control selection surface. */
+    reg_accessor(vm, el_cls, "selectionStart", native_el_get_selectionStart, native_el_set_selectionStart, bridge);
+    reg_accessor(vm, el_cls, "selectionEnd",   native_el_get_selectionEnd,   native_el_set_selectionEnd,   bridge);
+    vm_reg_native(vm, el_cls, "select()", native_el_select, bridge);
+    vm_reg_native(vm, el_cls, "setSelectionRange(a,b)", native_el_setSelectionRange, bridge);
+    reg_accessor(vm, el_cls, "dataset", native_el_get_dataset, NULL, bridge);
+    reg_accessor(vm, el_cls, "attributes", native_el_get_attributes, NULL, bridge);
     vm_reg_native(vm, el_cls, "scrollIntoView(a)", native_el_scrollIntoView, bridge);
     static const char* kGeomProps[] = {
         "offsetWidth", "offsetHeight", "offsetLeft", "offsetTop",

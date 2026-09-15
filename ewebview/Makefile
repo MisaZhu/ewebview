@@ -60,7 +60,7 @@ $(ARCH)/src/%.o: src/%.cc
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(ARCH)/porting/%.o: porting/src/%.c
+$(PORT_OBJS): $(ARCH)/porting/$(PORTING)/%.o: porting/$(PORTING)/src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 

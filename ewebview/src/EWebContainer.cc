@@ -736,7 +736,8 @@ std::string EWebContainer::normalizeURL(const eweb_port_t* port, const std::stri
 }
 
 uint8_t* EWebContainer::loadURL(const eweb_port_t* port, const std::string& url, int* sz,
-                                const std::string& pageUrl, bool topLevel)
+                                const std::string& pageUrl, bool topLevel,
+                                std::string* finalUrl)
 {
     uint8_t* ret = NULL;
     if(sz != NULL)
@@ -784,7 +785,9 @@ uint8_t* EWebContainer::loadURL(const eweb_port_t* port, const std::string& url,
             }
 
             eweb_http_response_t resp;
-            if(!port->net.request(port->net.ud, cur_url.c_str(), req_hdrs, req_hdr_count, &resp)) {
+            /* Resource loads are always plain GETs with no body. */
+            if(!port->net.request(port->net.ud, cur_url.c_str(), "GET", NULL, 0,
+                                  req_hdrs, req_hdr_count, &resp)) {
                 EWEB_LOG("[ewebview] loadURL http: request failed url=%s cost=%u ms\n",
                     cur_url.c_str(), (uint32_t)(port->clock.tic_ms(port->clock.ud) - start_ms));
                 return NULL;
@@ -858,6 +861,12 @@ uint8_t* EWebContainer::loadURL(const eweb_port_t* port, const std::string& url,
 
             if(sz != NULL)
                 *sz = body_size;
+            /* Report the URL the body actually came from: redirect hops
+             * replace cur_url, and the caller (a top-level navigation) must
+             * publish the FINAL url so the address bar, session history and
+             * relative-resource resolution all agree with what was fetched. */
+            if(finalUrl != NULL)
+                *finalUrl = cur_url;
             EWEB_LOG("[ewebview] loadURL http: url=%s status=%d size=%d cost=%u ms\n",
                 cur_url.c_str(), resp.status, body_size,
                 (uint32_t)(port->clock.tic_ms(port->clock.ud) - start_ms));
@@ -1178,6 +1187,13 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
     uint32_t color = web_color_to_argb(bg.color);
     uint8_t alpha = color >> 24;
 
+    /* The root background propagates to the canvas in CSS: it must cover the
+     * whole viewport, not just the html box. Painting only the html box left
+     * any window margin the layout did not reach untouched, so a stale frame
+     * showed through at the left/bottom edges (leaf photo bleed). */
+    if(bg.is_root && alpha > 0 && gfx->fill_rect)
+        gfx->fill_rect(gfx->ud, s, 0, 0, m_client_width, m_client_height, color);
+
     if(!do_image) {
         if(alpha == 0)
             return;
@@ -1404,6 +1420,13 @@ int EWebContainer::top_clip_radius() const
     if(e.radius <= 0) return 0;
     int half = (e.r.width < e.r.height ? e.r.width : e.r.height) / 2;
     return e.radius < half ? e.radius : half;
+}
+
+litehtml::position EWebContainer::top_clip_rect() const
+{
+    litehtml::position r;
+    if(!m_clips.empty()) r = m_clips.back().r;
+    return r;
 }
 
 void EWebContainer::set_clip(const litehtml::position& pos, const litehtml::border_radiuses& bdr_radius, bool valid_x, bool valid_y)

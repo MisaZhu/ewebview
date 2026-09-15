@@ -171,6 +171,7 @@ namespace litehtml
 
 		virtual void				set_attr(const tchar_t* name, const tchar_t* val) override;
 		virtual const tchar_t*		get_attr(const tchar_t* name, const tchar_t* def = 0) override;
+		virtual const string_map*	eweb_attrs() override { return &m_attrs; }
 		virtual void				remove_attr(const tchar_t* name) override;
 		virtual void				apply_stylesheet(const litehtml::css& stylesheet) override;
 		/* Own-element stylesheet matching without the children walk; used by

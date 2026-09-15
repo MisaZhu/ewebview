@@ -49,9 +49,12 @@ LDFLAGS += -L $(TARGET_DIR)/lib
 # Link order matters: ewebview references litehtml/mario/webp/tinyhttpsc
 # symbols, and the SDL2 port inside libewebview.a references SDL2 companions.
 # libewebview.a is C++14 internally, so link with $(CXX) to pull in libstdc++.
-# -lsvg: the core's inline <svg> anti-aliased fill (plutovg) and the SDL2
-# port's SVG decode (plutosvg) live in libsvg.a.
-LIBS = -lewebview -lsvg -llitehtml -lmario_jsn -lwebp -ltinyhttpsc \
+# -lsvg: the SDL2 port's <img src="*.svg"> decode (plutosvg + svg_doc_t
+# wrapper, lives under ewebview/porting/sdl2/libsvg). -lplutovg: the
+# rasteriser half (top-level libplutovg/) that both the core's inline <svg>
+# anti-aliased fill and plutosvg itself call into. Order matters: svg
+# references plutovg, and ewebview references both.
+LIBS = -lewebview -lsvg -lplutovg -llitehtml -lmario_jsn -lwebp -ltinyhttpsc \
        $(SDL2_LIBS) -lm -lpthread
 
 # macOS appearance detection (AppleInterfaceStyle) uses CoreFoundation.
@@ -67,6 +70,7 @@ OBJS = $(ARCH)/main.o $(ARCH)/compat.o
 # builds every one of these before it descends here, so they always exist.
 PROJ_LIBS = $(TARGET_DIR)/lib/libewebview.a \
             $(TARGET_DIR)/lib/libsvg.a \
+            $(TARGET_DIR)/lib/libplutovg.a \
             $(TARGET_DIR)/lib/liblitehtml.a \
             $(TARGET_DIR)/lib/libmario_jsn.a \
             $(TARGET_DIR)/lib/libwebp.a \

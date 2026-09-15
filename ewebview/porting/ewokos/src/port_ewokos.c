@@ -224,7 +224,8 @@ typedef struct {
     eweb_http_header_t* headers;
 } ek_http_t;
 
-static bool ek_net_request(void* ud, const char* url,
+static bool ek_net_request(void* ud, const char* url, const char* method,
+                           const char* req_body, int req_body_size,
                            const eweb_http_header_t* req_headers, int req_header_count,
                            eweb_http_response_t* resp) {
     TinyHttpsRequest* request;
@@ -241,12 +242,18 @@ static bool ek_net_request(void* ud, const char* url,
 
     HttpsRequestSetTimeout(request, 10000);
     HttpsRequestSetMaxRedirections(request, 0);   /* the core follows redirects */
+    if(method && method[0] && strcmp(method, "GET") != 0)
+        HttpsRequestSetMethod(request, method);   /* copies internally */
     HttpsRequestAddHeader(request, "User-Agent", "ewokos-ewebview/1");
     for(i = 0; i < req_header_count; i++) {
         if(req_headers[i].key)
             HttpsRequestAddHeader(request, req_headers[i].key,
                                   req_headers[i].value ? req_headers[i].value : "");
     }
+    /* SendBodyStr copies the payload (default COPY strategy) and the client
+     * emits Content-Length itself, so a borrowed pointer is safe here. */
+    if(req_body && req_body_size > 0)
+        HttpsRequestSendBodyStr(request, (char*)req_body);
 
     response = HttpsRequestFetch(request);
     HttpsRequestFree(request);

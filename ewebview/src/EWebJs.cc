@@ -294,6 +294,10 @@ void EWebEngine::initJsVm()
     cb.el_focus          = jsElFocus;
     cb.el_blur           = jsElBlur;
     cb.get_active_element = jsGetActiveElement;
+    cb.el_get_sel        = jsElGetSel;
+    cb.el_set_sel        = jsElSetSel;
+    cb.el_get_dataset    = jsElGetDataset;
+    cb.el_attr_snapshot  = jsElAttrSnapshot;
     cb.el_scroll_into_view = jsElScrollIntoView;
     if(!js_register_dom_natives(m_jsVm, this, &cb)) {
         EWEB_LOG("[ewebview] js: DOM native registration failed\n");
@@ -331,6 +335,18 @@ bool EWebEngine::runPageScripts()
 
     while(m_jsNextScript < m_jsScripts.size()) {
         size_t i = m_jsNextScript;
+        /* Pre-paint wall clock: hand the scripts that did not run yet to the
+         * post-swap phase (BUILD_SWAP_DOC re-arms BUILD_RUN_JS for them) and
+         * let the build paint now. Checked before the fetch wait below too, so
+         * a slow subresource cannot hold the first paint either. */
+        if(m_jsPrePaintAt != 0 && (ticMs() - m_jsPrePaintAt) > kJsPrePaintBudgetMs) {
+            EWEB_LOG("[ewebview] js: pre-paint budget exhausted at script %d of %d - painting first\n",
+                (int)i, (int)m_jsScripts.size());
+            m_jsPrePaintAt = 0;
+            m_jsPrePaintCut = true;
+            m_jsRunBeforePaint = false;
+            return true;
+        }
         /* Document order: an inline block after an external <script src> must
          * see the globals that script defines (w3.org's bootstrap news
          * FontFaceObserver from the library script ahead of it), so park the
@@ -351,6 +367,16 @@ bool EWebEngine::runPageScripts()
          * reference held across vm_load_run below. */
         std::string src = m_jsScripts[i];
         if(src.empty()) continue;
+        /* A body the run budget already terminated once proved runaway on this
+         * engine (obfuscated ad SDKs spin in a decode loop whose checksum never
+         * matches); portals serve the same bundle from several mirrors, so
+         * re-running it only buys another full budget of frozen input. */
+        if(jsIsRunaway(src)) {
+            EWEB_LOG("[ewebview] js: script %d skipped (runaway body, %u bytes)\n",
+                (int)i, (unsigned)src.size());
+            continue;
+        }
+        uint64_t run_start = ticMs();
         /* vm_load_run appends this script's bytecode after the previous one and
          * runs it; globals persist in vm->root across scripts, matching
          * separate <script> blocks that share one global scope. m_jsInScript
@@ -358,6 +384,7 @@ bool EWebEngine::runPageScripts()
          * termination abort; window interaction stays live on its own thread
          * even through this pre-paint (document.write) script run. */
         jsVmEnter();
+        m_jsCurScriptSrc = &src;
         {   /* Tag uncaught VM errors with the script index so a failing
              * minified bundle can be matched to its EWEB_DUMP_SCRIPTS file. */
             static char s_jsDbgTag[64];
@@ -372,7 +399,24 @@ bool EWebEngine::runPageScripts()
             jsDumpScript(i, src, false);
         }
         m_jsVm->dbg_tag = nullptr;
+        m_jsCurScriptSrc = nullptr;
         jsVmExit();
+        EWEB_LOG("[ewebview] js: script %d ran %u ms url=%s\n", (int)i,
+            (uint32_t)(ticMs() - run_start),
+            (i < m_jsScriptSrcs.size() && !m_jsScriptSrcs[i].empty())
+                ? m_jsScriptSrcs[i].c_str() : "(inline)");
+        /* The watchdog dropped this page's JS (three run-budget timeouts): stop
+         * at once. The entry guard above is only evaluated once per call, so
+         * without this the loop keeps spending a run budget per remaining
+         * script - minutes on an ad-heavy portal - and the build never reaches
+         * BUILD_RENDER_DOC, i.e. the page never paints at all. */
+        if(m_jsPageDisabled) {
+            EWEB_LOG("[ewebview] js: page JS dropped at script %d - skipping %d remaining\n",
+                (int)i, (int)m_jsScripts.size() - (int)m_jsNextScript);
+            m_jsPrePaintAt = 0;
+            m_jsNextScript = m_jsScripts.size();
+            break;
+        }
     }
     EWEB_LOG("[ewebview] js: ran %d script(s)\n", (int)m_jsScripts.size());
     return true;
@@ -392,6 +436,21 @@ bool EWebEngine::runNextPageScript()
 
     while(m_jsNextScript < m_jsScripts.size()) {
         size_t i = m_jsNextScript;
+        /* Post-swap phase wall clock: an ad-heavy portal carries dozens of
+         * scripts, each able to burn a full kJsRunBudgetLiveMs, so without a
+         * phase cap the engine never returns to serving input, a queued
+         * navigation, or the blank-SPA notice decision - the page looks frozen
+         * for tens of seconds. Past the budget stop STARTING new scripts (one
+         * already in flight unwinds under its own per-run budget) and let the
+         * phase complete: DOMContentLoaded/load fire and the page is usable,
+         * the remaining ad scripts are simply dropped. */
+        if(m_jsPostSwapAt != 0 && (ticMs() - m_jsPostSwapAt) > kJsPostSwapBudgetMs) {
+            EWEB_LOG("[ewebview] js: post-swap budget %u ms exhausted at script %d of %d - dropping the rest\n",
+                (unsigned)kJsPostSwapBudgetMs, (int)i, (int)m_jsScripts.size());
+            m_jsNextScript = m_jsScripts.size();
+            m_jsPostSwapAt = 0;
+            break;
+        }
         /* An external <script src> slot stays empty until its EWEB_TASK_SCRIPT
          * fetch lands (processResults fills m_jsScripts[i] and flips
          * m_jsScriptDone[i] to 1). Report "still running" so the engine keeps
@@ -407,6 +466,11 @@ bool EWebEngine::runNextPageScript()
          * reference held across vm_load_run below would then dangle. */
         std::string src = m_jsScripts[i];
         if(src.empty()) continue;
+        if(jsIsRunaway(src)) {
+            EWEB_LOG("[ewebview] js: script %d skipped (runaway body, %u bytes)\n",
+                (int)i, (unsigned)src.size());
+            continue;
+        }
         uint64_t run_start = ticMs();
         /* Bracket vm_load_run so the DOM-bridge mutation callbacks push the
          * page to the screen mid-script (jsMarkLayoutDirty -> jsProgressiveFlush
@@ -415,6 +479,7 @@ bool EWebEngine::runNextPageScript()
          * abort). Window interaction is unaffected - it runs on the UI thread. */
         m_jsProgressiveActive = true;
         jsVmEnter();
+        m_jsCurScriptSrc = &src;
         m_jsLastFlushAt = run_start;
         {
             static char s_jsDbgTag[64];
@@ -429,10 +494,13 @@ bool EWebEngine::runNextPageScript()
             jsDumpScript(i, src, false);
         }
         m_jsVm->dbg_tag = nullptr;
+        m_jsCurScriptSrc = nullptr;
         jsVmExit();
         m_jsProgressiveActive = false;
-        EWEB_LOG("[ewebview] js: script %d ran %u ms (post-swap)\n",
-            (int)i, (uint32_t)(ticMs() - run_start));
+        EWEB_LOG("[ewebview] js: script %d ran %u ms (post-swap) url=%s\n",
+            (int)i, (uint32_t)(ticMs() - run_start),
+            (i < m_jsScriptSrcs.size() && !m_jsScriptSrcs[i].empty())
+                ? m_jsScriptSrcs[i].c_str() : "(inline)");
         /* Paint what this script produced before the next one runs. */
         jsProgressiveFlush(true);
         break;
@@ -492,6 +560,7 @@ void EWebEngine::jsDynamicScriptInserted(void* script_el)
      * phase restarted; m_deferBuildStep lets a just-queued fetch settle first. */
     if(m_buildPhase == BUILD_IDLE && m_jsVm != nullptr) {
         m_jsPostSwapRun = true;
+        m_jsPostSwapAt = ticMs();   /* fresh budget for the re-armed phase */
         m_buildPhase = BUILD_RUN_JS;
         m_deferBuildStep = true;
     }
@@ -546,6 +615,29 @@ void EWebEngine::jsProgressiveFlush(bool force)
     m_jsLastFlushAt = ticMs();
     EWEB_LOG("[ewebview] js progressive flush: %u ms force=%d\n",
         m_jsFlushCostMs, force ? 1 : 0);
+}
+
+void EWebEngine::jsDropWriteBuffer()
+{
+    /* Discard whatever document.write() accumulated without splicing it: the
+     * pre-paint phase ended on its wall-clock budget, and splicing restarts the
+     * build with a cleared script list, which would drop every script that still
+     * has to run post-swap. The partial write of a page we stopped early is ad
+     * scaffolding, not content. */
+    if(m_jsVm == nullptr) return;
+    char* buf = js_dom_take_write_buffer(m_jsVm);
+    if(buf == nullptr) return;
+    EWEB_LOG("[ewebview] js: document.write buffer dropped (%d byte(s)) on pre-paint cut\n",
+        (int)strlen(buf));
+    mario_free(buf);
+}
+
+bool EWebEngine::jsIsRunaway(const std::string& src) const
+{
+    for(size_t i = 0; i < m_jsRunawaySrcs.size(); ++i) {
+        if(m_jsRunawaySrcs[i] == src) return true;
+    }
+    return false;
 }
 
 bool EWebEngine::applyJsWriteBuffer()
@@ -608,7 +700,13 @@ void EWebEngine::jsVmEnter()
      * generation is snapshotted so jsOnVmStep can tell an abort raised DURING
      * this run apart from a stale flag left by a STOP consumed while idle. */
     m_jsEnterAt = ticMs();
+    /* The pre-paint phase answers to its own wall clock, so a single run may
+     * keep the (larger) legacy budget; every run against a live page gets the
+     * short one, because the engine thread cannot serve input while it lasts. */
+    m_jsRunDeadline = m_jsEnterAt +
+        ((m_jsPrePaintAt != 0) ? kJsRunBudgetMs : kJsRunBudgetLiveMs);
     m_jsEnterGen = m_buildAbortGen;
+    m_jsAbortPrePaint = false;
     m_jsInScript = true;
 }
 
@@ -623,6 +721,14 @@ bool EWebEngine::jsVmExit()
      * serve the next callback, and clear the flag vm_run loops on. */
     vm_terminate(m_jsVm);
     m_jsVm->terminated = false;
+    if(m_jsAbortPrePaint) {
+        /* The pre-paint wall clock ran out, not this script: the page's JS is
+         * fine, the build just has to stop deferring the first paint. Charging
+         * it to the watchdog would drop a working page's scripts after three. */
+        EWEB_LOG("[ewebview] js: pre-paint budget %u ms exhausted - deferring the rest post-swap\n",
+             (unsigned)kJsPrePaintBudgetMs);
+        return true;
+    }
     /* An abort raised by a termination/navigation request DURING this run (the
      * generation moved past the jsVmEnter snapshot) is intentional and must NOT
      * count against the page's watchdog budget; only a genuine run-budget
@@ -632,6 +738,10 @@ bool EWebEngine::jsVmExit()
         m_jsAbortCount++;
         EWEB_LOG("[ewebview] js: script run aborted by watchdog (%d/%d)\n",
              m_jsAbortCount, kJsRunAbortMax);
+        /* Remember the body so its mirrors/replicas are not run again: one
+         * terminated run already proved it cannot finish on this engine. */
+        if(m_jsCurScriptSrc != nullptr && !m_jsCurScriptSrc->empty())
+            m_jsRunawaySrcs.push_back(*m_jsCurScriptSrc);
         if(m_jsAbortCount >= kJsRunAbortMax) {
             EWEB_LOG("[ewebview] js: too many aborted runs - dropping this page's JS\n");
             m_jsPageDisabled = true;
@@ -660,10 +770,18 @@ void EWebEngine::jsOnVmStep(struct st_vm* vm)
         return;
     }
     uint64_t now = ticMs();
-    if(m_jsEnterAt != 0 && (now - m_jsEnterAt) > kJsRunBudgetMs) {
+    if(m_jsRunDeadline != 0 && now > m_jsRunDeadline) {
         EWEB_LOG("[ewebview] js: run budget %u ms exceeded - terminating\n",
-             (unsigned)kJsRunBudgetMs);
+             (unsigned)(m_jsRunDeadline - m_jsEnterAt));
         vm->terminated = true;   /* unwind every nested vm_run frame */
+        return;
+    }
+    /* Pre-paint pages additionally answer to the phase wall clock, so ONE slow
+     * script cannot spend the whole run budget before the first paint: the
+     * cut is flagged so jsVmExit does not charge it to the watchdog. */
+    if(m_jsPrePaintAt != 0 && (now - m_jsPrePaintAt) > kJsPrePaintBudgetMs) {
+        m_jsAbortPrePaint = true;
+        vm->terminated = true;
         return;
     }
 }
@@ -842,9 +960,35 @@ char* EWebEngine::jsElGetAttr(void* ctx, void* el, const char* name)
     (void)ctx;
     if(el == nullptr || name == nullptr) return nullptr;
     litehtml::element* e = (litehtml::element*)el;
+    /* Form controls expose their LIVE state: .value / .checked (and
+     * getAttribute on them) read the widget's single source of truth, so what
+     * the user typed or ticked is exactly what scripts observe. */
+    void* w = e->eweb_form_widget();
+    if(w != nullptr) {
+        eweb_el_input* wi = (eweb_el_input*)w;
+        if(strcmp(name, "value") == 0)
+            return js_strdup_mario(wi->value().c_str());
+        if(strcmp(name, "checked") == 0)
+            return wi->isChecked() ? js_strdup_mario("") : nullptr;
+    }
     const char* v = e->get_attr(name, nullptr);
     if(v == nullptr) return nullptr;
     return js_strdup_mario(v);
+}
+
+/* JS-driven changes to class/id alter which selectors match, and a style=
+ * change alters the inline cascade: a layout-only invalidation would repaint
+ * the OLD resolved values. Re-match the subtree against the sheets (budgeted
+ * inside litehtml) and re-resolve used styles so class toggles (".chip.on"
+ * and friends) actually paint. ENGINE-THREAD ONLY (VM callback context). */
+static void jsRestyleSubtree(litehtml::element* e, bool recascade)
+{
+    if(e == nullptr) return;
+    if(recascade) {
+        litehtml::document* doc = e->get_document();
+        if(doc != nullptr) doc->style_detached_subtree(e);
+    }
+    e->parse_styles(true);
 }
 
 void EWebEngine::jsElSetAttr(void* ctx, void* el, const char* name, const char* value)
@@ -852,7 +996,30 @@ void EWebEngine::jsElSetAttr(void* ctx, void* el, const char* name, const char* 
     EWebEngine* self = (EWebEngine*)ctx;
     if(el == nullptr || name == nullptr) return;
     litehtml::element* e = (litehtml::element*)el;
-    e->set_attr(name, value != nullptr ? value : "");
+    /* Writing .value / .checked goes to the widget so the edit buffer and the
+     * drawn text stay the single source of truth (setValue re-syncs the
+     * attribute itself); every other name keeps plain attribute behaviour. */
+    bool routed = false;
+    void* w = e->eweb_form_widget();
+    if(w != nullptr) {
+        eweb_el_input* wi = (eweb_el_input*)w;
+        if(strcmp(name, "value") == 0) {
+            wi->setValue(value != nullptr ? value : "");
+            routed = true;
+        } else if(strcmp(name, "checked") == 0) {
+            wi->setChecked(true);
+            routed = true;
+        }
+    }
+    if(!routed) {
+        e->set_attr(name, value != nullptr ? value : "");
+        /* class/id decide selector matching; style= feeds the inline cascade.
+         * Neither is visible to a layout-only invalidation, so restyle. */
+        if(strcmp(name, "class") == 0 || strcmp(name, "id") == 0)
+            jsRestyleSubtree(e, true);
+        else if(strcmp(name, "style") == 0)
+            jsRestyleSubtree(e, false);
+    }
     if(self != nullptr) {
         const char* idv = e->get_attr("id", nullptr);
         if(idv != nullptr && idv[0] != 0)
@@ -1020,11 +1187,28 @@ void* EWebEngine::jsElParent(void* ctx, void* el)
     return (void*)((litehtml::element*)el)->parent();
 }
 
+/* Pseudo-elements (::before/::after) are layout artifacts of litehtml, not DOM
+ * nodes: the spec keeps them out of childNodes/children/firstChild. Exposing
+ * them made w3.org's convertLinkToButton() treat the link's ::before as its
+ * first child and shuffle the label text into the wrong node. */
+static bool jsElIsPseudo(void* el)
+{
+    if(el == nullptr) return false;
+    const char* t = ((litehtml::element*)el)->get_tagName();
+    return (t != nullptr && t[0] == ':' && t[1] == ':');
+}
+
 int EWebEngine::jsElChildCount(void* ctx, void* el)
 {
     (void)ctx;
     if(el == nullptr) return 0;
-    return (int)((litehtml::element*)el)->get_children_count();
+    litehtml::element* e = (litehtml::element*)el;
+    int n = 0;
+    for(size_t i = 0; i < e->get_children_count(); i++)
+    {
+        if(!jsElIsPseudo((void*)e->get_child(i))) n++;
+    }
+    return n;
 }
 
 void* EWebEngine::jsElChild(void* ctx, void* el, int idx)
@@ -1032,8 +1216,15 @@ void* EWebEngine::jsElChild(void* ctx, void* el, int idx)
     (void)ctx;
     if(el == nullptr || idx < 0) return nullptr;
     litehtml::element* e = (litehtml::element*)el;
-    if((size_t)idx >= e->get_children_count()) return nullptr;
-    return (void*)e->get_child(idx);
+    int seen = 0;
+    for(size_t i = 0; i < e->get_children_count(); i++)
+    {
+        void* c = (void*)e->get_child(i);
+        if(jsElIsPseudo(c)) continue;
+        if(seen == idx) return c;
+        seen++;
+    }
+    return nullptr;
 }
 
 bool EWebEngine::jsElIsTag(void* ctx, void* el)
@@ -1045,7 +1236,9 @@ bool EWebEngine::jsElIsTag(void* ctx, void* el)
      * distinction childNodes (everything) vs children (elements only) needs,
      * and it avoids a dynamic_cast - the build uses -fno-rtti. */
     const char* t = ((litehtml::element*)el)->get_tagName();
-    return (t != nullptr && t[0] != 0);
+    if(t == nullptr || t[0] == 0) return false;
+    if(t[0] == ':' && t[1] == ':') return false; /* pseudo: not an element */
+    return true;
 }
 
 bool EWebEngine::jsElIsLive(void* ctx, void* el)
@@ -1173,11 +1366,21 @@ void EWebEngine::jsElRemoveAttr(void* ctx, void* el, const char* name)
 {
     EWebEngine* self = (EWebEngine*)ctx;
     if(el == nullptr || name == nullptr) return;
-    /* html_tag::remove_attr drops the attribute outright, so a later
-     * getAttribute reports null rather than "" - which set_attr(name, "")
-     * cannot express. It also clears the style-property cache and the parsed
-     * class list, so removing class= really stops matching .foo selectors. */
-    ((litehtml::element*)el)->remove_attr(name);
+    /* el.checked = false reaches the bridge as removeAttribute("checked");
+     * route it to the widget so the live tick state follows the script. */
+    void* w = ((litehtml::element*)el)->eweb_form_widget();
+    if(w != nullptr && strcmp(name, "checked") == 0)
+        ((eweb_el_input*)w)->setChecked(false);
+    else {
+        litehtml::element* e = (litehtml::element*)el;
+        e->remove_attr(name);
+        /* Same restyle contract as jsElSetAttr: dropping class/id/style can
+         * change which rules match or what the inline cascade contributes. */
+        if(strcmp(name, "class") == 0 || strcmp(name, "id") == 0)
+            jsRestyleSubtree(e, true);
+        else if(strcmp(name, "style") == 0)
+            jsRestyleSubtree(e, false);
+    }
     if(self != nullptr) self->jsMarkLayoutDirty();
 }
 
@@ -1244,6 +1447,112 @@ void EWebEngine::jsElBlur(void* ctx, void* el)
     /* blur() only affects the element that currently holds focus. */
     if((litehtml::element*)el == (litehtml::element*)self->m_focusElement)
         self->clearFocus();
+}
+
+/* The widget keeps caret/selection as BYTE offsets; the DOM reports codepoint
+ * offsets, so both directions walk the UTF-8 of the live value. */
+static int ewebUtf8Step(const std::string& t, int i)
+{
+    unsigned char c = (unsigned char)t[i];
+    return (c & 0x80) == 0 ? 1 : ((c & 0xE0) == 0xC0) ? 2 :
+           ((c & 0xF0) == 0xE0) ? 3 : 4;
+}
+
+static int ewebBytesToCps(const std::string& t, int bytes)
+{
+    if(bytes > (int)t.size()) bytes = (int)t.size();
+    int n = 0, i = 0;
+    while(i < bytes) { i += ewebUtf8Step(t, i); n++; }
+    return n;
+}
+
+static int ewebCpsToBytes(const std::string& t, int cps)
+{
+    int i = 0, n = 0;
+    while(i < (int)t.size() && n < cps) { i += ewebUtf8Step(t, i); n++; }
+    return i;
+}
+
+bool EWebEngine::jsElGetSel(void* ctx, void* el, int* s, int* e)
+{
+    (void)ctx;
+    if(el == nullptr) return false;
+    void* w = ((litehtml::element*)el)->eweb_form_widget();
+    if(w == nullptr || !((eweb_el_input*)w)->isTextEditing()) return false;
+    eweb_el_input* wi = (eweb_el_input*)w;
+    std::string t = wi->value();
+    if(s) *s = ewebBytesToCps(t, wi->selStart());
+    if(e) *e = ewebBytesToCps(t, wi->selEnd());
+    return true;
+}
+
+void EWebEngine::jsElSetSel(void* ctx, void* el, int s, int e)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(el == nullptr) return;
+    void* w = ((litehtml::element*)el)->eweb_form_widget();
+    if(w == nullptr || !((eweb_el_input*)w)->isTextEditing()) return;
+    eweb_el_input* wi = (eweb_el_input*)w;
+    std::string t = wi->value();
+    wi->setSelectionRange(ewebCpsToBytes(t, s), ewebCpsToBytes(t, e));
+    if(self != nullptr) self->markContentDirty();
+}
+
+char* EWebEngine::jsElGetDataset(void* ctx, void* el)
+{
+    (void)ctx;
+    if(el == nullptr) return nullptr;
+    const litehtml::string_map* am = ((litehtml::element*)el)->eweb_attrs();
+    if(am == nullptr) return nullptr;
+
+    /* Seed the JS-side dataset object: every data-* attribute with its key
+     * camelCased (data-my-id -> myId), packed as "key\x1fvalue\x1e". */
+    std::string out;
+    for(litehtml::string_map::const_iterator it = am->begin(); it != am->end(); ++it) {
+        const std::string& k = it->first;
+        if(k.compare(0, 5, "data-") != 0 || k.size() <= 5) continue;
+        std::string ck;
+        bool up = false;
+        for(size_t i = 5; i < k.size(); i++) {
+            char c = k[i];
+            if(c == '-') { up = true; continue; }
+            ck += up ? (char)toupper((unsigned char)c) : c;
+            up = false;
+        }
+        if(ck.empty()) continue;
+        out += ck;
+        out += '\x1f';
+        out += it->second;
+        out += '\x1e';
+    }
+    if(out.empty()) return nullptr;
+    char* r = (char*)mario_malloc(out.size() + 1);
+    if(r == nullptr) return nullptr;
+    memcpy(r, out.c_str(), out.size() + 1);
+    return r;
+}
+
+char* EWebEngine::jsElAttrSnapshot(void* ctx, void* el)
+{
+    (void)ctx;
+    if(el == nullptr) return nullptr;
+    const litehtml::string_map* am = ((litehtml::element*)el)->eweb_attrs();
+    if(am == nullptr) return nullptr;
+
+    /* Element.attributes seed: every attribute packed as
+     * "name\x1fvalue\x1e"; the DOM bridge expands it into a NamedNodeMap. */
+    std::string out;
+    for(litehtml::string_map::const_iterator it = am->begin(); it != am->end(); ++it) {
+        out += it->first;
+        out += '\x1f';
+        out += it->second;
+        out += '\x1e';
+    }
+    if(out.empty()) return nullptr;
+    char* r = (char*)mario_malloc(out.size() + 1);
+    if(r == nullptr) return nullptr;
+    memcpy(r, out.c_str(), out.size() + 1);
+    return r;
 }
 
 void* EWebEngine::jsGetActiveElement(void* ctx)
@@ -1384,6 +1693,165 @@ void EWebEngine::jsWebReload(void* ctx)
     EWEB_LOG("[ewebview] js: reload queued -> %s\n", self->m_currentHtmlUrl.c_str());
 }
 
+/* First value of one response header, case-insensitively matched, or NULL.
+ * Same scan EWebContainer.cc applies to its own responses. */
+static const char* js_resp_header(const eweb_http_response_t* resp, const char* name)
+{
+    if(resp == NULL || resp->headers == NULL) return NULL;
+    size_t nlen = strlen(name);
+    for(int i = 0; i < resp->header_count; i++) {
+        const char* k = resp->headers[i].key;
+        if(k == NULL) continue;
+        if(strncasecmp(k, name, nlen) == 0 && (k[nlen] == 0 || k[nlen] == ':'))
+            return resp->headers[i].value;
+    }
+    return NULL;
+}
+
+bool EWebEngine::jsWebRequest(void* ctx, const char* method, const char* url,
+                              const char* headers, const char* body,
+                              int* status, char** out_body, char** out_headers)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(self == nullptr || url == nullptr || url[0] == 0) return false;
+    if(status != nullptr) *status = 0;
+    if(out_body != nullptr) *out_body = nullptr;
+    if(out_headers != nullptr) *out_headers = nullptr;
+    const eweb_port_t* port = &self->m_port;
+    if(!port->net.request || !port->net.free_response) return false;
+
+    /* Relative refs resolve against the document the script is running in,
+     * exactly like <script src> does. */
+    std::string full = EWebContainer::getFullURL(port, url, self->jsDocumentUrl());
+    if(full.empty()) return false;
+
+    /* Split the "\r\n"-joined request header block into (key,value) pairs.
+     * keys/vals keep stable copies alive; hdrs points into them and both
+     * outlive every request below. */
+    std::vector<std::string> keys, vals;
+    std::vector<eweb_http_header_t> hdrs;
+    if(headers != nullptr) {
+        const char* p = headers;
+        while(*p != 0) {
+            const char* eol = strstr(p, "\r\n");
+            size_t len = eol ? (size_t)(eol - p) : strlen(p);
+            const char* colon = (const char*)memchr(p, ':', len);
+            if(colon != nullptr && colon > p) {
+                keys.push_back(std::string(p, colon - p));
+                const char* v = colon + 1;
+                size_t vlen = len - (size_t)(v - p);
+                while(vlen > 0 && (*v == ' ' || *v == '\t')) { v++; vlen--; }
+                vals.push_back(std::string(v, vlen));
+            }
+            p += len;
+            if(eol != nullptr) p += 2;
+        }
+        for(size_t i = 0; i < keys.size(); i++) {
+            eweb_http_header_t h;
+            h.key = keys[i].c_str();
+            h.value = vals[i].c_str();
+            hdrs.push_back(h);
+        }
+    }
+
+    int body_len = (body != nullptr) ? (int)strlen(body) : 0;
+    const char* mth = (method != nullptr && method[0] != 0) ? method : "GET";
+
+    /* The port never follows redirects, so hop here - capped, resolving a
+     * relative Location against the URL it came from, and re-scoping the
+     * cookie jar per hop like the resource path does. A 303 (or a 301/302
+     * answering a POST) comes back as a plain GET, body dropped. */
+    std::string cur = full;
+    std::string cur_method = mth;
+    const char* cur_body = body;
+    int cur_body_len = body_len;
+    eweb_http_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    bool got = false;
+    for(int hop = 0; hop < 5; hop++) {
+        /* Session cookies for THIS hop: an API that logged the page in with
+         * Set-Cookie keeps working across its fetches. Same-site to the
+         * document, never top-level. */
+        std::string cookie = EWebCookieJar::instance().requestHeader(
+                cur, self->jsDocumentUrl(), false);
+        std::vector<eweb_http_header_t> send = hdrs;
+        std::string cookie_storage;   /* keeps cookie.c_str() alive per hop */
+        if(!cookie.empty()) {
+            cookie_storage = cookie;
+            eweb_http_header_t ch;
+            ch.key = "Cookie";
+            ch.value = cookie_storage.c_str();
+            send.push_back(ch);
+        }
+
+        if(!port->net.request(port->net.ud, cur.c_str(), cur_method.c_str(),
+                              cur_body, cur_body_len,
+                              send.empty() ? NULL : &send[0], (int)send.size(),
+                              &resp)) {
+            return false;   /* transport failure => XHR status 0 / rejected fetch */
+        }
+        if(resp.error) {
+            port->net.free_response(port->net.ud, &resp);
+            return false;
+        }
+
+        std::vector<std::string> set_cookies;
+        for(int i = 0; i < resp.header_count; i++) {
+            const char* k = resp.headers[i].key;
+            if(k != NULL && strcasecmp(k, "set-cookie") == 0 && resp.headers[i].value != NULL)
+                set_cookies.push_back(std::string(resp.headers[i].value));
+        }
+        if(!set_cookies.empty())
+            EWebCookieJar::instance().storeResponseCookies(cur, set_cookies);
+
+        const char* location = js_resp_header(&resp, "location");
+        bool redir = (resp.status == 301 || resp.status == 302 || resp.status == 303 ||
+                      resp.status == 307 || resp.status == 308) && location != NULL;
+        if(!redir) { got = true; break; }
+
+        std::string next = EWebContainer::getFullURL(port, location, cur);
+        int prev_status = resp.status;
+        port->net.free_response(port->net.ud, &resp);
+        memset(&resp, 0, sizeof(resp));
+        if(next.empty() || next == cur) return false;   /* redirect loop / junk */
+        if(prev_status == 303 ||
+           ((prev_status == 301 || prev_status == 302) && cur_method != "GET")) {
+            cur_method = "GET";
+            cur_body = NULL;
+            cur_body_len = 0;
+        }
+        cur = next;
+    }
+    if(!got) return false;
+
+    if(status != nullptr) *status = resp.status;
+
+    /* The bridge adopts both outputs and frees them with mario_free, so they
+     * are mario-owned NUL-terminated copies (a binary body survives as bytes
+     * plus the terminator; js_web.c treats it as a string anyway). */
+    if(out_body != nullptr) {
+        int n = resp.body_size > 0 ? resp.body_size : 0;
+        char* ob = (char*)mario_malloc((uint32_t)n + 1);
+        if(ob == nullptr) { port->net.free_response(port->net.ud, &resp); return false; }
+        if(n > 0) memcpy(ob, resp.body, (size_t)n);
+        ob[n] = 0;
+        *out_body = ob;
+    }
+    if(out_headers != nullptr) {
+        std::string block;
+        for(int i = 0; i < resp.header_count; i++) {
+            if(resp.headers[i].key == NULL || resp.headers[i].value == NULL) continue;
+            if(!block.empty()) block += "\r\n";
+            block += resp.headers[i].key;
+            block += ": ";
+            block += resp.headers[i].value;
+        }
+        *out_headers = js_strdup_mario(block.c_str());
+    }
+    port->net.free_response(port->net.ud, &resp);
+    return true;
+}
+
 char* EWebEngine::jsWebGetCookie(void* ctx)
 {
     EWebEngine* self = (EWebEngine*)ctx;
@@ -1494,16 +1962,18 @@ void EWebEngine::registerWebNatives(struct st_vm* vm)
     cb.storage_load = jsWebStorageLoad;
     cb.storage_save = jsWebStorageSave;
 
-    /* http_request stays NULL. It MUST block the VM thread until the response
-     * is complete, but this engine's HTTP path is an asynchronous task queue
-     * (download worker -> m_resultQueue -> processResults() on the engine
-     * loop). The VM runs on that same engine thread, so waiting for a download
-     * would deadlock the very loop that delivers it.
-     *
-     * With the hook absent js_web.c still installs XMLHttpRequest, fetch(),
-     * Response and Headers; every request reports a network error (XHR
-     * readyState 4 / status 0, fetch a rejected Promise) instead of throwing,
-     * which is what a browser does for a failed request. */
+    /* XHR/fetch go through jsWebRequest, which performs the request right on
+     * the engine thread via port->net.request instead of deferring through the
+     * download task queue. The hook contract demands a blocking call, and the
+     * VM runs on the engine thread itself, so routing it through the queue
+     * (whose results only that same thread drains) would deadlock it - a
+     * direct synchronous port call cannot. The engine loop simply stalls for
+     * the duration of one request (the port's 10s timeout caps it), which is
+     * exactly what a synchronous XHR does to a browser's page thread too.
+     * With the hook wired, XMLHttpRequest/fetch/Response/Headers are live;
+     * a transport failure still reports XHR readyState 4 / status 0 and a
+     * rejected fetch Promise, like a browser does for a failed request. */
+    cb.http_request = jsWebRequest;
 
     if(!js_register_web_natives(vm, &cb)) {
         EWEB_LOG("[ewebview] js: web native registration failed\n");

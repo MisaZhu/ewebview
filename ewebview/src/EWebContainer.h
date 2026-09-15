@@ -86,6 +86,11 @@ public:
     void                               clear_images();
     void                               clear_inputs();
 
+    /* Active (innermost) overflow clip: uniform border radius of the clip box
+     * (0 when rectangular / mixed corners) and the clip rectangle itself. */
+    int                                top_clip_radius() const;
+    litehtml::position                 top_clip_rect() const;
+
     void                               get_client_rect(litehtml::position& client) const;
     void                               set_client_size(int width, int height);
     void                               on_anchor_click(const litehtml::tchar_t* url, const litehtml::element::ptr& el);
@@ -111,7 +116,8 @@ public:
     static uint8_t*                    loadURL(const eweb_port_t* port,
                                                const std::string& url, int* sz,
                                                const std::string& pageUrl = std::string(),
-                                               bool topLevel = false);
+                                               bool topLevel = false,
+                                               std::string* finalUrl = NULL);
     static std::string                 normalizeURL(const eweb_port_t* port,
                                                     const std::string& url,
                                                     const std::string& baseurl);
@@ -181,7 +187,6 @@ private:
      * to the round box; the HAL clip itself stays rectangular. */
     struct clip_entry { litehtml::position r; int radius; };
     std::vector<clip_entry> m_clips;
-    int                        top_clip_radius() const;
     void* m_paint_surf;
 
     /* Paint-time affine transform (CSS transform of the box whose borders are

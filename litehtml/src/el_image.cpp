@@ -1,6 +1,7 @@
 #include "html.h"
 #include "el_image.h"
 #include "document.h"
+#include <math.h>
 
 /* Pick one URL from a srcset attribute: an exact 1x candidate wins, then the
  * narrowest w descriptor (this device is a low-density viewport), then the
@@ -342,8 +343,35 @@ void litehtml::el_image::draw( uint_ptr hdc, int x, int y, const position* clip 
 	el_pos += m_padding;
 	el_pos += m_borders;
 
+	/* Replaced elements honour transform too: apple.com centres its hero art
+	 * with "inset-inline-start:50%; transform:translate(-50%)" on an absolutely
+	 * positioned <img>. The port's paint transform only skews border quads, it
+	 * never moves a background bitmap, so a pure translation is folded into the
+	 * destination box itself: bitmap, background, borders and the culling test
+	 * below then all land on the transformed position. Non-translational
+	 * matrices (rotate/scale) still go through push_paint_transform for the
+	 * border quads, and culling is skipped for them because the clip test uses
+	 * the untransformed box. */
+	float xform[6];
+	bool have_xform = compute_transform_matrix(el_pos, xform);
+	if(have_xform && xform[0] == 1.0f && xform[1] == 0.0f &&
+	   xform[2] == 0.0f && xform[3] == 1.0f)
+	{
+		int tx = (int)lroundf(xform[4]);
+		int ty = (int)lroundf(xform[5]);
+		pos.x += tx;
+		pos.y += ty;
+		el_pos.x += tx;
+		el_pos.y += ty;
+		have_xform = false;
+	}
+	if(have_xform)
+	{
+		doc->container()->push_paint_transform(xform);
+	}
+
 	// draw standard background here
-	if (el_pos.does_intersect(clip))
+	if (have_xform || el_pos.does_intersect(clip))
 	{
 		const background* bg = get_background();
 		if (bg)
@@ -356,7 +384,7 @@ void litehtml::el_image::draw( uint_ptr hdc, int x, int y, const position* clip 
 	}
 
 	// draw image as background
-	if(pos.does_intersect(clip))
+	if(have_xform || pos.does_intersect(clip))
 	{
 		if (pos.width > 0 && pos.height > 0) {
 			background_paint bg;
@@ -367,17 +395,56 @@ void litehtml::el_image::draw( uint_ptr hdc, int x, int y, const position* clip 
 			bg.border_box			+= m_padding;
 			bg.border_box			+= m_borders;
 			bg.repeat				= background_repeat_no_repeat;
-			bg.image_size.width		= pos.width;
-			bg.image_size.height	= pos.height;
+			/* object-fit: the content box is the destination viewport. Size the
+			 * bitmap inside it (cover/contain/none/scale-down) and centre it;
+			 * draw_background clips the overflowing tile back to clip_box and
+			 * back-computes the source sub-rect, which is exactly the centre
+			 * crop browsers show for object-fit:cover (history thumbs).
+			 * The default 'fill' keeps stretching to the whole box. */
+			int fw = pos.width, fh = pos.height, fx = pos.x, fy = pos.y;
+			litehtml::size nat;
+			int iw = 0, ih = 0;
+			if (doc->container())
+			{
+				doc->container()->get_image_size(m_src.c_str(), 0, nat);
+				iw = nat.width; ih = nat.height;
+			}
+			if (iw > 0 && ih > 0)
+			{
+				const tchar_t* of = get_style_property(_t("object-fit"), false, 0);
+				bool is_cover = false, is_contain = false, is_none = false, is_sdown = false;
+				if (of)
+				{
+					if (!t_strcasecmp(of, _t("cover"))) is_cover = true;
+					else if (!t_strcasecmp(of, _t("contain"))) is_contain = true;
+					else if (!t_strcasecmp(of, _t("none"))) is_none = true;
+					else if (!t_strcasecmp(of, _t("scale-down"))) is_sdown = true;
+				}
+				if (is_cover || is_contain || is_none || is_sdown)
+				{
+					float sx = (float)pos.width / (float)iw;
+					float sy = (float)pos.height / (float)ih;
+					float s;
+					if (is_cover) s = sx > sy ? sx : sy;
+					else if (is_contain) s = sx < sy ? sx : sy;
+					else if (is_none) s = 1.0f;
+					else { s = sx < sy ? sx : sy; if (s > 1.0f) s = 1.0f; }
+					fw = (int)(iw * s); fh = (int)(ih * s);
+					fx = pos.x + (pos.width - fw) / 2;
+					fy = pos.y + (pos.height - fh) / 2;
+				}
+			}
+			bg.image_size.width		= fw;
+			bg.image_size.height	= fh;
 			bg.border_radius		= m_css_borders.radius.calc_percents(bg.border_box.width, bg.border_box.height);
-			bg.position_x			= pos.x;
-			bg.position_y			= pos.y;
+			bg.position_x			= fx;
+			bg.position_y			= fy;
 			doc->container()->draw_background(hdc, bg);
 		}
 	}
 
 	// draw borders
-	if (el_pos.does_intersect(clip))
+	if (have_xform || el_pos.does_intersect(clip))
 	{
 		position border_box = pos;
 		border_box += m_padding;
@@ -387,6 +454,10 @@ void litehtml::el_image::draw( uint_ptr hdc, int x, int y, const position* clip 
 		bdr.radius = m_css_borders.radius.calc_percents(border_box.width, border_box.height);
 
 		doc->container()->draw_borders(hdc, bdr, border_box, have_parent() ? false : true);
+	}
+	if(have_xform)
+	{
+		doc->container()->pop_paint_transform();
 	}
 }
 

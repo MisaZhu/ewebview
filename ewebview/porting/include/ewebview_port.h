@@ -229,10 +229,14 @@ typedef struct eweb_net_api {
     /* Perform ONE http(s) request WITHOUT following redirects (the core follows
      * redirects itself so it can re-scope cookies per hop). `req_headers`
      * carries the Cookie:/User-Agent: headers the core built for this hop.
+     * `method` NULL/empty means GET; `body` (with `body_size`, may be NULL/0)
+     * is the request payload for POST/PUT/... and is copied by the port.
      * Returns true and fills *resp when a response was received (even 4xx/5xx);
-     * returns false on a transport failure. Runs on a download worker thread.
+     * returns false on a transport failure. Runs on a download worker thread
+     * (core fetches) or on the engine thread (js fetch/XHR bridge).
      * REQUIRED for http(s) pages. */
-    bool (*request)(void* ud, const char* url,
+    bool (*request)(void* ud, const char* url, const char* method,
+                    const char* body, int body_size,
                     const eweb_http_header_t* req_headers, int req_header_count,
                     eweb_http_response_t* resp);
 

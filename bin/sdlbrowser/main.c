@@ -1596,12 +1596,15 @@ static void browser_destroy(browser_t* b) {
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char** argv) {
+    fprintf(stderr, "[MARK] sdlbrowser main start\n");
     browser_t browser;
     browser_detect_color_scheme();
     if(!browser_init(&browser, argc, argv)) {
+        fprintf(stderr, "[MARK] browser_init failed\n");
         browser_destroy(&browser);
         return 1;
     }
+    fprintf(stderr, "[MARK] browser_init ok\n");
 
     browser_t* b = &browser;
     const uint32_t TICK_MS = 16;   /* ~60 Hz UI pump */
@@ -1638,9 +1641,13 @@ int main(int argc, char** argv) {
                         inj_exec(b, s);
                         b->inject_next_ms = SDL_GetTicks() + s->delay;
                     }
-                } else {
-                    /* Script finished: settle once more so the effects render,
-                     * then fall through to the capture on the next pass. */
+                } else if((int32_t)(now - b->inject_next_ms) >= 0) {
+                    /* Script finished AND the last step's own delay has
+                     * elapsed (a trailing `wait N` must actually gate the
+                     * capture, or an effect that needs N ms - a redirect
+                     * landing page reaching its blank-SPA notice, say - is
+                     * screenshotted too early). Settle once more so the
+                     * effects render, then fall through to the capture. */
                     b->inject_active = false;
                     b->inject_done = true;
                     b->shot_start_ms = SDL_GetTicks();

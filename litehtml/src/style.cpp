@@ -178,8 +178,28 @@ void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, con
 	{
 		name = _t("max-height");
 	} else
+	/* Logical offsets: apple.com centres its hero art with
+	 * "inset-inline-start:50%; transform:translate(-50%)"; unmapped the
+	 * absolute box keeps left:auto and the artwork lands off to one side. */
+	if(!t_strcmp(name, _t("inset-inline-start")))
+	{
+		name = _t("left");
+	} else
+	if(!t_strcmp(name, _t("inset-inline-end")))
+	{
+		name = _t("right");
+	} else
+	if(!t_strcmp(name, _t("inset-block-start")))
+	{
+		name = _t("top");
+	} else
+	if(!t_strcmp(name, _t("inset-block-end")))
+	{
+		name = _t("bottom");
+	} else
 	if(!t_strcmp(name, _t("margin-inline")) || !t_strcmp(name, _t("padding-inline")) ||
-	   !t_strcmp(name, _t("margin-block")) || !t_strcmp(name, _t("padding-block")))
+	   !t_strcmp(name, _t("margin-block")) || !t_strcmp(name, _t("padding-block")) ||
+	   !t_strcmp(name, _t("inset-inline")) || !t_strcmp(name, _t("inset-block")))
 	{
 		const tchar_t* a;
 		const tchar_t* b;
@@ -194,6 +214,14 @@ void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, con
 		if(!t_strcmp(name, _t("margin-block")))
 		{
 			a = _t("margin-top"); b = _t("margin-bottom");
+		} else
+		if(!t_strcmp(name, _t("inset-inline")))
+		{
+			a = _t("left"); b = _t("right");
+		} else
+		if(!t_strcmp(name, _t("inset-block")))
+		{
+			a = _t("top"); b = _t("bottom");
 		} else
 		{
 			a = _t("padding-top"); b = _t("padding-bottom");

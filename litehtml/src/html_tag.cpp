@@ -1620,6 +1620,23 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	const tchar_t* own_text_transform = own_style_ref_ptr(own_refs.text_transform);
 
 	m_el_position	= (element_position)	value_index((own_position && t_strcasecmp(own_position, _t("inherit"))) ? own_position : _t("static"),			element_position_strings,	element_position_fixed);
+	/* overflow:clip is hidden without any scrollability: for painting purposes
+	 * the engine clips identically, and apple.com relies on it to keep
+	 * full-bleed tile artwork inside its tile. */
+	if(own_overflow && !t_strcasecmp(own_overflow, _t("clip")))
+	{
+		static const bool dbg_clip = getenv("EWEB_DBG_CLIP") != 0;
+		if(dbg_clip)
+		{
+			fprintf(stderr, "[clip] tag=%s class=%s parent=%s pdisplay=%d owndisplay=%d\n",
+					(const char*)m_tag.c_str(),
+					(const char*)(get_attr(_t("class")) ? get_attr(_t("class")) : "-"),
+					(el_parent && el_parent->get_tagName()) ? (const char*)el_parent->get_tagName() : "-",
+					el_parent ? (int)el_parent->get_display() : -1,
+					(int)m_display);
+		}
+		own_overflow = _t("hidden");
+	}
 	m_overflow		= (overflow)			value_index((own_overflow && t_strcasecmp(own_overflow, _t("inherit"))) ? own_overflow : _t("visible"),		overflow_strings,			overflow_visible);
 	if(own_display && t_strcasecmp(own_display, _t("inherit")))
 	{
@@ -1651,6 +1668,15 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	 * menus of modern sites paint as giant black overlays. */
 	if(m_display != display_none && m_tag != _t("summary") && el_parent &&
 		!t_strcasecmp(el_parent->get_tagName(), _t("details")) && !el_parent->get_attr(_t("open")))
+	{
+		m_display = display_none;
+	}
+
+	/* UA behaviour for <noscript>: this engine always runs scripts, so the
+	 * fallback content must stay out of the box tree (apple.com ships whole
+	 * unpositioned fallback <img> sets inside noscript that otherwise paint
+	 * over the following sections). */
+	if(m_display != display_none && m_tag == _t("noscript"))
 	{
 		m_display = display_none;
 	}
@@ -2005,6 +2031,31 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		{
 			m_display = display_block;
 		}
+		/* Flex/grid items are block-level: the computed display of an in-flow
+		 * child of a flex/grid container is blockified (CSS Display 3 2.4). The
+		 * style walk is top-down so the parent's display is already final here.
+		 * This must live inside the is_inline_box() branch - every blockifiable
+		 * display is an inline box, so a separate else-if below never runs.
+		 * Without it an undeclared-display ::after caret inside a flex button
+		 * stays display:inline - the inline draw path applies no transform, so
+		 * the border-trick chevron paints as an unrotated corner (w3.org nav). */
+		else if (el_parent)
+		{
+		style_display pd = el_parent->get_display();
+		if (pd == display_flex || pd == display_inline_flex ||
+			pd == display_grid || pd == display_inline_grid)
+		{
+			switch (m_display)
+			{
+			case display_inline:		m_display = display_block;	break;
+			case display_inline_block:	m_display = display_block;	break;
+			case display_inline_table:	m_display = display_table;	break;
+			case display_inline_flex:	m_display = display_flex;	break;
+			case display_inline_grid:	m_display = display_grid;	break;
+			default:											break;
+			}
+		}
+		}
 	}
 
 	/* display:contents generates no box of its own: queue the child lift for
@@ -2021,6 +2072,13 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	m_css_text_indent.fromString(	get_style_property(_t("text-indent"),	true,	_t("0")),	_t("0"));
 
 	const tchar_t* own_width = get_style_property_own(_t("width"));
+	if(!own_width)
+	{
+		/* CSS Logical: inline-size is the writing-mode-aware width. w3.org sizes
+		 * its nav caret purely with inline-size/block-size, so without this the
+		 * border-trick chevron collapses to a 0x0 dot. */
+		own_width = get_style_property_own(_t("inline-size"));
+	}
 	if(own_width) {
 		m_css_width.fromString(own_width, _t("auto"));
 	} else {
@@ -2028,6 +2086,10 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	}
 
 	const tchar_t* own_height = get_style_property_own(_t("height"));
+	if(!own_height)
+	{
+		own_height = get_style_property_own(_t("block-size"));
+	}
 	if(own_height) {
 		m_css_height.fromString(own_height, _t("auto"));
 	} else {
@@ -2377,49 +2439,64 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		parse_style_profile_add(g_parse_style_profile.background_ms, part_start);
 	}
 
-	if(!is_reparse)
+	/* A restyle (is_reparse) must reach the whole subtree: jsRestyleSubtree
+	 * re-cascades every descendant's m_style, but only this recursive walk
+	 * re-resolves the computed values (display and friends). Without it a
+	 * class toggle on an ancestor (apple.com flips html.no-js to html.js in
+	 * a head script) leaves descendants painting stale resolved values. */
+	if(step_parse)
 	{
-		if(step_parse)
-		{
-			step_doc->style_step_stamp(this);
-		}
-		if(profile_enabled)
-			part_start = sys_tic_ms(0);
-		for(auto& el : m_children)
-		{
-			if(step_parse && step_doc->style_step_exhausted())
-				break;
-			el->parse_styles();
-		}
-		if(step_parse && !step_doc->style_step_exhausted())
-		{
-			m_step_done = true; /* subtree fully covered in this epoch */
-		}
-		if(profile_enabled)
-		{
-			parse_style_profile_add(g_parse_style_profile.child_ms, part_start);
-		}
+		step_doc->style_step_stamp(this);
+	}
+	if(profile_enabled)
+		part_start = sys_tic_ms(0);
+	for(auto& el : m_children)
+	{
+		if(step_parse && step_doc->style_step_exhausted())
+			break;
+		el->parse_styles(is_reparse);
+	}
+	if(step_parse && !step_doc->style_step_exhausted())
+	{
+		m_step_done = true; /* subtree fully covered in this epoch */
+	}
+	if(profile_enabled)
+	{
+		parse_style_profile_add(g_parse_style_profile.child_ms, part_start);
 	}
 }
 
 int litehtml::html_tag::render( int x, int y, int max_width, bool second_pass )
 {
+	static int rdbg_on = -1;
+	if(rdbg_on < 0) rdbg_on = getenv("EWEB_RDBG") ? 1 : 0;
+	const tchar_t* rcls = rdbg_on ? get_attr(_t("class")) : 0;
+	bool rdbg = rdbg_on && rcls &&
+		(strstr(rcls, "nav-link") || strstr(rcls, "top-nav-item"));
+	if(rdbg)
+		printf("[rdbg] enter class=%s disp=%d maxw=%d h=%d skip=%d\n",
+				(const char*)rcls, (int)m_display, max_width, m_pos.height, (int)m_skip);
+	int rret = 0;
 	if (m_display == display_table || m_display == display_inline_table)
 	{
-		return render_table(x, y, max_width, second_pass);
+		rret = render_table(x, y, max_width, second_pass);
 	}
-
-	if (m_display == display_flex || m_display == display_inline_flex)
+	else if (m_display == display_flex || m_display == display_inline_flex)
 	{
-		return render_flex(x, y, max_width, second_pass);
+		rret = render_flex(x, y, max_width, second_pass);
 	}
-
-	if (m_display == display_grid || m_display == display_inline_grid)
+	else if (m_display == display_grid || m_display == display_inline_grid)
 	{
-		return render_grid(x, y, max_width, second_pass);
+		rret = render_grid(x, y, max_width, second_pass);
 	}
-
-	return render_box(x, y, max_width, second_pass);
+	else
+	{
+		rret = render_box(x, y, max_width, second_pass);
+	}
+	if(rdbg)
+		printf("[rdbg] exit class=%s disp=%d h=%d w=%d\n",
+				(const char*)rcls, (int)m_display, m_pos.height, m_pos.width);
+	return rret;
 }
 
 bool litehtml::html_tag::is_white_space() const
@@ -5146,6 +5223,25 @@ void litehtml::html_tag::init_background_paint(position pos, background_paint &b
 	bg_paint.border_radius	= m_css_borders.radius.calc_percents(border_box.width, border_box.height);;
 	bg_paint.border_box		= border_box;
 	bg_paint.is_root		= have_parent() ? false : true;
+	if(!bg_paint.is_root)
+	{
+		/* CSS canvas propagation: when the root (html) background is transparent
+		 * the BODY background is painted over the whole canvas, not just the
+		 * body box. Mark body as a root paint so the container can fill the
+		 * full viewport and window margins never show a stale frame. */
+		document* d = get_document();
+		const tchar_t* tn = get_tagName();
+		if(d && tn && !t_strcasecmp(tn, _t("body")))
+		{
+			element::ptr r = d->root();
+			if(r)
+			{
+				const background* rb = static_cast<html_tag*>(r)->get_background();
+				if(!rb || rb->m_color.alpha == 0)
+					bg_paint.is_root = true;
+			}
+		}
+	}
 }
 
 litehtml::visibility litehtml::html_tag::get_visibility() const
@@ -6337,8 +6433,21 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 
 	bool was_space = false;
 
+	static int cdbg_on = -1;
+	if(cdbg_on < 0) cdbg_on = getenv("EWEB_CDBG") ? 1 : 0;
+	const tchar_t* cdbg_cls = cdbg_on ? get_attr(_t("class")) : 0;
+	bool cdbg = cdbg_on && cdbg_cls && strstr(cdbg_cls, "top-nav-item");
+
 	for (auto el : m_children)
 	{
+		if(cdbg)
+		{
+			printf("[cdbg] li child tag=%s class=%s disp=%d skip=%d vis=%d posn=%d\n",
+					(const char*)el->get_tagName(),
+					el->get_attr(_t("class")) ? (const char*)el->get_attr(_t("class")) : "",
+					(int)el->get_display(), (int)el->m_skip, (int)el->is_visible(),
+					(int)el->get_element_position());
+		}
 		// display:contents elements generate no box of their own
 		if (el->get_display() == display_contents) continue;
 

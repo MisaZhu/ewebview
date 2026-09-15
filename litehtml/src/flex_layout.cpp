@@ -2,6 +2,7 @@
 #include "html_tag.h"
 #include "document.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <algorithm>
 #include <vector>
@@ -117,11 +118,26 @@ static void flex_parse_gap(html_tag* el, int avail, int& row_gap, int& col_gap)
 static int preferred_content_width(const litehtml::element::ptr& el)
 {
 	if(!el) return 0;
+	static int pdbg_on = -1;
+	if(pdbg_on < 0) pdbg_on = getenv("EWEB_PDBG") ? 1 : 0;
+	const tchar_t* pcls = pdbg_on ? el->get_attr(_t("class")) : 0;
+	bool pdbg = pdbg_on && pcls &&
+		(strstr(pcls, "top-nav-item") || strstr(pcls, "nav-link"));
 	litehtml::style_display d = el->get_display();
+	if(pdbg)
+		printf("[pdbg] pcw enter class=%s disp=%d\n", (const char*)pcls, (int)d);
 	if(el->is_replaced() || d == litehtml::display_inline_block ||
 	   d == litehtml::display_inline_text)
 	{
-		return el->width();
+		/* Replaced atoms ONLY when they are not flex containers: a replaced
+		 * box with display:flex (w3.org's nav triggers are <button> widgets
+		 * styled display:flex) still flex-lays-out its children in render_flex,
+		 * so its max-content is the children sum. Returning width() for it
+		 * handed back the FILL width of the last pass (the whole nav row),
+		 * which inflated the owning li's flex base to ~1000px and drove the
+		 * row into a catastrophic shrink/wrap ratchet. */
+		if(d != litehtml::display_flex && d != litehtml::display_inline_flex)
+			return el->width();
 	}
 	if(d == litehtml::display_flex || d == litehtml::display_inline_flex)
 	{
@@ -149,6 +165,13 @@ static int preferred_content_width(const litehtml::element::ptr& el)
 		if(c->get_element_position() == litehtml::element_position_absolute ||
 		   c->get_element_position() == litehtml::element_position_fixed) continue;
 		int mw = c->margin_left() + c->margin_right();
+		if(pdbg)
+		{
+			const tchar_t* ccls = c->get_attr(_t("class"));
+			printf("[pdbg]   child tag=%s class=%s disp=%d vis=%d w=%d\n",
+					(const char*)c->get_tagName(), ccls ? (const char*)ccls : "",
+					(int)c->get_display(), (int)c->is_visible(), c->width());
+		}
 		if(c->is_break())
 		{
 			if(line > w) w = line;
@@ -246,9 +269,30 @@ static int flex_run_wrap(const std::vector<litehtml::element::ptr>& run, int inn
 static int flex_min_content_inner(const litehtml::element::ptr& el)
 {
 	if(!el) return 0;
+	/* A specified definite width IS the box's min-content size. Falling back
+	 * to children / replaced intrinsics instead clamped w3.org's .logo-link
+	 * shrink to the SVG logo's 480px default width (its span carries
+	 * width:clamp(...)), inflating the logo item fourfold and pushing the
+	 * whole nav row off screen. Percentages stay content-based: against an
+	 * unknown shrink target they are indefinite. */
+	litehtml::css_length cw = el->get_css_width();
+	if(!cw.is_predefined() && cw.units() != litehtml::css_units_none &&
+	   cw.units() != litehtml::css_units_percentage)
+	{
+		int wv = el->get_document()->cvt_units(cw, el->get_font_size(), 0);
+		if(wv > 0) return wv;
+	}
 	litehtml::style_display d = el->get_display();
-	if(el->is_replaced() || d == litehtml::display_inline_block ||
-	   d == litehtml::display_inline_text)
+	if(el->is_replaced())
+	{
+		/* intrinsic, not the last laid-out width: reading m_pos here fed the
+		 * previous pass' resolved size back into the shrink clamp and ratcheted
+		 * the item wider on every relayout. */
+		litehtml::size sz;
+		el->get_content_size(sz, 0);
+		return sz.width;
+	}
+	if(d == litehtml::display_inline_block || d == litehtml::display_inline_text)
 	{
 		return el->width();
 	}
@@ -357,6 +401,19 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 	bool do_wrap			= flex_flag(wrap_s, "wrap", "wrap-reverse");
 	const tchar_t* jc_s		= get_style_property(_t("justify-content"), false, _t("flex-start"));
 	const tchar_t* ai_s		= get_style_property(_t("align-items"), false, _t("stretch"));
+	static int flexdbg_on = -1;
+	if(flexdbg_on < 0) flexdbg_on = getenv("EWEB_FLEXDBG") ? 1 : 0;
+	const tchar_t* flexdbg_ccls = get_attr(_t("class"));
+	const tchar_t* flexdbg_pcls = parent() ? parent()->get_attr(_t("class")) : 0;
+	bool flexdbg = flexdbg_on &&
+		((flexdbg_ccls &&
+		 (strstr(flexdbg_ccls, "global-nav") || strstr(flexdbg_ccls, "top-nav") ||
+		  strstr(flexdbg_ccls, "nav-link") || strstr(flexdbg_ccls, "icon-link") ||
+		  strstr(flexdbg_ccls, "account") || strstr(flexdbg_ccls, "logo"))) ||
+		 (flexdbg_pcls && strstr(flexdbg_pcls, "global-nav")));
+	if(flexdbg)
+		printf("[flexdbg] container class=%s avail=%d ai=%s wrap=%s\n",
+				flexdbg_ccls, avail, ai_s, wrap_s);
 	int row_gap = 0, col_gap = 0;
 	flex_parse_gap(this, avail, row_gap, col_gap);
 
@@ -455,6 +512,16 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			if(n >= 3 && b >= 0)
 			{
 				it.base = (int)b + it.ml + it.mr;
+				it.has_main = true;
+				basis_set = true;
+			}
+			else if(n >= 1)
+			{
+				/* The flex shorthand resets flex-basis to 0% when it is omitted
+				 * (`flex:1` == `1 1 0%`), unlike the longhand's auto. Falling back
+				 * to width made `.seed-row input{flex:1;width:100%}` measure a
+				 * 100%-of-container base and overflow the row. */
+				it.base = it.ml + it.mr;
 				it.has_main = true;
 				basis_set = true;
 			}
@@ -563,6 +630,12 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			}
 		}
 		if(it.base < it.ml + it.mr) it.base = it.ml + it.mr;
+		if(flexdbg)
+		{
+			const tchar_t* mcls = it.run.empty() ? it.el->get_attr(_t("class")) : _t("<run>");
+			printf("[flexdbg]   measure class=%s base=%d grow=%g shrink=%g\n",
+					mcls ? (const char*)mcls : "", it.base, it.grow, it.shrink);
+		}
 	}
 
 	/* An inline-flex atom sizes to its content (max-content), so resolve its
@@ -688,6 +761,12 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 					minc = flex_min_content(it.el);
 				}
 				minc += it.ml + it.mr;
+				if(flexdbg)
+				{
+					const tchar_t* scls = it.run.empty() ? it.el->get_attr(_t("class")) : _t("<run>");
+					printf("[flexdbg]   shrink class=%s base=%d sh=%d minc=%d main=%d\n",
+							scls ? (const char*)scls : "", it.base, sh, minc, it.main);
+				}
 				if(it.main < minc) it.main = minc;
 				if(it.main < it.ml + it.mr) it.main = it.ml + it.mr;
 			}
@@ -747,6 +826,9 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		 * centers within the container rather than the tallest item */
 		int line_h = line_cross;
 		if(has_fixed_h && lines.size() == 1 && fixed_h > line_cross) line_h = fixed_h;
+		if(flexdbg)
+			printf("[flexdbg]   line %d line_cross=%d line_h=%d free=%d items=%d\n",
+					(int)li, line_cross, line_h, free, (int)line.size());
 
 		// main-axis packing of the leftover space
 		int lead = 0, jgap = 0;
@@ -795,8 +877,25 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			if(!is_run && flex_flag(ai_s, "stretch", "normal") && ch.is_predefined())
 			{
 				iy = 0;
-				it.el->get_position().height = line_h - it.mt - it.mb;
+				/* True stretch: give the item a definite height for the duration
+				 * of its placement render so percentage-height children (w3.org's
+				 * nav links carry height:100%) resolve against the stretched box
+				 * and center their content in it. Writing m_pos.height directly
+				 * either got wiped by the render or leaked into the next pass'
+				 * measurement and ratcheted the row taller every relayout. */
+				html_tag* sht = static_cast<html_tag*>(it.el);
+				css_length shv = sht->m_css_height;
+				int fh = line_h - it.mt - it.mb;
+				if(fh < 0) fh = 0;
+				css_length fv; fv = (float)fh;
+				sht->m_css_height = fv;
+				render_item(it, xs[i], bottom + iy);
+				sht->m_css_height = shv;
 				it.cross = line_h;
+				if(flexdbg)
+					printf("[flexdbg]   stretch class=%s forced_h=%d\n",
+							it.el->get_attr(_t("class")) ? (const char*)it.el->get_attr(_t("class")) : "",
+							fh);
 			}
 			else if(flex_flag(ai_s, "center"))
 			{
@@ -815,10 +914,27 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				int inner = it.main - it.ml - it.mr;
 				if(inner < 0) inner = 0;
 				flex_run_wrap(it.run, inner, true, xs[i] + it.ml, bottom + iy + it.mt);
+				if(flexdbg)
+				{
+					tstring ts;
+					it.run[0]->get_text(ts);
+					printf("[flexdbg]     run text=%.20s main=%d cross=%d iy=%d y=%d\n",
+							(const char*)ts.c_str(), it.main, it.cross, iy,
+							it.run[0]->get_position().y);
+				}
 			}
 			else
 			{
 				render_item(it, xs[i], bottom + iy);
+				if(flexdbg)
+				{
+					const tchar_t* icls = it.el->get_attr(_t("class"));
+					printf("[flexdbg]     item tag=%s class=%s main=%d cross=%d iy=%d y=%d h=%d css_h=%s\n",
+							(const char*)it.el->get_tagName(), icls ? (const char*)icls : "",
+							it.main, it.cross, iy, it.el->get_position().y,
+							it.el->get_position().height,
+							ch.is_predefined() ? "auto" : "set");
+				}
 			}
 		}
 
@@ -1297,12 +1413,14 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 	/* Author-specified heights, saved so the stretch pass below can force a
 	 * row height and a later relayout measures from the clean state again. */
 	std::vector<css_length> orig_h(items.size());
+	std::vector<css_length> orig_w(items.size());
 	std::vector<int> crossv(items.size(), 0);
 	for(size_t i = 0; i < items.size(); i++)
 	{
 		if(items[i]->get_display() != display_inline_text)
 		{
 			orig_h[i] = static_cast<html_tag*>(items[i])->m_css_height;
+			orig_w[i] = static_cast<html_tag*>(items[i])->m_css_width;
 		}
 	}
 
@@ -1384,6 +1502,23 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 		return w;
 	};
 
+	/* Form controls report is_replaced(), so litehtml sizes them to their
+	 * intrinsic width and they left-align inside the cell, leaving the rest
+	 * empty (a two-button .segmented control showed each button at ~76px in a
+	 * ~128px 1fr track). Real browsers blockify grid items and, with the
+	 * default justify-self:stretch, fill the cell. Mirror that for auto-width
+	 * form widgets by pinning the CSS width to the cell box for this render. */
+	auto stretch_item_width = [&](const element::ptr& el, int outer) {
+		if(el->eweb_form_widget() == 0) return;
+		html_tag* t = static_cast<html_tag*>(el);
+		if(!t->m_css_width.is_predefined()) return;
+		int w = outer - el->margin_left() - el->margin_right();
+		if(w < 0) w = 0;
+		css_length cw;
+		cw = (float)w;
+		t->m_css_width = cw;
+	};
+
 	for(int r = 0; r < row_count; r++)
 	{
 		int cur_row_h = 0;
@@ -1412,6 +1547,8 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 			else
 			{
 				static_cast<html_tag*>(el)->m_css_height = orig_h[k];
+				static_cast<html_tag*>(el)->m_css_width = orig_w[k];
+				stretch_item_width(el, outer);
 				el->render(ix, bottom, outer, second_pass);
 				cross = el->get_position().height + el->margin_top() + el->margin_bottom();
 			}
@@ -1432,6 +1569,7 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 			css_length h;
 			h = (float)(row_h - el->margin_top() - el->margin_bottom());
 			static_cast<html_tag*>(el)->m_css_height = h;
+			stretch_item_width(el, outer);
 			el->render(ix, bottom, outer, second_pass);
 		}
 
@@ -1446,6 +1584,7 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 		if(items[k]->get_display() != display_inline_text)
 		{
 			static_cast<html_tag*>(items[k])->m_css_height = orig_h[k];
+			static_cast<html_tag*>(items[k])->m_css_width = orig_w[k];
 		}
 	}
 
