@@ -28,6 +28,7 @@
 #include "EWebInternal.h"
 #include "EWebLog.h"
 #include "EWebCookies.h"
+#include <algorithm>   /* std::find (runaway/requeue bookkeeping) */
 #include "eweb_el_input.h"
 
 #include <mario/mario.h>
@@ -495,8 +496,26 @@ bool EWebEngine::runNextPageScript()
         }
         m_jsVm->dbg_tag = nullptr;
         m_jsCurScriptSrc = nullptr;
-        jsVmExit();
+        bool terminated = jsVmExit();
         m_jsProgressiveActive = false;
+        /* A watchdog cut only proved this body cannot finish within the run
+         * budget - but in document order it blocks everything behind it until
+         * it burns the budget (taobao's telemetry SDK spins for minutes ahead
+         * of the mtop/React bundles that render the page). Requeue the cut
+         * body ONCE at the tail of the queue so the app chain gets its turn
+         * first; the slow body retries last and, cut again, stays marked
+         * runaway exactly as before. */
+        if(terminated &&
+           std::find(m_jsRequeuedSrcs.begin(), m_jsRequeuedSrcs.end(), src) ==
+               m_jsRequeuedSrcs.end()) {
+            m_jsRequeuedSrcs.push_back(src);
+            m_jsScripts.push_back(src);
+            m_jsScriptDone.push_back(1);
+            for(auto it = m_jsRunawaySrcs.begin(); it != m_jsRunawaySrcs.end(); ++it) {
+                if(*it == src) { m_jsRunawaySrcs.erase(it); break; }
+            }
+            EWEB_LOG("[ewebview] js: script %d requeued at tail (watchdog cut)\n", (int)i);
+        }
         EWEB_LOG("[ewebview] js: script %d ran %u ms (post-swap) url=%s\n",
             (int)i, (uint32_t)(ticMs() - run_start),
             (i < m_jsScriptSrcs.size() && !m_jsScriptSrcs[i].empty())
@@ -541,17 +560,26 @@ void EWebEngine::jsDynamicScriptInserted(void* script_el)
     /* Append a new slot. m_jsScripts holds the body (empty until an external
      * fetch fills it), m_jsScriptSrcs the absolute URL ("" for inline), and
      * m_jsScriptDone whether the body is ready (inline: now; external: not
-     * until processResults lands the EWEB_TASK_SCRIPT result). */
-    m_jsScripts.push_back(body);
-    m_jsScriptSrcs.push_back(srcabs);
-    m_jsScriptDone.push_back(srcabs.empty() ? 1 : 0);
-
-    if(!srcabs.empty()) {
-        EWebTask task;
-        task.url = srcabs;
-        task.type = EWEB_TASK_SCRIPT;
-        task.loading = false;
-        addTask(task);
+     * until processResults lands the EWEB_TASK_SCRIPT result).
+     *
+     * An external CDN combo ("/??a,b,c") downloads as ONE body, so a watchdog
+     * cut on a hanging middle component discards everything after it. Split it
+     * into one slot + one fetch per component, exactly like the initial
+     * <script src> queue does, so each part gets its own run budget. The inline
+     * body (srcabs empty) passes through ewebSplitComboUrl untouched. */
+    std::vector<std::string> parts = ewebSplitComboUrl(srcabs);
+    for(size_t k = 0; k < parts.size(); ++k) {
+        bool external = !parts[k].empty();
+        m_jsScripts.push_back(external ? std::string() : body);
+        m_jsScriptSrcs.push_back(parts[k]);
+        m_jsScriptDone.push_back(external ? 0 : 1);
+        if(external) {
+            EWebTask task;
+            task.url = parts[k];
+            task.type = EWEB_TASK_SCRIPT;
+            task.loading = false;
+            addTask(task);
+        }
     }
 
     /* Re-arm only if the run already finished (BUILD_IDLE): during a normal

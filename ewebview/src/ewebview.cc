@@ -97,6 +97,11 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
 {
     if(has_inline_handlers != nullptr) *has_inline_handlers = false;
     if(has_module_scripts != nullptr) *has_module_scripts = false;
+    /* EWEB_RUN_MODULES opts in to executing type="module" scripts: "1" runs
+     * them all, any other value runs only modules whose src contains it (so a
+     * single bundle can be exercised while the rest stay skipped). */
+    static const char* run_modules_env = ::getenv("EWEB_RUN_MODULES");
+    const bool run_modules_all = (run_modules_env != nullptr && run_modules_env[0] == '1');
     if(html.empty()) {
         return html;
     }
@@ -164,18 +169,31 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
 
         std::string src_val = script_attr_value(open_tag, open_tag_orig, "src");
         bool external = !src_val.empty();
-        /* A type= that is present and not a JS mime means "do not execute". */
+        /* A type= that is present and not a JS mime means "do not execute".
+         * type="module" is executable in principle (the mario VM parses the
+         * ES2015+ syntax these bundles use and implements import/export), but
+         * apple.com's homepage bundles still abort midway (missing stdlib
+         * pieces) after mutating the DOM, which loses the stylesheet links and
+         * paints an unstyled page. So modules stay skipped unless the operator
+         * opts in with EWEB_RUN_MODULES=1 while those VM gaps are closed. */
         bool non_js = false;
-        size_t tp = open_tag.find("type=");
-        if(tp != std::string::npos) {
-            non_js = (open_tag.find("javascript", tp) == std::string::npos);
+        std::string type_val = script_attr_value(open_tag, open_tag_orig, "type");
+        for(char& ch : type_val) ch = (char)::tolower((unsigned char)ch);
+        if(!type_val.empty()) {
+            bool js_mime = (type_val.find("javascript") != std::string::npos ||
+                            type_val == "text/ecmascript" ||
+                            type_val == "application/ecmascript");
+            bool module_ok = false;
+            if(type_val == "module" && run_modules_env != nullptr) {
+                module_ok = run_modules_all ||
+                            (src_val.find(run_modules_env) != std::string::npos);
+            }
+            non_js = !(js_mime || module_ok);
         }
-        /* Remember a skipped type="module": the VM cannot parse ES2020 module
-         * bundles, so a page whose content lives in one renders blank; the
-         * engine arms a plain notice for that case (decideModuleNotice). */
+        /* Remember a skipped type="module": if the VM still fails to parse one,
+         * a page whose content lives in it renders blank; the engine arms a
+         * plain notice for that case (decideModuleNotice). */
         if(has_module_scripts != nullptr && !*has_module_scripts) {
-            std::string type_val = script_attr_value(open_tag, open_tag_orig, "type");
-            for(char& ch : type_val) ch = (char)::tolower((unsigned char)ch);
             if(type_val == "module") *has_module_scripts = true;
         }
         if(scripts != nullptr && !non_js) {
@@ -2803,12 +2821,23 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
             if(i < m_jsScriptDone.size()) m_jsScriptDone[i] = 1;   /* unresolvable: skip, never block */
             continue;
         }
-        m_jsScriptSrcs[i] = abs;   /* results are matched by this absolute URL */
-        EWebTask task;
-        task.url = abs;
-        task.type = EWEB_TASK_SCRIPT;
-        task.loading = false;
-        addTask(task);
+        /* CDN combo ("/??a,b,c"): one slot per component so a watchdog cut on a
+         * hanging middle component cannot discard the ones after it. */
+        std::vector<std::string> parts = ewebSplitComboUrl(abs);
+        m_jsScriptSrcs[i] = parts[0];
+        for(size_t k = 1; k < parts.size(); ++k) {
+            m_jsScriptSrcs.insert(m_jsScriptSrcs.begin() + (long)(i + k), parts[k]);
+            m_jsScripts.insert(m_jsScripts.begin() + (long)(i + k), std::string());
+            m_jsScriptDone.insert(m_jsScriptDone.begin() + (long)(i + k), 0);
+        }
+        i += parts.size() - 1;
+        for(size_t k = 0; k < parts.size(); ++k) {
+            EWebTask task;
+            task.url = parts[k];
+            task.type = EWEB_TASK_SCRIPT;
+            task.loading = false;
+            addTask(task);
+        }
     }
 
     setBuildStatus("preparing document", 5);

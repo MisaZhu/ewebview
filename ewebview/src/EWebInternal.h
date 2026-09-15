@@ -63,15 +63,17 @@ static const uint32_t kJsFlushMaxGapMs   = 1500;
  * an event handler). Past it the step hook terminates the VM; after
  * kJsRunAbortMax violations the page's JS is dropped until the next
  * navigation, so no script - broken or hostile - can pin the engine. */
-static const uint32_t kJsRunBudgetMs     = 10000;
-static const int      kJsRunAbortMax     = 3;
+static const uint32_t kJsRunBudgetMs     = 8000;  /* TEMP taobao iteration */
+static const int      kJsRunAbortMax     = 100;   /* TEMP taobao iteration */
 /* Per-run budget OUTSIDE the pre-paint phase (post-swap scripts, timer
  * callbacks, event handlers): those run against a live page whose input queue
  * the engine thread cannot drain while a VM run is in flight, so a runaway
  * body freezes clicks and scrolls for the whole budget. The pre-paint phase
  * keeps kJsRunBudgetMs because its own wall clock (kJsPrePaintBudgetMs) cuts
  * the run long before this one would. */
-static const uint32_t kJsRunBudgetLiveMs = 3000;
+static const uint32_t kJsRunBudgetLiveMs = 7000;  /* TEMP taobao iteration: the
+ * slowest legitimate taobao bundle (pegasus 444.js) runs ~4.9 s, so 7 s keeps
+ * the app chain intact while a runaway SDK body costs half what 15 s did. */
 
 /* Wall-clock budget for the WHOLE pre-paint script phase (the document.write()
  * pages that must run their scripts before the first paint). Past it the build
@@ -91,7 +93,38 @@ static const uint32_t kJsPrePaintBudgetMs = 4000;
  * phase stops STARTING new scripts (one already in flight still unwinds under
  * its own per-run budget), fires the load events and goes idle, exactly like
  * the pre-paint budget paints first and defers the rest. */
-static const uint32_t kJsPostSwapBudgetMs = 8000;
+static const uint32_t kJsPostSwapBudgetMs = 120000; /* TEMP taobao iteration */
+
+/* Expand a CDN combo URL ("https://host/path/??a.js,b.js,c.js") into one URL
+ * per component. A combo downloads as ONE script body, so a watchdog cut on a
+ * hanging middle component (taobao's jstracker telemetry spins forever between
+ * lib-mtop and lib-env in the same bundle) discards every component after it
+ * and starves the page's data path. Queueing the components as separate slots
+ * keeps document order while giving each its own run budget. Non-combo URLs
+ * pass through untouched. */
+inline std::vector<std::string> ewebSplitComboUrl(const std::string& url) {
+    std::vector<std::string> out;
+    size_t q = url.find("/??");
+    if(q == std::string::npos) { out.push_back(url); return out; }
+    std::string base = url.substr(0, q + 1);   /* through the trailing '/' */
+    std::string rest = url.substr(q + 3);
+    size_t start = 0;
+    while(start <= rest.size()) {
+        size_t comma = rest.find(',', start);
+        std::string part = (comma == std::string::npos)
+            ? rest.substr(start) : rest.substr(start, comma - start);
+        if(!part.empty()) {
+            if(part.compare(0, 7, "http://") == 0 || part.compare(0, 8, "https://") == 0)
+                out.push_back(part);
+            else
+                out.push_back(base + part);
+        }
+        if(comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    if(out.empty()) out.push_back(url);
+    return out;
+}
 
 /* Layout debounce / force caps (see applyPendingLayoutUpdates). */
 static const uint32_t kLayoutDebounceMs    = 30;
@@ -654,6 +687,7 @@ public:
     bool                        m_jsPrePaintCut;  /* pre-paint phase ended on the budget, not on completion */
     const std::string*          m_jsCurScriptSrc; /* body in flight, for runaway bookkeeping */
     std::vector<std::string>    m_jsRunawaySrcs;  /* bodies the run budget terminated: never re-run */
+    std::vector<std::string>    m_jsRequeuedSrcs; /* bodies already requeued once after a watchdog cut (see runNextPageScript) */
     uint32_t                    m_jsEnterGen;
     int                         m_jsAbortCount;
     bool                        m_jsPageDisabled;

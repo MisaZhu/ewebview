@@ -619,6 +619,19 @@ int litehtml::document::render( int max_width, render_type rt )
 	 * rules. Refresh every layout so 100vh tracks the live viewport (and window
 	 * resizes) even on pages without @media. */
 	container()->get_media_features(m_media);
+	/* Selectors scoped by @media were evaluated against the features snapshotted
+	 * at document-create time - frequently before the widget had a client size
+	 * (width 0), which makes every max-width breakpoint match and pins the page
+	 * to its narrow layout (apple.com's global nav then paints its 28px mobile
+	 * type at desktop widths). Nothing ever called media_changed() afterwards,
+	 * so re-evaluate the lists now that the viewport is real and restyle if any
+	 * breakpoint flipped. */
+	if(m_root && !m_media_lists.empty() && update_media_lists(m_media))
+	{
+		abort_style_step();
+		m_root->refresh_styles();
+		m_root->parse_styles();
+	}
 	if(m_root)
 	{
 		/* A post-creation style update can flip a cell's computed display; the

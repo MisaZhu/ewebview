@@ -55,7 +55,7 @@ LDFLAGS += -L $(TARGET_DIR)/lib
 # anti-aliased fill and plutosvg itself call into. Order matters: svg
 # references plutovg, and ewebview references both.
 LIBS = -lewebview -lsvg -lplutovg -llitehtml -lmario_jsn -lwebp -ltinyhttpsc \
-       $(SDL2_LIBS) -lm -lpthread
+       $(SDL2_LIBS) -lm -lpthread -lz
 
 # macOS appearance detection (AppleInterfaceStyle) uses CoreFoundation.
 ifeq ($(shell uname -s),Darwin)

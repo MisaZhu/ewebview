@@ -96,6 +96,16 @@ void ewok_freeaddrinfo_compat(struct addrinfo *res);
 
 uint64_t ewok_https_entropy_state = 0;
 
+/*
+ * Why the most recent non-blocking connect attempt failed. A timed-out
+ * non-blocking connect leaves errno == EINPROGRESS, so printing errno after
+ * the fact is misleading (on Darwin EINPROGRESS == 36, which reads like a
+ * bogus "errno=36"). connect_ipv4*_no_error_raise records the real outcome
+ * here; private_BearHttps_connect_host folds it into the response error.
+ * Plain libc/socket only (snprintf/strerror/getsockopt).
+ */
+static char private_BearHttps_last_connect_reason[128] = "unknown error";
+
 uint64_t ewok_https_entropy_word(void) {
     struct timespec ts;
     uint64_t usec = 0;
@@ -94429,8 +94439,9 @@ static int private_BearHttps_connect_host(BearHttpsRequest *self, BearHttpsRespo
                 }
             }
         }
-        char connect_error[96] = {0};
-        snprintf(connect_error, sizeof(connect_error), "failed to connect errno=%d", errno);
+        char connect_error[192] = {0};
+        snprintf(connect_error, sizeof(connect_error), "failed to connect to %s:%d (%s)",
+                 host, port, private_BearHttps_last_connect_reason);
         BearHttpsResponse_set_error(response, connect_error, BEARSSL_HTTPS_FAILT_TO_CONNECT);
     }
     else {
@@ -94610,6 +94621,8 @@ static int private_BearHttpsRequest_connect_ipv4(BearHttpsResponse *self, const 
 
 
 static int private_BearHttpsRequest_connect_ipv4_no_error_raise( const char *ipv4_ip, int port,long connection_timeout) {
+    snprintf(private_BearHttps_last_connect_reason, sizeof(private_BearHttps_last_connect_reason),
+             "connect to %s:%d not completed", ipv4_ip, port);
     int sockfd = Universal_socket(UNI_AF_INET, UNI_SOCK_STREAM, 0);
     if (sockfd < 0) {
         return -1;
@@ -94652,12 +94665,23 @@ static int private_BearHttpsRequest_connect_ipv4_no_error_raise( const char *ipv
     
     ret = ewok_https_select_compat(sockfd + 1, NULL, &write_fds, NULL, &timeout);
     if (ret <= 0) {
+        if (ret == 0)
+            snprintf(private_BearHttps_last_connect_reason, sizeof(private_BearHttps_last_connect_reason),
+                     "connection timed out after %ldms (port %d unreachable?)", connection_timeout, port);
+        else
+            snprintf(private_BearHttps_last_connect_reason, sizeof(private_BearHttps_last_connect_reason),
+                     "select() failed errno=%d", errno);
         Universal_close(sockfd);
         return -1;
     }
 
     // Check if connection succeeded
     if (private_BearHttps_socket_check_connect_error(sockfd) < 0) {
+        int so_error = 0;
+        socklen_t so_len = sizeof(so_error);
+        getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &so_len);
+        snprintf(private_BearHttps_last_connect_reason, sizeof(private_BearHttps_last_connect_reason),
+                 "connect failed: %s (SO_ERROR=%d)", strerror(so_error), so_error);
         Universal_close(sockfd);
         return -1;
     }
