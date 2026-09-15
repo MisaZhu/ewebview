@@ -55,9 +55,12 @@ extern "C" {
 /* Element wrapper identity cache. Handing back the SAME var for the same
  * embedder handle is what makes `e.target === el` and `a === b` behave like a
  * real browser; without it every getElementById() builds a fresh object and
- * identity comparisons always fail. 128 covers a page's working set, and the
- * round-robin eviction keeps the anchor array bounded. */
-#define JS_EL_CACHE 128
+ * identity comparisons always fail. The table GROWS and is never evicted:
+ * the anchor array is the only root keeping a wrapper alive while a script
+ * holds it across a GC, so dropping an entry (a previous 128-slot ring did)
+ * lets the VM recycle memory a live JS variable still points at - the wrapper
+ * then reads back as a prototype-less plain object and every member access
+ * on it yields undefined. Cleared only when the document goes away. */
 
 typedef struct {
     js_element_t          handle;       /* NULL when the slot is empty */
@@ -81,8 +84,9 @@ typedef struct {
     int                   timer_next_id;  /* monotonic id source */
     uint64_t              timer_last_now; /* embedder clock at the previous poll */
     bool                  timer_synced;   /* false until the first poll seeds it */
-    js_el_cache_t         el_cache[JS_EL_CACHE];
-    int                   el_cache_next;  /* round-robin eviction cursor */
+    js_el_cache_t*        el_cache;       /* growable, never evicted (see above) */
+    int                   el_cache_len;
+    int                   el_cache_cap;
 } js_dom_state;
 
 /* ------------------------------------------------------------------ */
@@ -93,6 +97,7 @@ static void dom_state_free(void* p) {
     js_dom_state* st = (js_dom_state*)p;
     if(st == NULL) return;
     if(st->write_buf != NULL) mstr_free(st->write_buf);
+    if(st->el_cache != NULL) mario_free(st->el_cache);
     mario_free(st);
 }
 
@@ -354,7 +359,7 @@ static void js_reanchor_el_cache(vm_t* vm, js_dom_state* st) {
     if(bridge == NULL) return;
     vm->gc.gc_defer++;
     var_t* fresh = var_new_array(vm);
-    for(int i = 0; i < JS_EL_CACHE; ++i)
+    for(int i = 0; i < st->el_cache_len; ++i)
         if(st->el_cache[i].handle != NULL && st->el_cache[i].obj != NULL)
             var_array_add(fresh, st->el_cache[i].obj);
     node_t* n = var_add(bridge, DOM_ELCACHE_KEY, fresh);
@@ -365,7 +370,7 @@ static void js_reanchor_el_cache(vm_t* vm, js_dom_state* st) {
 static var_t* wrap_element(vm_t* vm, js_element_t el) {
     js_dom_state* st = state_from_vm(vm);
     if(st != NULL) {
-        for(int i = 0; i < JS_EL_CACHE; ++i)
+        for(int i = 0; i < st->el_cache_len; ++i)
             if(st->el_cache[i].handle == el && st->el_cache[i].obj != NULL)
                 return st->el_cache[i].obj;   /* rooted by the anchor array */
     }
@@ -378,11 +383,22 @@ static var_t* wrap_element(vm_t* vm, js_element_t el) {
     obj->value = el;
     obj->free_func = el_free;
     if(st != NULL) {
-        int slot = st->el_cache_next;
-        st->el_cache_next = (slot + 1) % JS_EL_CACHE;
-        st->el_cache[slot].handle = el;
-        st->el_cache[slot].obj    = obj;
-        js_reanchor_el_cache(vm, st);
+        if(st->el_cache_len == st->el_cache_cap) {
+            int ncap = (st->el_cache_cap > 0) ? st->el_cache_cap * 2 : 64;
+            js_el_cache_t* nn = (js_el_cache_t*)mario_malloc(sizeof(js_el_cache_t) * (size_t)ncap);
+            if(nn != NULL) {
+                for(int i = 0; i < st->el_cache_len; ++i) nn[i] = st->el_cache[i];
+                if(st->el_cache != NULL) mario_free(st->el_cache);
+                st->el_cache = nn;
+                st->el_cache_cap = ncap;
+            }
+        }
+        if(st->el_cache_len < st->el_cache_cap) {
+            st->el_cache[st->el_cache_len].handle = el;
+            st->el_cache[st->el_cache_len].obj    = obj;
+            st->el_cache_len++;
+            js_reanchor_el_cache(vm, st);
+        }
     }
     return obj;
 }
@@ -1417,6 +1433,15 @@ static char* style_lookup(js_dom_state* st, js_element_t el, const char* css) {
  * (NULL/empty removes the declaration). */
 static void style_write(js_dom_state* st, js_element_t el, const char* css, const char* value) {
     if(st == NULL || el == NULL || css == NULL || st->cb.el_set_attr == NULL) return;
+    /* Opt-in trace of JS-written transforms (EWEB_TFDBG): the apple.com gallery
+     * spreads its stacked slides purely by assigning style.transform at runtime,
+     * so seeing the exact function/value the bundle writes is the only way to
+     * tell a litehtml parse gap (translate3d) from a zero measurement. */
+    if(getenv("EWEB_TFDBG") && strstr(css, "transform") != NULL) {
+        char* cls = (st->cb.el_get_attr != NULL) ? st->cb.el_get_attr(st->ctx, el, "class") : NULL;
+        fprintf(stderr, "[tfdbg] set %s = %s | class=%s\n", css, (value != NULL) ? value : "(null)", (cls != NULL) ? cls : "-");
+        if(cls != NULL) mario_free(cls);
+    }
     char* old = (st->cb.el_get_attr != NULL) ? st->cb.el_get_attr(st->ctx, el, "style") : NULL;
     char* neu = css_decl_set(old, css, (value != NULL && value[0] != 0) ? value : NULL);
     if(old != NULL) mario_free(old);
@@ -1848,6 +1873,7 @@ static var_t* native_el_get_childElementCount(vm_t* vm, var_t* env, void* data) 
 static var_t* native_el_get_parentNode(vm_t* vm, var_t* env, void* data) {
     js_dom_state* st = state_any(vm, data);
     js_element_t el = this_handle(env);
+    fprintf(stderr, "[DIAGPN] parentNode this=%p st=%p\n", (void*)el, (void*)st);
     if(st == NULL || el == NULL || st->cb.el_parent == NULL) return var_new_null(vm);
     return wrap_or_null(vm, st->cb.el_parent(st->ctx, el));
 }
@@ -2246,6 +2272,20 @@ static var_t* native_document_get_activeElement(vm_t* vm, var_t* env, void* data
     return doc_node_get(vm, data, 2);
 }
 
+/* document.currentScript: the <script> element whose body is executing right
+ * now, null outside a script run. Security SDKs (baxia) insert their loader
+ * with currentScript.parentNode.insertBefore(...) and never install their
+ * request signer when the property is missing. */
+static var_t* native_document_get_currentScript(vm_t* vm, var_t* env, void* data) {
+    (void)env;
+    js_dom_state* st = state_any(vm, data);
+    if(st != NULL && st->cb.get_current_script != NULL) {
+        js_element_t el = st->cb.get_current_script(st->ctx);
+        if(el != NULL) return wrap_or_null(vm, el);
+    }
+    return var_new_null(vm);
+}
+
 static var_t* native_document_get_url(vm_t* vm, var_t* env, void* data) {
     (void)env;
     js_dom_state* st = state_any(vm, data);
@@ -2496,8 +2536,9 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     st->timer_next_id  = 0;
     st->timer_last_now = 0;
     st->timer_synced   = false;
-    memset(st->el_cache, 0, sizeof(st->el_cache));
-    st->el_cache_next  = 0;
+    st->el_cache       = NULL;
+    st->el_cache_len   = 0;
+    st->el_cache_cap   = 0;
 
     var_t* bridge = var_new_obj_no_proto(vm, st, dom_state_free);
     if(bridge == NULL) {
@@ -2530,6 +2571,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     reg_accessor(vm, doc_cls, "title", native_document_get_title, native_document_set_title, bridge);
     reg_accessor(vm, doc_cls, "body", native_document_get_body, NULL, bridge);
     reg_accessor(vm, doc_cls, "activeElement", native_document_get_activeElement, NULL, bridge);
+    reg_accessor(vm, doc_cls, "currentScript", native_document_get_currentScript, NULL, bridge);
     reg_accessor(vm, doc_cls, "head", native_document_get_head, NULL, bridge);
     reg_accessor(vm, doc_cls, "documentElement", native_document_get_documentElement, NULL, bridge);
     reg_accessor(vm, doc_cls, "URL", native_document_get_url, NULL, bridge);
@@ -2546,6 +2588,24 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
      * body; there is no global Element binding to construct directly. */
     var_t* el_cls = vm_new_class(vm, CLS_ELEMENT);
     var_t* el_proto = var_get_prototype(el_cls);
+    /* Web content references the standard DOM constructor globals -
+     * `instanceof HTMLElement`, `class X extends HTMLElement`, feature tests on
+     * Node/EventTarget. Only "Element" was registered, so those threw
+     * "'HTMLElement' undefined!". Expose them as classes (bound on the global
+     * scope by vm_new_class) so the references resolve and are extendable;
+     * Element wrappers keep their own "Element" class. */
+    vm_new_class(vm, "HTMLElement");
+    vm_new_class(vm, "Node");
+    vm_new_class(vm, "EventTarget");
+    /* The same references appear for the other IDL bases web bundles test or
+     * subclass (SVG markup, fragments, observers). vm_new_class reuses an
+     * existing live binding, so these are no-ops if a real impl is registered
+     * elsewhere (e.g. Event/CustomEvent in js_event.c). */
+    vm_new_class(vm, "SVGElement");
+    vm_new_class(vm, "DocumentFragment");
+    vm_new_class(vm, "MutationObserver");
+    vm_new_class(vm, "IntersectionObserver");
+    vm_new_class(vm, "ResizeObserver");
     reg_accessor(vm, el_cls, "textContent", native_el_get_textContent, native_el_set_textContent, bridge);
     reg_accessor(vm, el_cls, "innerText", native_el_get_innerText, native_el_set_innerText, bridge);
     reg_accessor(vm, el_cls, "innerHTML", native_el_get_innerHTML, native_el_set_innerHTML, bridge);
@@ -2701,11 +2761,11 @@ void js_dom_reset_element_cache(vm_t* vm) {
      * the cache's one reference to each wrapper; anything a script still holds
      * stays alive (refs > 0) and anything it dropped is collected. el_free is a
      * no-op, so no handle is ever freed here - they belong to the embedder. */
-    for(int i = 0; i < JS_EL_CACHE; ++i) {
+    for(int i = 0; i < st->el_cache_len; ++i) {
         st->el_cache[i].handle = NULL;
         st->el_cache[i].obj    = NULL;
     }
-    st->el_cache_next = 0;
+    st->el_cache_len = 0;
     js_reanchor_el_cache(vm, st);
 }
 

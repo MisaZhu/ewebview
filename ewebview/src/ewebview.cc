@@ -1984,6 +1984,8 @@ void EWebEngine::cleanupBuildResources()
     m_jsScriptSrcs.clear();
     m_jsScriptDone.clear();
     m_jsHasInlineHandlers = false;
+    m_jsCurScriptEl = nullptr;
+    m_jsCurScriptElUrl.clear();
     m_jsReparseCount = 0;
     m_jsRunBeforePaint = false;
     m_jsNextScript = 0;
@@ -2731,6 +2733,8 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     m_jsScriptSrcs.clear();
     m_jsScriptDone.clear();
     m_jsHasInlineHandlers = false;
+    m_jsCurScriptEl = nullptr;
+    m_jsCurScriptElUrl.clear();
     m_jsBuildHasModules = false;
     m_buildHtmlContent = extract_scripts(content, m_jsEnabled ? &m_jsScripts : nullptr,
                                          m_jsEnabled ? &m_jsScriptSrcs : nullptr,

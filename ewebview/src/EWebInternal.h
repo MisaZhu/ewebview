@@ -474,6 +474,10 @@ public:
     static void  jsElFocus(void* ctx, void* el);
     static void  jsElBlur(void* ctx, void* el);
     static void* jsGetActiveElement(void* ctx);
+    /* document.currentScript backend: the <script> element whose body is
+     * executing right now (nullptr outside a script run). */
+    static void* jsGetCurrentScript(void* ctx);
+    void*        jsCurrentScriptEl();
     /* selectionStart/End + setSelectionRange()/select() backends: codepoint
      * offsets into the focused text control's live value. */
     static bool  jsElGetSel(void* ctx, void* el, int* s, int* e);
@@ -686,6 +690,15 @@ public:
     bool                        m_jsAbortPrePaint; /* last termination was the pre-paint budget */
     bool                        m_jsPrePaintCut;  /* pre-paint phase ended on the budget, not on completion */
     const std::string*          m_jsCurScriptSrc; /* body in flight, for runaway bookkeeping */
+    /* Resolved src of the <script> body in flight ("" for inline): backs
+     * document.currentScript, which security SDKs use to insert their loader
+     * next to themselves. */
+    std::string                 m_jsCurScriptUrl;
+    /* Stand-in element handed out as document.currentScript for a stripped
+     * static <script src> (see jsCurrentScriptEl): the URL it was built for
+     * and the cached node, so repeated reads see one stable element. */
+    std::string                 m_jsCurScriptElUrl;
+    void*                       m_jsCurScriptEl = nullptr;
     std::vector<std::string>    m_jsRunawaySrcs;  /* bodies the run budget terminated: never re-run */
     std::vector<std::string>    m_jsRequeuedSrcs; /* bodies already requeued once after a watchdog cut (see runNextPageScript) */
     uint32_t                    m_jsEnterGen;

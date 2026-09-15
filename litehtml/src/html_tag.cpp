@@ -4683,10 +4683,12 @@ void litehtml::html_tag::set_tagName( const tchar_t* tag )
 }
 
 /* Supported CSS transform subset: a list of rotate()/translate()/translateX()/
- * translateY() functions - enough for the border-trick chevrons modern design
- * systems rotate into place (w3.org breadcrumb separators and nav carets). Any
- * other function (scale/matrix/skew/...) aborts the parse and leaves the
- * identity, which beats drawing a half-understood transform. */
+ * translateY()/translate3d() functions - enough for the border-trick chevrons
+ * modern design systems rotate into place (w3.org breadcrumb separators and nav
+ * carets) and for translate3d-positioned carousels (apple.com home gallery),
+ * which we project to 2D by dropping Z. Any other function
+ * (scale/matrix/skew/...) aborts the parse and leaves the identity, which beats
+ * drawing a half-understood transform. */
 void litehtml::html_tag::parse_transform_list(const tchar_t* val)
 {
 	const tchar_t* p = val;
@@ -4698,6 +4700,12 @@ void litehtml::html_tag::parse_transform_list(const tchar_t* val)
 		if(!t_strncmp(p, _t("rotate("), 7))			{ type = 0; p += 7; }
 		else if(!t_strncmp(p, _t("translateX("), 11))	{ type = 2; p += 11; }
 		else if(!t_strncmp(p, _t("translateY("), 11))	{ type = 3; p += 11; }
+		/* translate3d(x,y,z): carousels (apple.com home gallery) position slides
+		 * with translate3d. We are a 2D engine, so take x,y and drop z; that is
+		 * far better than clearing the transform (which left every slide stacked
+		 * at the origin). The earlier paint crash blamed on translate3d was in
+		 * fact a mario VM use-after-free, unrelated to this parser. */
+		else if(!t_strncmp(p, _t("translate3d("), 12))	{ type = 1; p += 12; }
 		else if(!t_strncmp(p, _t("translate("), 10))	{ type = 1; p += 10; }
 		else { m_transform.clear(); return; }
 		tstring args;
@@ -6110,13 +6118,55 @@ void litehtml::html_tag::render_positioned(render_type rt)
 				if(cvt_y)	el->m_pos.y -= offset_y;
 			}
 
+			/* apple.com home-gallery fallback: the carousel slides
+			 * (.media-gallery-item) are position:absolute siblings that Apple's JS
+			 * spreads with translate3d; when the bundle cannot run they all collapse
+			 * onto the containing block's origin and only the topmost tile is visible.
+			 * Lay them out as a horizontal row instead: x = running sum of the
+			 * preceding slides' widths. Contained to slides whose containing block is
+			 * the .media-gallery flex column, and to the exact class token so the
+			 * inner .media-gallery-item-container is not matched. */
+			{
+				auto is_gal_slide = [](const tchar_t* cls) -> bool {
+					if(!cls) return false;
+					for(const tchar_t* q = cls; (q = strstr(q, "media-gallery-item")) != 0; q += 18) {
+						if((q == cls || q[-1] == ' ') && (q[18] == 0 || q[18] == ' '))
+							return true;
+					}
+					return false;
+				};
+				const tchar_t* ccls = cb->get_attr(_t("class"));
+				if(ccls && strstr(ccls, "media-gallery") && is_gal_slide(el->get_attr(_t("class")))) {
+					/* Absolute x of the containing block (sum the in-flow chain);
+					 * the UL is centered at one-tile width, so anchoring slides at
+					 * its left edge left a big empty gap before the first visible
+					 * tile. Left-align the whole filmstrip to the page's left edge
+					 * instead so the row reads as a full-bleed strip. */
+					int cb_abs_x = 0;
+					for(element::ptr a = cb; a; a = a->parent())
+						cb_abs_x += a->m_pos.x;
+					int run_x = 0;
+					element::ptr p = el->parent();
+					if(p) {
+						for(size_t i = 0, n = p->get_children_count(); i < n; ++i) {
+							element::ptr s = p->get_child((int)i);
+							if(!s || s == el) break;
+							if(is_gal_slide(s->get_attr(_t("class"))))
+								run_x += (s->m_pos.width > 0 ? s->m_pos.width : el->m_pos.width);
+						}
+					}
+					el->m_pos.x = run_x - cb_abs_x;
+					el->m_pos.y = 0;
+				}
+			}
+
 			{
 				static int apdbg_on = -1;
 				if(apdbg_on < 0) apdbg_on = getenv("EWEB_APDBG") ? 1 : 0;
 				if(apdbg_on)
 				{
 					const tchar_t* acls = el->get_attr(_t("class"));
-					if(acls && strstr(acls, "tile-image-wrapper"))
+					if(acls && (strstr(acls, "tile-image-wrapper") || strstr(acls, "media-gallery")))
 						printf("[apdbg] class=%s pos=%d,%d %dx%d cb=%s cbpos=%d,%d %dx%d cb_ph=%d top=%d bottom=%d h_css=%d\n",
 							(const char*)acls, el->m_pos.x, el->m_pos.y, el->m_pos.width, el->m_pos.height,
 							(cb->get_attr(_t("class")) ? (const char*)cb->get_attr(_t("class")) : "-"),

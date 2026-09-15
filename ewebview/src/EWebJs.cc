@@ -295,6 +295,7 @@ void EWebEngine::initJsVm()
     cb.el_focus          = jsElFocus;
     cb.el_blur           = jsElBlur;
     cb.get_active_element = jsGetActiveElement;
+    cb.get_current_script = jsGetCurrentScript;
     cb.el_get_sel        = jsElGetSel;
     cb.el_set_sel        = jsElSetSel;
     cb.el_get_dataset    = jsElGetDataset;
@@ -386,12 +387,18 @@ bool EWebEngine::runPageScripts()
          * even through this pre-paint (document.write) script run. */
         jsVmEnter();
         m_jsCurScriptSrc = &src;
+        m_jsCurScriptUrl = (i < m_jsScriptSrcs.size()) ? m_jsScriptSrcs[i] : std::string();
         {   /* Tag uncaught VM errors with the script index so a failing
              * minified bundle can be matched to its EWEB_DUMP_SCRIPTS file. */
             static char s_jsDbgTag[64];
             snprintf(s_jsDbgTag, sizeof(s_jsDbgTag), "script_%d", (int)i);
             m_jsVm->dbg_tag = s_jsDbgTag;
         }
+        /* Same per-run state reset as the post-swap path (see above). */
+        m_jsVm->terminated = false;
+        m_jsVm->abort_run = false;
+        m_jsVm->propagating_err = nullptr;
+        m_jsVm->call_depth = 0;
         if(!vm_load_run(m_jsVm, src.c_str())) {
             EWEB_LOG("[ewebview] js: script %d failed to compile\n", (int)i);
             jsDumpScript(i, src, true);
@@ -401,6 +408,7 @@ bool EWebEngine::runPageScripts()
         }
         m_jsVm->dbg_tag = nullptr;
         m_jsCurScriptSrc = nullptr;
+        m_jsCurScriptUrl.clear();
         jsVmExit();
         EWEB_LOG("[ewebview] js: script %d ran %u ms url=%s\n", (int)i,
             (uint32_t)(ticMs() - run_start),
@@ -481,12 +489,24 @@ bool EWebEngine::runNextPageScript()
         m_jsProgressiveActive = true;
         jsVmEnter();
         m_jsCurScriptSrc = &src;
+        m_jsCurScriptUrl = (i < m_jsScriptSrcs.size()) ? m_jsScriptSrcs[i] : std::string();
         m_jsLastFlushAt = run_start;
         {
             static char s_jsDbgTag[64];
             snprintf(s_jsDbgTag, sizeof(s_jsDbgTag), "script_%d", (int)i);
             m_jsVm->dbg_tag = s_jsDbgTag;
         }
+        /* A prior script may have ended abnormally INSIDE the VM (runaway
+         * recursion calls vm_terminate from func_call; a cross-frame throw can
+         * leave abort_run/propagating_err set). vm_run loops on !vm->terminated
+         * and bails on abort_run, so any residue here makes THIS script's body
+         * no-op silently - one bad script must never suppress the rest of the
+         * page's JS (taobao: script_3 stack-overflow killed scripts 4..32).
+         * Reset the per-run state; jsVmExit below re-detects a fresh cut. */
+        m_jsVm->terminated = false;
+        m_jsVm->abort_run = false;
+        m_jsVm->propagating_err = nullptr;
+        m_jsVm->call_depth = 0;
         if(!vm_load_run(m_jsVm, src.c_str())) {
             EWEB_LOG("[ewebview] js: script %d failed to compile\n", (int)i);
             jsDumpScript(i, src, true);
@@ -496,6 +516,7 @@ bool EWebEngine::runNextPageScript()
         }
         m_jsVm->dbg_tag = nullptr;
         m_jsCurScriptSrc = nullptr;
+        m_jsCurScriptUrl.clear();
         bool terminated = jsVmExit();
         m_jsProgressiveActive = false;
         /* A watchdog cut only proved this body cannot finish within the run
@@ -711,6 +732,8 @@ bool EWebEngine::applyJsWriteBuffer()
     if(m_buildDoc) { delete m_buildDoc; m_buildDoc = nullptr; }
     if(m_buildContainer) { delete m_buildContainer; m_buildContainer = nullptr; }
     m_jsScripts.clear();
+    m_jsCurScriptEl = nullptr;
+    m_jsCurScriptElUrl.clear();
     EWEB_LOG("[ewebview] js: document.write spliced %d byte(s), reparse #%d\n",
         (int)written.size(), m_jsReparseCount);
     return true;
@@ -1088,10 +1111,12 @@ void* EWebEngine::jsGetBody(void* ctx)
     EWebEngine* self = (EWebEngine*)ctx;
     if(self == nullptr) return nullptr;
     litehtml::document* doc = self->jsActiveDoc();
-    if(doc == nullptr) return nullptr;
+    if(doc == nullptr) { EWEB_LOG("jsGetBody: no active doc"); return nullptr; }
     litehtml::element::ptr root = doc->root();
-    if(root == nullptr) return nullptr;
-    return (void*)root->select_one("body");
+    if(root == nullptr) { EWEB_LOG("jsGetBody: no root"); return nullptr; }
+    void* b = (void*)root->select_one("body");
+    if(b == nullptr) EWEB_LOG("jsGetBody: body NOT FOUND in tree");
+    return b;
 }
 
 void* EWebEngine::jsGetHead(void* ctx)
@@ -1103,6 +1128,71 @@ void* EWebEngine::jsGetHead(void* ctx)
     litehtml::element::ptr root = doc->root();
     if(root == nullptr) return nullptr;
     return (void*)root->select_one("head");
+}
+
+/* document.currentScript: the <script> element whose body is executing right
+ * now. Security SDKs (taobao's baxia) insert their loader next to themselves
+ * via currentScript.parentNode.insertBefore(...); without the property they
+ * fall back to parsing Error().stack, whose format never matches here, so the
+ * SDK dereferences null and never installs its request signer. */
+void* EWebEngine::jsGetCurrentScript(void* ctx)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(self == nullptr) return nullptr;
+    void* r = self->jsCurrentScriptEl();
+    EWEB_LOG("[ewebview] currentScript: url=%s -> %p\n",
+        self->m_jsCurScriptUrl.c_str(), r);
+    return r;
+}
+
+void* EWebEngine::jsCurrentScriptEl()
+{
+    if(m_jsCurScriptUrl.empty()) return nullptr;
+    litehtml::document* doc = jsActiveDoc();
+    if(doc == nullptr) return nullptr;
+    litehtml::element::ptr root = doc->root();
+    if(root == nullptr) return nullptr;
+    /* Compare scheme-less: markup often carries "//g.alicdn.com/..." while the
+     * run queue stores the resolved absolute URL. */
+    auto norm = [](const std::string& u) -> std::string {
+        if(u.compare(0, 6, "https:") == 0) return u.substr(6);
+        if(u.compare(0, 5, "http:") == 0) return u.substr(5);
+        return u;
+    };
+    std::string want = norm(m_jsCurScriptUrl);
+    size_t n = root->get_children_count();
+    for(size_t i = 0; i < n; ++i) {
+        litehtml::element::ptr c = root->get_child((int)i);
+        if(c == nullptr) continue;
+        litehtml::elements_vector part = c->select_all(litehtml::tstring("script"));
+        for(size_t j = 0; j < part.size(); ++j) {
+            if(part[j] == nullptr) continue;
+            const char* sa = part[j]->get_attr("src", nullptr);
+            if(sa == nullptr || sa[0] == 0) continue;
+            if(norm(std::string(sa)) == want) return (void*)part[j];
+        }
+    }
+    /* Static <script src> tags are stripped from the markup before parsing
+     * (their bodies run from the ordered queue), so the tree holds no element
+     * for them. Materialise a stand-in in <head> carrying the same src: SDKs
+     * only use currentScript to splice their loader next to it, and a real
+     * attached element is what makes parentNode.insertBefore() work. Cached
+     * per URL so repeated reads see one stable node. */
+    if(m_jsCurScriptEl != nullptr && m_jsCurScriptElUrl == m_jsCurScriptUrl)
+        return m_jsCurScriptEl;
+    litehtml::string_map attrs;
+    litehtml::element::ptr el = doc->create_element("script", attrs);
+    if(el == nullptr) return nullptr;
+    el->set_attr("src", m_jsCurScriptUrl.c_str());
+    litehtml::element::ptr host = root->select_one("head");
+    if(host == nullptr) host = root->select_one("body");
+    if(host == nullptr) return nullptr;
+    host->appendChild(el);
+    m_jsCurScriptEl = (void*)el;
+    m_jsCurScriptElUrl = m_jsCurScriptUrl;
+    EWEB_LOG("[ewebview] currentScript: stand-in created el=%p host=%s\n",
+        m_jsCurScriptEl, (root->select_one("head") != nullptr) ? "head" : "body");
+    return m_jsCurScriptEl;
 }
 
 int EWebEngine::jsQueryAll(void* ctx, void* root, const char* selector,
