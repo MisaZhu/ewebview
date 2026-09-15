@@ -1596,15 +1596,12 @@ static void browser_destroy(browser_t* b) {
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char** argv) {
-    fprintf(stderr, "[MARK] sdlbrowser main start\n");
     browser_t browser;
     browser_detect_color_scheme();
     if(!browser_init(&browser, argc, argv)) {
-        fprintf(stderr, "[MARK] browser_init failed\n");
         browser_destroy(&browser);
         return 1;
     }
-    fprintf(stderr, "[MARK] browser_init ok\n");
 
     browser_t* b = &browser;
     const uint32_t TICK_MS = 16;   /* ~60 Hz UI pump */

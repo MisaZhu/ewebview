@@ -126,18 +126,32 @@ static int preferred_content_width(const litehtml::element::ptr& el)
 	litehtml::style_display d = el->get_display();
 	if(pdbg)
 		printf("[pdbg] pcw enter class=%s disp=%d\n", (const char*)pcls, (int)d);
-	if(el->is_replaced() || d == litehtml::display_inline_block ||
-	   d == litehtml::display_inline_text)
+	if(el->is_replaced())
 	{
-		/* Replaced atoms ONLY when they are not flex containers: a replaced
-		 * box with display:flex (w3.org's nav triggers are <button> widgets
-		 * styled display:flex) still flex-lays-out its children in render_flex,
-		 * so its max-content is the children sum. Returning width() for it
-		 * handed back the FILL width of the last pass (the whole nav row),
-		 * which inflated the owning li's flex base to ~1000px and drove the
-		 * row into a catastrophic shrink/wrap ratchet. */
-		if(d != litehtml::display_flex && d != litehtml::display_inline_flex)
-			return el->width();
+		/* A replaced box with a flex display is a form widget styled as a flex
+		 * container (w3.org's nav triggers are <button> styled display:flex):
+		 * the widget places/paints its children itself at draw time, so they
+		 * carry no laid-out width to sum (0 on the first pass, then whatever a
+		 * draw-time placement left on a pseudo - a ratchet that collapsed the
+		 * nav buttons to caret width), and width() is the FILL width of the
+		 * last pass (the whole nav row), which inflates the owning li's flex
+		 * base into a shrink/wrap ratchet. Its max-content is the widget
+		 * intrinsic size, which is context-free. Any other replaced element
+		 * (an <img> the page CSS scales down from a 512px source to 16px, say)
+		 * must keep width(): its intrinsic size ignores the CSS scaling and
+		 * would blow the row budget instead. */
+		if(d == litehtml::display_flex || d == litehtml::display_inline_flex)
+		{
+			litehtml::size sz;
+			sz.width = 0; sz.height = 0;
+			el->get_content_size(sz, 0);
+			return sz.width;
+		}
+		return el->width();
+	}
+	if(d == litehtml::display_inline_block || d == litehtml::display_inline_text)
+	{
+		return el->width();
 	}
 	if(d == litehtml::display_flex || d == litehtml::display_inline_flex)
 	{
@@ -283,16 +297,60 @@ static int flex_min_content_inner(const litehtml::element::ptr& el)
 		if(wv > 0) return wv;
 	}
 	litehtml::style_display d = el->get_display();
-	if(el->is_replaced())
+	bool flexd = (d == litehtml::display_flex || d == litehtml::display_inline_flex);
+	if(el->is_replaced() && !flexd)
 	{
-		/* intrinsic, not the last laid-out width: reading m_pos here fed the
+		/* Intrinsic, not the last laid-out width: reading m_pos here fed the
 		 * previous pass' resolved size back into the shrink clamp and ratcheted
-		 * the item wider on every relayout. */
+		 * the item wider on every relayout. But the raw source intrinsic is
+		 * wrong too when the page scales the box through the other axis
+		 * (.icon{height:16px} on a 512x512 source): the shrink floor then blew
+		 * the item past the row budget and pushed the trailing nav items off
+		 * screen. Resolve a definite CSS height through the aspect ratio, the
+		 * way el_image::render does; a definite CSS width is handled above. */
 		litehtml::size sz;
+		sz.width = 0; sz.height = 0;
 		el->get_content_size(sz, 0);
+		litehtml::css_length ch = el->get_css_height();
+		if(!ch.is_predefined() && ch.units() != litehtml::css_units_percentage &&
+		   sz.width > 0 && sz.height > 0)
+		{
+			int hv = el->get_document()->cvt_units(ch, el->get_font_size(), 0);
+			if(hv > 0)
+				return (int)((float)hv * (float)sz.width / (float)sz.height);
+		}
 		return sz.width;
 	}
-	if(d == litehtml::display_inline_block || d == litehtml::display_inline_text)
+	if(d == litehtml::display_inline_text)
+	{
+		/* min-content of a text run is its LONGEST WORD. Reading the laid-out
+		 * run width made every shrink floor equal the current base, so an
+		 * over-budget row could never shrink and overflowed the container
+		 * instead (narrow windows pushed the trailing nav items off screen). */
+		litehtml::tstring t;
+		el->get_text(t);
+		litehtml::uint_ptr f = el->get_font();
+		litehtml::document* doc = el->get_document();
+		if(!f || !doc || !doc->container()) return el->width();
+		int w = 0;
+		std::string cur;
+		for(const char* p = t.c_str(); ; p++)
+		{
+			if(*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == 0)
+			{
+				if(!cur.empty())
+				{
+					int cw = doc->container()->text_width(cur.c_str(), f);
+					if(cw > w) w = cw;
+					cur.clear();
+				}
+				if(*p == 0) break;
+			}
+			else cur += *p;
+		}
+		return w;
+	}
+	if(d == litehtml::display_inline_block)
 	{
 		return el->width();
 	}
@@ -305,7 +363,18 @@ static int flex_min_content_inner(const litehtml::element::ptr& el)
 		if(c->get_element_position() == litehtml::element_position_absolute ||
 		   c->get_element_position() == litehtml::element_position_fixed) continue;
 		int cw = flex_min_content_inner(c);
-		if(cw > w) w = cw;
+		if(flexd)
+		{
+			/* row flex: the items sit side by side even at min-content, so
+			 * their floors add up (a replaced flex box - w3.org's nav button
+			 * widget - reaches here: its label can clip, so its floor is the
+			 * longest label word plus the caret, not the full label) */
+			w += c->margin_left() + c->margin_right() + cw;
+		}
+		else if(cw > w)
+		{
+			w = cw;
+		}
 	}
 	return w;
 }
@@ -409,8 +478,11 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		((flexdbg_ccls &&
 		 (strstr(flexdbg_ccls, "global-nav") || strstr(flexdbg_ccls, "top-nav") ||
 		  strstr(flexdbg_ccls, "nav-link") || strstr(flexdbg_ccls, "icon-link") ||
-		  strstr(flexdbg_ccls, "account") || strstr(flexdbg_ccls, "logo"))) ||
-		 (flexdbg_pcls && strstr(flexdbg_pcls, "global-nav")));
+		  strstr(flexdbg_ccls, "account") || strstr(flexdbg_ccls, "logo") ||
+		  strstr(flexdbg_ccls, "tile-content") || strstr(flexdbg_ccls, "tile-ctas") ||
+		  strstr(flexdbg_ccls, "ribbon"))) ||
+		 (flexdbg_pcls && (strstr(flexdbg_pcls, "global-nav") ||
+		  strstr(flexdbg_pcls, "tile-content") || strstr(flexdbg_pcls, "ribbon"))));
 	if(flexdbg)
 		printf("[flexdbg] container class=%s avail=%d ai=%s wrap=%s\n",
 				flexdbg_ccls, avail, ai_s, wrap_s);

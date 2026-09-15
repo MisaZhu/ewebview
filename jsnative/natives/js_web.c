@@ -52,9 +52,9 @@ extern "C" {
 
 /* Fallbacks for the identity strings, so feature detection that reads
  * navigator.userAgent unconditionally always sees something sane. */
-#define DEFAULT_UA      "Mozilla/5.0 (EwokOS) AppleWebKit/537.36 (KHTML, like Gecko) xBrowser/1.0 Safari/537.36"
+#define DEFAULT_UA      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 MyEwokoBrowser/1.0"
 #define DEFAULT_LANG    "en-US"
-#define DEFAULT_PLATFORM "EwokOS"
+#define DEFAULT_PLATFORM "Linux x86_64"
 
 typedef struct {
     vm_t*              vm;

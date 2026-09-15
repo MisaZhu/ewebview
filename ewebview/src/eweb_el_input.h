@@ -204,6 +204,23 @@ private:
     int  part_dim(bool thumb, const char* prop, int defval) const;
     float range_fraction();
     void extra_box_size(int& w, int& h) const;
+    /* The page cascade declares padding/border on the axis, i.e. it replaces
+     * the UA control chrome there; gates the +24/24 intrinsic emulation in
+     * get_content_size (a styled button sizes from its label alone). */
+    bool styled_horizontal() const;
+    bool styled_vertical() const;
+    /* Font line height: the single-line content height of a styled control
+     * (the UA 24px face height only applies to unstyled ones). */
+    int  content_line_height() const;
+    /* True when a <button> carries real element children (an <img> thumbnail,
+     * an inline <svg> glyph): such a control is a layout CONTAINER, not an
+     * atomic replaced widget - the children need boxes and paint, and the
+     * button's height must come from them (a history thumb sized only by
+     * aspect-ratio/children would otherwise collapse to the UA 24px face and
+     * clip its <img> to nothing). Text-only buttons stay on the widget path.
+     * When true, is_replaced/render/draw/get_content_size delegate to
+     * html_tag so flex/block layout and child paint run normally. */
+    bool container_mode() const;
 
     /* The user-visible label: value/placeholder attribute for <input>, the
      * selected <option> text for <select>, the element text otherwise. */

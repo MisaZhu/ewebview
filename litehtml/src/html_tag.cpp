@@ -1,11 +1,13 @@
 #include "html.h"
 #include "html_tag.h"
 #include "document.h"
+#include "el_text.h"
 #include "iterators.h"
 #include "stylesheet.h"
 #include "table.h"
 #include <algorithm>
 #include <locale>
+#include <new>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -277,6 +279,7 @@ litehtml::html_tag::html_tag(litehtml::document* doc) : litehtml::element(doc)
 #endif
 	m_box_sizing			= box_sizing_content_box;
 	m_z_index				= 0;
+	m_z_index_auto			= true;
 	m_overflow				= overflow_visible;
 	m_box					= 0;
 	m_text_align			= text_align_left;
@@ -326,12 +329,68 @@ litehtml::html_tag::~html_tag()
 	m_children.clear();
 }
 
+/* A script-inserted text node (document.createTextNode, textContent, the
+ * string form of append()) is one unbreakable run: the line packer only
+ * breaks between nodes, so a Chinese sentence would never wrap. Split it
+ * into kinsoku-aware per-character chunks (split_cjk_text); the inserted
+ * node keeps the first chunk so caller handles stay valid, the rest go in
+ * as siblings at the same position. Non-text nodes pass through. */
+static void cjk_split_insert(litehtml::document* doc, const litehtml::element::ptr& el,
+                             std::vector<litehtml::element::ptr>& nodes)
+{
+	nodes.clear();
+	if(!el)
+	{
+		return;
+	}
+	if(el->get_display() != litehtml::display_inline_text || el->is_white_space())
+	{
+		nodes.push_back(el);
+		return;
+	}
+	litehtml::tstring txt;
+	el->get_text(txt);
+	std::vector<litehtml::tstring> chunks;
+	litehtml::split_cjk_text(txt, chunks);
+	if(chunks.size() <= 1)
+	{
+		nodes.push_back(el);
+		return;
+	}
+	static_cast<litehtml::el_text*>(el)->set_text(chunks[0]);
+	nodes.push_back(el);
+	for(size_t i = 1; i < chunks.size(); i++)
+	{
+		void* mem = malloc(sizeof(litehtml::el_text));
+		if(!mem)
+		{
+			break;
+		}
+		litehtml::element::ptr t = new (mem) litehtml::el_text(chunks[i].c_str(), doc);
+		nodes.push_back(t);
+	}
+}
+
+static void parent_and_style_text(litehtml::element* parent, litehtml::element::ptr t)
+{
+	t->parent(parent);
+	if(t->get_display() == litehtml::display_inline_text)
+	{
+		t->parse_styles(false);
+	}
+}
+
 bool litehtml::html_tag::appendChild(const element::ptr &el)
 {
 	if(el)
 	{
-		el->parent(this);
-		m_children.push_back(el);
+		std::vector<element::ptr> nodes;
+		cjk_split_insert(m_doc, el, nodes);
+		for(size_t i = 0; i < nodes.size(); i++)
+		{
+			parent_and_style_text(this, nodes[i]);
+			m_children.push_back(nodes[i]);
+		}
 		return true;
 	}
 	return false;
@@ -382,20 +441,30 @@ bool litehtml::html_tag::insertBefore(const element::ptr &el, const element::ptr
 	{
 		old_parent->removeChild(el);
 	}
+	std::vector<element::ptr> nodes;
+	cjk_split_insert(m_doc, el, nodes);
 	if(ref && ref->parent() == this)
 	{
 		for(size_t i = 0; i < m_children.size(); i++)
 		{
 			if(m_children[i] == ref)
 			{
-				el->parent(this);
-				m_children.insert(m_children.begin() + i, el);
+				for(size_t k = 0; k < nodes.size(); k++)
+				{
+					parent_and_style_text(this, nodes[k]);
+					m_children.insert(m_children.begin() + i + k, nodes[k]);
+				}
 				return true;
 			}
 		}
 	}
 	/* No ref, or a ref that is not our child: append, exactly like the DOM. */
-	return appendChild(el);
+	for(size_t k = 0; k < nodes.size(); k++)
+	{
+		parent_and_style_text(this, nodes[k]);
+		m_children.push_back(nodes[k]);
+	}
+	return true;
 }
 
 void litehtml::html_tag::clearRecursive()
@@ -1791,12 +1860,21 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		part_start = sys_tic_ms(0);
 	}
 
-	if(m_el_position != element_position_static)
+	/* z-index applies to positioned boxes and, per the flexbox/grid specs, to
+	 * flex/grid items even when position:static. Parse it unconditionally and
+	 * record whether the value was the keyword 'auto' (or absent) so the
+	 * stacking-context / stacking-participant tests can tell z-index:auto apart
+	 * from an explicit z-index:0. */
 	{
 		const tchar_t* val = own_style_ref_ptr(own_refs.z_index);
-		if(val)
+		if(val && t_strcasecmp(val, _t("auto")))
 		{
 			m_z_index = t_atoi(val);
+			m_z_index_auto = false;
+		} else
+		{
+			m_z_index = 0;
+			m_z_index_auto = true;
 		}
 	}
 
@@ -2472,10 +2550,15 @@ int litehtml::html_tag::render( int x, int y, int max_width, bool second_pass )
 	if(rdbg_on < 0) rdbg_on = getenv("EWEB_RDBG") ? 1 : 0;
 	const tchar_t* rcls = rdbg_on ? get_attr(_t("class")) : 0;
 	bool rdbg = rdbg_on && rcls &&
-		(strstr(rcls, "nav-link") || strstr(rcls, "top-nav-item"));
+		(strstr(rcls, "nav-link") || strstr(rcls, "top-nav-item") ||
+		 strstr(rcls, "tile-subhead") || strstr(rcls, "tile-callout") ||
+		 strstr(rcls, "tile-ctas") || strstr(rcls, "tile-copy-wrapper") ||
+		 strstr(rcls, "tile-headline") || strstr(rcls, "ribbon-content") ||
+		 strstr(rcls, "tile-content"));
 	if(rdbg)
-		printf("[rdbg] enter class=%s disp=%d maxw=%d h=%d skip=%d\n",
-				(const char*)rcls, (int)m_display, max_width, m_pos.height, (int)m_skip);
+		printf("[rdbg] enter class=%s disp=%d maxw=%d h=%d skip=%d opac=%g cum=%g\n",
+				(const char*)rcls, (int)m_display, max_width, m_pos.height, (int)m_skip,
+				(double)m_opacity, (double)m_opacity_cum);
 	int rret = 0;
 	if (m_display == display_table || m_display == display_inline_table)
 	{
@@ -2494,8 +2577,8 @@ int litehtml::html_tag::render( int x, int y, int max_width, bool second_pass )
 		rret = render_box(x, y, max_width, second_pass);
 	}
 	if(rdbg)
-		printf("[rdbg] exit class=%s disp=%d h=%d w=%d\n",
-				(const char*)rcls, (int)m_display, m_pos.height, m_pos.width);
+		printf("[rdbg] exit class=%s disp=%d x=%d y=%d h=%d w=%d\n",
+				(const char*)rcls, (int)m_display, m_pos.x, m_pos.y, m_pos.height, m_pos.width);
 	return rret;
 }
 
@@ -3689,7 +3772,13 @@ void litehtml::html_tag::parse_background()
 
 void litehtml::html_tag::add_positioned(const element::ptr &el)
 {
-	if (m_el_position != element_position_static || (!have_parent()))
+	/* Bubble the participant up to the nearest ancestor STACKING CONTEXT, not
+	 * merely the nearest positioned ancestor. A z-index:auto positioned box is
+	 * transparent for stacking, so el's z-index has to compete at the real
+	 * stacking context (CSS 2.1 Appendix E). Coordinates are recovered at paint
+	 * time: draw_children_box descends the box tree through every non-stacking-
+	 * context box, accumulating m_pos per level, so no offset is stored here. */
+	if (is_stacking_context())
 	{
 		m_positioned.push_back(el);
 	} else
@@ -3698,8 +3787,67 @@ void litehtml::html_tag::add_positioned(const element::ptr &el)
 		if (el_parent)
 		{
 			el_parent->add_positioned(el);
+		} else
+		{
+			m_positioned.push_back(el);
 		}
 	}
+}
+
+bool litehtml::html_tag::is_stacking_participant() const
+{
+	/* Positioned boxes always take part in the positioned painting phase; a
+	 * static flex/grid item does too when it carries an explicit z-index. */
+	if (m_el_position != element_position_static)
+	{
+		return true;
+	}
+	if (!m_z_index_auto && have_parent())
+	{
+		style_display pd = parent()->get_display();
+		if (pd == display_flex || pd == display_inline_flex ||
+			pd == display_grid || pd == display_inline_grid)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool litehtml::html_tag::is_stacking_context() const
+{
+	/* Real painting boundaries only. A positioned element with z-index:auto is
+	 * NOT one, so its z-indexed descendants escape to the nearest ancestor
+	 * stacking context instead of being trapped inside it. */
+	if (!have_parent())
+	{
+		return true;
+	}
+	if (m_el_position == element_position_fixed)
+	{
+		return true;
+	}
+	if (m_opacity < 1.0f)
+	{
+		return true;
+	}
+	if (!m_z_index_auto)
+	{
+		if (m_el_position != element_position_static)
+		{
+			return true;
+		}
+		if (have_parent())
+		{
+			style_display pd = parent()->get_display();
+			if (pd == display_flex || pd == display_inline_flex ||
+				pd == display_grid || pd == display_inline_grid)
+			{
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 void litehtml::html_tag::calc_outlines( int parent_width )
@@ -4463,7 +4611,17 @@ int litehtml::html_tag::render_inline(const element::ptr &container, int max_wid
 
 int litehtml::html_tag::place_element(const element::ptr &el, int max_width)
 {
+	static int pdbg_on = -1;
+	if(pdbg_on < 0) pdbg_on = getenv("EWEB_PDBG") ? 1 : 0;
 	if(!el) return 0;
+	const tchar_t* pdbg_cls = pdbg_on ? el->get_attr(_t("class")) : 0;
+	bool pdbg = pdbg_on && pdbg_cls && strstr(pdbg_cls, "nav-link") && !strstr(pdbg_cls, "icon-link");
+	if(pdbg)
+	{
+		printf("[pdbg] place enter class=%s disp=%d float=%d posn=%d repl=%d maxw=%d\n",
+				(const char*)pdbg_cls, (int)el->get_display(), (int)el->get_float(),
+				(int)el->get_element_position(), (int)el->is_replaced(), max_width);
+	}
 	if(el->get_display() == display_none) return 0;
 
 	if(el->get_display() == display_inline)
@@ -4691,6 +4849,7 @@ int litehtml::html_tag::place_element(const element::ptr &el, int max_width)
 			case display_table_row:
 				if(el->is_replaced() || el->is_floats_holder())
 				{
+					if(pdbg) printf("[pdbg] replaced-block render lw=%d\n", line_ctx.width());
 					ret_width = el->render(line_ctx.left, line_ctx.top, line_ctx.width()) + line_ctx.left + (max_width - line_ctx.right);
 				} else
 				{
@@ -5340,7 +5499,7 @@ bool litehtml::html_tag::fetch_positioned()
 	for(auto& el : m_children)
 	{
 		el_pos = el->get_element_position();
-		if (el_pos != element_position_static)
+		if (el->is_stacking_participant())
 		{
 			add_positioned(el);
 		}
@@ -6152,7 +6311,7 @@ litehtml::element::ptr litehtml::html_tag::get_child_by_point(int x, int y, int 
 			switch(flag)
 			{
 			case draw_positioned:
-				if(el->is_positioned() && el->get_zindex() == zindex)
+				if(el->is_stacking_participant() && el->get_zindex() == zindex)
 				{
 					if(el->get_element_position() == element_position_fixed)
 					{
@@ -6161,6 +6320,7 @@ litehtml::element::ptr litehtml::html_tag::get_child_by_point(int x, int y, int 
 						{
 							ret = (*i);
 						}
+						el = 0;
 					} else
 					{
 						ret = el->get_element_by_point(pos.x, pos.y, client_x, client_y);
@@ -6168,12 +6328,18 @@ litehtml::element::ptr litehtml::html_tag::get_child_by_point(int x, int y, int 
 						{
 							ret = (*i);
 						}
+						/* Transparent (non-stacking-context) box: keep `el` so the
+						 * recursion below still descends into it and can reach
+						 * deeper same-z positioned descendants. */
+						if(el->is_stacking_context())
+						{
+							el = 0;
+						}
 					}
-					el = 0;
 				}
 				break;
 			case draw_block:
-				if(!el->is_inline_box() && el->get_float() == float_none && !el->is_positioned())
+				if(!el->is_inline_box() && el->get_float() == float_none && !el->is_stacking_participant())
 				{
 					if(el->is_point_inside(pos.x, pos.y))
 					{
@@ -6182,7 +6348,7 @@ litehtml::element::ptr litehtml::html_tag::get_child_by_point(int x, int y, int 
 				}
 				break;
 			case draw_floats:
-				if(el->get_float() != float_none && !el->is_positioned())
+				if(el->get_float() != float_none && !el->is_stacking_participant())
 				{
 					ret = el->get_element_by_point(pos.x, pos.y, client_x, client_y);
 
@@ -6194,7 +6360,7 @@ litehtml::element::ptr litehtml::html_tag::get_child_by_point(int x, int y, int 
 				}
 				break;
 			case draw_inlines:
-				if(el->is_inline_box() && el->get_float() == float_none && !el->is_positioned())
+				if(el->is_inline_box() && el->get_float() == float_none && !el->is_stacking_participant())
 				{
 					if(el->get_display() == display_inline_block)
 					{
@@ -6211,16 +6377,21 @@ litehtml::element::ptr litehtml::html_tag::get_child_by_point(int x, int y, int 
 				break;
 			}
 
-			if(el && !el->is_positioned())
+			if(el)
 			{
 				if(flag == draw_positioned)
 				{
-					element::ptr child = el->get_child_by_point(pos.x, pos.y, client_x, client_y, flag, zindex);
-					if(child)
+					/* Mirror draw_children_box: descend through non-stacking-
+					 * context boxes to reach bubbled z-indexed descendants. */
+					if(!el->is_stacking_context())
 					{
-						ret = child;
+						element::ptr child = el->get_child_by_point(pos.x, pos.y, client_x, client_y, flag, zindex);
+						if(child)
+						{
+							ret = child;
+						}
 					}
-				} else
+				} else if(!el->is_stacking_participant())
 				{
 					if(	el->get_float() == float_none &&
 						el->get_display() != display_inline_block)
@@ -7026,29 +7197,43 @@ void litehtml::html_tag::draw_children_box(uint_ptr hdc, int x, int y, const pos
 			switch (flag)
 			{
 			case draw_positioned:
-				if (el->is_positioned() && el->get_zindex() == zindex)
+				if (el->is_stacking_participant() && el->get_zindex() == zindex)
 				{
 					if (el->get_element_position() == element_position_fixed)
 					{
 						el->draw(hdc, browser_wnd.x, browser_wnd.y, clip);
 						el->draw_stacking_context(hdc, browser_wnd.x, browser_wnd.y, clip, true);
+						el = 0;
 					}
 					else
 					{
+						bool el_sc = el->is_stacking_context();
 						el->draw(hdc, pos.x, pos.y, clip);
-						el->draw_stacking_context(hdc, pos.x, pos.y, clip, true);
+						/* A z-index:auto positioned box is not a stacking context:
+						 * paint its own in-flow content here (with_positioned is
+						 * false) and let its z-indexed descendants be painted by
+						 * this stacking context at their own z levels. For such a
+						 * transparent box keep `el` set so the recursion below also
+						 * descends into it and reaches deeper same-z (z-index:auto)
+						 * positioned descendants - nested position:relative wrappers
+						 * are extremely common and must not swallow their children.
+						 * A real stacking context is atomic, so consume it. */
+						el->draw_stacking_context(hdc, pos.x, pos.y, clip, el_sc);
+						if (el_sc)
+						{
+							el = 0;
+						}
 					}
-					el = 0;
 				}
 				break;
 			case draw_block:
-				if (!el->is_inline_box() && el->get_float() == float_none && !el->is_positioned())
+				if (!el->is_inline_box() && el->get_float() == float_none && !el->is_stacking_participant())
 				{
 					el->draw(hdc, pos.x, pos.y, clip);
 				}
 				break;
 			case draw_floats:
-				if (el->get_float() != float_none && !el->is_positioned())
+				if (el->get_float() != float_none && !el->is_stacking_participant())
 				{
 					el->draw(hdc, pos.x, pos.y, clip);
 					el->draw_stacking_context(hdc, pos.x, pos.y, clip, false);
@@ -7056,7 +7241,7 @@ void litehtml::html_tag::draw_children_box(uint_ptr hdc, int x, int y, const pos
 				}
 				break;
 			case draw_inlines:
-				if (el->is_inline_box() && el->get_float() == float_none && !el->is_positioned())
+				if (el->is_inline_box() && el->get_float() == float_none && !el->is_stacking_participant())
 				{
 					el->draw(hdc, pos.x, pos.y, clip);
 					if (el->get_display() == display_inline_block)
@@ -7074,7 +7259,11 @@ void litehtml::html_tag::draw_children_box(uint_ptr hdc, int x, int y, const pos
 			{
 				if (flag == draw_positioned)
 				{
-					if (!el->is_positioned())
+					/* Descend through every box that is not a stacking context
+					 * (static boxes and z-index:auto positioned boxes) so that
+					 * z-indexed descendants which bubbled up to this stacking
+					 * context are still found at their own z level. */
+					if (!el->is_stacking_context())
 					{
 						el->draw_children(hdc, pos.x, pos.y, clip, flag, zindex);
 					}
@@ -7083,7 +7272,7 @@ void litehtml::html_tag::draw_children_box(uint_ptr hdc, int x, int y, const pos
 				{
 					if (el->get_float() == float_none &&
 						el->get_display() != display_inline_block &&
-						!el->is_positioned())
+						!el->is_stacking_participant())
 					{
 						el->draw_children(hdc, pos.x, pos.y, clip, flag, zindex);
 					}

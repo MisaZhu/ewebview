@@ -17,6 +17,19 @@ namespace litehtml
 		el_text(const tchar_t* text, litehtml::document* doc);
 		virtual ~el_text();
 
+		/* Replace the character data (used by the CJK chunk split in
+		 * html_tag::appendChild/insertBefore, which truncates the inserted
+		 * node to the first chunk and adds the rest as siblings). Drops the
+		 * cached measure; parse_styles re-measures against the parent font. */
+		void				set_text(const tstring& t)
+		{
+			m_text = t;
+			m_transformed_text.clear();
+			m_use_transformed = false;
+			m_size.width = 0;
+			m_size.height = 0;
+		}
+
 		virtual void				get_text(tstring& text) override;
 		virtual element::ptr		clone_node(bool deep) override;
 		virtual const tchar_t*		get_style_property(const tchar_t* name, bool inherited, const tchar_t* def = 0) override;

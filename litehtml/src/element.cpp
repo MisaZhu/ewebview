@@ -366,6 +366,8 @@ void litehtml::element::draw_stacking_context( uint_ptr hdc, int x, int y, const
 void litehtml::element::render_positioned(render_type rt)							LITEHTML_EMPTY_FUNC
 int litehtml::element::get_zindex() const											LITEHTML_RETURN_FUNC(0)
 bool litehtml::element::fetch_positioned()											LITEHTML_RETURN_FUNC(false)
+bool litehtml::element::is_stacking_participant() const								LITEHTML_RETURN_FUNC(is_positioned())
+bool litehtml::element::is_stacking_context() const									LITEHTML_RETURN_FUNC(false)
 litehtml::visibility litehtml::element::get_visibility() const						LITEHTML_RETURN_FUNC(visibility_visible)
 float litehtml::element::get_opacity_cum() const									LITEHTML_RETURN_FUNC(1.0f)
 void litehtml::element::apply_vertical_align()										LITEHTML_EMPTY_FUNC

@@ -889,18 +889,28 @@ void eweb_el_input::draw_scrolled_text(eweb_surface_t* s, const litehtml::positi
 
 void eweb_el_input::get_content_size(litehtml::size& sz, int max_width)
 {
+    if (container_mode()) {
+        litehtml::html_tag::get_content_size(sz, max_width);
+        return;
+    }
     switch (m_inputType) {
     case EWEB_INPUT_TEXT:
         sz.width = 100;
-        sz.height = 24;
+        sz.height = styled_vertical() ? content_line_height() : 24;
         break;
     case EWEB_INPUT_TEXTAREA:
         sz.width = 160;
         sz.height = 48;
         break;
     case EWEB_INPUT_BUTTON:
-        sz.width = label_width(label()) + 24;
-        sz.height = 24;
+        /* CONTENT box (flex/grid item sizing adds the padding/border itself;
+         * render() below adds it for the widget path). The page's own padding
+         * replaces the UA chrome, so the +24/24 emulation only applies to
+         * controls the page left unstyled - with .job-actions{padding:3px 9px}
+         * buttons the old border-box return double-counted 20px per button
+         * inside flex base sizes and scattered the row. */
+        sz.width = label_width(label()) + (styled_horizontal() ? 0 : 24);
+        sz.height = styled_vertical() ? content_line_height() : 24;
         if (sz.width < 24) {
             sz.width = 24;
         }
@@ -912,7 +922,7 @@ void eweb_el_input::get_content_size(litehtml::size& sz, int max_width)
         break;
     case EWEB_INPUT_SELECT:
         sz.width = label_width(label()) + 30;
-        sz.height = 24;
+        sz.height = styled_vertical() ? content_line_height() : 24;
         if (sz.width < 40) {
             sz.width = 40;
         }
@@ -928,11 +938,8 @@ void eweb_el_input::get_content_size(litehtml::size& sz, int max_width)
         sz.height = 0;
         break;
     }
-    /* The intrinsic size is the BORDER box (render() assigns it straight to
-     * m_pos): without the page padding/borders every control came out at the
-     * bare UA size - .ghost-btn{padding:6px 14px} buttons rendered 12px too
-     * short, the 8px-padded field rule could not reach its ~40px height. */
-    extra_box_size(sz.width, sz.height);
+    /* sz is the CONTENT box here; render() folds in the page padding/borders
+     * (extra_box_size) before assigning m_pos, which is the border box. */
 }
 
 void eweb_el_input::extra_box_size(int& w, int& h) const
@@ -950,6 +957,23 @@ void eweb_el_input::extra_box_size(int& w, int& h) const
     }
     w += m_padding.left + m_padding.right + m_borders.left + m_borders.right;
     h += m_padding.top + m_padding.bottom + m_borders.top + m_borders.bottom;
+}
+
+bool eweb_el_input::styled_horizontal() const
+{
+    return (m_padding.left + m_padding.right + m_borders.left + m_borders.right) > 0;
+}
+
+bool eweb_el_input::styled_vertical() const
+{
+    return (m_padding.top + m_padding.bottom + m_borders.top + m_borders.bottom) > 0;
+}
+
+int eweb_el_input::content_line_height() const
+{
+    litehtml::font_metrics fm;
+    litehtml::uint_ptr f = const_cast<eweb_el_input*>(this)->get_font(&fm);
+    return f ? fm.height : 16;
 }
 
 litehtml::style_display eweb_el_input::get_display() const
@@ -1191,6 +1215,12 @@ void eweb_el_input::draw(litehtml::uint_ptr hdc, int x, int y, const litehtml::p
         return;
     }
     if (m_inputType == EWEB_INPUT_HIDDEN) {
+        return;
+    }
+    /* Container-mode buttons paint through the normal html_tag path (box +
+     * children); the widget chrome below would cover the laid-out content. */
+    if (container_mode()) {
+        litehtml::html_tag::draw(hdc, x, y, clip);
         return;
     }
     /* opacity:0 (own or from an ancestor) hides the whole widget; the box draw
@@ -1473,6 +1503,10 @@ void eweb_el_input::draw(litehtml::uint_ptr hdc, int x, int y, const litehtml::p
 
 void eweb_el_input::draw_stacking_context(litehtml::uint_ptr hdc, int x, int y, const litehtml::position* clip, bool with_positioned)
 {
+    if (container_mode()) {
+        litehtml::html_tag::draw_stacking_context(hdc, x, y, clip, with_positioned);
+        return;
+    }
     /* Replaced control: draw() paints the whole widget, label included. A
      * <button>'s text child is the label SOURCE, not inline content - letting
      * html_tag recurse into it painted the label a second time (in the page
@@ -1496,14 +1530,73 @@ int eweb_el_input::line_height() const
     return h;
 }
 
+bool eweb_el_input::container_mode() const
+{
+    if (m_inputType != EWEB_INPUT_BUTTON) {
+        return false;
+    }
+    for (size_t i = 0; i < get_children_count(); i++) {
+        litehtml::element::ptr ch = get_child((int)i);
+        if (!ch) {
+            continue;
+        }
+        const litehtml::tchar_t* tn = ch->get_tagName();
+        if (!tn || !tn[0]) {
+            continue;   /* text node: the label source, not content */
+        }
+        if (tn[0] == _t(':') && tn[1] == _t(':')) {
+            continue;   /* generated content: placed by the widget draw */
+        }
+        return true;
+    }
+    return false;
+}
+
 bool eweb_el_input::is_replaced() const
 {
-    return true;
+    return !container_mode();
 }
 
 int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
 {
     using namespace litehtml;
+
+    static int idbg_on = -1;
+    if (idbg_on < 0) idbg_on = getenv("EWEB_IDBG") ? 1 : 0;
+    if (idbg_on) {
+        const litehtml::tchar_t* icls = get_attr(_t("class"));
+        if (icls && strstr(icls, "nav-link") && !strstr(icls, "icon-link")) {
+            std::string kids;
+            for (size_t i = 0; i < get_children_count(); i++) {
+                litehtml::element::ptr ch = get_child((int)i);
+                const litehtml::tchar_t* tn = ch ? ch->get_tagName() : 0;
+                if (tn && tn[0]) {
+                    kids += tn;
+                } else if (ch) {
+                    litehtml::tstring tt;
+                    ch->get_text(tt);
+                    std::string s(tt.c_str());
+                    if (s.size() > 14) s = s.substr(0, 14);
+                    kids += "[" + s + "]";
+                } else {
+                    kids += ".";
+                }
+                kids += ",";
+            }
+            fprintf(stderr, "[idbg] btn render mode=%d kids=%s label=[%s] lw=%d font=%d maxw=%d\n",
+                    (int)container_mode(), kids.c_str(), label().c_str(),
+                    label_width(label()), get_font() ? 1 : 0, max_width);
+        }
+    }
+
+    /* A button with real element children lays out like any other container:
+     * html_tag::render runs the flex/block algorithm and gives the children
+     * (a history-thumb <img>) boxes, and derives the button height from them.
+     * The replaced-widget path below would size the face from the UA label
+     * metrics and leave the children at 0x0. */
+    if (container_mode()) {
+        return litehtml::html_tag::render(x, y, max_width, second_pass);
+    }
 
     int parent_width = max_width;
 
@@ -1515,6 +1608,8 @@ int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
 
     litehtml::size sz;
     get_content_size(sz, max_width);
+    /* content box -> border box (the page padding/borders the widget draws) */
+    extra_box_size(sz.width, sz.height);
 
     m_pos.width = sz.width;
     m_pos.height = sz.height;
