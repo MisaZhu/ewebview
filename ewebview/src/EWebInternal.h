@@ -134,6 +134,14 @@ static const uint32_t kLayoutBehindStyleMs = 500;
  * <link> sheets (m_pendingCss) while subresources keep re-dirtying layout:
  * past it the walk starts anyway (new sheets restart it from scratch). */
 static const uint32_t kStyleMaxWaitMs      = 1500;
+/* How long BUILD_RENDER_DOC holds the first paint while the <link> sheets
+ * queued during the parse (m_pendingCss) are still in flight: the previous
+ * page and the progress overlay stay on screen instead of an unstyled
+ * skeleton frame (default bullets/link colours, every normally-hidden
+ * responsive duplicate visible) that would then restyle live for seconds.
+ * Past the cap the paint proceeds with whatever landed - a stuck fetch must
+ * not black the view out - and late sheets restyle the visible page. */
+static const uint32_t kFirstPaintCssWaitMs = 6000;
 /* Wall-clock budget for ONE chunk of a master-style pass, so the engine loop
  * returns to drain commands (STOP/NAVIGATE) and render frames even mid-walk. */
 static const uint64_t kStyleBudgetIdleMs   = 25;
@@ -478,6 +486,16 @@ public:
      * executing right now (nullptr outside a script run). */
     static void* jsGetCurrentScript(void* ctx);
     void*        jsCurrentScriptEl();
+    /* Stand-in <script src> element for a stripped static script tag: searches
+     * the live tree for a <script> carrying this src, else materialises one in
+     * <head> and returns it (nullptr if the doc/host is gone). Pre-materialising
+     * every queued external script makes document.getElementsByTagName("script")
+     * and document.scripts see real attached nodes - SDKs that locate themselves
+     * via the script list otherwise get an empty list and dereference undefined
+     * (taobao baxia: `ref.parentNode.insertBefore(...)` -> "can not find
+     * function 'insertBefore'"). */
+    void*        jsScriptStandInEl(const std::string& url);
+    void         jsMaterializeScriptStandIns();
     /* selectionStart/End + setSelectionRange()/select() backends: codepoint
      * offsets into the focused text control's live value. */
     static bool  jsElGetSel(void* ctx, void* el, int* s, int* e);
@@ -624,6 +642,9 @@ public:
     uint64_t                    m_styleNeedSince;
     bool                        m_needsLayout;
     int                         m_pendingCss;
+    /* Wall-clock anchor of the BUILD_RENDER_DOC render-blocking stylesheet
+     * wait (kFirstPaintCssWaitMs); 0 = not waiting yet. */
+    uint64_t                    m_firstPaintCssWaitSince;
     bool                        m_styleStepInFlight;
     /* Click-vs-drag bookkeeping (ECMD_INPUT). */
     int                         m_pressX;

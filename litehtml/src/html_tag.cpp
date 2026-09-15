@@ -6175,10 +6175,46 @@ void litehtml::html_tag::render_positioned(render_type rt)
 							(int)el_h.is_predefined());
 				}
 			}
+			/* A replaced element (an <img>) sizes an auto width/height from its
+			 * intrinsic content, which arrives asynchronously when the image
+			 * decodes - possibly long after this positioned box was first laid
+			 * out at 0 because the load was deferred during the build. The
+			 * CSS-offset logic above only ever sets DEFINITE dimensions, so an
+			 * auto-width image keeps its stale 0 box: need_render never fires
+			 * (nothing about the CSS changed) and el_image::draw skips a
+			 * zero-width box, so apple.com's absolutely-positioned hero art never
+			 * paints once its bitmap lands. When the box is still missing an auto
+			 * dimension but the intrinsic size is now known, force a re-render and
+			 * keep the freshly computed auto dimension instead of restoring the
+			 * stale one. */
+			bool replaced_autosize = false;
+			if(el->is_replaced() &&
+			   ((el_w.is_predefined() && el->m_pos.width <= 0) ||
+			    (el_h.is_predefined() && el->m_pos.height <= 0)))
+			{
+				litehtml::size intr;
+				intr.width = 0;
+				intr.height = 0;
+				el->get_content_size(intr, parent_width);
+				if(intr.width > 0 || intr.height > 0)
+				{
+					need_render = true;
+					replaced_autosize = true;
+				}
+			}
+
 			if(need_render)
 			{
 				position pos = el->m_pos;
 				el->render(el->left(), el->top(), el->width(), true);
+				if(replaced_autosize)
+				{
+					/* Preserve the CSS-driven position and any definite dimension,
+					 * but take the auto dimension(s) from the fresh intrinsic layout
+					 * rather than the stale (0) saved box. */
+					if(el_w.is_predefined()) pos.width = el->m_pos.width;
+					if(el_h.is_predefined()) pos.height = el->m_pos.height;
+				}
 				el->m_pos = pos;
 			}
 

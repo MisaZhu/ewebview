@@ -58,7 +58,8 @@ Note that the **visible page `m_doc` is not released at this point** — it keep
 `BUILD_RENDER_DOC` (progress 80%) does two things:
 
 1. **Full style computation**: the document is created in "fast mode" — `parse_styles` skips the entire box model, so dependencies like `100vh` and `attr(width)` collapse to 0. So before layout, fast mode is turned off and a full style traversal is forced. The traversal is **sharded**: `update_master_styles_step(deadline)` caps each shard at `kStyleBudgetIdleMs = 25ms`; between shards the engine returns to the main loop to drain commands / paint frames, and the abort flag can take effect mid-traversal.
-2. **Layout**: `m_buildDoc->render(m_clientWidth)` computes all geometry. Then performance stats are printed (`text_width` calls/time/cache-hit rate, etc., visible under `EWEBVIEW_DEBUG`).
+2. **Render-blocking stylesheets**: `<link>` sheets discovered during the parse are counted in `m_pendingCss`. `BUILD_RENDER_DOC` holds the first paint while any are still in flight (up to `kFirstPaintCssWaitMs = 6000`), so the first frame that reaches the screen is already styled instead of an unstyled flash that would then restyle live. A failed sheet still releases its slot.
+3. **Layout**: `m_buildDoc->render(m_clientWidth)` computes all geometry. Then performance stats are printed (`text_width` calls/time/cache-hit rate, etc., visible under `EWEBVIEW_DEBUG`).
 
 On completion it enters `BUILD_SWAP_DOC`.
 
@@ -90,6 +91,8 @@ m_engineScrollX = m_engineScrollY = 0;     // new page returns to the top
 m_cacheValid = false;                      // frame cache invalidated → repaint immediately
 m_flushDeferredImages = true;              // images held back during construction now issue tasks
 ```
+
+Each image that later decodes is mounted into the live container and marks the layout dirty, so the page re-lays out around its real intrinsic size. Absolutely-positioned replaced elements (`<img>` with `width:auto`) need this especially: their box is laid out once by the positioned pass while the bitmap is still missing (width 0), and litehtml's `render_positioned` only re-renders a positioned box when its CSS-derived geometry changes — so it now also re-renders a positioned replaced element whose auto dimension is still empty once the intrinsic size becomes known, letting hero art paint after decode.
 
 Then `postScrollClamp()` emits `EUET_SCROLL_CLAMP` so the UI syncs its scrollbar. If scripts remain unrun (progressive mode), the state machine stays in `BUILD_RUN_JS` to continue; otherwise it returns to `BUILD_IDLE` and the page enters its live phase.
 

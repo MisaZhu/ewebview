@@ -307,6 +307,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_styleNeedSince(0)
     , m_needsLayout(false)
     , m_pendingCss(0)
+    , m_firstPaintCssWaitSince(0)
     , m_styleStepInFlight(false)
     , m_pressX(0)
     , m_pressY(0)
@@ -2043,6 +2044,7 @@ void EWebEngine::cleanupBuildResources()
     m_defaultCssLoading = false;
     m_deferBuildStep = false;
     m_styleStepInFlight = false;
+    m_firstPaintCssWaitSince = 0;
     m_layoutDirtyAt = 0;
     m_buildLayoutDirtyAt = 0;
     m_layoutDirtySince = 0;
@@ -2895,19 +2897,15 @@ bool EWebEngine::processResults()
     }
 
     /* A post-swap script run (m_jsPostSwapRun) is not a build for results:
-     * the page on screen owns the caches, so CSS/images must keep landing in
-     * it instead of stalling behind a script that may run for many ticks. */
+     * the page on screen owns the caches, so images must keep landing in it
+     * instead of stalling behind a script that may run for many ticks.
+     * Stylesheets are NOT deferred: loadCSSContent() routes them into the
+     * build context while a build is in flight, and BUILD_RENDER_DOC waits
+     * for them to drain so the first paint carries the author CSS instead
+     * of an unstyled skeleton that restyles live seconds later. */
     if(result.type == EWEB_TASK_IMAGE && m_buildPhase != BUILD_IDLE && !m_jsPostSwapRun) {
         EWEB_LOG("[ewebview] process image deferred by build: size=%d phase=%d\n",
             (int)result.content.size(), (int)m_buildPhase);
-        pthread_mutex_lock(&m_resultMutex);
-        m_resultQueue.insert(m_resultQueue.begin(), result);
-        pthread_mutex_unlock(&m_resultMutex);
-        return false;
-    }
-    if(result.type == EWEB_TASK_CSS &&
-            m_buildPhase != BUILD_IDLE && !m_jsPostSwapRun &&
-            !(m_buildPhase == BUILD_PRELOAD_CSS && result.url == m_defaultCSSUrl)) {
         pthread_mutex_lock(&m_resultMutex);
         m_resultQueue.insert(m_resultQueue.begin(), result);
         pthread_mutex_unlock(&m_resultMutex);
@@ -2944,6 +2942,11 @@ bool EWebEngine::processResults()
         }
         if(result.type == EWEB_TASK_CSS) {
             forgetCSS(result.url);
+            /* Release the pending-sheet slot on failure too: the first-paint
+             * gate and the visible doc's style walk both wait on m_pendingCss,
+             * and a 404'd sheet must not make them wait out their caps. */
+            if(m_pendingCss > 0)
+                m_pendingCss--;
             if(result.url == m_defaultCSSUrl) {
                 m_defaultCssLoading = false;
                 m_defaultCssPrepared = true;
@@ -3357,6 +3360,22 @@ void EWebEngine::advanceBuildStep()
 
     if(m_buildPhase == BUILD_RENDER_DOC) {
         setBuildStatus("layout and first paint", 80);
+        /* Render-blocking stylesheets: the <link> fetches queued during the
+         * parse land in the build context now that processResults no longer
+         * defers them, so hold the swap until they drain - the previous page
+         * and the progress overlay stay on screen, which beats painting an
+         * unstyled skeleton and restyling it live. The cap keeps a stuck
+         * fetch from holding the view; whatever landed by then is painted. */
+        if(m_pendingCss > 0) {
+            if(m_firstPaintCssWaitSince == 0) {
+                m_firstPaintCssWaitSince = ticMs();
+                EWEB_LOG("[ewebview] first paint waits for %d stylesheet(s)\n", m_pendingCss);
+            }
+            if(ticMs() - m_firstPaintCssWaitSince < kFirstPaintCssWaitMs)
+                return;
+            EWEB_LOG("[ewebview] first paint css wait timed out with %d pending\n", m_pendingCss);
+        }
+        m_firstPaintCssWaitSince = 0;
         if(m_buildDoc) {
             /* The DOM was created in fast mode, whose parse_styles path skips
              * the whole box model (height/width stay predef(0)), so layout
@@ -3377,6 +3396,12 @@ void EWebEngine::advanceBuildStep()
             while(!styles_done && !m_buildAbort) {
                 styles_done = m_buildDoc->update_master_styles_step(
                         ticMs() + kStyleBudgetIdleMs);
+            }
+            if(styles_done) {
+                /* The monolithic walk finished: no chunked step remains in
+                 * flight and no build style debt survives into the swap. */
+                m_buildNeedsStyleUpdate = false;
+                m_styleStepInFlight = false;
             }
             uint64_t render_start = ticMs();
             if(!m_buildAbort)
@@ -3456,6 +3481,17 @@ void EWebEngine::advanceBuildStep()
         m_engineScrollX = 0;
         m_engineScrollY = 0;
         m_cacheValid = false;
+        /* A sheet that landed on the tick before the swap left the handed-
+         * over document style-dirty under the BUILD flags; carry the debt
+         * into the visible-doc flags, or the next applyPendingLayoutUpdates
+         * (build doc now null) drops it and the fresh master CSS is never
+         * walked on the page on screen. */
+        if(m_buildNeedsStyleUpdate) {
+            m_buildNeedsStyleUpdate = false;
+            if(!m_needsStyleUpdate)
+                m_styleNeedSince = ticMs();
+            m_needsStyleUpdate = true;
+        }
 
         // Defer deletion of the old page to a later loop iteration to prevent
         // re-entrant corruption (the engine loop flushes these at its top).

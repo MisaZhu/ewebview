@@ -58,7 +58,8 @@ engineNavigate() 排队 HTML 任务
 `BUILD_RENDER_DOC`（进度 80%）做两件事：
 
 1. **全量样式计算**：文档在"快模式"（fast mode）下创建——`parse_styles` 跳过整个盒模型，`100vh`、`attr(width)` 这类依赖会塌成 0。所以布局前先关快模式，强制一轮完整样式遍历。遍历是**分片**的：`update_master_styles_step(deadline)` 每片最多 `kStyleBudgetIdleMs = 25ms`，片间引擎回主循环排命令/画帧，中止标志可以在遍历中途生效。
-2. **布局**：`m_buildDoc->render(m_clientWidth)` 计算全部几何。随后打印性能统计（`text_width` 调用/耗时/缓存命中率等，`EWEBVIEW_DEBUG` 下可见）。
+2. **渲染阻塞样式表**：解析期发现的 `<link>` 样式表计入 `m_pendingCss`。`BUILD_RENDER_DOC` 在仍有样式表在途时（上限 `kFirstPaintCssWaitMs = 6000`）暂缓首绘，使上屏的第一帧就是已排好版的画面，而不是先闪一张未排版页再现场重排。加载失败的样式表同样释放其名额。
+3. **布局**：`m_buildDoc->render(m_clientWidth)` 计算全部几何。随后打印性能统计（`text_width` 调用/耗时/缓存命中率等，`EWEBVIEW_DEBUG` 下可见）。
 
 完成后进入 `BUILD_SWAP_DOC`。
 
@@ -90,6 +91,8 @@ m_engineScrollX = m_engineScrollY = 0;     // 新页回到顶部
 m_cacheValid = false;                      // 帧缓存作废 → 立即重绘
 m_flushDeferredImages = true;              // 构建期压下的图片现在发任务
 ```
+
+之后每解码完一张图片就挂进活动容器并把布局标脏，页面围绕其真实固有尺寸重排。绝对定位的替换元素（`width:auto` 的 `<img>`）尤其依赖这一点：它的盒在位图尚未到达时就被定位pass布局过一次（宽度 0），而 litehtml 的 `render_positioned` 只在 CSS 推导的几何变化时才重排定位盒——因此现在当一个定位替换元素的 auto 维度仍为空、而固有尺寸已可知时，也会重渲染它，使 hero 大图在解码后能画出来。
 
 随后 `postScrollClamp()` 发 `EUET_SCROLL_CLAMP` 让 UI 同步滚动条。若还有脚本没跑（渐进模式），状态机留在 `BUILD_RUN_JS` 继续；否则回 `BUILD_IDLE`，页面进入存活期。
 

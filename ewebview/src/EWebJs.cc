@@ -469,6 +469,10 @@ bool EWebEngine::runNextPageScript()
          * fetch is still marked done with an empty body, so a 404 never wedges
          * the ordered run. */
         if(i < m_jsScriptDone.size() && !m_jsScriptDone[i]) return true;
+        /* First script of this page: pre-materialise a stand-in <script src>
+         * element for every queued external script so the DOM script list is
+         * populated BEFORE any SDK reads it (see jsScriptStandInEl). */
+        if(m_jsNextScript == 0) jsMaterializeScriptStandIns();
         m_jsNextScript++;
         /* Copy by value: this script may inject another (appendChild of a
          * <script>), which push_backs to m_jsScripts and can realloc - a
@@ -1148,6 +1152,24 @@ void* EWebEngine::jsGetCurrentScript(void* ctx)
 void* EWebEngine::jsCurrentScriptEl()
 {
     if(m_jsCurScriptUrl.empty()) return nullptr;
+    void* el = jsScriptStandInEl(m_jsCurScriptUrl);
+    if(el != nullptr) {
+        m_jsCurScriptEl = el;
+        m_jsCurScriptElUrl = m_jsCurScriptUrl;
+    }
+    return el;
+}
+
+/* Stand-in <script src> for a stripped static script tag. Static <script src>
+ * tags are removed from the markup before parsing (their bodies run from the
+ * ordered queue), so the live tree holds no element for them and the DOM script
+ * list (getElementsByTagName("script")/document.scripts) comes back empty. SDKs
+ * that locate themselves through that list then dereference undefined and abort
+ * (taobao baxia: `ref.parentNode.insertBefore(...)`). Search first so a real or
+ * previously materialised node is reused; otherwise create one in <head>. */
+void* EWebEngine::jsScriptStandInEl(const std::string& url)
+{
+    if(url.empty()) return nullptr;
     litehtml::document* doc = jsActiveDoc();
     if(doc == nullptr) return nullptr;
     litehtml::element::ptr root = doc->root();
@@ -1159,7 +1181,7 @@ void* EWebEngine::jsCurrentScriptEl()
         if(u.compare(0, 5, "http:") == 0) return u.substr(5);
         return u;
     };
-    std::string want = norm(m_jsCurScriptUrl);
+    std::string want = norm(url);
     size_t n = root->get_children_count();
     for(size_t i = 0; i < n; ++i) {
         litehtml::element::ptr c = root->get_child((int)i);
@@ -1172,27 +1194,24 @@ void* EWebEngine::jsCurrentScriptEl()
             if(norm(std::string(sa)) == want) return (void*)part[j];
         }
     }
-    /* Static <script src> tags are stripped from the markup before parsing
-     * (their bodies run from the ordered queue), so the tree holds no element
-     * for them. Materialise a stand-in in <head> carrying the same src: SDKs
-     * only use currentScript to splice their loader next to it, and a real
-     * attached element is what makes parentNode.insertBefore() work. Cached
-     * per URL so repeated reads see one stable node. */
-    if(m_jsCurScriptEl != nullptr && m_jsCurScriptElUrl == m_jsCurScriptUrl)
-        return m_jsCurScriptEl;
     litehtml::string_map attrs;
     litehtml::element::ptr el = doc->create_element("script", attrs);
     if(el == nullptr) return nullptr;
-    el->set_attr("src", m_jsCurScriptUrl.c_str());
+    el->set_attr("src", url.c_str());
     litehtml::element::ptr host = root->select_one("head");
     if(host == nullptr) host = root->select_one("body");
     if(host == nullptr) return nullptr;
     host->appendChild(el);
-    m_jsCurScriptEl = (void*)el;
-    m_jsCurScriptElUrl = m_jsCurScriptUrl;
-    EWEB_LOG("[ewebview] currentScript: stand-in created el=%p host=%s\n",
-        m_jsCurScriptEl, (root->select_one("head") != nullptr) ? "head" : "body");
-    return m_jsCurScriptEl;
+    EWEB_LOG("[ewebview] script stand-in created el=%p src=%s\n", (void*)el, url.c_str());
+    return (void*)el;
+}
+
+void EWebEngine::jsMaterializeScriptStandIns()
+{
+    for(size_t i = 0; i < m_jsScriptSrcs.size(); ++i) {
+        if(m_jsScriptSrcs[i].empty()) continue;
+        jsScriptStandInEl(m_jsScriptSrcs[i]);
+    }
 }
 
 int EWebEngine::jsQueryAll(void* ctx, void* root, const char* selector,

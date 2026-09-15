@@ -987,6 +987,18 @@ static var_t* native_document_getElementsByTagName(vm_t* vm, var_t* env, void* d
     return arr;
 }
 
+static var_t* native_document_get_scripts(vm_t* vm, var_t* env, void* data) {
+    /* document.scripts: live collection of every <script> element. Security
+     * SDKs (taobao baxia) locate their own tag through it
+     * (`document.scripts[i].parentNode.insertBefore(...)`) when currentScript
+     * is unavailable; without it the chain dereferences undefined and the SDK
+     * never installs its request signer. query_elements returns a plain JS
+     * array, which covers length/[i] iteration the way an HTMLCollection would. */
+    js_dom_state* st = state_any(vm, data);
+    (void)env;
+    return query_elements(vm, st, NULL, "script");
+}
+
 static var_t* native_document_getElementsByClassName(vm_t* vm, var_t* env, void* data) {
     js_dom_state* st = state_any(vm, data);
     mstr_t* s = mstr_new("");
@@ -2572,6 +2584,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     reg_accessor(vm, doc_cls, "body", native_document_get_body, NULL, bridge);
     reg_accessor(vm, doc_cls, "activeElement", native_document_get_activeElement, NULL, bridge);
     reg_accessor(vm, doc_cls, "currentScript", native_document_get_currentScript, NULL, bridge);
+    reg_accessor(vm, doc_cls, "scripts", native_document_get_scripts, NULL, bridge);
     reg_accessor(vm, doc_cls, "head", native_document_get_head, NULL, bridge);
     reg_accessor(vm, doc_cls, "documentElement", native_document_get_documentElement, NULL, bridge);
     reg_accessor(vm, doc_cls, "URL", native_document_get_url, NULL, bridge);
@@ -2594,15 +2607,15 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
      * "'HTMLElement' undefined!". Expose them as classes (bound on the global
      * scope by vm_new_class) so the references resolve and are extendable;
      * Element wrappers keep their own "Element" class. */
-    vm_new_class(vm, "HTMLElement");
-    vm_new_class(vm, "Node");
+    var_t* htmlel_cls = vm_new_class(vm, "HTMLElement");
+    var_t* node_cls   = vm_new_class(vm, "Node");
     vm_new_class(vm, "EventTarget");
     /* The same references appear for the other IDL bases web bundles test or
      * subclass (SVG markup, fragments, observers). vm_new_class reuses an
      * existing live binding, so these are no-ops if a real impl is registered
      * elsewhere (e.g. Event/CustomEvent in js_event.c). */
     vm_new_class(vm, "SVGElement");
-    vm_new_class(vm, "DocumentFragment");
+    var_t* frag_cls   = vm_new_class(vm, "DocumentFragment");
     vm_new_class(vm, "MutationObserver");
     vm_new_class(vm, "IntersectionObserver");
     vm_new_class(vm, "ResizeObserver");
@@ -2653,6 +2666,36 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     vm_reg_native(vm, el_cls, "cloneNode(deep)", native_el_cloneNode, bridge);
     vm_reg_native(vm, el_cls, "remove()", native_el_remove, bridge);
     vm_reg_native(vm, el_cls, "contains(node)", native_el_contains, bridge);
+
+    /* Real DOM hangs the mutation + tree-walking surface off Node.prototype, so
+     * EVERY node kind (Document, DocumentFragment, Element, ...) inherits it.
+     * mario classes are flat (no shared Node base), so mirror the surface onto
+     * the other node classes: React-DOM and the security SDKs call
+     * insertBefore/appendChild/replaceChild on fragments and on document, which
+     * otherwise miss ("can not find function 'insertBefore'") and abort the
+     * mount. Element wrappers keep el_cls; these classes serve subclasses and
+     * any wrapper bound to them. */
+    {
+        var_t* node_classes[3] = { node_cls, frag_cls, htmlel_cls };
+        for(int ci = 0; ci < 3; ++ci) {
+            var_t* nc = node_classes[ci];
+            if(nc == NULL || nc == el_cls) continue;
+            reg_accessor(vm, nc, "parentNode", native_el_get_parentNode, NULL, bridge);
+            reg_accessor(vm, nc, "parentElement", native_el_get_parentNode, NULL, bridge);
+            reg_accessor(vm, nc, "childNodes", native_el_get_childNodes, NULL, bridge);
+            reg_accessor(vm, nc, "children", native_el_get_children, NULL, bridge);
+            reg_accessor(vm, nc, "firstChild", native_el_get_firstChild, NULL, bridge);
+            reg_accessor(vm, nc, "lastChild", native_el_get_lastChild, NULL, bridge);
+            vm_reg_native(vm, nc, "appendChild(node)", native_el_appendChild, bridge);
+            vm_reg_native(vm, nc, "append(node)", native_el_append, bridge);
+            vm_reg_native(vm, nc, "insertBefore(node, ref)", native_el_insertBefore, bridge);
+            vm_reg_native(vm, nc, "removeChild(node)", native_el_removeChild, bridge);
+            vm_reg_native(vm, nc, "replaceChild(node, old)", native_el_replaceChild, bridge);
+            vm_reg_native(vm, nc, "cloneNode(deep)", native_el_cloneNode, bridge);
+            vm_reg_native(vm, nc, "remove()", native_el_remove, bridge);
+            vm_reg_native(vm, nc, "contains(node)", native_el_contains, bridge);
+        }
+    }
 
     /* Scoped queries. */
     vm_reg_native(vm, el_cls, "querySelector(sel)", native_el_querySelector, bridge);
