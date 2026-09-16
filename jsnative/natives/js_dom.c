@@ -1445,15 +1445,6 @@ static char* style_lookup(js_dom_state* st, js_element_t el, const char* css) {
  * (NULL/empty removes the declaration). */
 static void style_write(js_dom_state* st, js_element_t el, const char* css, const char* value) {
     if(st == NULL || el == NULL || css == NULL || st->cb.el_set_attr == NULL) return;
-    /* Opt-in trace of JS-written transforms (EWEB_TFDBG): the apple.com gallery
-     * spreads its stacked slides purely by assigning style.transform at runtime,
-     * so seeing the exact function/value the bundle writes is the only way to
-     * tell a litehtml parse gap (translate3d) from a zero measurement. */
-    if(getenv("EWEB_TFDBG") && strstr(css, "transform") != NULL) {
-        char* cls = (st->cb.el_get_attr != NULL) ? st->cb.el_get_attr(st->ctx, el, "class") : NULL;
-        fprintf(stderr, "[tfdbg] set %s = %s | class=%s\n", css, (value != NULL) ? value : "(null)", (cls != NULL) ? cls : "-");
-        if(cls != NULL) mario_free(cls);
-    }
     char* old = (st->cb.el_get_attr != NULL) ? st->cb.el_get_attr(st->ctx, el, "style") : NULL;
     char* neu = css_decl_set(old, css, (value != NULL && value[0] != 0) ? value : NULL);
     if(old != NULL) mario_free(old);
@@ -1885,7 +1876,6 @@ static var_t* native_el_get_childElementCount(vm_t* vm, var_t* env, void* data) 
 static var_t* native_el_get_parentNode(vm_t* vm, var_t* env, void* data) {
     js_dom_state* st = state_any(vm, data);
     js_element_t el = this_handle(env);
-    fprintf(stderr, "[DIAGPN] parentNode this=%p st=%p\n", (void*)el, (void*)st);
     if(st == NULL || el == NULL || st->cb.el_parent == NULL) return var_new_null(vm);
     return wrap_or_null(vm, st->cb.el_parent(st->ctx, el));
 }
@@ -2676,8 +2666,13 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
      * mount. Element wrappers keep el_cls; these classes serve subclasses and
      * any wrapper bound to them. */
     {
-        var_t* node_classes[3] = { node_cls, frag_cls, htmlel_cls };
-        for(int ci = 0; ci < 3; ++ci) {
+        /* doc_cls too: Document IS a Node in the real DOM, and `with(document)`
+         * + a bare `insertBefore(...)` (taobao's beacon bootstrap) resolves the
+         * method on the document wrapper when the inner with-object misses. The
+         * document singleton carries no element handle, so the natives degrade
+         * to null/no-op for it - name RESOLUTION is what matters here. */
+        var_t* node_classes[4] = { node_cls, frag_cls, htmlel_cls, doc_cls };
+        for(int ci = 0; ci < 4; ++ci) {
             var_t* nc = node_classes[ci];
             if(nc == NULL || nc == el_cls) continue;
             reg_accessor(vm, nc, "parentNode", native_el_get_parentNode, NULL, bridge);

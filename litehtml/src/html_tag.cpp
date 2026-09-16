@@ -1924,29 +1924,11 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	 * full-bleed tile artwork inside its tile. */
 	if(own_overflow && !t_strcasecmp(own_overflow, _t("clip")))
 	{
-		static const bool dbg_clip = getenv("EWEB_DBG_CLIP") != 0;
-		if(dbg_clip)
-		{
-			fprintf(stderr, "[clip] tag=%s class=%s parent=%s pdisplay=%d owndisplay=%d\n",
-					(const char*)m_tag.c_str(),
-					(const char*)(get_attr(_t("class")) ? get_attr(_t("class")) : "-"),
-					(el_parent && el_parent->get_tagName()) ? (const char*)el_parent->get_tagName() : "-",
-					el_parent ? (int)el_parent->get_display() : -1,
-					(int)m_display);
-		}
 		own_overflow = _t("hidden");
 	}
 	m_overflow		= (overflow)			value_index((own_overflow && t_strcasecmp(own_overflow, _t("inherit"))) ? own_overflow : _t("visible"),		overflow_strings,			overflow_visible);
 	if(own_display && t_strcasecmp(own_display, _t("inherit")))
 	{
-		static int ddbg_on = -1;
-		if(ddbg_on < 0) ddbg_on = getenv("EWEB_DBG_DISP") ? 1 : 0;
-		if(ddbg_on)
-		{
-			const tchar_t* dcls = get_attr(_t("class"));
-			if(dcls && strstr(dcls, "tile-ctas"))
-				printf("[ddbg] class=%s own_display=%s\n", (const char*)dcls, (const char*)own_display);
-		}
 		m_display = (style_display) value_index(own_display, style_display_strings, display_block);
 	}
 	else if(own_display && el_parent)
@@ -2784,73 +2766,22 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 
 int litehtml::html_tag::render( int x, int y, int max_width, bool second_pass )
 {
-	static int rdbg_on = -1;
-	if(rdbg_on < 0) rdbg_on = getenv("EWEB_RDBG") ? 1 : 0;
-	/* EWEB_RDBG_CLASS overrides the built-in class filter with a comma
-	 * separated substring list, so any page box can be inspected without
-	 * a rebuild. */
-	static const char* rdbg_spec = 0;
-	static int rdbg_spec_init = 0;
-	if(!rdbg_spec_init)
-	{
-		rdbg_spec_init = 1;
-		rdbg_spec = getenv("EWEB_RDBG_CLASS");
-		if(rdbg_spec && !rdbg_spec[0]) rdbg_spec = 0;
-	}
-	const tchar_t* rcls = rdbg_on ? get_attr(_t("class")) : 0;
-	bool rdbg = false;
-	if(rdbg_on && rcls)
-	{
-		if(rdbg_spec)
-		{
-			const char* p = rdbg_spec;
-			while(*p)
-			{
-				const char* e = strchr(p, ',');
-				size_t n = e ? (size_t)(e - p) : strlen(p);
-				if(n && strstr((const char*)rcls, std::string(p, n).c_str()))
-				{
-					rdbg = true;
-					break;
-				}
-				p = e ? e + 1 : p + n;
-			}
-		}
-		else
-		{
-			rdbg =
-				(strstr(rcls, "nav-link") || strstr(rcls, "top-nav-item") ||
-				 strstr(rcls, "tile-subhead") || strstr(rcls, "tile-callout") ||
-				 strstr(rcls, "tile-ctas") || strstr(rcls, "tile-copy-wrapper") ||
-				 strstr(rcls, "tile-headline") || strstr(rcls, "ribbon-content") ||
-				 strstr(rcls, "tile-content"));
-		}
-	}
-	if(rdbg)
-		printf("[rdbg] enter class=%s disp=%d maxw=%d h=%d skip=%d opac=%g cum=%g\n",
-				(const char*)rcls, (int)m_display, max_width, m_pos.height, (int)m_skip,
-				(double)m_opacity, (double)m_opacity_cum);
-	int rret = 0;
 	if (m_display == display_table || m_display == display_inline_table)
 	{
-		rret = render_table(x, y, max_width, second_pass);
+		return render_table(x, y, max_width, second_pass);
 	}
 	else if (m_display == display_flex || m_display == display_inline_flex)
 	{
-		rret = render_flex(x, y, max_width, second_pass);
+		return render_flex(x, y, max_width, second_pass);
 	}
 	else if (m_display == display_grid || m_display == display_inline_grid)
 	{
-		rret = render_grid(x, y, max_width, second_pass);
+		return render_grid(x, y, max_width, second_pass);
 	}
 	else
 	{
-		rret = render_box(x, y, max_width, second_pass);
+		return render_box(x, y, max_width, second_pass);
 	}
-	if(rdbg)
-		printf("[rdbg] exit class=%s disp=%d x=%d y=%d h=%d w=%d fs=%d\n",
-				(const char*)rcls, (int)m_display, m_pos.x, m_pos.y, m_pos.height, m_pos.width, m_font_size);
-	return rret;
 }
 
 bool litehtml::html_tag::is_white_space() const
@@ -4965,17 +4896,7 @@ int litehtml::html_tag::render_inline(const element::ptr &container, int max_wid
 
 int litehtml::html_tag::place_element(const element::ptr &el, int max_width)
 {
-	static int pdbg_on = -1;
-	if(pdbg_on < 0) pdbg_on = getenv("EWEB_PDBG") ? 1 : 0;
 	if(!el) return 0;
-	const tchar_t* pdbg_cls = pdbg_on ? el->get_attr(_t("class")) : 0;
-	bool pdbg = pdbg_on && pdbg_cls && strstr(pdbg_cls, "nav-link") && !strstr(pdbg_cls, "icon-link");
-	if(pdbg)
-	{
-		printf("[pdbg] place enter class=%s disp=%d float=%d posn=%d repl=%d maxw=%d\n",
-				(const char*)pdbg_cls, (int)el->get_display(), (int)el->get_float(),
-				(int)el->get_element_position(), (int)el->is_replaced(), max_width);
-	}
 	if(el->get_display() == display_none) return 0;
 
 	if(el->get_display() == display_inline)
@@ -5203,7 +5124,6 @@ int litehtml::html_tag::place_element(const element::ptr &el, int max_width)
 			case display_table_row:
 				if(el->is_replaced() || el->is_floats_holder())
 				{
-					if(pdbg) printf("[pdbg] replaced-block render lw=%d\n", line_ctx.width());
 					ret_width = el->render(line_ctx.left, line_ctx.top, line_ctx.width()) + line_ctx.left + (max_width - line_ctx.right);
 				} else
 				{
@@ -6159,22 +6079,7 @@ void litehtml::html_tag::render_positioned(render_type rt)
 					el->m_pos.y = 0;
 				}
 			}
-
-			{
-				static int apdbg_on = -1;
-				if(apdbg_on < 0) apdbg_on = getenv("EWEB_APDBG") ? 1 : 0;
-				if(apdbg_on)
-				{
-					const tchar_t* acls = el->get_attr(_t("class"));
-					if(acls && (strstr(acls, "tile-image-wrapper") || strstr(acls, "media-gallery")))
-						printf("[apdbg] class=%s pos=%d,%d %dx%d cb=%s cbpos=%d,%d %dx%d cb_ph=%d top=%d bottom=%d h_css=%d\n",
-							(const char*)acls, el->m_pos.x, el->m_pos.y, el->m_pos.width, el->m_pos.height,
-							(cb->get_attr(_t("class")) ? (const char*)cb->get_attr(_t("class")) : "-"),
-							cb->m_pos.x, cb->m_pos.y, cb->m_pos.width, cb->m_pos.height, cb_ph,
-							(int)css_top.is_predefined(), (int)css_bottom.is_predefined(),
-							(int)el_h.is_predefined());
-				}
-			}
+			
 			/* A replaced element (an <img>) sizes an auto width/height from its
 			 * intrinsic content, which arrives asynchronously when the image
 			 * decodes - possibly long after this positioned box was first laid
@@ -7089,21 +6994,8 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 
 	bool was_space = false;
 
-	static int cdbg_on = -1;
-	if(cdbg_on < 0) cdbg_on = getenv("EWEB_CDBG") ? 1 : 0;
-	const tchar_t* cdbg_cls = cdbg_on ? get_attr(_t("class")) : 0;
-	bool cdbg = cdbg_on && cdbg_cls && strstr(cdbg_cls, "top-nav-item");
-
 	for (auto el : m_children)
 	{
-		if(cdbg)
-		{
-			printf("[cdbg] li child tag=%s class=%s disp=%d skip=%d vis=%d posn=%d\n",
-					(const char*)el->get_tagName(),
-					el->get_attr(_t("class")) ? (const char*)el->get_attr(_t("class")) : "",
-					(int)el->get_display(), (int)el->m_skip, (int)el->is_visible(),
-					(int)el->get_element_position());
-		}
 		// display:contents elements generate no box of their own
 		if (el->get_display() == display_contents) continue;
 

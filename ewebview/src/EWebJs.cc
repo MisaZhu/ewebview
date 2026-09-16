@@ -379,6 +379,10 @@ bool EWebEngine::runPageScripts()
             continue;
         }
         uint64_t run_start = ticMs();
+        /* DIAG: record this script's base pc in the shared bytecode so a
+         * MARIO_THROWDBG pc from an uncaught throw can be mapped onto the
+         * MARIO_DUMPC disassembly of the same dumped script file. */
+        PC jsBasePc = m_jsVm->bc.cindex;
         /* vm_load_run appends this script's bytecode after the previous one and
          * runs it; globals persist in vm->root across scripts, matching
          * separate <script> blocks that share one global scope. m_jsInScript
@@ -414,6 +418,8 @@ bool EWebEngine::runPageScripts()
             (uint32_t)(ticMs() - run_start),
             (i < m_jsScriptSrcs.size() && !m_jsScriptSrcs[i].empty())
                 ? m_jsScriptSrcs[i].c_str() : "(inline)");
+        EWEB_LOG("[ewebview] js: script %d pc_range=[%u,%u)\n", (int)i,
+            (unsigned)jsBasePc, (unsigned)m_jsVm->bc.cindex);
         /* The watchdog dropped this page's JS (three run-budget timeouts): stop
          * at once. The entry guard above is only evaluated once per call, so
          * without this the loop keeps spending a run budget per remaining
@@ -485,6 +491,10 @@ bool EWebEngine::runNextPageScript()
             continue;
         }
         uint64_t run_start = ticMs();
+        /* DIAG: base pc of this script in the shared bytecode (pairs with the
+         * pc_range log below) so a MARIO_THROWDBG frame pc can be mapped onto
+         * the MARIO_DUMPC disassembly of the same dumped script file. */
+        PC jsBasePc = m_jsVm->bc.cindex;
         /* Bracket vm_load_run so the DOM-bridge mutation callbacks push the
          * page to the screen mid-script (jsMarkLayoutDirty -> jsProgressiveFlush
          * -> engineRenderFrame): a long test script then shows its results as
@@ -545,6 +555,8 @@ bool EWebEngine::runNextPageScript()
             (int)i, (uint32_t)(ticMs() - run_start),
             (i < m_jsScriptSrcs.size() && !m_jsScriptSrcs[i].empty())
                 ? m_jsScriptSrcs[i].c_str() : "(inline)");
+        EWEB_LOG("[ewebview] js: script %d pc_range=[%u,%u)\n", (int)i,
+            (unsigned)jsBasePc, (unsigned)m_jsVm->bc.cindex);
         /* Paint what this script produced before the next one runs. */
         jsProgressiveFlush(true);
         break;

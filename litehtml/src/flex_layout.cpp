@@ -122,14 +122,7 @@ static int grid_max_content_width(litehtml::html_tag* el, int avail);
 static int preferred_content_width(const litehtml::element::ptr& el)
 {
 	if(!el) return 0;
-	static int pdbg_on = -1;
-	if(pdbg_on < 0) pdbg_on = getenv("EWEB_PDBG") ? 1 : 0;
-	const tchar_t* pcls = pdbg_on ? el->get_attr(_t("class")) : 0;
-	bool pdbg = pdbg_on && pcls &&
-		(strstr(pcls, "top-nav-item") || strstr(pcls, "nav-link"));
 	litehtml::style_display d = el->get_display();
-	if(pdbg)
-		printf("[pdbg] pcw enter class=%s disp=%d\n", (const char*)pcls, (int)d);
 	if(el->is_replaced())
 	{
 		/* A replaced box with a flex display is a form widget styled as a flex
@@ -206,13 +199,6 @@ static int preferred_content_width(const litehtml::element::ptr& el)
 		if(c->get_element_position() == litehtml::element_position_absolute ||
 		   c->get_element_position() == litehtml::element_position_fixed) continue;
 		int mw = c->margin_left() + c->margin_right();
-		if(pdbg)
-		{
-			const tchar_t* ccls = c->get_attr(_t("class"));
-			printf("[pdbg]   child tag=%s class=%s disp=%d vis=%d w=%d\n",
-					(const char*)c->get_tagName(), ccls ? (const char*)ccls : "",
-					(int)c->get_display(), (int)c->is_visible(), c->width());
-		}
 		if(c->is_break())
 		{
 			if(line > w) w = line;
@@ -536,7 +522,13 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				if(w < 0) w = 0;
 			}
 			kids[i]->render(0, 0, w, second_pass);
-			chh[i] = kids[i]->get_position().height + mtv[i] + mbv[i];
+			/* Main size is the child's OUTER height: boxes whose space comes from
+			 * padding alone (the .l-frame aspect-ratio trick: content height 0 +
+			 * padding-bottom, w3.org's card images) otherwise contribute nothing
+			 * and the column collapses over them. */
+			chh[i] = kids[i]->get_position().height + mtv[i] + mbv[i]
+				+ kids[i]->padding_top() + kids[i]->padding_bottom()
+				+ kids[i]->border_top() + kids[i]->border_bottom();
 			/* Cross size is the child's ACTUAL outer width, not the width we
 			 * offered: a child with a declared width of its own but no in-flow
 			 * content (apple.com's gallery strip, .media-gallery-item-container
@@ -574,14 +566,6 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		/* main-axis (vertical) packing of leftover space */
 		int lead = 0, jgap = 0;
 		int free = cont_h - total;
-		{
-			static int coldbg_on = -1;
-			if(coldbg_on < 0) coldbg_on = getenv("EWEB_FLEXDBG") ? 1 : 0;
-			const tchar_t* ccls = get_attr(_t("class"));
-			if(coldbg_on && ccls && (strstr(ccls, "tile-content") || strstr(ccls, "tile-wrapper")))
-				printf("[flexdbg] column class=%s avail=%d n=%d total=%d cont_h=%d free=%d jc=%s ai=%s\n",
-						ccls, avail, n, total, cont_h, free, col_jc, col_ai);
-		}
 		if(free > 0)
 		{
 			if(flex_flag(col_jc, "center")) lead = free / 2;
@@ -625,23 +609,6 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 	bool do_wrap			= flex_flag(wrap_s, "wrap", "wrap-reverse");
 	const tchar_t* jc_s		= get_style_property(_t("justify-content"), false, _t("flex-start"));
 	const tchar_t* ai_s		= get_style_property(_t("align-items"), false, _t("stretch"));
-	static int flexdbg_on = -1;
-	if(flexdbg_on < 0) flexdbg_on = getenv("EWEB_FLEXDBG") ? 1 : 0;
-	const tchar_t* flexdbg_ccls = get_attr(_t("class"));
-	const tchar_t* flexdbg_pcls = parent() ? parent()->get_attr(_t("class")) : 0;
-	bool flexdbg = flexdbg_on &&
-		((flexdbg_ccls &&
-		 (strstr(flexdbg_ccls, "global-nav") || strstr(flexdbg_ccls, "top-nav") ||
-		  strstr(flexdbg_ccls, "nav-link") || strstr(flexdbg_ccls, "icon-link") ||
-		  strstr(flexdbg_ccls, "account") || strstr(flexdbg_ccls, "logo") ||
-		  strstr(flexdbg_ccls, "tile-content") || strstr(flexdbg_ccls, "tile-ctas") ||
-		  strstr(flexdbg_ccls, "tile-wrapper") || strstr(flexdbg_ccls, "section-promo") ||
-		  strstr(flexdbg_ccls, "ribbon"))) ||
-		 (flexdbg_pcls && (strstr(flexdbg_pcls, "global-nav") ||
-		  strstr(flexdbg_pcls, "tile-content") || strstr(flexdbg_pcls, "ribbon"))));
-	if(flexdbg)
-		printf("[flexdbg] container class=%s avail=%d ai=%s wrap=%s\n",
-				flexdbg_ccls, avail, ai_s, wrap_s);
 	int row_gap = 0, col_gap = 0;
 	flex_parse_gap(this, avail, row_gap, col_gap);
 
@@ -858,12 +825,6 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			}
 		}
 		if(it.base < it.ml + it.mr) it.base = it.ml + it.mr;
-		if(flexdbg)
-		{
-			const tchar_t* mcls = it.run.empty() ? it.el->get_attr(_t("class")) : _t("<run>");
-			printf("[flexdbg]   measure class=%s base=%d grow=%g shrink=%g\n",
-					mcls ? (const char*)mcls : "", it.base, it.grow, it.shrink);
-		}
 	}
 
 	/* An inline-flex atom sizes to its content (max-content), so resolve its
@@ -1003,12 +964,6 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 					minc = flex_min_content(it.el);
 				}
 				minc += it.ml + it.mr;
-				if(flexdbg)
-				{
-					const tchar_t* scls = it.run.empty() ? it.el->get_attr(_t("class")) : _t("<run>");
-					printf("[flexdbg]   shrink class=%s base=%d sh=%d minc=%d main=%d\n",
-							scls ? (const char*)scls : "", it.base, sh, minc, it.main);
-				}
 				if(it.main < minc) it.main = minc;
 				if(it.main < it.ml + it.mr) it.main = it.ml + it.mr;
 			}
@@ -1072,9 +1027,6 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			if(has_fixed_h && fixed_h > line_cross) line_h = fixed_h;
 			if(cont_min_h > line_h) line_h = cont_min_h;
 		}
-		if(flexdbg)
-			printf("[flexdbg]   line %d line_cross=%d line_h=%d free=%d items=%d\n",
-					(int)li, line_cross, line_h, free, (int)line.size());
 
 		// main-axis packing of the leftover space
 		int lead = 0, jgap = 0;
@@ -1144,10 +1096,6 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				 * everything the stretched render arranged (apple.com's column
 				 * .tile-content lost its justify-content:flex-end anchoring). */
 				placed = true;
-				if(flexdbg)
-					printf("[flexdbg]   stretch class=%s forced_h=%d\n",
-							it.el->get_attr(_t("class")) ? (const char*)it.el->get_attr(_t("class")) : "",
-							fh);
 			}
 			else if(flex_flag(ai_s, "center"))
 			{
@@ -1166,27 +1114,10 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				int inner = it.main - it.ml - it.mr;
 				if(inner < 0) inner = 0;
 				flex_run_wrap(it.run, inner, true, xs[i] + it.ml, bottom + iy + it.mt);
-				if(flexdbg)
-				{
-					tstring ts;
-					it.run[0]->get_text(ts);
-					printf("[flexdbg]     run text=%.20s main=%d cross=%d iy=%d y=%d\n",
-							(const char*)ts.c_str(), it.main, it.cross, iy,
-							it.run[0]->get_position().y);
-				}
 			}
 			else if(!placed)
 			{
 				render_item(it, xs[i], bottom + iy);
-				if(flexdbg)
-				{
-					const tchar_t* icls = it.el->get_attr(_t("class"));
-					printf("[flexdbg]     item tag=%s class=%s main=%d cross=%d iy=%d y=%d h=%d css_h=%s\n",
-							(const char*)it.el->get_tagName(), icls ? (const char*)icls : "",
-							it.main, it.cross, iy, it.el->get_position().y,
-							it.el->get_position().height,
-							ch.is_predefined() ? "auto" : "set");
-				}
 			}
 		}
 
