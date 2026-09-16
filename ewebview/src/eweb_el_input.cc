@@ -1521,6 +1521,14 @@ void eweb_el_input::draw_stacking_context(litehtml::uint_ptr hdc, int x, int y, 
     }
 }
 
+void eweb_el_input::draw_children(litehtml::uint_ptr hdc, int x, int y, const litehtml::position* clip, litehtml::draw_flag flag, int zindex)
+{
+    if (container_mode()) {
+        litehtml::html_tag::draw_children(hdc, x, y, clip, flag, zindex);
+    }
+    /* widget mode: deliberately empty - see the declaration in the header */
+}
+
 int eweb_el_input::line_height() const
 {
     int h = height();

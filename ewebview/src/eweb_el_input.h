@@ -46,6 +46,14 @@ public:
     virtual int      render(int x, int y, int max_width, bool second_pass = false) override;
     virtual void     draw(litehtml::uint_ptr hdc, int x, int y, const litehtml::position* clip) override;
     virtual void     draw_stacking_context(litehtml::uint_ptr hdc, int x, int y, const litehtml::position* clip, bool with_positioned) override;
+    /* Widget-mode controls paint everything themselves (face, centred label,
+     * centred svg glyph, placed pseudos). The generic html_tag child recursion
+     * would repaint un-laid-out text children at the box origin (a ghost label
+     * at the top-left corner), because draw_children_box descends into any
+     * child whose display is not inline-block - and form controls resolve to
+     * block/flex from the UA sheet. Container-mode buttons keep the normal
+     * recursion so their laid-out content paints. */
+    virtual void     draw_children(litehtml::uint_ptr hdc, int x, int y, const litehtml::position* clip, litehtml::draw_flag flag, int zindex) override;
     virtual void     parse_styles(bool is_reparse) override;
     virtual void     add_widget_part_style(const litehtml::tstring& part, const litehtml::style& st) override;
     /* Hand the engine an opaque handle to this control so a mouse hit on the
