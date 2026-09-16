@@ -55,7 +55,8 @@ LITEHTML_OBJS = \
 	$(ARCH)/src/el_cdata.o \
 	$(ARCH)/src/el_title.o \
 	$(ARCH)/src/web_color.o \
-	$(ARCH)/src/stylesheet.o
+	$(ARCH)/src/stylesheet.o \
+	$(ARCH)/src/animation.o
 
 # Gumbo parser source files
 GUMBO_OBJS = \

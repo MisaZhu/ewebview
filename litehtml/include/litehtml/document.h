@@ -2,6 +2,7 @@
 #include "style.h"
 #include "types.h"
 #include "context.h"
+#include "animation.h"
 #include "gumbo/gumbo.h"
 #include <stdint.h>
 
@@ -102,6 +103,24 @@ namespace litehtml
 		uint32_t							m_step_parse_ms;
 		uint64_t							m_step_start;
 		bool								m_step_exhausted;
+		/* CSS animation subsystem (Phase 2). @keyframes rules keyed by their
+		 * lowercase name, populated by css::parse_atrule when a stylesheet
+		 * carrying @keyframes is added. The active timeline holds every
+		 * running transition/animation instance; tick_animations() advances
+		 * them and writes interpolated values back onto their target
+		 * elements. m_animations_disabled latches EWEB_DISABLE_ANIMATION at
+		 * construction so a single env var can turn the whole subsystem off
+		 * for regression bisecting. */
+		std::map<tstring, keyframes_rule>	m_keyframes;
+		std::vector<active_anim>			m_anim_timeline;
+		bool								m_animations_disabled;
+		uint64_t							m_anim_last_tick_ms;
+		/* Phase 3.1: elements whose geometry changed this tick because a
+		 * layout-affecting length property was interpolated. The engine drains
+		 * this after tick_animations() and re-runs parse_styles + render on
+		 * them (animation-driven relayout). Elements whose subtree exceeds the
+		 * relayout node budget are skipped (degraded to a discrete switch). */
+		std::vector<html_tag*>				m_anim_relayout;
 	public:
 		document(litehtml::document_container* objContainer, litehtml::context* ctx);
 		virtual ~document();
@@ -180,6 +199,42 @@ namespace litehtml
 		/* Master css changed while a step was in flight: restart from scratch. */
 		void							abort_style_step() { m_step_phase = 0; }
 		bool							is_fast_mode() const { return m_context && m_context->is_fast_mode(); }
+
+		/* ---- CSS animation subsystem (Phase 2) ---- */
+		/* Register a parsed @keyframes rule. Later registrations with the
+		 * same name replace earlier ones (CSS cascade order). */
+		void							add_keyframes(const tstring& name, const keyframes_rule& rule);
+		/* Look up a @keyframes rule by (case-insensitive) name; returns
+		 * nullptr when the name is unknown. */
+		const keyframes_rule*			find_keyframes(const tstring& name) const;
+		/* Enqueue a new active animation on the timeline. Silently drops the
+		 * request when animations are disabled, when the timeline is at its
+		 * hard cap, or when the element already has a running animation on
+		 * the same (property, keyframes_name) pair (in which case the
+		 * existing entry is replaced). */
+		void							start_animation(const active_anim& a);
+		/* Advance every active animation to `now_ms` and write interpolated
+		 * values onto the target elements. Returns true when any animation
+		 * is still running after the tick (so the caller can request another
+		 * frame). Safe to call with an empty timeline. */
+		bool							tick_animations(uint64_t now_ms);
+		/* Phase 3.1: move the set of elements that need an animation-driven
+		 * relayout into `out` and clear the internal list. The engine re-runs
+		 * parse_styles + render on each. Returns true when non-empty. */
+		bool							drain_anim_relayout(std::vector<html_tag*>& out);
+		bool							has_anim_relayout() const { return !m_anim_relayout.empty(); }
+		/* Phase 3.1: record that `el` needs a relayout because a layout-affecting
+		 * length property was just interpolated. No-op for paint-only props and
+		 * for elements whose subtree exceeds the relayout node budget. */
+		void							note_anim_relayout(html_tag* el, const tstring& prop);
+		/* Drop every active animation. Called on navigation and when a
+		 * target element is removed from the tree. */
+		void							clear_animations();
+		/* Drop only the animations targeting `el`. Called from html_tag's
+		 * teardown path so a deleted element cannot leave a dangling
+		 * pointer in the timeline. */
+		void							clear_animations_for(html_tag* el);
+		bool							animations_disabled() const { return m_animations_disabled; }
 
 		static litehtml::document::ptr createFromString(const tchar_t* str, litehtml::document_container* objPainter, litehtml::context* ctx, litehtml::css* user_styles = 0);
 		static litehtml::document::ptr createFromUTF8(const char* str, litehtml::document_container* objPainter, litehtml::context* ctx, litehtml::css* user_styles = 0);

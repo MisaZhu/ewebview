@@ -953,8 +953,30 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 	bool has_fixed_h = !m_css_height.is_predefined() && m_css_height.units() != css_units_none;
 	if(has_fixed_h)
 	{
-		fixed_h = get_document()->cvt_units(m_css_height, m_font_size, 0);
-		if(m_box_sizing == box_sizing_border_box)
+		if(m_css_height.units() == css_units_percentage)
+		{
+			/* A percentage height resolves against a parent with a definite
+			 * height only (w3.org's .card{height:100%} inside a stretched
+			 * flex-row li: the stretch pass parks a definite px height on
+			 * the li, so the card can fill the row and its last text rows
+			 * stop hanging under the row's overflow clip). Auto-height
+			 * parents keep the CSS fallback: percentage behaves as auto,
+			 * never against a stale pass value. */
+			element::ptr p = parent();
+			if(p && !p->get_css_height().is_predefined())
+			{
+				fixed_h = m_css_height.calc_percent(p->m_pos.height);
+			}
+			else
+			{
+				has_fixed_h = false;
+			}
+		}
+		else
+		{
+			fixed_h = get_document()->cvt_units(m_css_height, m_font_size, 0);
+		}
+		if(has_fixed_h && m_box_sizing == box_sizing_border_box)
 		{
 			fixed_h -= m_padding.top + m_padding.bottom + m_borders.top + m_borders.bottom;
 		}
@@ -1073,7 +1095,15 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			else
 			{
 				render_item(it, 0, 0);
-				it.cross = it.el->get_position().height + it.mt + it.mb;
+				/* Cross size is the item's OUTER (margin-box) height. Content-box
+				 * only under-measured padded items (w3.org's card li carries
+				 * padding:1.5%): the line then came out shorter than the items it
+				 * packed, the items' padding spilled past the row box, and an
+				 * overflow:hidden ancestor (.component--columns) sliced the last
+				 * text rows of every card in half. */
+				it.cross = it.el->get_position().height + it.mt + it.mb
+					+ it.el->padding_top() + it.el->padding_bottom()
+					+ it.el->border_top() + it.el->border_bottom();
 			}
 			if(it.cross > line_cross) line_cross = it.cross;
 		}
@@ -1143,7 +1173,18 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				 * measurement and ratcheted the row taller every relayout. */
 				html_tag* sht = static_cast<html_tag*>(it.el);
 				css_length shv = sht->m_css_height;
+				/* Stretch sizes the item's OUTER box to the line: the forced
+				 * content height must give back margins AND padding/borders,
+				 * else the stretched item overgrows the line by exactly its
+				 * padding and the row's overflow clip eats its last rows.
+				 * border-box items take m_css_height as the border box, so only
+				 * the margins come off for them. */
 				int fh = line_h - it.mt - it.mb;
+				if(sht->get_box_sizing() != box_sizing_border_box)
+				{
+					fh -= it.el->padding_top() + it.el->padding_bottom()
+						+ it.el->border_top() + it.el->border_bottom();
+				}
 				if(fh < 0) fh = 0;
 				css_length fv; fv = (float)fh;
 				sht->m_css_height = fv;

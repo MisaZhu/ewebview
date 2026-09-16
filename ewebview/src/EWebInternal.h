@@ -93,6 +93,16 @@ static const uint32_t kJsPrePaintBudgetMs = 4000;
  * the pre-paint budget paints first and defers the rest. */
 static const uint32_t kJsPostSwapBudgetMs = 8000;
 
+/* Post-swap phase budget while the viewport still shows ONLY a server-side
+ * skeleton placeholder (client-rendered shells such as taobao.com). Dropping
+ * the tail of the script queue in that state guarantees a useless permanent
+ * skeleton, because the bundle that replaces it (React app entry + its mtop
+ * data call) sits behind the heavy telemetry/nav SDKs that consume the normal
+ * budget. While nothing real is on screen we therefore keep starting scripts
+ * up to this much larger cap; the moment real content paints the ordinary
+ * kJsPostSwapBudgetMs applies again so ad-heavy portals still go idle fast. */
+static const uint32_t kJsPostSwapSkeletonBudgetMs = 45000;
+
 /* Expand a CDN combo URL ("https://host/path/??a.js,b.js,c.js") into one URL
  * per component. A combo downloads as ONE script body, so a watchdog cut on a
  * hanging middle component (taobao's jstracker telemetry spins forever between
@@ -413,6 +423,12 @@ public:
      * focus/focusin on the new element. Repaints when the caret changes. */
     void setFocus(litehtml::element* el);
     void clearFocus();
+    /* Toggle a runtime pseudo-class (e.g. "hover", "focus") on `el` and every
+     * ancestor up to the root, then re-run the CSS cascade so :hover/:focus/
+     * :focus-within selectors that just started or stopped matching take
+     * effect. Returns true when any element's pseudo-class list actually
+     * changed. Safe to call with el=NULL. */
+    bool applyPseudoClassChain(litehtml::element* el, const char* name, bool add);
     /* Focus traversal across focusable elements (form widgets + <a href>) in
      * document order; reverse walks backwards (Shift+Tab). */
     void focusNext(bool reverse);
@@ -467,10 +483,12 @@ public:
                             int skip, void** out, int max);
     static void* jsCreateElement(void* ctx, const char* tag);
     static void* jsCreateTextNode(void* ctx, const char* text);
+    static void* jsCreateComment(void* ctx, const char* text);
     static void* jsElParent(void* ctx, void* el);
     static int   jsElChildCount(void* ctx, void* el);
     static void* jsElChild(void* ctx, void* el, int idx);
     static bool  jsElIsTag(void* ctx, void* el);
+    static bool  jsElIsComment(void* ctx, void* el);
     static bool  jsElIsLive(void* ctx, void* el);
     static bool  jsElAppendChild(void* ctx, void* parent, void* child);
     static bool  jsElInsertBefore(void* ctx, void* parent, void* child, void* ref);
@@ -668,6 +686,11 @@ public:
     bool                        m_cacheValid;
     bool                        m_contentDirty;
     uint64_t                    m_contentDirtySince;
+    /* True when the visible document's animation timeline has at least one
+     * running entry. Set by the engine-loop animation tick; included in the
+     * busy check so the loop polls at 4ms instead of parking for 200ms while
+     * an animation is in flight. */
+    bool                        m_animActive;
 
     /* ---- JavaScript (mario VM) state ---- */
     struct st_vm*               m_jsVm;

@@ -62,6 +62,56 @@ static bool html_has_inline_handlers(const std::string& lower);
  * offset found in one indexes the other. Matches only a whole attribute name -
  * preceded by start/whitespace and followed by optional space then '=' - so
  * data-src= / srcset= never false-match. Returns "" when absent or empty. */
+/* HTML-decode an attribute value (&quot; &apos; &#39; &lt; &gt; &nbsp; &amp;
+ * and numeric &#NN;/&#xNN;). Attribute values are entity-encoded in HTML; using
+ * them raw as URLs mangles requests: src="a?x=1&amp;y=2" must fetch a real '&',
+ * and CodePen fullpage emits src values wrapped in &quot; entities which then
+ * resolve as relative paths against the page URL (404). Non-ASCII codepoints
+ * are left encoded (URLs here stay byte-oriented). */
+static std::string html_decode_attr(const std::string& in)
+{
+    std::string out;
+    out.reserve(in.size());
+    for(size_t i = 0; i < in.size(); ) {
+        if(in[i] != '&') { out += in[i++]; continue; }
+        size_t semi = in.find(';', i);
+        if(semi == std::string::npos || semi - i > 10) { out += in[i++]; continue; }
+        std::string ent = in.substr(i + 1, semi - i - 1);
+        char c = 0;
+        if(ent == "quot") c = '"';
+        else if(ent == "apos" || ent == "#39") c = '\'';
+        else if(ent == "lt") c = '<';
+        else if(ent == "gt") c = '>';
+        else if(ent == "nbsp") c = ' ';
+        else if(ent == "amp") c = '&';
+        else if(ent.size() > 1 && ent[0] == '#') {
+            bool hex = (ent.size() > 2 && (ent[1] == 'x' || ent[1] == 'X'));
+            int cp = 0;
+            bool bad = false;
+            for(size_t k = hex ? 2 : 1; k < ent.size(); ++k) {
+                int d;
+                char ch = ent[k];
+                if(ch >= '0' && ch <= '9') d = ch - '0';
+                else if(hex && ch >= 'a' && ch <= 'f') d = ch - 'a' + 10;
+                else if(hex && ch >= 'A' && ch <= 'F') d = ch - 'A' + 10;
+                else { bad = true; break; }
+                cp = cp * (hex ? 16 : 10) + d;
+                if(cp > 127) { bad = true; break; }
+            }
+            if(!bad && cp > 0) c = (char)cp;
+        }
+        if(c == 0) { out += in[i++]; continue; }
+        out += c;
+        i = semi + 1;
+    }
+    /* A decoded value still wrapped in one quote pair (the &quot;-escaped form)
+     * is not a URL: drop the quotes so the asset resolves absolutely. */
+    if(out.size() >= 2 &&
+       ((out.front() == '"' && out.back() == '"') || (out.front() == '\'' && out.back() == '\'')))
+        out = out.substr(1, out.size() - 2);
+    return out;
+}
+
 static std::string script_attr_value(const std::string& lower_tag,
                                      const std::string& orig_tag, const char* name)
 {
@@ -83,7 +133,7 @@ static std::string script_attr_value(const std::string& lower_tag,
             } else {
                 while(v < orig_tag.size() && !::isspace((unsigned char)orig_tag[v]) && orig_tag[v] != '>') val += orig_tag[v++];
             }
-            return val;
+            return html_decode_attr(val);
         }
         pos = f + 1;
     }
@@ -328,6 +378,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_cacheValid(false)
     , m_contentDirty(false)
     , m_contentDirtySince(0)
+    , m_animActive(false)
     , m_jsVm(nullptr)
     , m_jsHasInlineHandlers(false)
     , m_jsEnabled(true)
@@ -490,7 +541,20 @@ void EWebEngine::engineStart()
      * whole. If the spawn fails the engine still works as a blank viewport:
      * the destructor sees m_engineStarted == false and tears down inline. */
     m_engineStop = false;
-    if(pthread_create(&m_engineThread, NULL, _ew_engine_thread, this) != 0) {
+    /* macOS pthreads default to a 512KB stack. The engine thread runs the mario
+     * VM AND the mark phase of its GC (gc_mark recurses one C frame per link of
+     * a captured-closure / object chain), and real bundles (webpack/React) build
+     * chains deep enough to blow 512KB and die on the stack guard page. Give the
+     * engine thread a browser-sized stack so deep-but-finite recursion survives. */
+    pthread_attr_t eng_attr;
+    pthread_attr_t* eng_attr_p = NULL;
+    if(pthread_attr_init(&eng_attr) == 0) {
+        pthread_attr_setstacksize(&eng_attr, 16 * 1024 * 1024);
+        eng_attr_p = &eng_attr;
+    }
+    int eng_rc = pthread_create(&m_engineThread, eng_attr_p, _ew_engine_thread, this);
+    if(eng_attr_p != NULL) pthread_attr_destroy(eng_attr_p);
+    if(eng_rc != 0) {
         EWEB_LOG("[ewebview] engine thread create FAILED\n");
         m_engineStarted = false;
         return;
@@ -675,6 +739,45 @@ void EWebEngine::engineLoop()
             markContentDirty();
         }
 
+        /* 8b. CSS animation tick. Advance every running transition/@keyframes
+         * entry on the visible document, write interpolated values onto the
+         * target elements, and mark content dirty so step 9 re-renders.
+         * m_animActive keeps the loop polling at 4ms while any animation is
+         * in flight instead of parking for 200ms. */
+        if(m_doc) {
+            uint64_t anim_now = ticMs();
+            bool anim_running = m_doc->tick_animations(anim_now);
+            if(anim_running) {
+                markContentDirty();
+            }
+            m_animActive = anim_running;
+
+            /* Phase 3.1: animation-driven relayout. tick_animations wrote new
+             * interpolated length values (width/height/margin/top/...) onto the
+             * target elements' override layer and queued the geometry-changing
+             * ones here. Re-run parse_styles on each so its box picks up the
+             * animated value, then relayout the document once and repaint.
+             * parse_styles is feedback-safe: the transition trigger only
+             * watches opacity/transform and the @keyframes trigger only
+             * restarts when the declaration set changes, so re-parsing for a
+             * length never spawns a new animation. Paint-only props (opacity,
+             * transform, border-radius) are never queued here, so a page that
+             * only animates those skips this block entirely. */
+            if(m_doc->has_anim_relayout()) {
+                std::vector<litehtml::html_tag*> relayout;
+                if(m_doc->drain_anim_relayout(relayout)) {
+                    for(size_t i = 0; i < relayout.size(); i++) {
+                        if(relayout[i]) relayout[i]->parse_styles(true);
+                    }
+                    m_doc->render(m_clientWidth);
+                    clampScrollLocked(m_doc->width(), m_doc->height());
+                    markContentDirty();
+                }
+            }
+        } else {
+            m_animActive = false;
+        }
+
         /* 9. render the viewport if the page changed or the scroll offset
          * moved away from what the cache holds. engineRenderFrame is a no-op
          * while a previous frame still awaits adoption (back-pressure). */
@@ -698,6 +801,7 @@ void EWebEngine::engineLoop()
                     m_contentDirty || m_needsLayout || m_needsStyleUpdate ||
                     m_buildNeedsLayout || m_buildNeedsStyleUpdate ||
                     m_styleStepInFlight || m_deferBuildStep || m_flushDeferredImages ||
+                    m_animActive ||
                     !m_jsPendingNav.empty() || m_jsScrollPending ||
                     (m_doc && (m_engineScrollX != m_cacheScrollX ||
                                m_engineScrollY != m_cacheScrollY || !m_cacheValid));
@@ -1744,6 +1848,35 @@ litehtml::element* EWebEngine::focusableAt(litehtml::element* el) const
     return nullptr;
 }
 
+bool EWebEngine::applyPseudoClassChain(litehtml::element* el, const char* name, bool add)
+{
+    /* ENGINE-THREAD ONLY. Toggle a runtime pseudo-class on `el` and every
+     * ancestor, then re-run the cascade so :hover/:focus/:focus-within rules
+     * that just started or stopped matching take effect. litehtml exposes
+     * set_pseudo_class() on element; find_styles_changes() on the document
+     * root walks the whole tree re-evaluating used selectors and calls
+     * refresh_styles()/parse_styles() on any element whose match state
+     * flipped. Returns true when at least one element's pseudo-class list
+     * actually changed (so callers can skip the restyle walk on no-ops). */
+    if(el == nullptr || name == nullptr || name[0] == 0) return false;
+    litehtml::document* doc = jsActiveDoc();
+    if(doc == nullptr) return false;
+
+    bool changed = false;
+    int guard = 0;
+    for(litehtml::element* cur = el; cur != nullptr && guard++ < 256; cur = cur->parent()) {
+        if(cur->set_pseudo_class(name, add)) changed = true;
+    }
+    if(!changed) return false;
+
+    litehtml::element::ptr root = doc->root();
+    if(root != nullptr) {
+        litehtml::position::vector redraw_boxes;
+        root->find_styles_changes(redraw_boxes, 0, 0);
+    }
+    return true;
+}
+
 void EWebEngine::setFocus(litehtml::element* el)
 {
     /* ENGINE-THREAD ONLY. Move keyboard focus, firing blur/focusout on the old
@@ -1766,6 +1899,13 @@ void EWebEngine::setFocus(litehtml::element* el)
         jsDispatchSimpleEvent(el, "focus", false);
         jsDispatchSimpleEvent(el, "focusin", true);
     }
+    /* Toggle the CSS :focus pseudo-class on both chains so pages that style
+     * :focus / :focus-visible / :focus-within actually see the state change.
+     * applyPseudoClassChain() also re-runs the cascade, so no explicit restyle
+     * is needed here. Order matters: clear the old first so overlapping
+     * ancestors don't briefly lose :focus-within. */
+    applyPseudoClassChain(old, "focus", false);
+    applyPseudoClassChain(el, "focus", true);
     /* Repaint so the caret / focus ring appears or disappears. */
     markContentDirty();
 }
@@ -3443,6 +3583,11 @@ void EWebEngine::advanceBuildStep()
         EWebContainer* old_container = m_container;
         litehtml::document::ptr old_doc = m_doc;
 
+        /* Clear any running CSS animations on the outgoing page so the
+         * timeline does not carry stale element pointers into the new doc. */
+        if(old_doc) old_doc->clear_animations();
+        m_animActive = false;
+
         // Install the new page.
         m_doc = m_buildDoc;
         m_container = m_buildContainer;
@@ -3700,6 +3845,32 @@ bool EWebEngine::pageShowsSkeletonPlaceholder() const
     return pageHasVisibleSkeleton(root, m_clientWidth * m_clientHeight * 3 / 10);
 }
 
+/* TEMP DIAGNOSTIC (taobao): count elements in a subtree and locate the app's
+ * mount point (#ice-container) so we can tell whether the React entry actually
+ * wrote DOM or bailed before rendering. Gated by EWEB_DOMDBG. Remove with the
+ * other temp probes. */
+static int ewebCountElements(litehtml::element* el)
+{
+    if(el == nullptr) return 0;
+    int n = 1;
+    size_t c = el->get_children_count();
+    for(size_t i = 0; i < c; ++i)
+        n += ewebCountElements(el->get_child((int)i));
+    return n;
+}
+static void ewebDumpMountDiag(litehtml::element* el, const char* wantId,
+                              int* foundCount, int* total)
+{
+    if(el == nullptr) return;
+    (*total)++;
+    const litehtml::tchar_t* id = el->get_attr(_t("id"), nullptr);
+    if(id != nullptr && t_strcasecmp(id, _t(wantId)) == 0)
+        *foundCount = ewebCountElements(el);
+    size_t c = el->get_children_count();
+    for(size_t i = 0; i < c; ++i)
+        ewebDumpMountDiag(el->get_child((int)i), wantId, foundCount, total);
+}
+
 void EWebEngine::decideCsrNotice()
 {
     /* ENGINE-THREAD ONLY. Classic-script client-rendered shell (taobao.com):
@@ -3709,6 +3880,15 @@ void EWebEngine::decideCsrNotice()
      * never loads) and the data APIs are unreachable by design. Arm the notice
      * instead of leaving grey blocks standing in for content forever. */
     m_moduleNoticeDecided = true;
+    if(getenv("EWEB_DOMDBG") != nullptr && m_doc != nullptr) {
+        litehtml::element::ptr root = m_doc->root();
+        int iceCount = 0, total = 0;
+        ewebDumpMountDiag(root, "ice-container", &iceCount, &total);
+        int bodyCount = 0, bodyTotal = 0;
+        /* body child element count: walk root, find body */
+        fprintf(stderr, "[domdbg] total_elements=%d ice-container_subtree=%d\n", total, iceCount);
+        (void)bodyCount; (void)bodyTotal;
+    }
     if(!pageShowsSkeletonPlaceholder())
         return;
     m_showModuleNotice = true;

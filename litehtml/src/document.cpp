@@ -179,6 +179,17 @@ litehtml::document::document(litehtml::document_container* objContainer, litehtm
 	m_step_parse_ms = 0;
 	m_step_start = 0;
 	m_step_exhausted = false;
+	/* Animation subsystem: latch the disable env var once at construction so
+	 * a single flag governs every start_animation() / tick_animations() call
+	 * for the lifetime of the document. Reading getenv on every tick would
+	 * be wasteful and could also produce inconsistent behaviour if the
+	 * environment mutated mid-page (which it does not on any supported
+	 * platform, but cheap insurance). */
+	{
+		const char* dis = getenv("EWEB_DISABLE_ANIMATION");
+		m_animations_disabled = (dis && dis[0] && dis[0] != '0');
+	}
+	m_anim_last_tick_ms = 0;
 }
 
 void litehtml::reset_dom_internal_profile()
@@ -722,15 +733,27 @@ int litehtml::document::cvt_units( css_length& val, int fontSize, int size ) con
 		val.set_value((float) ret, css_units_px);
 		break;
 	case css_units_vw:
+	case css_units_dvw:
+	case css_units_lvw:
+	case css_units_svw:
 		ret = (int)((double)m_media.width * (double)val.val() / 100.0);
 		break;
 	case css_units_vh:
+	case css_units_dvh:
+	case css_units_lvh:
+	case css_units_svh:
 		ret = (int)((double)m_media.height * (double)val.val() / 100.0);
 		break;
 	case css_units_vmin:
+	case css_units_dvmin:
+	case css_units_lvmin:
+	case css_units_svmin:
 		ret = (int)((double)std::min(m_media.height, m_media.width) * (double)val.val() / 100.0);
 		break;
 	case css_units_vmax:
+	case css_units_dvmax:
+	case css_units_lvmax:
+	case css_units_svmax:
 		ret = (int)((double)std::max(m_media.height, m_media.width) * (double)val.val() / 100.0);
 		break;
 	case css_units_rem:
@@ -1901,4 +1924,399 @@ void litehtml::document::fix_table_parent(element::ptr& el_ptr, style_display di
 			parent->m_children.insert(first, annon_tag);
 		}
 	}
+}
+
+/* ---- CSS animation subsystem (Phase 2) ---------------------------------- */
+
+void litehtml::document::add_keyframes(const tstring& name, const keyframes_rule& rule)
+{
+	tstring key = name;
+	lcase(key);
+	m_keyframes[key] = rule;
+}
+
+const litehtml::keyframes_rule* litehtml::document::find_keyframes(const tstring& name) const
+{
+	tstring key = name;
+	lcase(key);
+	std::map<tstring, keyframes_rule>::const_iterator it = m_keyframes.find(key);
+	if(it == m_keyframes.end()) return nullptr;
+	return &it->second;
+}
+
+void litehtml::document::start_animation(const active_anim& a)
+{
+	if(m_animations_disabled) return;
+	if(!a.element) return;
+
+	/* Hard cap: refuse new entries beyond 64 to prevent a runaway SPA from
+	 * growing the timeline without bound. */
+	const size_t kMaxTimeline = 64;
+	/* Maximum single-animation duration: 60s. Clamp so a mistyped value
+	 * (e.g. 999999s) cannot keep an entry alive forever. */
+	const int kMaxDurationMs = 60000;
+
+	active_anim entry = a;
+	if(entry.duration_ms > kMaxDurationMs)
+		entry.duration_ms = kMaxDurationMs;
+
+	/* Replace an existing entry for the same (element, property/keyframes_name)
+	 * pair so a re-cascade restarts the animation rather than stacking
+	 * duplicates. */
+	for(size_t i = 0; i < m_anim_timeline.size(); i++)
+	{
+		active_anim& ex = m_anim_timeline[i];
+		if(ex.element != entry.element) continue;
+		bool same = entry.is_transition
+			? (ex.is_transition && ex.property == entry.property)
+			: (!ex.is_transition && ex.keyframes_name == entry.keyframes_name);
+		if(same)
+		{
+			m_anim_timeline[i] = entry;
+			return;
+		}
+	}
+
+	if(m_anim_timeline.size() >= kMaxTimeline)
+	{
+		/* Drop the oldest finished entry first; if none, refuse. */
+		bool dropped = false;
+		for(size_t i = 0; i < m_anim_timeline.size(); i++)
+		{
+			if(m_anim_timeline[i].finished)
+			{
+				m_anim_timeline.erase(m_anim_timeline.begin() + (int)i);
+				dropped = true;
+				break;
+			}
+		}
+		if(!dropped) return;
+	}
+
+	m_anim_timeline.push_back(entry);
+}
+
+bool litehtml::document::tick_animations(uint64_t now_ms)
+{
+	if(m_animations_disabled) return false;
+	if(m_anim_timeline.empty()) return false;
+
+	m_anim_last_tick_ms = now_ms;
+	bool any_running = false;
+
+	/* EWEB_ANIM_DEBUG: dump timeline stats to stderr once per tick. */
+	static bool s_anim_debug = []() {
+		const char* d = getenv("EWEB_ANIM_DEBUG");
+		return d && d[0] && d[0] != '0';
+	}();
+	if(s_anim_debug)
+	{
+		uint64_t oldest_age = 0;
+		size_t running_count = 0;
+		for(size_t i = 0; i < m_anim_timeline.size(); i++)
+		{
+			if(!m_anim_timeline[i].finished)
+			{
+				running_count++;
+				uint64_t age = (now_ms > m_anim_timeline[i].start_ms)
+					? (now_ms - m_anim_timeline[i].start_ms) : 0;
+				if(age > oldest_age) oldest_age = age;
+			}
+		}
+		fprintf(stderr, "[anim] tick now=%llu timeline=%zu running=%zu oldest_age=%llums\n",
+			(unsigned long long)now_ms, m_anim_timeline.size(), running_count,
+			(unsigned long long)oldest_age);
+	}
+
+	/* Hard cap on per-tick work: advance at most 128 entries per call so a
+	 * large timeline cannot stall the engine loop. */
+	const size_t kMaxPerTick = 128;
+	size_t processed = 0;
+
+	for(size_t i = 0; i < m_anim_timeline.size() && processed < kMaxPerTick; i++)
+	{
+		active_anim& a = m_anim_timeline[i];
+		if(a.finished)
+		{
+			/* Keep finished entries with fill-mode:forwards so the override
+			 * stays applied; drop the rest lazily below. */
+			if(a.fill_mode == anim_fill_forwards || a.fill_mode == anim_fill_both)
+				any_running = false;  /* not running, but keep the entry */
+			continue;
+		}
+		processed++;
+
+		if(!a.element) { a.finished = true; continue; }
+
+		/* Paused: accumulate pause time but do not advance. */
+		if(a.play_state == anim_play_paused)
+		{
+			if(a.paused_at_ms == 0) a.paused_at_ms = now_ms;
+			any_running = true;
+			continue;
+		}
+		if(a.paused_at_ms != 0)
+		{
+			a.pause_accum_ms += now_ms - a.paused_at_ms;
+			a.paused_at_ms = 0;
+		}
+
+		uint64_t elapsed = (now_ms > a.start_ms + a.pause_accum_ms)
+			? (now_ms - a.start_ms - a.pause_accum_ms) : 0;
+
+		/* Delay phase. */
+		if((int)elapsed < a.delay_ms)
+		{
+			/* fill-mode backwards/both: apply the from-value during delay. */
+			if(a.fill_mode == anim_fill_backwards || a.fill_mode == anim_fill_both)
+			{
+				if(a.is_transition && property_is_interpolable(a.property))
+				{
+					a.element->set_anim_override(a.property.c_str(), a.from_str.c_str());
+					note_anim_relayout(a.element, a.property);
+					if(a.property == _t("opacity"))
+					{
+						float fv = (float) atof(a.from_str.c_str());
+						a.element->set_animated_opacity(fv);
+					}
+					else if(a.property == _t("transform"))
+					{
+						a.element->set_animated_transform(a.from_str.c_str());
+					}
+				}
+				else if(!a.is_transition)
+				{
+					const keyframes_rule* rule = find_keyframes(a.keyframes_name);
+					if(rule)
+					{
+						props_map sampled;
+						sample_keyframes(*rule, 0.0f, sampled);
+						for(props_map::const_iterator it = sampled.begin(); it != sampled.end(); ++it)
+						{
+							if(property_is_interpolable(it->first))
+							{
+								a.element->set_anim_override(it->first.c_str(), it->second.m_value.c_str());
+								note_anim_relayout(a.element, it->first);
+								if(it->first == _t("opacity"))
+									a.element->set_animated_opacity((float) atof(it->second.m_value.c_str()));
+								else if(it->first == _t("transform"))
+									a.element->set_animated_transform(it->second.m_value.c_str());
+							}
+						}
+					}
+				}
+			}
+			any_running = true;
+			continue;
+		}
+
+		uint64_t active_elapsed = elapsed - (uint64_t)a.delay_ms;
+		int duration = a.duration_ms > 0 ? a.duration_ms : 1;
+		float raw_progress = (float)active_elapsed / (float)duration;
+
+		/* Iteration handling. */
+		float total_iters;
+		if(a.iteration_count < 0.0f)
+		{
+			/* infinite */
+			total_iters = raw_progress;
+			any_running = true;
+		}
+		else
+		{
+			total_iters = raw_progress;
+			if(raw_progress >= a.iteration_count)
+			{
+				/* Animation finished. */
+				a.finished = true;
+				total_iters = a.iteration_count;
+				if(a.fill_mode == anim_fill_forwards || a.fill_mode == anim_fill_both)
+				{
+					/* Keep the end-state override applied. */
+				}
+				else
+				{
+					/* Clear overrides so the element snaps back to CSS. */
+					if(a.is_transition)
+					{
+						a.element->clear_anim_override(a.property.c_str());
+						/* The override is gone, so geometry reverts to the CSS
+						 * value; request one relayout so the element doesn't keep
+						 * the last interpolated size. No-op for paint-only props. */
+						note_anim_relayout(a.element, a.property);
+						if(a.property == _t("opacity"))
+						{
+							/* Restore CSS opacity by re-reading the style. */
+							const tchar_t* css_op = a.element->get_style_property(_t("opacity"), false, _t("1"));
+							float rv = css_op ? (float) atof(css_op) : 1.0f;
+							a.element->set_animated_opacity(rv);
+						}
+						else if(a.property == _t("transform"))
+						{
+							/* Restore the authored CSS transform (m_transform still
+							 * holds the last animated matrix otherwise). */
+							const tchar_t* css_xf = a.element->get_style_property(_t("transform"), false, _t("none"));
+							a.element->parse_transform_list(css_xf ? css_xf : _t("none"));
+						}
+					}
+					else
+					{
+						a.element->clear_anim_overrides();
+						/* Keyframe snap-back: if any stop touched a layout prop,
+						 * note a relayout (note_anim_relayout dedups, so this is
+						 * at most one entry per element). */
+						const keyframes_rule* done_rule = find_keyframes(a.keyframes_name);
+						if(done_rule)
+						{
+							for(size_t si = 0; si < done_rule->stops.size(); si++)
+							{
+								for(props_map::const_iterator pi = done_rule->stops[si].props.begin();
+									pi != done_rule->stops[si].props.end(); ++pi)
+								{
+									note_anim_relayout(a.element, pi->first);
+								}
+							}
+						}
+						const tchar_t* css_op = a.element->get_style_property(_t("opacity"), false, _t("1"));
+						float rv = css_op ? (float) atof(css_op) : 1.0f;
+						a.element->set_animated_opacity(rv);
+						const tchar_t* css_xf = a.element->get_style_property(_t("transform"), false, _t("none"));
+						a.element->parse_transform_list(css_xf ? css_xf : _t("none"));
+					}
+				}
+				continue;
+			}
+			any_running = true;
+		}
+
+		/* Per-iteration progress and direction. */
+		float iter_progress = fmodf(total_iters, 1.0f);
+		int   cur_iter      = (int) floorf(total_iters);
+		bool  reverse       = false;
+		switch(a.direction)
+		{
+		case anim_dir_normal:            reverse = false; break;
+		case anim_dir_reverse:           reverse = true;  break;
+		case anim_dir_alternate:         reverse = (cur_iter % 2 == 1); break;
+		case anim_dir_alternate_reverse: reverse = (cur_iter % 2 == 0); break;
+		}
+		if(reverse) iter_progress = 1.0f - iter_progress;
+
+		float eased = a.timing.eval(iter_progress);
+
+		/* Write the interpolated value. */
+		if(a.is_transition)
+		{
+			if(property_is_interpolable(a.property))
+			{
+				tstring val;
+				if(interpolate_property(a.property, a.from_str, a.to_str, eased, val))
+				{
+					a.element->set_anim_override(a.property.c_str(), val.c_str());
+					note_anim_relayout(a.element, a.property);
+					if(a.property == _t("opacity"))
+						a.element->set_animated_opacity((float) atof(val.c_str()));
+					else if(a.property == _t("transform"))
+						a.element->set_animated_transform(val.c_str());
+				}
+			}
+		}
+		else
+		{
+			const keyframes_rule* rule = find_keyframes(a.keyframes_name);
+			if(rule)
+			{
+				props_map sampled;
+				sample_keyframes(*rule, eased, sampled);
+				for(props_map::const_iterator it = sampled.begin(); it != sampled.end(); ++it)
+				{
+					if(property_is_interpolable(it->first))
+					{
+						a.element->set_anim_override(it->first.c_str(), it->second.m_value.c_str());
+						note_anim_relayout(a.element, it->first);
+						if(it->first == _t("opacity"))
+							a.element->set_animated_opacity((float) atof(it->second.m_value.c_str()));
+						else if(it->first == _t("transform"))
+							a.element->set_animated_transform(it->second.m_value.c_str());
+					}
+				}
+			}
+		}
+	}
+
+	/* Lazily drop finished entries that have no fill-mode keeping them alive.
+	 * Done after the main loop so indices stay stable during iteration. */
+	for(int i = (int)m_anim_timeline.size() - 1; i >= 0; i--)
+	{
+		const active_anim& a = m_anim_timeline[i];
+		if(a.finished && a.fill_mode != anim_fill_forwards && a.fill_mode != anim_fill_both)
+		{
+			m_anim_timeline.erase(m_anim_timeline.begin() + i);
+		}
+	}
+
+	return any_running;
+}
+
+void litehtml::document::clear_animations()
+{
+	/* Clear overrides on every targeted element before dropping the timeline
+	 * so no stale animated value survives a navigation. */
+	for(size_t i = 0; i < m_anim_timeline.size(); i++)
+	{
+		if(m_anim_timeline[i].element)
+			m_anim_timeline[i].element->clear_anim_overrides();
+	}
+	m_anim_timeline.clear();
+	m_anim_last_tick_ms = 0;
+}
+
+void litehtml::document::clear_animations_for(html_tag* el)
+{
+	if(!el) return;
+	for(int i = (int)m_anim_timeline.size() - 1; i >= 0; i--)
+	{
+		if(m_anim_timeline[i].element == el)
+		{
+			m_anim_timeline.erase(m_anim_timeline.begin() + i);
+		}
+	}
+	el->clear_anim_overrides();
+}
+
+void litehtml::document::note_anim_relayout(html_tag* el, const tstring& prop)
+{
+	/* Phase 3.1: only layout-affecting length properties (width/height/
+	 * margin/padding/top/left/...) need an animation-driven relayout. Paint-
+	 * only props (opacity, transform, border-radius) are consumed at draw
+	 * time and must NOT be recorded here or we would re-render the whole
+	 * document every frame for a value that never moves geometry. */
+	if(!el) return;
+	if(!property_needs_relayout(prop)) return;
+
+	/* Dedup first (cheap): one element may interpolate several length props in
+	 * a single tick, and a single relayout pass covers all of them. Checking
+	 * this before the subtree walk avoids repeating the walk per property. */
+	for(size_t i = 0; i < m_anim_relayout.size(); i++)
+	{
+		if(m_anim_relayout[i] == el) return;
+	}
+
+	/* Node budget guard: relayouting a huge subtree every frame is the main
+	 * perf hazard of animating geometry, so degrade those to a discrete
+	 * switch (the override is already applied by the caller, the element just
+	 * snaps instead of smoothly reflowing). The walk itself is bounded by the
+	 * budget so this check is never more expensive than the relayout it vets. */
+	static const int kAnimRelayoutNodeBudget = 512;
+	if(!el->subtree_within_budget(kAnimRelayoutNodeBudget)) return;
+
+	m_anim_relayout.push_back(el);
+}
+
+bool litehtml::document::drain_anim_relayout(std::vector<html_tag*>& out)
+{
+	if(m_anim_relayout.empty()) return false;
+	out.swap(m_anim_relayout);
+	m_anim_relayout.clear();
+	return true;
 }

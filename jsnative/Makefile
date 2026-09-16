@@ -55,6 +55,8 @@ NATIVE_OBJS = \
 	$(ARCH)/vm/lang/js/native/builtin/SharedArrayBuffer/native_SharedArrayBuffer.o \
 	$(ARCH)/vm/lang/js/native/builtin/Atomics/native_Atomics.o \
 	$(ARCH)/vm/lang/js/native/builtin/RegExp/native_RegExp.o \
+	$(ARCH)/vm/lang/js/native/builtin/TextEncoder/native_TextEncoder.o \
+	$(ARCH)/vm/lang/js/native/builtin/Stream/native_Stream.o \
 	\
 	$(ARCH)/vm/lang/js/native/natives/natives.o \
 	$(ARCH)/vm/lang/js/native/natives/JSON/JSON.o \

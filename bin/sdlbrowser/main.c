@@ -42,6 +42,86 @@
 #include <ewebview.h>
 #include <ewebview_port.h>
 
+/* TEMP DIAGNOSTIC: in-process crash backtrace. lldb changes timing enough that
+ * the intermittent SIGSEGV (Heisenbug) never reproduces under it, and /cores is
+ * root-only so no core dump lands. Installing a SIGSEGV/SIGBUS handler that
+ * walks the native stack with backtrace_symbols_fd() captures the faulting
+ * frames without a debugger and without perturbing timing. Remove with the rest
+ * of the temporary diagnostics once the crash root cause is fixed. */
+#if defined(__APPLE__) || defined(__linux__)
+#include <signal.h>
+#include <execinfo.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/ucontext.h>
+#endif
+static void browser_crash_handler(int sig, siginfo_t* si, void* uc) {
+    /* If a JS run boundary (a page script / the timer poll) armed a SEGV
+     * recovery checkpoint, jump back to it and skip the faulting unit instead
+     * of aborting the whole browser. Returns 0 (no-op) when nothing is armed,
+     * in which case fall through to the diagnostic dump below. */
+    extern int eweb_segv_try_recover(void);
+    if(eweb_segv_try_recover()) return;   /* not reached when a checkpoint is armed */
+    void* frames[128];
+    int n = backtrace(frames, 128);
+    char hdr[512];
+    int len = snprintf(hdr, sizeof(hdr),
+        "\n[crash] signal=%d addr=%p\n", sig, si ? si->si_addr : (void*)0);
+    if(len > 0) (void)!write(STDERR_FILENO, hdr, (size_t)len);
+#if defined(__APPLE__) && defined(__arm64__)
+    /* TEMP DIAGNOSTIC: dump the real faulting PC/LR/SP and the callee-saved +
+     * argument registers straight from the signal ucontext. The backtrace below
+     * only yields return addresses (the LR pushed at the `blr` site), so it can
+     * not show WHICH opcode handler dereferenced the wild data pointer nor which
+     * register held it. __knownsym is a static symbol whose link-time address is
+     * in nm; slide = runtime(__knownsym) - static(__knownsym) lets the raw pc be
+     * mapped back to a disassemblable file offset. */
+    if(uc != NULL) {
+        ucontext_t* ucp = (ucontext_t*)uc;
+        _STRUCT_MCONTEXT64* mc = (_STRUCT_MCONTEXT64*)ucp->uc_mcontext;
+        if(mc != NULL) {
+            struct __darwin_arm_thread_state64 ss = mc->__ss;
+            static volatile int knownsym_anchor = 0;
+            (void)knownsym_anchor;
+            char rb[1024];
+            int rl = snprintf(rb, sizeof(rb),
+                "[crashreg] pc=%p lr=%p sp=%p fp=%p knownsym=%p\n",
+                (void*)ss.__pc, (void*)ss.__lr, (void*)ss.__sp, (void*)ss.__fp,
+                (void*)&browser_crash_handler);
+            if(rl > 0) (void)!write(STDERR_FILENO, rb, (size_t)rl);
+            for(int i = 0; i < 29; i += 4) {
+                char xb[512];
+                int xl = snprintf(xb, sizeof(xb),
+                    "[crashreg] x%d=%p x%d=%p x%d=%p x%d=%p\n",
+                    i,   (void*)ss.__x[i],
+                    i+1, (i+1 < 29) ? (void*)ss.__x[i+1] : (void*)0,
+                    i+2, (i+2 < 29) ? (void*)ss.__x[i+2] : (void*)0,
+                    i+3, (i+3 < 29) ? (void*)ss.__x[i+3] : (void*)0);
+                if(xl > 0) (void)!write(STDERR_FILENO, xb, (size_t)xl);
+            }
+        }
+    }
+#endif
+    /* Dump the mario VM scope/closure chain health at the fault (read-only, never
+     * dereferences a corrupt key) so the use-after-free var is identified. */
+    extern void mario_report_scope_integrity(void);
+    mario_report_scope_integrity();
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    _exit(128 + sig);
+}
+static void browser_install_crash_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = browser_crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+#else
+static void browser_install_crash_handler(void) {}
+#endif
+
 /* The SDL2 port lives in libewebview.a (porting/src/sdl2/port_sdl2.c) but is
  * not declared in the public header; declare it here. */
 extern void eweb_port_sdl2(eweb_port_t* port, void* ud);
@@ -1131,6 +1211,18 @@ static void browser_apply_scale(browser_t* b) {
     float old_scale = b->ui_scale;
     b->ui_scale = (pts_w > 0 && b->win_w > 0) ? ((float)b->win_w / (float)pts_w) : 1.0f;
     if(b->ui_scale < 0.5f) b->ui_scale = 1.0f;   /* guard: unknown -> treat as 1x */
+    /* Headless / CI HiDPI regression: force the device-pixel ratio so the
+     * dpr>1 raster paths (gradient temp surfaces, crisp text) can run on a
+     * 1x or dummy display where SDL reports no window scale. The viewport
+     * below derives logical CSS px from win_w/ui_scale, so a forced 2x on a
+     * 1x renderer is exactly a Retina window of half the logical size. */
+    {
+        const char* us = SDL_getenv("EWEB_UI_SCALE");
+        if(us && us[0]) {
+            float f = (float)SDL_atof(us);
+            if(f >= 0.5f && f <= 4.0f) b->ui_scale = f;
+        }
+    }
     /* The SDL2 port rasterises the page at this ratio: logical CSS-px layout at
      * native device-px resolution (crisp text at normal physical size). */
     eweb_port_sdl2_set_dpr(b->ui_scale);
@@ -1605,6 +1697,7 @@ static void browser_destroy(browser_t* b) {
 
 int main(int argc, char** argv) {
     browser_t browser;
+    browser_install_crash_handler();
     browser_detect_color_scheme();
     if(!browser_init(&browser, argc, argv)) {
         browser_destroy(&browser);

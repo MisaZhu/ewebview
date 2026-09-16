@@ -1282,7 +1282,13 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
                     px[yy * tw + xx] = c;
                 }
             }
-            gfx->blit_fit_alpha(gfx->ud, tmp, 0, 0, tw, th, s, cb.x, cb.y, cb.width, cb.height, 0xFF);
+            /* src rect lives in the SOURCE surface's logical space (the HAL
+             * scales it by tmp's own dpr); tmp was created at cb.width x
+             * cb.height logical, so passing the device-pixel tw/th here
+             * double-scaled the src rect on HiDPI (dpr=2) and SDL's clip of
+             * the oversized src shrank the dst to half the clip box - the
+             * half-size hero gradient and clipped pill buttons on Retina. */
+            gfx->blit_fit_alpha(gfx->ud, tmp, 0, 0, cb.width, cb.height, s, cb.x, cb.y, cb.width, cb.height, 0xFF);
         }
         gfx->surface_free(gfx->ud, tmp);
         return;
@@ -1447,6 +1453,75 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
     if(!do_image) {
         if(alpha == 0)
             return;
+        if(m_xform_on && !bg.is_root) {
+            /* CSS transform: the software HAL has no transformed blit, so fill
+             * the (rounded) box through the paint matrix as a polygon. Rounded
+             * corners are approximated with arc segments; gradient/image
+             * backgrounds are not transformed in this path (rare combination).
+             * Content (text/children) is painted separately and stays
+             * untransformed in this phase. */
+            const float* M = m_xform;
+            const litehtml::position& cb = bg.clip_box;
+            float X = (float)cb.x, Y = (float)cb.y;
+            float W = (float)cb.width, H = (float)cb.height;
+            if(W > 0.0f && H > 0.0f) {
+                float rtl = (float)bg.border_radius.top_left_x,     rty = (float)bg.border_radius.top_left_y;
+                float rtr = (float)bg.border_radius.top_right_x,    rry = (float)bg.border_radius.top_right_y;
+                float rbr = (float)bg.border_radius.bottom_right_x, rby = (float)bg.border_radius.bottom_right_y;
+                float rbl = (float)bg.border_radius.bottom_left_x,  rly = (float)bg.border_radius.bottom_left_y;
+                /* Clamp opposing corners so arcs never overlap (CSS rule). */
+                float f = 1.0f;
+                if(rtl + rtr > 0) f = std::min(f, W / (rtl + rtr));
+                if(rbl + rbr > 0) f = std::min(f, W / (rbl + rbr));
+                if(rty + rly > 0) f = std::min(f, H / (rty + rly));
+                if(rry + rby > 0) f = std::min(f, H / (rry + rby));
+                rtl *= f; rtr *= f; rbr *= f; rbl *= f;
+                rty *= f; rry *= f; rby *= f; rly *= f;
+                std::vector<float> local;
+                local.reserve(64);
+                const int SEG = 6;
+                auto arc = [&](float cx, float cy, float rx, float ry, float a0, float a1) {
+                    for(int i = 0; i <= SEG; i++) {
+                        float a = a0 + (a1 - a0) * (float)i / (float)SEG;
+                        local.push_back(cx + rx * cosf(a));
+                        local.push_back(cy + ry * sinf(a));
+                    }
+                };
+                const float kPi = 3.14159265358979f;
+                /* Clockwise from the top-left corner. */
+                local.push_back(X + rtl); local.push_back(Y);
+                local.push_back(X + W - rtr); local.push_back(Y);
+                if(rtr > 0 && rry > 0) arc(X + W - rtr, Y + rry, rtr, rry, -kPi * 0.5f, 0.0f);
+                local.push_back(X + W); local.push_back(Y + H - rby);
+                if(rbr > 0 && rby > 0) arc(X + W - rbr, Y + H - rby, rbr, rby, 0.0f, kPi * 0.5f);
+                local.push_back(X + rbl); local.push_back(Y + H);
+                if(rbl > 0 && rly > 0) arc(X + rbl, Y + H - rly, rbl, rly, kPi * 0.5f, kPi);
+                local.push_back(X); local.push_back(Y + rty);
+                if(rtl > 0 && rty > 0) arc(X + rtl, Y + rty, rtl, rty, kPi, kPi * 1.5f);
+                /* Transform every point and compute the bbox clip. */
+                size_t n = local.size() / 2;
+                std::vector<float> pts(n * 2);
+                float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f;
+                for(size_t i = 0; i < n; i++) {
+                    float lx = local[i * 2], ly = local[i * 2 + 1];
+                    float dx = M[0] * lx + M[2] * ly + M[4];
+                    float dy = M[1] * lx + M[3] * ly + M[5];
+                    pts[i * 2] = dx; pts[i * 2 + 1] = dy;
+                    if(dx < minx) minx = dx;
+                    if(dx > maxx) maxx = dx;
+                    if(dy < miny) miny = dy;
+                    if(dy > maxy) maxy = dy;
+                }
+                litehtml::position cp;
+                cp.x = (int)floorf(minx); cp.y = (int)floorf(miny);
+                cp.width = (int)ceilf(maxx) - cp.x + 1;
+                cp.height = (int)ceilf(maxy) - cp.y + 1;
+                std::vector<int> counts(1, (int)n);
+                if(!fill_polys_aa(s, gfx, cp, pts.data(), counts.data(), 1, color))
+                    fill_polys_nz(s, gfx, cp, pts.data(), counts.data(), 1, color);
+                return;
+            }
+        }
         int rad_x = bg.border_radius.top_left_x;
         int rad_y = bg.border_radius.top_left_y;
         bool rounded = (rad_x > 0 || rad_y > 0) &&

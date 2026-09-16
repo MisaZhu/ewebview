@@ -165,6 +165,9 @@ typedef struct js_dom_callbacks {
      * may return NULL when the embedder cannot build the node. */
     js_element_t (*create_element)(void* ctx, const char* tag);
     js_element_t (*create_text_node)(void* ctx, const char* text);
+    /* document.createComment(text): a nodeType-8 marker node (React Suspense
+     * boundaries). Optional; NULL makes createComment throw. */
+    js_element_t (*create_comment)(void* ctx, const char* text);
 
     /* ---- tree walking / mutation ---- */
 
@@ -175,6 +178,8 @@ typedef struct js_dom_callbacks {
      * (elements only) from `childNodes` (everything). NULL => every child is
      * treated as an element. */
     bool         (*el_is_tag)(void* ctx, js_element_t el);
+    /* True for comment nodes (nodeType 8); NULL means "no comments exist". */
+    bool         (*el_is_comment)(void* ctx, js_element_t el);
 
     /* All three return true on success. insert_before appends when `ref` is
      * NULL. The embedder owns layout invalidation for these mutations. */

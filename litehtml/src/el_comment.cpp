@@ -16,6 +16,11 @@ void litehtml::el_comment::get_text( tstring& text )
 	text += m_text;
 }
 
+bool litehtml::el_comment::is_comment() const
+{
+	return true;
+}
+
 void litehtml::el_comment::set_data( const tchar_t* data )
 {
 	if(data)

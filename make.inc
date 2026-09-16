@@ -36,7 +36,7 @@ include $(ewebview_root)/host.rule
 endif
 
 
-LDFLAGS = -L $(SDK_DIR)/lib
+LDFLAGS = -L $(SDK_DIR)/lib $(LDFLAGS_EXTRA)
 # LITEHTML_LIFETIME_DEBUG is NOT a verbose-logging switch (that is XBROWSER_DEBUG):
 # it compiles in the html_tag lifetime registry and the authoritative liveness
 # gates in apply_stylesheet/apply_stylesheet_own/style_detached_subtree_walk.

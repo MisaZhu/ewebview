@@ -12,5 +12,6 @@ namespace litehtml
 
 		virtual void	get_text(tstring& text) override;
 		virtual void	set_data(const tchar_t* data) override;
+		virtual bool	is_comment() const override;
 	};
 }

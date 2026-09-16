@@ -309,6 +309,12 @@ litehtml::html_tag::~html_tag()
 #ifdef LITEHTML_LIFETIME_DEBUG
 	litehtml_lifetime_remove(this);
 #endif
+	/* Remove any running animations targeting this element so the document
+	 * timeline never holds a dangling pointer after the element is freed. */
+	{
+		document* doc = get_document();
+		if(doc) doc->clear_animations_for(this);
+	}
 	// Clear parent reference for all children before deleting them
 	// to prevent any issues with dangling parent pointers
 	for(auto& child : m_children)
@@ -1239,6 +1245,15 @@ const litehtml::tchar_t* litehtml::html_tag::get_style_property( const tchar_t* 
 
 const litehtml::tchar_t* litehtml::html_tag::get_style_property_own(const tchar_t* name) const
 {
+	/* Animation overrides (transition/@keyframes, Phase 3.1) win over the
+	 * cascade so an animation-driven relayout picks up the interpolated value
+	 * without rewriting the stylesheet. The map is empty except while an
+	 * animation runs, so non-animated pages are byte-for-byte unaffected. */
+	if(name && !m_anim_overrides.empty())
+	{
+		const tchar_t* ov = anim_override(name);
+		if(ov) return ov;
+	}
 	return m_style.get_property(name);
 }
 
@@ -1875,6 +1890,15 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		}
 	}
 	clear_style_property_cache();
+	/* Snapshot the pre-cascade opacity so the transition trigger at the end
+	 * of parse_styles can detect a change. m_opacity holds the value from
+	 * the previous parse_styles call (or the constructor default on first
+	 * call). */
+	float old_opacity_for_transition = m_opacity;
+	/* Snapshot the pre-cascade transform string for the same reason: the
+	 * trigger block at the end compares it against the freshly computed
+	 * m_transform_str to fire a transform transition. */
+	tstring old_transform_for_transition = m_transform_str;
 	bool profile_enabled = parse_style_profile_enabled();
 	uint64_t part_start = 0;
 	if(profile_enabled)
@@ -1996,12 +2020,20 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		m_text_transform = text_transform_none;
 	}
 
-	/* transform is not inherited: an absent own declaration is the identity */
+	/* transform is not inherited: an absent own declaration is the identity.
+	 * An animation override (m_anim_overrides["transform"]) wins over the CSS
+	 * value so tick_animations can drive transform without a re-cascade. */
 	m_transform.clear();
-	const tchar_t* own_transform = get_style_property_own(_t("transform"));
+	const tchar_t* own_transform = anim_override(_t("transform"));
+	if(!own_transform)
+		own_transform = get_style_property_own(_t("transform"));
 	if(own_transform)
 	{
 		parse_transform_list(own_transform);
+	}
+	else
+	{
+		m_transform_str.clear();
 	}
 
 	const tchar_t* own_white_space = own_style_ref_ptr(own_refs.white_space);
@@ -2054,9 +2086,13 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	 * product of this element's opacity and every ancestor's, so accumulate
 	 * top-down: the style walk visits parents first (see the display:inherit
 	 * path above), therefore the parent's cumulative value is already final.
-	 * opacity:0 keeps layout but must paint nothing - handled at draw time. */
+	 * opacity:0 keeps layout but must paint nothing - handled at draw time.
+	 * An animation override (m_anim_overrides["opacity"]) wins over the CSS
+	 * value so tick_animations can drive the property without a re-cascade. */
 	{
-		const tchar_t* own_opacity = get_style_property(_t("opacity"), false, _t("1"));
+		const tchar_t* own_opacity = anim_override(_t("opacity"));
+		if(!own_opacity)
+			own_opacity = get_style_property(_t("opacity"), false, _t("1"));
 		float op = own_opacity ? (float)atof(own_opacity) : 1.0f;
 		if(op < 0.0f) op = 0.0f;
 		if(op > 1.0f) op = 1.0f;
@@ -2755,6 +2791,142 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		parse_style_profile_add(g_parse_style_profile.background_ms, part_start);
 	}
 
+	/* ---- CSS animation trigger (Phase 2) ----
+	 * Parse transition/animation declarations from the freshly cascaded
+	 * m_style, detect changes, and enqueue active_anim entries on the
+	 * document timeline. Only opacity is interpolable in this phase; other
+	 * properties declared in transition/animation are captured but snap to
+	 * their end state (no half-animated garbage). */
+	{
+		std::vector<anim_declaration> new_transitions;
+		std::vector<anim_declaration> new_animations;
+		parse_transition_declarations(m_style.properties(), new_transitions);
+		parse_animation_declarations(m_style.properties(), new_animations);
+
+		document* adoc = get_document();
+		if(adoc && !adoc->animations_disabled())
+		{
+			uint64_t now = sys_tic_ms(0);
+
+			/* Transition trigger: fire when the computed opacity changed and
+			 * a transition declaration covers it. */
+			if(fabsf(m_opacity - old_opacity_for_transition) > 0.0001f)
+			{
+				for(size_t ti = 0; ti < new_transitions.size(); ti++)
+				{
+					const anim_declaration& tr = new_transitions[ti];
+					bool applies = (tr.property == _t("all") || tr.property == _t("opacity"));
+					if(!applies || tr.duration_ms <= 0) continue;
+					active_anim a;
+					a.element      = this;
+					a.is_transition = true;
+					a.property     = _t("opacity");
+					char fbuf[32], tbuf[32];
+					snprintf(fbuf, sizeof(fbuf), "%.4f", old_opacity_for_transition);
+					snprintf(tbuf, sizeof(tbuf), "%.4f", m_opacity);
+					a.from_str     = fbuf;
+					a.to_str       = tbuf;
+					a.start_ms     = now;
+					a.duration_ms  = tr.duration_ms;
+					a.delay_ms     = tr.delay_ms;
+					a.timing       = tr.timing;
+					a.iteration_count = 1.0f;
+					a.direction    = anim_dir_normal;
+					a.fill_mode    = tr.fill_mode;
+					a.play_state   = tr.play_state;
+					adoc->start_animation(a);
+					break;  /* one transition per property */
+				}
+			}
+
+			/* Transform transition trigger: fire when the computed transform
+			 * string changed and a transition declaration covers it. Empty and
+			 * "none" both mean identity, so a class flip between them is not a
+			 * change. from/to are passed as raw strings; interpolate_property
+			 * resolves each to a matrix and lerps the components. */
+			{
+				tstring old_xf = old_transform_for_transition;
+				tstring new_xf = m_transform_str;
+				trim(old_xf);
+				trim(new_xf);
+				bool old_none = old_xf.empty() || old_xf == _t("none");
+				bool new_none = new_xf.empty() || new_xf == _t("none");
+				bool xf_changed = (old_none != new_none) ||
+					(!old_none && !new_none && old_xf != new_xf);
+				if(xf_changed)
+				{
+					for(size_t ti = 0; ti < new_transitions.size(); ti++)
+					{
+						const anim_declaration& tr = new_transitions[ti];
+						bool applies = (tr.property == _t("all") || tr.property == _t("transform"));
+						if(!applies || tr.duration_ms <= 0) continue;
+						active_anim a;
+						a.element      = this;
+						a.is_transition = true;
+						a.property     = _t("transform");
+						a.from_str     = old_none ? _t("none") : old_xf;
+						a.to_str       = new_none ? _t("none") : new_xf;
+						a.start_ms     = now;
+						a.duration_ms  = tr.duration_ms;
+						a.delay_ms     = tr.delay_ms;
+						a.timing       = tr.timing;
+						a.iteration_count = 1.0f;
+						a.direction    = anim_dir_normal;
+						a.fill_mode    = tr.fill_mode;
+						a.play_state   = tr.play_state;
+						adoc->start_animation(a);
+						break;  /* one transition per property */
+					}
+				}
+			}
+
+			/* Animation trigger: start (or restart) each @keyframes animation
+			 * whose declaration set changed since the last parse_styles call.
+			 * Comparing name+duration is enough to detect a meaningful change
+			 * without restarting on every re-cascade that doesn't touch the
+			 * animation shorthand. */
+			bool anims_changed = (m_animations.size() != new_animations.size());
+			if(!anims_changed)
+			{
+				for(size_t i = 0; i < m_animations.size(); i++)
+				{
+					if(m_animations[i].name != new_animations[i].name ||
+					   m_animations[i].duration_ms != new_animations[i].duration_ms ||
+					   m_animations[i].iteration_count != new_animations[i].iteration_count)
+					{
+						anims_changed = true;
+						break;
+					}
+				}
+			}
+			if(anims_changed)
+			{
+				for(size_t ai = 0; ai < new_animations.size(); ai++)
+				{
+					const anim_declaration& an = new_animations[ai];
+					if(an.name.empty() || an.name == _t("none")) continue;
+					if(an.duration_ms <= 0) continue;
+					active_anim a;
+					a.element        = this;
+					a.is_transition  = false;
+					a.keyframes_name = an.name;
+					a.start_ms       = now;
+					a.duration_ms    = an.duration_ms;
+					a.delay_ms       = an.delay_ms;
+					a.timing         = an.timing;
+					a.iteration_count = an.iteration_count;
+					a.direction      = an.direction;
+					a.fill_mode      = an.fill_mode;
+					a.play_state     = an.play_state;
+					adoc->start_animation(a);
+				}
+			}
+		}
+
+		m_transitions = std::move(new_transitions);
+		m_animations  = std::move(new_animations);
+	}
+
 	/* A restyle (is_reparse) must reach the whole subtree: jsRestyleSubtree
 	 * re-cascades every descendant's m_style, but only this recursive walk
 	 * re-resolves the computed values (display and friends). Without it a
@@ -3064,6 +3236,109 @@ static bool has_matching_descendant(litehtml::html_tag* el, const litehtml::tstr
 	return false;
 }
 
+/* --- Attribute / state pseudo-class helpers (Phase 1.2) -------------------- */
+
+/* True when the element is a form control the CSS pseudo-classes :enabled,
+ * :disabled, :required, :optional, :read-only, :read-write, :default apply
+ * to. Kept in one place so the individual matchers agree on the tag set. */
+static bool is_form_control(litehtml::html_tag* el)
+{
+	const litehtml::tchar_t* tag = el->get_tagName();
+	if(!tag) return false;
+	return !t_strcasecmp(tag, _t("input")) ||
+		   !t_strcasecmp(tag, _t("textarea")) ||
+		   !t_strcasecmp(tag, _t("select")) ||
+		   !t_strcasecmp(tag, _t("button"));
+}
+
+/* :any-link / :link — element that is a hyperlink source. */
+static bool is_link_element(litehtml::html_tag* el)
+{
+	const litehtml::tchar_t* tag = el->get_tagName();
+	if(!tag) return false;
+	const litehtml::tchar_t* href = el->get_attr(_t("href"), nullptr);
+	if(!href || !href[0]) return false;
+	return !t_strcasecmp(tag, _t("a")) ||
+		   !t_strcasecmp(tag, _t("area")) ||
+		   !t_strcasecmp(tag, _t("link"));
+}
+
+/* :checked — checkbox/radio input with the checked attribute, or an <option>
+ * with the selected attribute. We deliberately do not track the live checked
+ * state mutated by user clicks; the DOM attribute is what CSS reads for
+ * cascade-time selection, and dynamic re-check is out of scope here. */
+static bool is_checked_element(litehtml::html_tag* el)
+{
+	const litehtml::tchar_t* tag = el->get_tagName();
+	if(!tag) return false;
+	if(!t_strcasecmp(tag, _t("input")))
+	{
+		const litehtml::tchar_t* type = el->get_attr(_t("type"), nullptr);
+		if(!type) return false;
+		if(t_strcasecmp(type, _t("checkbox")) && t_strcasecmp(type, _t("radio")))
+		{
+			return false;
+		}
+		return el->get_attr(_t("checked"), nullptr) != nullptr;
+	}
+	if(!t_strcasecmp(tag, _t("option")))
+	{
+		return el->get_attr(_t("selected"), nullptr) != nullptr;
+	}
+	return false;
+}
+
+/* :dir(ltr|rtl) — nearest ancestor (or self) with an explicit dir attribute
+ * decides; if none carries one, the document direction defaults to ltr per
+ * HTML. We do not implement the unicode-bidi heuristic. */
+static bool matches_dir(litehtml::html_tag* el, const litehtml::tstring& want)
+{
+	litehtml::tstring want_lc = want;
+	litehtml::trim(want_lc);
+	litehtml::lcase(want_lc);
+	if(want_lc != _t("ltr") && want_lc != _t("rtl"))
+	{
+		return false;
+	}
+	litehtml::element* cur = el;
+	int guard = 0;
+	while(cur && guard++ < 128)
+	{
+		const litehtml::tchar_t* d = cur->get_attr(_t("dir"), nullptr);
+		if(d && d[0])
+		{
+			litehtml::tstring dv = d;
+			litehtml::lcase(dv);
+			return dv == want_lc;
+		}
+		cur = cur->parent();
+	}
+	return want_lc == _t("ltr");
+}
+
+/* :focus-within — self or any ancestor currently carries the runtime
+ * "focus" pseudo-class. The engine's setFocus() is responsible for adding
+ * and removing "focus" via set_pseudo_class(). */
+static bool has_focus_within(litehtml::html_tag* el)
+{
+	litehtml::element* cur = el;
+	int guard = 0;
+	while(cur && guard++ < 128)
+	{
+		if(cur->is_html_tag())
+		{
+			litehtml::html_tag* t = static_cast<litehtml::html_tag*>(cur);
+			const litehtml::string_vector& pcs = t->pseudo_classes();
+			if(std::find(pcs.begin(), pcs.end(), litehtml::tstring(_t("focus"))) != pcs.end())
+			{
+				return true;
+			}
+		}
+		cur = cur->parent();
+	}
+	return false;
+}
+
 int litehtml::html_tag::select(const css_element_selector& selector, bool apply_pseudo)
 {
 	select_element_scope_t scope;
@@ -3211,8 +3486,30 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 
 				/* Structural pseudo-classes need a parent; :root is the
 				 * opposite - it matches exactly the parentless element. :has()
-				 * inspects descendants, not the parent, so it is exempt too. */
-				if(!el_parent && selector != pseudo_class_root && selector != pseudo_class_has)
+				 * inspects descendants, not the parent, so it is exempt too.
+				 * Attribute/state pseudo-classes (:focus-within, :focus-visible,
+				 * :dir(), :checked, :disabled, :enabled, :required, :optional,
+				 * :read-only, :read-write, :empty, :any-link, :default) match on
+				 * self or ancestors, so they must not be rejected when the
+				 * element happens to be a root. */
+				auto parentless_ok = [](int s) {
+					return s == pseudo_class_root ||
+						   s == pseudo_class_has ||
+						   s == pseudo_class_focus_within ||
+						   s == pseudo_class_focus_visible ||
+						   s == pseudo_class_dir ||
+						   s == pseudo_class_checked ||
+						   s == pseudo_class_disabled ||
+						   s == pseudo_class_enabled ||
+						   s == pseudo_class_required ||
+						   s == pseudo_class_optional ||
+						   s == pseudo_class_read_only ||
+						   s == pseudo_class_read_write ||
+						   s == pseudo_class_empty ||
+						   s == pseudo_class_any_link ||
+						   s == pseudo_class_default;
+				};
+				if(!el_parent && !parentless_ok(selector))
 				{
 					return select_no_match;
 				}
@@ -3327,6 +3624,228 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 						{
 							return select_no_match;
 						}
+					}
+					break;
+				case pseudo_class_focus_within:
+					/* :focus-within matches when self or any ancestor carries
+					 * the runtime "focus" pseudo-class. */
+					if(!has_focus_within(this))
+					{
+						return select_no_match;
+					}
+					break;
+				case pseudo_class_focus_visible:
+					/* :focus-visible approximation: we do not track keyboard
+					 * vs pointer focus origin, so treat it as an alias for
+					 * :focus. Pages that hide focus rings for pointer input
+					 * will still show them; better than dropping the rule. */
+					if(std::find(m_pseudo_classes.begin(), m_pseudo_classes.end(), tstring(_t("focus"))) == m_pseudo_classes.end())
+					{
+						return select_no_match;
+					}
+					break;
+				case pseudo_class_dir:
+					if(!matches_dir(this, selector_param))
+					{
+						return select_no_match;
+					}
+					break;
+				case pseudo_class_checked:
+					if(!is_checked_element(this))
+					{
+						return select_no_match;
+					}
+					break;
+				case pseudo_class_disabled:
+					/* Form controls with the disabled attribute; button/optgroup/
+					 * option/fieldset also honour it. */
+					if(!is_form_control(this) &&
+					   t_strcasecmp(m_tag.c_str(), _t("optgroup")) &&
+					   t_strcasecmp(m_tag.c_str(), _t("option")) &&
+					   t_strcasecmp(m_tag.c_str(), _t("fieldset")))
+					{
+						return select_no_match;
+					}
+					if(!get_attr(_t("disabled"), nullptr))
+					{
+						return select_no_match;
+					}
+					break;
+				case pseudo_class_enabled:
+					/* Form controls without the disabled attribute. Browsers
+					 * also enable elements focusable by default; we stick to
+					 * the attribute rule that pages actually rely on. */
+					if(!is_form_control(this) &&
+					   t_strcasecmp(m_tag.c_str(), _t("optgroup")) &&
+					   t_strcasecmp(m_tag.c_str(), _t("option")) &&
+					   t_strcasecmp(m_tag.c_str(), _t("fieldset")))
+					{
+						return select_no_match;
+					}
+					if(get_attr(_t("disabled"), nullptr))
+					{
+						return select_no_match;
+					}
+					break;
+				case pseudo_class_required:
+					if(!is_form_control(this))
+					{
+						return select_no_match;
+					}
+					if(!get_attr(_t("required"), nullptr))
+					{
+						return select_no_match;
+					}
+					break;
+				case pseudo_class_optional:
+					if(!is_form_control(this))
+					{
+						return select_no_match;
+					}
+					if(get_attr(_t("required"), nullptr))
+					{
+						return select_no_match;
+					}
+					break;
+				case pseudo_class_read_only:
+					/* Non-form elements are :read-only by default in the spec;
+					 * form controls are :read-only when readonly or disabled,
+					 * or when the input type is not editable (submit/button/
+					 * checkbox/radio/hidden/etc.). We approximate by treating
+					 * text-ish inputs and textareas as the only editable set. */
+					{
+						const tchar_t* tn = m_tag.c_str();
+						bool editable = false;
+						if(!t_strcasecmp(tn, _t("textarea")))
+						{
+							editable = true;
+						} else if(!t_strcasecmp(tn, _t("input")))
+						{
+							const tchar_t* ty = get_attr(_t("type"), nullptr);
+							if(!ty) ty = _t("text");
+							editable = (!t_strcasecmp(ty, _t("text")) ||
+										!t_strcasecmp(ty, _t("search")) ||
+										!t_strcasecmp(ty, _t("tel")) ||
+										!t_strcasecmp(ty, _t("url")) ||
+										!t_strcasecmp(ty, _t("email")) ||
+										!t_strcasecmp(ty, _t("password")) ||
+										!t_strcasecmp(ty, _t("number")));
+						}
+						if(!editable)
+						{
+							/* contenteditable also makes an element editable. */
+							const tchar_t* ce = get_attr(_t("contenteditable"), nullptr);
+							if(ce && t_strcasecmp(ce, _t("false")))
+							{
+								editable = true;
+							}
+						}
+						if(editable)
+						{
+							if(get_attr(_t("readonly"), nullptr) || get_attr(_t("disabled"), nullptr))
+							{
+								/* fall through: read-only matches */
+							} else
+							{
+								return select_no_match;
+							}
+						}
+					}
+					break;
+				case pseudo_class_read_write:
+					{
+						const tchar_t* tn = m_tag.c_str();
+						bool editable = false;
+						if(!t_strcasecmp(tn, _t("textarea")))
+						{
+							editable = true;
+						} else if(!t_strcasecmp(tn, _t("input")))
+						{
+							const tchar_t* ty = get_attr(_t("type"), nullptr);
+							if(!ty) ty = _t("text");
+							editable = (!t_strcasecmp(ty, _t("text")) ||
+										!t_strcasecmp(ty, _t("search")) ||
+										!t_strcasecmp(ty, _t("tel")) ||
+										!t_strcasecmp(ty, _t("url")) ||
+										!t_strcasecmp(ty, _t("email")) ||
+										!t_strcasecmp(ty, _t("password")) ||
+										!t_strcasecmp(ty, _t("number")));
+						}
+						if(!editable)
+						{
+							const tchar_t* ce = get_attr(_t("contenteditable"), nullptr);
+							if(ce && t_strcasecmp(ce, _t("false")))
+							{
+								editable = true;
+							}
+						}
+						if(!editable) return select_no_match;
+						if(get_attr(_t("readonly"), nullptr) || get_attr(_t("disabled"), nullptr))
+						{
+							return select_no_match;
+						}
+					}
+					break;
+				case pseudo_class_empty:
+					/* :empty — no element children and no text children.
+					 * Comments and CDATA (m_skip=true from construction) do
+					 * not affect emptiness per the spec. We approximate by
+					 * iterating children and ignoring those whose original
+					 * skip flag was set at construction time; text nodes
+					 * with any content (even whitespace) make it non-empty. */
+					{
+						bool empty = true;
+						for(size_t ci = 0; ci < get_children_count(); ci++)
+						{
+							element::ptr c = get_child((int)ci);
+							if(!c) continue;
+							const tchar_t* cn = c->get_tagName();
+							/* Pseudo-elements are not real children. */
+							if(cn && cn[0] == _t(':')) continue;
+							/* el_comment / el_cdata set m_skip at construction;
+							 * el_text may also be marked skip later by line
+							 * layout, so we can't rely on skip() alone. Instead
+							 * we treat any child that produces non-empty text
+							 * OR has children as breaking emptiness. */
+							if(c->get_children_count() > 0)
+							{
+								empty = false;
+								break;
+							}
+							tstring txt;
+							c->get_text(txt);
+							if(!txt.empty())
+							{
+								empty = false;
+								break;
+							}
+							/* Comment/CDATA text is stored via set_data and
+							 * surfaces through get_text(); they still count
+							 * as empty for :empty purposes. Detect them by
+							 * the constructor-set skip flag BEFORE line
+							 * layout touches it. */
+							if(c->skip()) continue;
+							empty = false;
+							break;
+						}
+						if(!empty) return select_no_match;
+					}
+					break;
+				case pseudo_class_any_link:
+					if(!is_link_element(this))
+					{
+						return select_no_match;
+					}
+					break;
+				case pseudo_class_default:
+					/* :default — the default UI element among a group of
+					 * similar elements. We support the two forms pages
+					 * actually ship: checkbox/radio with the checked
+					 * attribute, and <option> with the selected attribute.
+					 * The submit button of a form is not modelled. */
+					if(!is_checked_element(this))
+					{
+						return select_no_match;
 					}
 					break;
 				case pseudo_class_lang:
@@ -4648,12 +5167,17 @@ void litehtml::html_tag::set_tagName( const tchar_t* tag )
  * drawing a half-understood transform. */
 void litehtml::html_tag::parse_transform_list(const tchar_t* val)
 {
+	m_transform.clear();
+	/* Record the string form so the transition trigger can detect changes
+	 * regardless of whether this parse came from parse_styles, an animated
+	 * writeback (set_animated_transform), or a snap-back-to-CSS restore. */
+	m_transform_str = val ? val : _t("");
 	const tchar_t* p = val;
 	while(p && *p)
 	{
 		while(*p == ' ' || *p == '\t') p++;
 		if(!*p) break;
-		int type;
+		int type = -1;
 		if(!t_strncmp(p, _t("rotate("), 7))			{ type = 0; p += 7; }
 		else if(!t_strncmp(p, _t("translateX("), 11))	{ type = 2; p += 11; }
 		else if(!t_strncmp(p, _t("translateY("), 11))	{ type = 3; p += 11; }
@@ -4664,23 +5188,73 @@ void litehtml::html_tag::parse_transform_list(const tchar_t* val)
 		 * fact a mario VM use-after-free, unrelated to this parser. */
 		else if(!t_strncmp(p, _t("translate3d("), 12))	{ type = 1; p += 12; }
 		else if(!t_strncmp(p, _t("translate("), 10))	{ type = 1; p += 10; }
-		else { m_transform.clear(); return; }
+		else if(!t_strncmp(p, _t("scaleX("), 7))		{ type = 5; p += 7; }
+		else if(!t_strncmp(p, _t("scaleY("), 7))		{ type = 6; p += 7; }
+		else if(!t_strncmp(p, _t("scale("), 6))			{ type = 4; p += 6; }
+		else if(!t_strncmp(p, _t("skewX("), 6))			{ type = 8; p += 6; }
+		else if(!t_strncmp(p, _t("skewY("), 6))			{ type = 9; p += 6; }
+		else if(!t_strncmp(p, _t("skew("), 5))			{ type = 7; p += 5; }
+		else if(!t_strncmp(p, _t("matrix("), 7))			{ type = 10; p += 7; }
+		else { return; }  /* unknown function: stop parsing, keep what we have */
 		tstring args;
 		while(*p && *p != ')') args += *p++;
 		if(*p == ')') p++;
 		transform_fn fn;
 		fn.type = type;
-		fn.deg = 0;
-		if(type == 0)
+		if(type == 0 || type == 7 || type == 8 || type == 9)
 		{
-			char* end = 0;
-			fn.deg = (float)strtod(args.c_str(), &end);
-			if(end && !t_strncmp(end, _t("rad"), 3))		fn.deg *= 57.2957795f;
-			else if(end && !t_strncmp(end, _t("turn"), 4))	fn.deg *= 360.0f;
-			else if(end && !t_strncmp(end, _t("grad"), 4))	fn.deg *= 0.9f;
+			/* Angle-valued functions: rotate, skew, skewX, skewY */
+			if(type == 7)
+			{
+				/* skew(ax, ay): two angles */
+				string_vector toks;
+				split_string(args, toks, _t(", "));
+				if(toks.size() >= 1)
+				{
+					char* end = 0;
+					fn.deg = (float)strtod(toks[0].c_str(), &end);
+					if(end && !t_strncmp(end, _t("rad"), 3))		fn.deg *= 57.2957795f;
+					else if(end && !t_strncmp(end, _t("turn"), 4))	fn.deg *= 360.0f;
+					else if(end && !t_strncmp(end, _t("grad"), 4))	fn.deg *= 0.9f;
+				}
+				if(toks.size() >= 2)
+				{
+					char* end = 0;
+					fn.sx = (float)strtod(toks[1].c_str(), &end);  /* reuse sx for ay */
+					if(end && !t_strncmp(end, _t("rad"), 3))		fn.sx *= 57.2957795f;
+					else if(end && !t_strncmp(end, _t("turn"), 4))	fn.sx *= 360.0f;
+					else if(end && !t_strncmp(end, _t("grad"), 4))	fn.sx *= 0.9f;
+				}
+			}
+			else
+			{
+				char* end = 0;
+				fn.deg = (float)strtod(args.c_str(), &end);
+				if(end && !t_strncmp(end, _t("rad"), 3))		fn.deg *= 57.2957795f;
+				else if(end && !t_strncmp(end, _t("turn"), 4))	fn.deg *= 360.0f;
+				else if(end && !t_strncmp(end, _t("grad"), 4))	fn.deg *= 0.9f;
+			}
+		}
+		else if(type == 4 || type == 5 || type == 6)
+		{
+			/* Scale functions */
+			string_vector toks;
+			split_string(args, toks, _t(", "));
+			if(toks.size() >= 1) fn.sx = (float)strtod(toks[0].c_str(), nullptr);
+			if(toks.size() >= 2) fn.sy = (float)strtod(toks[1].c_str(), nullptr);
+			else fn.sy = fn.sx;  /* scale(s) means scale(s,s) */
+		}
+		else if(type == 10)
+		{
+			/* matrix(a,b,c,d,e,f) */
+			string_vector toks;
+			split_string(args, toks, _t(", "));
+			for(int i = 0; i < 6 && i < (int)toks.size(); i++)
+				fn.mat[i] = (float)strtod(toks[i].c_str(), nullptr);
 		}
 		else
 		{
+			/* Translate functions */
 			string_vector toks;
 			split_string(args, toks, _t(", "));
 			if(toks.size() >= 1) fn.x.fromString(toks[0].c_str());
@@ -4698,21 +5272,62 @@ bool litehtml::html_tag::compute_transform_matrix(const position& box, float m[6
 	{
 		const transform_fn& fn = m_transform[i];
 		float fa = 1, fb = 0, fc = 0, fd = 1, fe = 0, ff = 0;
-		if(fn.type == 0)
+		switch(fn.type)
+		{
+		case 0:  /* rotate(deg) */
 		{
 			float th = fn.deg * 3.14159265358979f / 180.0f;
 			float cs = cosf(th), sn = sinf(th);
 			fa = cs; fb = sn; fc = -sn; fd = cs;
+			break;
 		}
-		else
+		case 1:  /* translate(x,y) / translate3d(x,y,z) */
 		{
-			float dx = 0, dy = 0;
-			/* cvt_units takes css_length&; fn is const here. */
 			css_length lx = fn.x, ly = fn.y;
-			if(fn.type == 1 || fn.type == 2) dx = (float)get_document()->cvt_units(lx, m_font_size, box.width);
-			if(fn.type == 1)					dy = (float)get_document()->cvt_units(ly, m_font_size, box.height);
-			if(fn.type == 3)					dy = (float)get_document()->cvt_units(lx, m_font_size, box.height);
-			fe = dx; ff = dy;
+			fe = (float)get_document()->cvt_units(lx, m_font_size, box.width);
+			ff = (float)get_document()->cvt_units(ly, m_font_size, box.height);
+			break;
+		}
+		case 2:  /* translateX(x) */
+		{
+			css_length lx = fn.x;
+			fe = (float)get_document()->cvt_units(lx, m_font_size, box.width);
+			break;
+		}
+		case 3:  /* translateY(y) */
+		{
+			css_length lx = fn.x;
+			ff = (float)get_document()->cvt_units(lx, m_font_size, box.height);
+			break;
+		}
+		case 4:  /* scale(sx,sy) */
+			fa = fn.sx; fd = fn.sy;
+			break;
+		case 5:  /* scaleX(sx) */
+			fa = fn.sx;
+			break;
+		case 6:  /* scaleY(sy) */
+			fd = fn.sy;
+			break;
+		case 7:  /* skew(ax,ay) */
+		{
+			float tx = tanf(fn.deg * 3.14159265358979f / 180.0f);
+			float ty = tanf(fn.sx  * 3.14159265358979f / 180.0f);  /* sx reused for ay */
+			fc = tx; fb = ty;
+			break;
+		}
+		case 8:  /* skewX(ax) */
+			fc = tanf(fn.deg * 3.14159265358979f / 180.0f);
+			break;
+		case 9:  /* skewY(ay) */
+			fb = tanf(fn.deg * 3.14159265358979f / 180.0f);
+			break;
+		case 10: /* matrix(a,b,c,d,e,f) */
+			fa = fn.mat[0]; fb = fn.mat[1]; fc = fn.mat[2];
+			fd = fn.mat[3]; fe = fn.mat[4]; ff = fn.mat[5];
+			break;
+		default:
+			break;
 		}
 		/* m = m * fn: the new function acts in the local frame of the product */
 		float na = a * fa + c * fb;
@@ -4748,6 +5363,22 @@ void litehtml::html_tag::draw_background( uint_ptr hdc, int x, int y, const posi
 	{
 		if(el_pos.does_intersect(clip))
 		{
+			position border_box = pos;
+			border_box += m_padding;
+			border_box += m_borders;
+
+			/* Compute the CSS transform once and wrap BOTH the background fill
+			 * and the borders in it, so a transformed element paints its whole
+			 * box (not just its border edges) through the matrix. The container
+			 * applies the matrix as a polygon transform in software; content
+			 * (text/children) is not transformed in this phase. */
+			float xform[6];
+			bool have_xform = compute_transform_matrix(border_box, xform);
+			if(have_xform)
+			{
+				get_document()->container()->push_paint_transform(xform);
+			}
+
 			const background* bg = get_background();
 			if(bg)
 			{
@@ -4759,9 +5390,6 @@ void litehtml::html_tag::draw_background( uint_ptr hdc, int x, int y, const posi
 
 				get_document()->container()->draw_background(hdc, bg_paint);
 			}
-			position border_box = pos;
-			border_box += m_padding;
-			border_box += m_borders;
 
 			borders bdr = m_css_borders;
 			bdr.radius = m_css_borders.radius.calc_percents(border_box.width, border_box.height);
@@ -4775,12 +5403,6 @@ void litehtml::html_tag::draw_background( uint_ptr hdc, int x, int y, const posi
 				bdr.bottom.color.alpha	= opacity_scale_alpha(bdr.bottom.color.alpha, m_opacity_cum);
 			}
 
-			float xform[6];
-			bool have_xform = compute_transform_matrix(border_box, xform);
-			if(have_xform)
-			{
-				get_document()->container()->push_paint_transform(xform);
-			}
 			get_document()->container()->draw_borders(hdc, bdr, border_box, have_parent() ? false : true);
 			if(have_xform)
 			{
@@ -5204,6 +5826,105 @@ bool litehtml::html_tag::set_pseudo_class( const tchar_t* pclass, bool add )
 		}
 	}
 	return ret;
+}
+
+/* ---- CSS animation override methods (Phase 2) ---------------------------- */
+
+void litehtml::html_tag::set_anim_override(const tchar_t* prop, const tchar_t* value)
+{
+	if(!prop || !value) return;
+	tstring key = prop;
+	lcase(key);
+	m_anim_overrides[key] = value;
+}
+
+void litehtml::html_tag::clear_anim_override(const tchar_t* prop)
+{
+	if(!prop) return;
+	tstring key = prop;
+	lcase(key);
+	m_anim_overrides.erase(key);
+}
+
+void litehtml::html_tag::clear_anim_overrides()
+{
+	m_anim_overrides.clear();
+}
+
+const litehtml::tchar_t* litehtml::html_tag::anim_override(const tchar_t* prop) const
+{
+	if(!prop) return nullptr;
+	tstring key = prop;
+	lcase(key);
+	string_map::const_iterator it = m_anim_overrides.find(key);
+	if(it == m_anim_overrides.end()) return nullptr;
+	return it->second.c_str();
+}
+
+void litehtml::html_tag::set_animated_opacity(float op)
+{
+	if(op < 0.0f) op = 0.0f;
+	if(op > 1.0f) op = 1.0f;
+	/* Same script-reveal guard as parse_styles: html/body opacity:0 is a
+	 * hydration gate that a JS-limited engine can never flip, so treat it
+	 * as revealed. */
+	if(op <= 0.0f && (m_tag == _t("html") || m_tag == _t("body"))) op = 1.0f;
+	m_opacity = op;
+	propagate_opacity_cum();
+}
+
+void litehtml::html_tag::propagate_opacity_cum()
+{
+	element::ptr el_parent = parent();
+	float parent_cum = el_parent ? el_parent->get_opacity_cum() : 1.0f;
+	m_opacity_cum = parent_cum * m_opacity;
+	for(auto& child : m_children)
+	{
+		if(child->is_html_tag())
+		{
+			static_cast<html_tag*>(child)->propagate_opacity_cum();
+		}
+	}
+}
+
+void litehtml::html_tag::set_animated_transform(const tchar_t* val)
+{
+	if(!val) return;
+	/* Store the raw override string (so a later parse_styles keeps it) and
+	 * re-parse into m_transform now: draw_background composes the paint
+	 * matrix from m_transform, and tick_animations runs on the engine thread
+	 * without re-running the full cascade, so the parse must happen here for
+	 * the transform to visibly animate frame to frame. */
+	set_anim_override(_t("transform"), val);
+	parse_transform_list(val);
+}
+
+bool litehtml::html_tag::subtree_within_budget(int limit) const
+{
+	/* Bounded iterative DFS counting this element and every descendant. We
+	 * stop the moment the count exceeds `limit` so the guard costs at most
+	 * O(limit) and never walks a huge subtree just to reject it. Phase 3.1
+	 * uses this to decide whether an animation-driven relayout of this
+	 * element's geometry is cheap enough to run every frame; oversized
+	 * subtrees are degraded to a discrete switch instead. */
+	if(limit <= 0) return false;
+	int count = 0;
+	std::vector<litehtml::element::ptr> stack;
+	stack.push_back(const_cast<litehtml::html_tag*>(this));
+	while(!stack.empty())
+	{
+		litehtml::element::ptr cur = stack.back();
+		stack.pop_back();
+		if(!cur) continue;
+		count++;
+		if(count > limit) return false;
+		for(size_t i = 0; i < cur->get_children_count(); i++)
+		{
+			litehtml::element::ptr c = cur->get_child((int)i);
+			if(c) stack.push_back(c);
+		}
+	}
+	return true;
 }
 
 bool litehtml::html_tag::set_class( const tchar_t* pclass, bool add )
@@ -5827,6 +6548,13 @@ bool litehtml::html_tag::fetch_positioned()
 			ret = true;
 		}
 	}
+	if(getenv("EWEB_POSDBG")) {
+		int nfix = 0;
+		for(auto& e2 : m_positioned)
+			if(e2->get_element_position() == element_position_fixed) nfix++;
+		fprintf(stderr, "[posdbg] fetch_positioned this=%p children=%d positioned=%d fixed=%d ret=%d\n",
+			(void*)this, (int)m_children.size(), (int)m_positioned.size(), nfix, (int)ret);
+	}
 	return ret;
 }
 
@@ -5839,6 +6567,10 @@ void litehtml::html_tag::render_positioned(render_type rt)
 {
 	position wnd_position;
 	get_document()->container()->get_client_rect(wnd_position);
+	if(getenv("EWEB_POSDBG")) {
+		fprintf(stderr, "[posdbg] render_positioned this=%p rt=%d positioned=%d\n",
+			(void*)this, (int)rt, (int)m_positioned.size());
+	}
 
 	element_position el_position;
 	bool process;
@@ -6186,6 +6918,10 @@ void litehtml::html_tag::render_positioned(render_type rt)
 
 void litehtml::html_tag::draw_stacking_context( uint_ptr hdc, int x, int y, const position* clip, bool with_positioned )
 {
+	if(getenv("EWEB_POSDBG")) {
+		fprintf(stderr, "[posdbg] draw_stacking this=%p id=%s visible=%d with_pos=%d npos=%d\n",
+			(void*)this, get_attr(_t("id"), ""), (int)is_visible(), (int)with_positioned, (int)m_positioned.size());
+	}
 	if(!is_visible()) return;
 
 	std::map<int, bool> zindexes;
@@ -7619,6 +8355,12 @@ void litehtml::html_tag::draw_children_box(uint_ptr hdc, int x, int y, const pos
 				{
 					if (el->get_element_position() == element_position_fixed)
 					{
+						if(getenv("EWEB_POSDBG")) {
+							fprintf(stderr, "[posdbg] DRAW fixed el=%p id=%s cls=%s mpos=%d,%d %dx%d wnd=%d,%d z=%d\n",
+								(void*)el, el->get_attr(_t("id"), ""), el->get_attr(_t("class"), ""),
+								el->m_pos.x, el->m_pos.y, el->m_pos.width, el->m_pos.height,
+								browser_wnd.x, browser_wnd.y, el->get_zindex());
+						}
 						el->draw(hdc, browser_wnd.x, browser_wnd.y, clip);
 						el->draw_stacking_context(hdc, browser_wnd.x, browser_wnd.y, clip, true);
 						el = 0;

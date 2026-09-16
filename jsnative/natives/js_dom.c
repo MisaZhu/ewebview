@@ -469,6 +469,54 @@ static var_t* native_el_get_tagName(vm_t* vm, var_t* env, void* data) {
     return adopt_cstr(vm, tag);
 }
 
+/* Node.nodeType. React's createRoot/hydrateRoot validate the container with
+ * `node.nodeType` (1 element / 3 text / 9 document); without it every wrapper
+ * reads undefined and hydration aborts with "Target container is not a DOM
+ * element" (React #299). Elements are 1; the embedder's el_is_tag() tells a
+ * text node (3) from a real element, defaulting to element when absent. */
+static var_t* native_el_get_nodeType(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = handle_from_this(this_from_env(env));
+    if(st == NULL || el == NULL)
+        return var_new_int(vm, 1);
+    if(st->cb.el_is_comment != NULL && st->cb.el_is_comment(st->ctx, el))
+        return var_new_int(vm, 8); /* COMMENT_NODE */
+    if(st->cb.el_is_tag != NULL && !st->cb.el_is_tag(st->ctx, el))
+        return var_new_int(vm, 3); /* TEXT_NODE */
+    return var_new_int(vm, 1);     /* ELEMENT_NODE */
+}
+
+/* Node.nodeValue / CharacterData.data: the text of a text node, null on
+ * elements. React's hydration diff reads nodeValue off every hydrated text
+ * instance; without it every text node compares undefined against the server
+ * string and hydrateRoot bails (Minified React error #423). */
+static var_t* native_el_get_nodeValue(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = handle_from_this(this_from_env(env));
+    if(st == NULL || el == NULL)
+        return var_new_null(vm);
+    if(st->cb.el_is_tag == NULL || st->cb.el_is_tag(st->ctx, el))
+        return var_new_null(vm); /* elements: nodeValue is null */
+    if(st->cb.el_get_text == NULL)
+        return var_new_str(vm, "");
+    return adopt_cstr(vm, st->cb.el_get_text(st->ctx, el));
+}
+
+static var_t* native_el_set_nodeValue(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = handle_from_this(this_from_env(env));
+    if(st == NULL || el == NULL)
+        return NULL;
+    if(st->cb.el_is_tag != NULL && st->cb.el_is_tag(st->ctx, el))
+        return NULL; /* elements: assignment is a no-op */
+    var_t* args = get_func_args(env);
+    node_t* n = var_array_get(args, 0);
+    const char* s = (n != NULL) ? var_get_str(n->var) : "";
+    if(st->cb.el_set_text != NULL)
+        st->cb.el_set_text(st->ctx, el, s ? s : "");
+    return NULL;
+}
+
 static var_t* native_el_getAttribute(vm_t* vm, var_t* env, void* data) {
     js_dom_state* st = state_any(vm, data);
     js_element_t el = handle_from_this(this_from_env(env));
@@ -805,8 +853,14 @@ int js_dom_poll_timers(vm_t* vm, uint64_t now_ms) {
             t->cb = NULL;
         }
         if(cb != NULL && cb->is_func) {
+            if(getenv("MARIO_TIMERDBG") != NULL)
+                fprintf(stderr, "[timerdbg] fire id=%d cb=%p scope_top=%d stack_top=%d call_depth=%d\n",
+                    t->id, (void*)cb, (int)vm->scope_stack_top, (int)vm->stack_top, (int)vm->call_depth);
             var_t* args = var_new_array(vm);
+            extern int mario_scopedbg_arm;
+            mario_scopedbg_arm = 1;
             var_t* r = call_m_func(vm, NULL, cb, args);
+            mario_scopedbg_arm = 0;
             if(r != NULL) var_unref(r);
             var_unref(args);
             fired++;
@@ -1064,6 +1118,44 @@ static var_t* native_document_createTextNode(vm_t* vm, var_t* env, void* data) {
     if(st != NULL && st->cb.create_text_node != NULL)
         el = st->cb.create_text_node(st->ctx, text);
     mstr_free(s);
+    if(el == NULL) return var_new_null(vm);
+    return wrap_element(vm, el);
+}
+
+/* document.createComment(text): React parks Suspense boundary markers
+ * (`<!--$-->`, `<!--/$-->`) in the live tree during client rendering; without
+ * createComment its render work loop throws and the whole root is discarded,
+ * taking every <script> the tree would have mounted with it. */
+static var_t* native_document_createComment(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    mstr_t* s = mstr_new("");
+    const char* text = arg_selector(env, s);
+    js_element_t el = NULL;
+    if(st != NULL && st->cb.create_comment != NULL)
+        el = st->cb.create_comment(st->ctx, text);
+    mstr_free(s);
+    if(el == NULL) return var_new_null(vm);
+    return wrap_element(vm, el);
+}
+
+/* document.createElementNS(ns, tag): this engine has no XML namespaces, and
+ * every namespaced use on the Web is SVG/MathML whose local name is what the
+ * layout engine keys off - so fold to a plain createElement of the local name
+ * (the part after ':', if the caller passed a qualified name). */
+static var_t* native_document_createElementNS(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    var_t* args = get_func_args(env);
+    node_t* n1 = var_array_get(args, 1);
+    const char* tag = (n1 != NULL) ? var_get_str(n1->var) : NULL;
+    js_element_t el = NULL;
+    if(st != NULL && st->cb.create_element != NULL && tag != NULL && tag[0] != 0) {
+        const char* colon = strrchr(tag, ':');
+        const char* local = (colon != NULL) ? colon + 1 : tag;
+        mstr_t* low = mstr_new("");
+        for(const char* p = local; *p != 0; ++p) mstr_add(low, js_ascii_lower(*p));
+        el = st->cb.create_element(st->ctx, low->cstr);
+        mstr_free(low);
+    }
     if(el == NULL) return var_new_null(vm);
     return wrap_element(vm, el);
 }
@@ -1880,6 +1972,25 @@ static var_t* native_el_get_parentNode(vm_t* vm, var_t* env, void* data) {
     return wrap_or_null(vm, st->cb.el_parent(st->ctx, el));
 }
 
+/* Node.ownerDocument: React-DOM resolves the event-listening root through
+ * rootContainer.ownerDocument and calls addEventListener on the result; with
+ * the back-pointer missing, createRoot() throws "undefined is not an object"
+ * inside its (swallowed) bootstrap and the whole app never mounts (taobao). */
+static var_t* native_el_get_ownerDocument(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* doc = var_find_member_var(vm->root, "document");
+    if(doc == NULL) return var_new_null(vm);
+    var_ref(doc);
+    return doc;
+}
+
+/* Node.namespaceURI: HTML elements live in the XHTML namespace; React reads it
+ * to tell SVG/MathML hosts apart. undefined made those checks misfire. */
+static var_t* native_el_get_namespaceURI(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    return var_new_str(vm, "http://www.w3.org/1999/xhtml");
+}
+
 /* Edge of a child list: `first` picks index 0, else the last one. */
 static var_t* edge_child(vm_t* vm, var_t* env, void* data, bool first, bool tags_only) {
     js_dom_state* st = state_any(vm, data);
@@ -2568,6 +2679,8 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     vm_reg_native(vm, doc_cls, "getElementsByName(name)", native_document_getElementsByName, bridge);
     vm_reg_native(vm, doc_cls, "createElement(tag)", native_document_createElement, bridge);
     vm_reg_native(vm, doc_cls, "createTextNode(text)", native_document_createTextNode, bridge);
+    vm_reg_native(vm, doc_cls, "createComment(text)", native_document_createComment, bridge);
+    vm_reg_native(vm, doc_cls, "createElementNS(ns,tag)", native_document_createElementNS, bridge);
     /* title / body as accessor properties so `document.title` and
      * `document.body.innerHTML` resolve like a real browser. */
     reg_accessor(vm, doc_cls, "title", native_document_get_title, native_document_set_title, bridge);
@@ -2583,6 +2696,19 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     reg_accessor(vm, doc_cls, "domain", native_document_get_empty_str, NULL, bridge);
     reg_accessor(vm, doc_cls, "referrer", native_document_get_empty_str, NULL, bridge);
     reg_accessor(vm, doc_cls, "characterSet", native_document_get_charset, NULL, bridge);
+    /* Node.nodeType for the Document singleton (9) plus the Node type
+     * constants pages and frameworks read off document / Node. */
+    {
+        var_t* dproto = var_get_prototype(doc_cls);
+        if(dproto != NULL) {
+            var_add(dproto, "nodeType", var_new_int(vm, 9)); /* DOCUMENT_NODE */
+            var_add(dproto, "ELEMENT_NODE", var_new_int(vm, 1));
+            var_add(dproto, "TEXT_NODE", var_new_int(vm, 3));
+            var_add(dproto, "COMMENT_NODE", var_new_int(vm, 8));
+            var_add(dproto, "DOCUMENT_NODE", var_new_int(vm, 9));
+            var_add(dproto, "DOCUMENT_FRAGMENT_NODE", var_new_int(vm, 11));
+        }
+    }
 
     var_t* document = new_obj(vm, CLS_DOCUMENT, 0);
     var_add(vm->root, "document", document);
@@ -2610,10 +2736,13 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     vm_new_class(vm, "IntersectionObserver");
     vm_new_class(vm, "ResizeObserver");
     reg_accessor(vm, el_cls, "textContent", native_el_get_textContent, native_el_set_textContent, bridge);
+    reg_accessor(vm, el_cls, "nodeValue", native_el_get_nodeValue, native_el_set_nodeValue, bridge);
+    reg_accessor(vm, el_cls, "data", native_el_get_nodeValue, native_el_set_nodeValue, bridge);
     reg_accessor(vm, el_cls, "innerText", native_el_get_innerText, native_el_set_innerText, bridge);
     reg_accessor(vm, el_cls, "innerHTML", native_el_get_innerHTML, native_el_set_innerHTML, bridge);
     reg_accessor(vm, el_cls, "tagName", native_el_get_tagName, NULL, bridge);
     reg_accessor(vm, el_cls, "nodeName", native_el_get_tagName, NULL, bridge);
+    reg_accessor(vm, el_cls, "nodeType", native_el_get_nodeType, NULL, bridge);
     reg_accessor(vm, el_cls, "className", native_el_get_className, native_el_set_className, bridge);
     reg_accessor(vm, el_cls, "classList", native_el_get_classList, NULL, bridge);
     reg_accessor(vm, el_cls, "style", native_el_get_style, NULL, bridge);
@@ -2637,6 +2766,8 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     reg_accessor(vm, el_cls, "childElementCount", native_el_get_childElementCount, NULL, bridge);
     reg_accessor(vm, el_cls, "parentNode", native_el_get_parentNode, NULL, bridge);
     reg_accessor(vm, el_cls, "parentElement", native_el_get_parentNode, NULL, bridge);
+    reg_accessor(vm, el_cls, "ownerDocument", native_el_get_ownerDocument, NULL, bridge);
+    reg_accessor(vm, el_cls, "namespaceURI", native_el_get_namespaceURI, NULL, bridge);
     reg_accessor(vm, el_cls, "firstChild", native_el_get_firstChild, NULL, bridge);
     reg_accessor(vm, el_cls, "lastChild", native_el_get_lastChild, NULL, bridge);
     reg_accessor(vm, el_cls, "firstElementChild", native_el_get_firstElementChild, NULL, bridge);
@@ -2677,6 +2808,8 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
             if(nc == NULL || nc == el_cls) continue;
             reg_accessor(vm, nc, "parentNode", native_el_get_parentNode, NULL, bridge);
             reg_accessor(vm, nc, "parentElement", native_el_get_parentNode, NULL, bridge);
+            reg_accessor(vm, nc, "ownerDocument", native_el_get_ownerDocument, NULL, bridge);
+            reg_accessor(vm, nc, "namespaceURI", native_el_get_namespaceURI, NULL, bridge);
             reg_accessor(vm, nc, "childNodes", native_el_get_childNodes, NULL, bridge);
             reg_accessor(vm, nc, "children", native_el_get_children, NULL, bridge);
             reg_accessor(vm, nc, "firstChild", native_el_get_firstChild, NULL, bridge);

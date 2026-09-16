@@ -654,6 +654,8 @@ static var_t* native_mc_dispatch(vm_t* vm, var_t* env, void* data) {
     (void)env;
     mc_disp_t* d = (mc_disp_t*)data;
     if(d == NULL) return NULL;
+    if(getenv("MARIO_MCDBG") != NULL)
+        fprintf(stderr, "[mcdbg] dispatch port=%p\n", (void*)d->port);
     var_t* port = d->port;
     var_t* bridge = d->bridge;
     mario_free(d);
@@ -702,9 +704,20 @@ static var_t* native_mc_postMessage(vm_t* vm, var_t* env, void* data) {
     d->port = peer;
     d->bridge = (var_t*)data;
     var_t* tr = var_new_native_func(vm, native_mc_dispatch, d);
-    if(js_dom_add_timer(vm, tr, 0, false) == 0)
+    if(getenv("MARIO_MCDBG") != NULL)
+        fprintf(stderr, "[mcdbg] post self=%p peer=%p tr=%p\n", (void*)self, (void*)peer, (void*)tr);
+    int mc_id = js_dom_add_timer(vm, tr, 0, false);
+    if(getenv("MARIO_MCDBG") != NULL)
+        fprintf(stderr, "[mcdbg] add_timer -> %d\n", mc_id);
+    if(mc_id == 0) {
         mario_free(d);   /* table full: no dispatch, drop the capture */
-    var_unref(tr);
+        var_unref(tr);   /* not anchored: release the trampoline ourselves */
+    }
+    /* On success js_add_timer's @@timers reanchor holds the ONLY reference to
+     * tr (var_new_* starts at refs==0). Unrefing here would drop it to zero and
+     * free the trampoline before it fires, so the due slot's cb reads as
+     * recycled non-func heap and poll_timers silently skips it - which is
+     * exactly how React 18's MessageChannel scheduler never ran. */
     return NULL;
 }
 
@@ -799,7 +812,58 @@ static void console_emit(const char* prefix, var_t* env) {
 }
 
 static var_t* native_console_warn(vm_t* vm, var_t* env, void* data)  { (void)vm; (void)data; console_emit("[warn] ", env);  return NULL; }
-static var_t* native_console_error(vm_t* vm, var_t* env, void* data) { (void)vm; (void)data; console_emit("[error] ", env); return NULL; }
+static var_t* native_console_error(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    /* DIAG (temp): identify what page code actually passed to console.error
+     * (React logs the raw thrown value during hydration recovery). */
+    var_t* a0 = js_arg(env, 0);
+    mstr_t* msg = console_args_to_str(env);
+    mstr_t* line = mstr_new("");
+    mstr_append(line, "[error] ");
+    mstr_append(line, msg->cstr);
+    if(a0 != NULL && a0->type == V_OBJECT) {
+        var_t* nm = var_find_member_var(a0, "name");
+        var_t* ms = var_find_member_var(a0, "message");
+        char extra[256] = {0};
+        snprintf(extra, sizeof(extra)-1, "  {obj name=%s message=%s}",
+            (nm != NULL && nm->type == V_STRING) ? var_get_str(nm) : "-",
+            (ms != NULL && ms->type == V_STRING) ? var_get_str(ms) : "-");
+        mstr_append(line, extra);
+    } else if(a0 != NULL) {
+        char extra[64] = {0};
+        snprintf(extra, sizeof(extra)-1, "  {type=%u}", (unsigned)a0->type);
+        mstr_append(line, extra);
+        /* DIAG (temp): a bare number passed to console.error - dump the VM
+         * call chain so the calling site can be identified. */
+        if(a0->type == V_INT) {
+            char hb[96] = {0};
+            snprintf(hb, sizeof(hb)-1, "[cerrdbg] int=%d scope_top=%d run_scope_base=%d pc=%u\n",
+                (int)var_get_int(a0), (int)vm->scope_stack_top, (int)vm->run_scope_base, (unsigned)vm->pc);
+            if(_platform_out != NULL) _platform_out(hb);
+            if(getenv("MARIO_CERRBC") != NULL) {
+                void bc_dump_window(bytecode_t* bc, PC center, PC radius);
+                bc_dump_window(&vm->bc, vm->pc, 30);
+            }
+            scope_t* dsc = (vm->scope_stack_top > 0) ? vm->scope_stack[vm->scope_stack_top - 1] : NULL;
+            int dd = 0;
+            while(dsc != NULL && dd < 24) {
+                char fb[128] = {0};
+                snprintf(fb, sizeof(fb)-1,
+                    "[cerrdbg]   sc[%d] func=%d block=%d try=%d loop=%d pc=%u func_pc=%u\n",
+                    dd, (int)dsc->is_func, (int)dsc->is_block, (int)dsc->is_try, (int)dsc->is_loop,
+                    (unsigned)dsc->pc, (dsc->func != NULL ? (unsigned)dsc->func->pc : 0u));
+                if(_platform_out != NULL) _platform_out(fb);
+                dsc = dsc->prev;
+                dd++;
+            }
+        }
+    }
+    mstr_add(line, '\n');
+    if(_platform_out != NULL) _platform_out(line->cstr);
+    mstr_free(line);
+    mstr_free(msg);
+    return NULL;
+}
 static var_t* native_console_info(vm_t* vm, var_t* env, void* data)  { (void)vm; (void)data; console_emit("[info] ", env);  return NULL; }
 static var_t* native_console_debug(vm_t* vm, var_t* env, void* data) { (void)vm; (void)data; console_emit("[debug] ", env); return NULL; }
 static var_t* native_console_trace(vm_t* vm, var_t* env, void* data) { (void)vm; (void)data; console_emit("[trace] ", env); return NULL; }
@@ -2191,6 +2255,8 @@ static var_t* native_xhr_send(vm_t* vm, var_t* env, void* data) {
     char* out_hdrs = NULL;
     /* No hook at all: report a network failure (status 0), which is what a
      * browser does for an unreachable URL, rather than throwing. */
+    if(getenv("MARIO_HTTPDBG") != NULL)
+        fprintf(stderr, "[httpdbg] XHR %s %s\n", method, url ? url : "(null)");
     bool ok = (st->cb.http_request != NULL) &&
               st->cb.http_request(web_ctx(vm), method, url,
                                   (hdrs->len > 0) ? hdrs->cstr : NULL, bs,
@@ -2417,6 +2483,8 @@ static var_t* native_fetch(vm_t* vm, var_t* env, void* data) {
     int status = 0;
     char* out_body = NULL;
     char* out_hdrs = NULL;
+    if(getenv("MARIO_HTTPDBG") != NULL)
+        fprintf(stderr, "[httpdbg] FETCH %s %s\n", method, url ? url : "(null)");
     bool ok = (st->cb.http_request != NULL) &&
               st->cb.http_request(web_ctx(vm), method, url,
                                   (hdrs->len > 0) ? hdrs->cstr : NULL, bs,
@@ -2445,6 +2513,882 @@ static var_t* native_fetch(vm_t* vm, var_t* env, void* data) {
     var_t* p = web_promise(vm, "resolve", result);
     if(p != NULL) return p;
     return result;
+}
+
+/* ------------------------------------------------------------------ */
+/* URLSearchParams / URL                                              */
+/*                                                                    */
+/* Both are real browser globals that pages (and core-js's URL        */
+/* modules) reference by bare name. mario resolves a bare global      */
+/* against vm->root, NOT against `window`/globalThis, so a polyfill   */
+/* that only does `globalThis.URLSearchParams = ...` stays invisible  */
+/* to `var kO = URLSearchParams` - which is exactly the top-level     */
+/* reference in core-js's web.url-search-params.iterable module that  */
+/* surfaced as `Uncaught Error: 'URLSearchParams' undefined!`. These  */
+/* natives live on vm->root (vm_new_class) so the bare name resolves. */
+/* ------------------------------------------------------------------ */
+
+#define CLS_URLSP   "URLSearchParams"
+#define CLS_URL     "URL"
+#define USP_ENTRIES "@@entries"   /* array of [name, value] string pairs */
+#define URL_SP      "@@sp"        /* URL's live URLSearchParams */
+
+/* application/x-www-form-urlencoded serializer: keep the alphanumerics and
+ * "*-._", turn space into '+', percent-escape everything else (upper hex). */
+static bool usp_plain(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '*' || c == '-' || c == '.' || c == '_';
+}
+static void usp_encode_into(mstr_t* out, const char* s) {
+    if(s == NULL) return;
+    static const char hex[] = "0123456789ABCDEF";
+    for(const unsigned char* p = (const unsigned char*)s; *p != 0; ++p) {
+        if(usp_plain(*p))       mstr_add(out, (char)*p);
+        else if(*p == ' ')      mstr_add(out, '+');
+        else {
+            mstr_add(out, '%');
+            mstr_add(out, hex[(*p >> 4) & 0xF]);
+            mstr_add(out, hex[*p & 0xF]);
+        }
+    }
+}
+/* Inverse: '+' -> space, %XX -> byte; a stray '%' that is not a valid escape
+ * is kept literally (browsers are tolerant here). */
+static void usp_decode_into(mstr_t* out, const char* s) {
+    if(s == NULL) return;
+    for(const char* p = s; *p != 0; ) {
+        if(*p == '+') { mstr_add(out, ' '); ++p; }
+        else if(p[0] == '%' && hex_val(p[1]) >= 0 && hex_val(p[2]) >= 0) {
+            mstr_add(out, (char)((hex_val(p[1]) << 4) | hex_val(p[2])));
+            p += 3;
+        }
+        else { mstr_add(out, *p); ++p; }
+    }
+}
+
+static var_t* usp_entries(var_t* self) {
+    return (self != NULL) ? var_find_own_member_var(self, USP_ENTRIES) : NULL;
+}
+static const char* usp_pair_at(var_t* pair, int idx) {
+    if(pair == NULL) return "";
+    node_t* n = var_array_get(pair, idx);
+    if(n == NULL || n->var == NULL) return "";
+    const char* s = var_get_str(n->var);
+    return (s != NULL) ? s : "";
+}
+#define usp_pair_name(pair)  usp_pair_at((pair), 0)
+#define usp_pair_value(pair) usp_pair_at((pair), 1)
+
+/* Freshly-created vars start at refs==0 and var_array_add()/var_add() ref them
+ * to 1, transferring ownership to the container - so no matching var_unref()
+ * (the storage_new()/response_new() convention). */
+static void usp_add_entry(vm_t* vm, var_t* entries, const char* name, const char* value) {
+    if(entries == NULL) return;
+    var_t* pair = var_new_array(vm);
+    var_array_add(pair, var_new_str(vm, (name != NULL) ? name : ""));
+    var_array_add(pair, var_new_str(vm, (value != NULL) ? value : ""));
+    var_array_add(entries, pair);
+}
+
+static void usp_replace_entries(var_t* self, var_t* keep) {
+    node_t* n = var_add(self, USP_ENTRIES, keep);
+    if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+}
+
+static void usp_serialize_into(var_t* e, mstr_t* out) {
+    if(e == NULL) return;
+    int cnt = (int)var_array_size(e);
+    bool first = true;
+    for(int i = 0; i < cnt; ++i) {
+        node_t* pn = var_array_get(e, i);
+        if(pn == NULL || pn->var == NULL) continue;
+        if(!first) mstr_add(out, '&');
+        first = false;
+        usp_encode_into(out, usp_pair_name(pn->var));
+        mstr_add(out, '=');
+        usp_encode_into(out, usp_pair_value(pn->var));
+    }
+}
+
+/* Parse a query string ("?a=1&b=2" or "a=1&b=2") into the entries array. */
+static void usp_parse(vm_t* vm, var_t* entries, const char* q) {
+    if(q == NULL || entries == NULL) return;
+    if(*q == '?') ++q;
+    const char* p = q;
+    while(*p != 0) {
+        const char* amp = strchr(p, '&');
+        const char* seg_end = (amp != NULL) ? amp : p + strlen(p);
+        if(seg_end > p) {
+            const char* eq = (const char*)memchr(p, '=', (size_t)(seg_end - p));
+            char* rawn;
+            char* rawv;
+            if(eq != NULL) {
+                rawn = js_strndup(p, (uint32_t)(eq - p));
+                rawv = js_strndup(eq + 1, (uint32_t)(seg_end - eq - 1));
+            }
+            else {
+                rawn = js_strndup(p, (uint32_t)(seg_end - p));
+                rawv = js_strdup("");
+            }
+            mstr_t* nm = mstr_new("");
+            mstr_t* vv = mstr_new("");
+            usp_decode_into(nm, rawn);
+            usp_decode_into(vv, rawv);
+            usp_add_entry(vm, entries, nm->cstr, vv->cstr);
+            mstr_free(nm);
+            mstr_free(vv);
+            if(rawn != NULL) mario_free(rawn);
+            if(rawv != NULL) mario_free(rawv);
+        }
+        if(amp == NULL) break;
+        p = amp + 1;
+    }
+}
+
+typedef struct { vm_t* vm; var_t* entries; } usp_obj_ctx;
+static void usp_obj_each(const char* key, void* value, void* ud) {
+    usp_obj_ctx* c = (usp_obj_ctx*)ud;
+    if(c == NULL || key == NULL || key[0] == 0 || key[0] == '@') return;
+    node_t* nd = (node_t*)value;
+    if(nd == NULL || nd->var == NULL || nd->invisable || nd->be_unenumerable) return;
+    mstr_t* tmp = mstr_new("");
+    usp_add_entry(c->vm, c->entries, key, js_cstr(nd->var, tmp));
+    mstr_free(tmp);
+}
+
+static bool usp_is_usp(var_t* v) {
+    return (v != NULL && v->type == V_OBJECT && usp_entries(v) != NULL);
+}
+
+static var_t* native_usp_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    var_t* entries = var_new_array(vm);
+    node_t* n = var_add(self, USP_ENTRIES, entries);
+    if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+    var_t* init = js_arg(env, 0);
+    if(init == NULL) return NULL;
+    if(init->type == V_STRING) {
+        usp_parse(vm, entries, var_get_str(init));
+    }
+    else if(init->type == V_OBJECT && init->is_array) {
+        int cnt = (int)var_array_size(init);
+        for(int i = 0; i < cnt; ++i) {
+            node_t* pn = var_array_get(init, i);
+            if(pn == NULL || pn->var == NULL || !pn->var->is_array) continue;
+            mstr_t* a = mstr_new("");
+            mstr_t* b = mstr_new("");
+            node_t* kn = var_array_get(pn->var, 0);
+            node_t* vn = var_array_get(pn->var, 1);
+            const char* ks = (kn != NULL && kn->var != NULL) ? js_cstr(kn->var, a) : "";
+            const char* vs = (vn != NULL && vn->var != NULL) ? js_cstr(vn->var, b) : "";
+            usp_add_entry(vm, entries, ks, vs);
+            mstr_free(a);
+            mstr_free(b);
+        }
+    }
+    else if(usp_is_usp(init)) {
+        var_t* src = usp_entries(init);
+        int cnt = (int)var_array_size(src);
+        for(int i = 0; i < cnt; ++i) {
+            node_t* pn = var_array_get(src, i);
+            if(pn == NULL || pn->var == NULL) continue;
+            usp_add_entry(vm, entries, usp_pair_name(pn->var), usp_pair_value(pn->var));
+        }
+    }
+    else if(init->type == V_OBJECT) {
+        usp_obj_ctx c; c.vm = vm; c.entries = entries;
+        hash_map_iterate(&init->children, usp_obj_each, &c);
+    }
+    return NULL;
+}
+
+static var_t* native_usp_append(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* e = usp_entries(js_this(env));
+    if(e == NULL) return NULL;
+    mstr_t* a = mstr_new("");
+    mstr_t* b = mstr_new("");
+    usp_add_entry(vm, e, js_arg_cstr(env, 0, a), js_arg_cstr(env, 1, b));
+    mstr_free(a);
+    mstr_free(b);
+    return NULL;
+}
+
+static var_t* native_usp_delete(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* e = usp_entries(self);
+    if(e == NULL) return NULL;
+    mstr_t* a = mstr_new("");
+    mstr_t* b = mstr_new("");
+    const char* name = js_arg_cstr(env, 0, a);
+    bool has_val = (js_arg_count(env) > 1);
+    const char* val = has_val ? js_arg_cstr(env, 1, b) : "";
+    var_t* keep = var_new_array(vm);
+    int cnt = (int)var_array_size(e);
+    for(int i = 0; i < cnt; ++i) {
+        node_t* pn = var_array_get(e, i);
+        if(pn == NULL || pn->var == NULL) continue;
+        bool match = (strcmp(usp_pair_name(pn->var), name) == 0) &&
+                     (!has_val || strcmp(usp_pair_value(pn->var), val) == 0);
+        if(!match) var_array_add(keep, pn->var);
+    }
+    usp_replace_entries(self, keep);
+    mstr_free(a);
+    mstr_free(b);
+    return NULL;
+}
+
+static var_t* native_usp_get(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* e = usp_entries(js_this(env));
+    mstr_t* a = mstr_new("");
+    const char* name = js_arg_cstr(env, 0, a);
+    var_t* r = var_new_null(vm);
+    if(e != NULL) {
+        int cnt = (int)var_array_size(e);
+        for(int i = 0; i < cnt; ++i) {
+            node_t* pn = var_array_get(e, i);
+            if(pn == NULL || pn->var == NULL) continue;
+            if(strcmp(usp_pair_name(pn->var), name) == 0) {
+                r = var_new_str(vm, usp_pair_value(pn->var));
+                break;
+            }
+        }
+    }
+    mstr_free(a);
+    return r;
+}
+
+static var_t* native_usp_getAll(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* e = usp_entries(js_this(env));
+    mstr_t* a = mstr_new("");
+    const char* name = js_arg_cstr(env, 0, a);
+    var_t* arr = var_new_array(vm);
+    if(e != NULL) {
+        int cnt = (int)var_array_size(e);
+        for(int i = 0; i < cnt; ++i) {
+            node_t* pn = var_array_get(e, i);
+            if(pn == NULL || pn->var == NULL) continue;
+            if(strcmp(usp_pair_name(pn->var), name) == 0)
+                var_array_add(arr, var_new_str(vm, usp_pair_value(pn->var)));
+        }
+    }
+    mstr_free(a);
+    return arr;
+}
+
+static var_t* native_usp_has(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* e = usp_entries(js_this(env));
+    mstr_t* a = mstr_new("");
+    mstr_t* b = mstr_new("");
+    const char* name = js_arg_cstr(env, 0, a);
+    bool has_val = (js_arg_count(env) > 1);
+    const char* val = has_val ? js_arg_cstr(env, 1, b) : "";
+    bool found = false;
+    if(e != NULL) {
+        int cnt = (int)var_array_size(e);
+        for(int i = 0; i < cnt; ++i) {
+            node_t* pn = var_array_get(e, i);
+            if(pn == NULL || pn->var == NULL) continue;
+            if(strcmp(usp_pair_name(pn->var), name) == 0 &&
+               (!has_val || strcmp(usp_pair_value(pn->var), val) == 0)) { found = true; break; }
+        }
+    }
+    mstr_free(a);
+    mstr_free(b);
+    return var_new_bool(vm, found);
+}
+
+static var_t* native_usp_set(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* e = usp_entries(self);
+    if(e == NULL) return NULL;
+    mstr_t* a = mstr_new("");
+    mstr_t* b = mstr_new("");
+    const char* name = js_arg_cstr(env, 0, a);
+    const char* val  = js_arg_cstr(env, 1, b);
+    var_t* keep = var_new_array(vm);
+    bool done = false;
+    int cnt = (int)var_array_size(e);
+    for(int i = 0; i < cnt; ++i) {
+        node_t* pn = var_array_get(e, i);
+        if(pn == NULL || pn->var == NULL) continue;
+        if(strcmp(usp_pair_name(pn->var), name) == 0) {
+            if(!done) { usp_add_entry(vm, keep, name, val); done = true; }
+        }
+        else var_array_add(keep, pn->var);
+    }
+    if(!done) usp_add_entry(vm, keep, name, val);
+    usp_replace_entries(self, keep);
+    mstr_free(a);
+    mstr_free(b);
+    return NULL;
+}
+
+static var_t* native_usp_toString(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    mstr_t* out = mstr_new("");
+    usp_serialize_into(usp_entries(js_this(env)), out);
+    var_t* r = var_new_str(vm, out->cstr);
+    mstr_free(out);
+    return r;
+}
+
+static var_t* native_usp_get_size(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* e = usp_entries(js_this(env));
+    return var_new_int(vm, (e != NULL) ? (int)var_array_size(e) : 0);
+}
+
+static var_t* native_usp_forEach(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* cb = js_arg_func(env, 0);
+    if(self == NULL || cb == NULL) return NULL;
+    var_t* thisArg = js_arg(env, 1);
+    /* The callback may mutate `self` (delete()/append()), which swaps the
+     * entries array out from under us, so re-read it every step and copy the
+     * name/value into C locals before the call. */
+    for(int i = 0; ; ++i) {
+        var_t* e = usp_entries(self);
+        if(e == NULL || i >= (int)var_array_size(e)) break;
+        node_t* pn = var_array_get(e, i);
+        if(pn == NULL || pn->var == NULL) continue;
+        char* nm = js_strdup(usp_pair_name(pn->var));
+        char* vl = js_strdup(usp_pair_value(pn->var));
+        var_t* args = var_new_array(vm);
+        var_array_add(args, var_new_str(vm, (vl != NULL) ? vl : ""));
+        var_array_add(args, var_new_str(vm, (nm != NULL) ? nm : ""));
+        var_array_add(args, self);
+        var_array_reverse(args);
+        var_t* res = call_m_func(vm, thisArg, cb, args);
+        var_unref(args);
+        if(res != NULL) var_unref(res);
+        if(nm != NULL) mario_free(nm);
+        if(vl != NULL) mario_free(vl);
+    }
+    return NULL;
+}
+
+/* keys()/values()/entries() hand back a plain array (mario iterates arrays
+ * with for..of); core-js's iterable module layers the real iterator protocol
+ * and Symbol.iterator on top of the prototype. */
+static var_t* usp_collect(vm_t* vm, var_t* e, int mode) {
+    var_t* arr = var_new_array(vm);
+    if(e == NULL) return arr;
+    int cnt = (int)var_array_size(e);
+    for(int i = 0; i < cnt; ++i) {
+        node_t* pn = var_array_get(e, i);
+        if(pn == NULL || pn->var == NULL) continue;
+        if(mode == 0)       var_array_add(arr, var_new_str(vm, usp_pair_name(pn->var)));
+        else if(mode == 1)  var_array_add(arr, var_new_str(vm, usp_pair_value(pn->var)));
+        else {
+            var_t* pair = var_new_array(vm);
+            var_array_add(pair, var_new_str(vm, usp_pair_name(pn->var)));
+            var_array_add(pair, var_new_str(vm, usp_pair_value(pn->var)));
+            var_array_add(arr, pair);
+        }
+    }
+    return arr;
+}
+static var_t* native_usp_keys(vm_t* vm, var_t* env, void* data)    { (void)data; return usp_collect(vm, usp_entries(js_this(env)), 0); }
+static var_t* native_usp_values(vm_t* vm, var_t* env, void* data)  { (void)data; return usp_collect(vm, usp_entries(js_this(env)), 1); }
+static var_t* native_usp_entries(vm_t* vm, var_t* env, void* data) { (void)data; return usp_collect(vm, usp_entries(js_this(env)), 2); }
+
+/* Stable insertion sort of the entries by name (spec: sort by code units). */
+static var_t* native_usp_sort(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* e = usp_entries(self);
+    if(e == NULL) return NULL;
+    int cnt = (int)var_array_size(e);
+    if(cnt <= 1) return NULL;
+    var_t** items = (var_t**)mario_malloc(sizeof(var_t*) * (size_t)cnt);
+    if(items == NULL) return NULL;
+    for(int i = 0; i < cnt; ++i) {
+        node_t* pn = var_array_get(e, i);
+        items[i] = (pn != NULL) ? pn->var : NULL;
+    }
+    for(int i = 1; i < cnt; ++i) {
+        var_t* cur = items[i];
+        const char* cn = usp_pair_name(cur);
+        int j = i - 1;
+        while(j >= 0 && items[j] != NULL && strcmp(usp_pair_name(items[j]), cn) > 0) {
+            items[j + 1] = items[j];
+            --j;
+        }
+        items[j + 1] = cur;
+    }
+    var_t* keep = var_new_array(vm);
+    for(int i = 0; i < cnt; ++i)
+        if(items[i] != NULL) var_array_add(keep, items[i]);
+    mario_free(items);
+    usp_replace_entries(self, keep);
+    return NULL;
+}
+
+/* ---- URL ---------------------------------------------------------- */
+
+typedef struct {
+    char* protocol; char* username; char* password;
+    char* hostname; char* port; char* pathname;
+    char* search; char* hash;
+} url_parts_t;
+
+static void url_parts_free(url_parts_t* p) {
+    if(p == NULL) return;
+    if(p->protocol) mario_free(p->protocol);
+    if(p->username) mario_free(p->username);
+    if(p->password) mario_free(p->password);
+    if(p->hostname) mario_free(p->hostname);
+    if(p->port)     mario_free(p->port);
+    if(p->pathname) mario_free(p->pathname);
+    if(p->search)   mario_free(p->search);
+    if(p->hash)     mario_free(p->hash);
+    memset(p, 0, sizeof(*p));
+}
+
+static void url_lower(char* s) {
+    if(s == NULL) return;
+    for(char* p = s; *p != 0; ++p) *p = js_ascii_lower(*p);
+}
+
+/* Parse an ABSOLUTE url into parts. Handles the userinfo ("user:pass@host")
+ * that url_parse() (used for location) deliberately ignores. Every field is
+ * set (possibly ""), so url_parts_free() is always safe. */
+static void url_parse2(const char* url, url_parts_t* p) {
+    memset(p, 0, sizeof(*p));
+    p->protocol = js_strdup("");
+    p->username = js_strdup("");
+    p->password = js_strdup("");
+    p->hostname = js_strdup("");
+    p->port     = js_strdup("");
+    p->pathname = js_strdup("");
+    p->search   = js_strdup("");
+    p->hash     = js_strdup("");
+    if(url == NULL) return;
+
+    const char* colon = strchr(url, ':');
+    const char* slash = strchr(url, '/');
+    const char* qm    = strchr(url, '?');
+    const char* hs    = strchr(url, '#');
+    bool has_scheme = (colon != NULL) && (slash == NULL || colon < slash) &&
+                      (qm == NULL || colon < qm) && (hs == NULL || colon < hs);
+    const char* rest = url;
+    if(has_scheme) {
+        char* sch = js_strndup(url, (uint32_t)(colon - url));
+        mstr_t* m = mstr_new((sch != NULL) ? sch : "");
+        mstr_add(m, ':');
+        if(sch != NULL) mario_free(sch);
+        mario_free(p->protocol);
+        url_lower(m->cstr);
+        p->protocol = js_strdup(m->cstr);
+        mstr_free(m);
+        rest = colon + 1;
+    }
+
+    bool hier = (rest[0] == '/' && rest[1] == '/');
+    if(hier) {
+        rest += 2;
+        const char* aend = rest;
+        while(*aend != 0 && *aend != '/' && *aend != '?' && *aend != '#') ++aend;
+        const char* hoststart = rest;
+        const char* at = (const char*)memchr(rest, '@', (size_t)(aend - rest));
+        if(at != NULL) {
+            const char* uc = (const char*)memchr(rest, ':', (size_t)(at - rest));
+            if(uc != NULL) {
+                mario_free(p->username);
+                p->username = js_strndup(rest, (uint32_t)(uc - rest));
+                mario_free(p->password);
+                p->password = js_strndup(uc + 1, (uint32_t)(at - uc - 1));
+            }
+            else {
+                mario_free(p->username);
+                p->username = js_strndup(rest, (uint32_t)(at - rest));
+            }
+            hoststart = at + 1;
+        }
+        const char* pc = (const char*)memchr(hoststart, ':', (size_t)(aend - hoststart));
+        if(pc != NULL) {
+            mario_free(p->hostname);
+            p->hostname = js_strndup(hoststart, (uint32_t)(pc - hoststart));
+            mario_free(p->port);
+            p->port = js_strndup(pc + 1, (uint32_t)(aend - pc - 1));
+        }
+        else {
+            mario_free(p->hostname);
+            p->hostname = js_strndup(hoststart, (uint32_t)(aend - hoststart));
+        }
+        url_lower(p->hostname);
+        rest = aend;
+    }
+
+    const char* base_end = rest + strlen(rest);
+    const char* hh = strchr(rest, '#');
+    if(hh != NULL) {
+        mario_free(p->hash);
+        p->hash = js_strdup(hh);
+        base_end = hh;
+    }
+    const char* qq = (const char*)memchr(rest, '?', (size_t)(base_end - rest));
+    if(qq != NULL) {
+        mario_free(p->pathname);
+        p->pathname = js_strndup(rest, (uint32_t)(qq - rest));
+        mario_free(p->search);
+        p->search = js_strndup(qq, (uint32_t)(base_end - qq));
+    }
+    else {
+        mario_free(p->pathname);
+        p->pathname = js_strndup(rest, (uint32_t)(base_end - rest));
+    }
+    if(p->pathname == NULL) p->pathname = js_strdup("");
+    if(p->pathname[0] == 0 && (hier || p->hostname[0] != 0)) {
+        mario_free(p->pathname);
+        p->pathname = js_strdup("/");
+    }
+}
+
+static bool url_special(const char* proto) {
+    return strcmp(proto, "http:") == 0 || strcmp(proto, "https:") == 0 ||
+           strcmp(proto, "ftp:") == 0 || strcmp(proto, "file:") == 0 ||
+           strcmp(proto, "ws:") == 0 || strcmp(proto, "wss:") == 0;
+}
+static bool url_default_port(const char* proto, const char* port) {
+    if(port == NULL || port[0] == 0) return false;
+    if(strcmp(proto, "http:") == 0 || strcmp(proto, "ws:") == 0)   return strcmp(port, "80") == 0;
+    if(strcmp(proto, "https:") == 0 || strcmp(proto, "wss:") == 0) return strcmp(port, "443") == 0;
+    if(strcmp(proto, "ftp:") == 0)                                  return strcmp(port, "21") == 0;
+    return false;
+}
+
+/* Resolve `ref` against `base` into an absolute URL string (mario_malloc'd).
+ * Approximate but covers the forms pages and core-js actually use. */
+static char* url_resolve2(const char* base, const char* ref) {
+    if(ref == NULL) ref = "";
+    if(base == NULL) base = "";
+    const char* colon = strchr(ref, ':');
+    const char* slash = strchr(ref, '/');
+    const char* qm    = strchr(ref, '?');
+    const char* hs    = strchr(ref, '#');
+    bool ref_abs = (colon != NULL) && (slash == NULL || colon < slash) &&
+                   (qm == NULL || colon < qm) && (hs == NULL || colon < hs);
+    if(ref_abs || base[0] == 0) return js_strdup(ref);
+
+    url_parts_t b;
+    url_parse2(base, &b);
+    mstr_t* auth = mstr_new("");
+    if(b.username[0] != 0) {
+        mstr_append(auth, b.username);
+        if(b.password[0] != 0) { mstr_add(auth, ':'); mstr_append(auth, b.password); }
+        mstr_add(auth, '@');
+    }
+    mstr_t* out = mstr_new("");
+    if(ref[0] == '/' && ref[1] == '/') {
+        mstr_append(out, b.protocol);
+        mstr_append(out, ref);
+    }
+    else {
+        mstr_append(out, b.protocol);
+        if(b.hostname[0] != 0 || url_special(b.protocol)) {
+            mstr_append(out, "//");
+            mstr_append(out, auth->cstr);
+            mstr_append(out, b.hostname);
+            if(b.port[0] != 0) { mstr_add(out, ':'); mstr_append(out, b.port); }
+        }
+        if(ref[0] == '/') {
+            mstr_append(out, ref);
+        }
+        else if(ref[0] == '?') {
+            mstr_append(out, b.pathname);
+            mstr_append(out, ref);
+        }
+        else if(ref[0] == '#') {
+            mstr_append(out, b.pathname);
+            mstr_append(out, b.search);
+            mstr_append(out, ref);
+        }
+        else {
+            const char* last = NULL;
+            for(const char* z = b.pathname; *z != 0; ++z)
+                if(*z == '/') last = z;
+            if(last != NULL) {
+                for(const char* z = b.pathname; z <= last; ++z) mstr_add(out, *z);
+            }
+            else mstr_add(out, '/');
+            mstr_append(out, ref);
+        }
+    }
+    char* r = js_strdup(out->cstr);
+    mstr_free(out);
+    mstr_free(auth);
+    url_parts_free(&b);
+    return r;
+}
+
+enum { UP_HREF, UP_PROTOCOL, UP_HOST, UP_HOSTNAME, UP_PORT, UP_PATHNAME,
+       UP_SEARCH, UP_HASH, UP_ORIGIN, UP_USERNAME, UP_PASSWORD };
+
+static const char* url_part(var_t* self, const char* key) {
+    var_t* v = (self != NULL) ? var_find_own_member_var(self, key) : NULL;
+    if(v == NULL || v->type != V_STRING) return "";
+    const char* s = var_get_str(v);
+    return (s != NULL) ? s : "";
+}
+static void url_store(vm_t* vm, var_t* self, const char* key, const char* val) {
+    node_t* n = var_add(self, key, var_new_str(vm, (val != NULL) ? val : ""));
+    if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+}
+static void url_store_parts(vm_t* vm, var_t* self, url_parts_t* p) {
+    url_store(vm, self, "@@protocol", p->protocol);
+    url_store(vm, self, "@@username", p->username);
+    url_store(vm, self, "@@password", p->password);
+    url_store(vm, self, "@@hostname", p->hostname);
+    url_store(vm, self, "@@port",     p->port);
+    url_store(vm, self, "@@pathname", p->pathname);
+    url_store(vm, self, "@@hash",     p->hash);
+}
+
+static void url_host_into(var_t* self, mstr_t* out) {
+    mstr_append(out, url_part(self, "@@hostname"));
+    const char* port = url_part(self, "@@port");
+    const char* proto = url_part(self, "@@protocol");
+    if(port[0] != 0 && !url_default_port(proto, port)) {
+        mstr_add(out, ':');
+        mstr_append(out, port);
+    }
+}
+static void url_href_into(var_t* self, mstr_t* out) {
+    const char* proto = url_part(self, "@@protocol");
+    mstr_append(out, proto);
+    if(url_special(proto)) {
+        mstr_append(out, "//");
+        const char* un = url_part(self, "@@username");
+        if(un[0] != 0) {
+            mstr_append(out, un);
+            const char* pw = url_part(self, "@@password");
+            if(pw[0] != 0) { mstr_add(out, ':'); mstr_append(out, pw); }
+            mstr_add(out, '@');
+        }
+        url_host_into(self, out);
+    }
+    mstr_append(out, url_part(self, "@@pathname"));
+    mstr_t* ss = mstr_new("");
+    usp_serialize_into(usp_entries(get_obj(self, URL_SP)), ss);
+    if(ss->len > 0) { mstr_add(out, '?'); mstr_append(out, ss->cstr); }
+    mstr_free(ss);
+    mstr_append(out, url_part(self, "@@hash"));
+}
+
+static var_t* native_url_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    mstr_t* a = mstr_new("");
+    mstr_t* b = mstr_new("");
+    const char* ref  = js_arg_cstr(env, 0, a);
+    const char* base = (js_arg_count(env) > 1) ? js_arg_cstr(env, 1, b) : "";
+    char* abs = url_resolve2(base, ref);
+    url_parts_t p;
+    url_parse2((abs != NULL) ? abs : "", &p);
+    vm->gc.gc_defer++;
+    url_store_parts(vm, self, &p);
+    var_t* sp = new_obj(vm, CLS_URLSP, 0);
+    if(sp != NULL) {
+        var_t* e = usp_entries(sp);
+        if(e == NULL) {
+            e = var_new_array(vm);
+            node_t* n = var_add(sp, USP_ENTRIES, e);
+            if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+        }
+        usp_parse(vm, e, p.search);
+        node_t* sn = var_add(self, URL_SP, sp);
+        if(sn != NULL) { sn->invisable = 1; sn->be_unenumerable = 1; }
+    }
+    vm->gc.gc_defer--;
+    url_parts_free(&p);
+    if(abs != NULL) mario_free(abs);
+    mstr_free(a);
+    mstr_free(b);
+    return NULL;
+}
+
+static var_t* native_url_get(vm_t* vm, var_t* env, void* data) {
+    var_t* self = js_this(env);
+    if(self == NULL) return var_new_str(vm, "");
+    int idx = (int)(intptr_t)data;
+    mstr_t* out = mstr_new("");
+    switch(idx) {
+        case UP_PROTOCOL: mstr_append(out, url_part(self, "@@protocol")); break;
+        case UP_USERNAME: mstr_append(out, url_part(self, "@@username")); break;
+        case UP_PASSWORD: mstr_append(out, url_part(self, "@@password")); break;
+        case UP_HOSTNAME: mstr_append(out, url_part(self, "@@hostname")); break;
+        case UP_PORT:     mstr_append(out, url_part(self, "@@port")); break;
+        case UP_PATHNAME: mstr_append(out, url_part(self, "@@pathname")); break;
+        case UP_HASH:     mstr_append(out, url_part(self, "@@hash")); break;
+        case UP_HOST:     url_host_into(self, out); break;
+        case UP_ORIGIN: {
+            const char* proto = url_part(self, "@@protocol");
+            if(url_special(proto) && url_part(self, "@@hostname")[0] != 0) {
+                mstr_append(out, proto);
+                mstr_append(out, "//");
+                url_host_into(self, out);
+            }
+            else mstr_append(out, "null");
+            break;
+        }
+        case UP_SEARCH: {
+            usp_serialize_into(usp_entries(get_obj(self, URL_SP)), out);
+            if(out->len > 0) {
+                mstr_t* q = mstr_new("?");
+                mstr_append(q, out->cstr);
+                mstr_reset(out);
+                mstr_append(out, q->cstr);
+                mstr_free(q);
+            }
+            break;
+        }
+        case UP_HREF: url_href_into(self, out); break;
+    }
+    var_t* r = var_new_str(vm, out->cstr);
+    mstr_free(out);
+    return r;
+}
+
+static var_t* native_url_toString(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    return native_url_get(vm, env, (void*)(intptr_t)UP_HREF);
+}
+
+static var_t* native_url_set(vm_t* vm, var_t* env, void* data) {
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    int idx = (int)(intptr_t)data;
+    mstr_t* s = mstr_new("");
+    const char* v = js_arg_cstr(env, 0, s);
+    if(idx == UP_HREF) {
+        char* abs = url_resolve2("", v);
+        url_parts_t p;
+        url_parse2((abs != NULL) ? abs : v, &p);
+        url_store_parts(vm, self, &p);
+        var_t* sp = get_obj(self, URL_SP);
+        var_t* e = (sp != NULL) ? usp_entries(sp) : NULL;
+        if(e == NULL && sp != NULL) {
+            e = var_new_array(vm);
+            node_t* n = var_add(sp, USP_ENTRIES, e);
+            if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+        }
+        if(e != NULL) {
+            var_t* fresh = var_new_array(vm);
+            usp_parse(vm, fresh, p.search);
+            usp_replace_entries(sp, fresh);
+        }
+        url_parts_free(&p);
+        if(abs != NULL) mario_free(abs);
+    }
+    else if(idx == UP_SEARCH) {
+        var_t* sp = get_obj(self, URL_SP);
+        if(sp != NULL) {
+            var_t* fresh = var_new_array(vm);
+            usp_parse(vm, fresh, v);
+            usp_replace_entries(sp, fresh);
+        }
+    }
+    else if(idx == UP_PATHNAME) {
+        mstr_t* pn = mstr_new("");
+        if(v[0] != '/') mstr_add(pn, '/');
+        mstr_append(pn, v);
+        url_store(vm, self, "@@pathname", pn->cstr);
+        mstr_free(pn);
+    }
+    else if(idx == UP_HASH) {
+        mstr_t* hh = mstr_new("");
+        if(v[0] != 0 && v[0] != '#') mstr_add(hh, '#');
+        mstr_append(hh, v);
+        url_store(vm, self, "@@hash", hh->cstr);
+        mstr_free(hh);
+    }
+    else if(idx == UP_HOSTNAME) { char* c = js_strdup(v); url_lower(c); url_store(vm, self, "@@hostname", c); if(c) mario_free(c); }
+    else if(idx == UP_PROTOCOL) { char* c = js_strdup(v); url_lower(c); url_store(vm, self, "@@protocol", c); if(c) mario_free(c); }
+    else if(idx == UP_HOST) {
+        const char* cc = strchr(v, ':');
+        if(cc != NULL) {
+            char* hn = js_strndup(v, (uint32_t)(cc - v));
+            url_lower(hn);
+            url_store(vm, self, "@@hostname", hn);
+            url_store(vm, self, "@@port", cc + 1);
+            if(hn != NULL) mario_free(hn);
+        }
+        else { char* hn = js_strdup(v); url_lower(hn); url_store(vm, self, "@@hostname", hn); url_store(vm, self, "@@port", ""); if(hn) mario_free(hn); }
+    }
+    else if(idx == UP_PORT)     url_store(vm, self, "@@port", v);
+    else if(idx == UP_USERNAME) url_store(vm, self, "@@username", v);
+    else if(idx == UP_PASSWORD) url_store(vm, self, "@@password", v);
+    mstr_free(s);
+    return NULL;
+}
+
+static var_t* native_url_get_searchParams(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* sp = (self != NULL) ? get_obj(self, URL_SP) : NULL;
+    if(sp != NULL) return sp;
+    return new_obj(vm, CLS_URLSP, 0);
+}
+
+static var_t* native_url_createObjectURL(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    return var_new_str(vm, "blob:");
+}
+static var_t* native_url_revokeObjectURL(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)env; (void)data;
+    return NULL;
+}
+
+static void web_register_url(vm_t* vm, var_t* bridge) {
+    var_t* cls = vm_new_class(vm, CLS_URLSP);
+    if(cls != NULL) {
+        vm_reg_native(vm, cls, "constructor(init)",   native_usp_ctor,     bridge);
+        vm_reg_native(vm, cls, "append(n, v)",        native_usp_append,   bridge);
+        vm_reg_native(vm, cls, "delete(n, v)",        native_usp_delete,   bridge);
+        vm_reg_native(vm, cls, "get(n)",              native_usp_get,      bridge);
+        vm_reg_native(vm, cls, "getAll(n)",           native_usp_getAll,   bridge);
+        vm_reg_native(vm, cls, "has(n, v)",           native_usp_has,      bridge);
+        vm_reg_native(vm, cls, "set(n, v)",           native_usp_set,      bridge);
+        vm_reg_native(vm, cls, "sort()",              native_usp_sort,     bridge);
+        vm_reg_native(vm, cls, "forEach(f, t)",       native_usp_forEach,  bridge);
+        vm_reg_native(vm, cls, "keys()",              native_usp_keys,     bridge);
+        vm_reg_native(vm, cls, "values()",            native_usp_values,   bridge);
+        vm_reg_native(vm, cls, "entries()",           native_usp_entries,  bridge);
+        vm_reg_native(vm, cls, "toString()",          native_usp_toString, bridge);
+        js_acc_cls(vm, cls, "size", native_usp_get_size, NULL, bridge);
+    }
+
+    cls = vm_new_class(vm, CLS_URL);
+    if(cls != NULL) {
+        vm_reg_native(vm, cls, "constructor(u, b)", native_url_ctor, bridge);
+        js_acc_cls(vm, cls, "href",        native_url_get, native_url_set, (void*)(intptr_t)UP_HREF);
+        js_acc_cls(vm, cls, "protocol",    native_url_get, native_url_set, (void*)(intptr_t)UP_PROTOCOL);
+        js_acc_cls(vm, cls, "username",    native_url_get, native_url_set, (void*)(intptr_t)UP_USERNAME);
+        js_acc_cls(vm, cls, "password",    native_url_get, native_url_set, (void*)(intptr_t)UP_PASSWORD);
+        js_acc_cls(vm, cls, "host",        native_url_get, native_url_set, (void*)(intptr_t)UP_HOST);
+        js_acc_cls(vm, cls, "hostname",    native_url_get, native_url_set, (void*)(intptr_t)UP_HOSTNAME);
+        js_acc_cls(vm, cls, "port",        native_url_get, native_url_set, (void*)(intptr_t)UP_PORT);
+        js_acc_cls(vm, cls, "pathname",    native_url_get, native_url_set, (void*)(intptr_t)UP_PATHNAME);
+        js_acc_cls(vm, cls, "search",      native_url_get, native_url_set, (void*)(intptr_t)UP_SEARCH);
+        js_acc_cls(vm, cls, "hash",        native_url_get, native_url_set, (void*)(intptr_t)UP_HASH);
+        js_acc_cls(vm, cls, "origin",      native_url_get, NULL,           (void*)(intptr_t)UP_ORIGIN);
+        js_acc_cls(vm, cls, "searchParams", native_url_get_searchParams, NULL, bridge);
+        vm_reg_native(vm, cls, "toString()", native_url_toString, bridge);
+        vm_reg_native(vm, cls, "toJSON()",   native_url_toString, bridge);
+        vm_reg_static(vm, cls, "createObjectURL(b)",  native_url_createObjectURL, bridge);
+        vm_reg_static(vm, cls, "revokeObjectURL(u)",  native_url_revokeObjectURL, bridge);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -2555,7 +3499,7 @@ static void web_mirror_globals(vm_t* vm, var_t* window) {
         "Event", "CustomEvent", "MouseEvent", "KeyboardEvent",
         "Element", "Document", "Storage", "Location", "History",
         "Navigator", "Screen", "Performance", "XMLHttpRequest",
-        "Response", "Headers"
+        "Response", "Headers", "URL", "URLSearchParams"
     };
     for(size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); ++i)
         web_link_global(vm, window, kNames[i]);
@@ -2911,6 +3855,9 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
         vm_reg_native(vm, cls, "get(k)", native_headers_get, bridge);
         vm_reg_native(vm, cls, "has(k)", native_headers_has, bridge);
     }
+
+    /* ---- URL / URLSearchParams ---- */
+    web_register_url(vm, bridge);
 
     /* ---- crypto ---- */
     var_t* crypto = var_new_obj_no_proto(vm, NULL, NULL);

@@ -409,6 +409,10 @@ bool litehtml::element::is_html_tag() const
 {
 	return false;
 }
+bool litehtml::element::is_comment() const
+{
+	return false;
+}
 void litehtml::element::set_tagName( const tchar_t* tag )							LITEHTML_EMPTY_FUNC
 void litehtml::element::set_data( const tchar_t* data )								LITEHTML_EMPTY_FUNC
 void litehtml::element::set_attr( const tchar_t* name, const tchar_t* val )			LITEHTML_EMPTY_FUNC

@@ -154,6 +154,11 @@ protected:
 		 * code that needs html_tag-only members (stylesheets, attributes map)
 		 * must check this before static_cast'ing - RTTI is compiled out. */
 		virtual bool				is_html_tag() const;
+		/* True only for el_comment: JS-created comment nodes (React's Suspense
+		 * boundaries, `document.createComment`) look like el_text to a tag-name
+		 * check (both report ""), so the DOM bridge needs a real discriminator
+		 * for Node.nodeType (8 vs 3). RTTI is compiled out. */
+		virtual bool				is_comment() const;
 		virtual void				set_tagName(const tchar_t* tag);
 		virtual void				set_data(const tchar_t* data);
 		virtual element_float		get_float() const;

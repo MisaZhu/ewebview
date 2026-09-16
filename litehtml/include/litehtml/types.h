@@ -360,7 +360,17 @@ namespace litehtml
 		clear_both
 	};
 
-#define  css_units_strings	_t("none;%;in;cm;mm;em;ex;pt;pc;px;dpi;dpcm;vw;vh;vmin;vmax;rem;ch")
+/* NOTE: value_index() does an exact segment match against this list, and the
+ * segment index is used directly as the css_units enum value. Any new unit
+ * MUST therefore be appended at the end (both in the string and in the enum)
+ * so pre-existing enum values do not shift.
+ *
+ * dvh/lvh/svh (and the vw/vmin/vmax variants) are the CSS Values 4 dynamic /
+ * large / small viewport units. ewebview's viewport is static (no browser
+ * chrome that collapses on scroll), so all three alias to the corresponding
+ * vh/vw/vmin/vmax in document::computeLength. They are enumerated separately
+ * so parser-side code can recognise them without string-munging. */
+#define  css_units_strings	_t("none;%;in;cm;mm;em;ex;pt;pc;px;dpi;dpcm;vw;vh;vmin;vmax;rem;ch;dvw;dvh;dvmin;dvmax;lvw;lvh;lvmin;lvmax;svw;svh;svmin;svmax")
 
 	enum css_units
 	{
@@ -382,6 +392,18 @@ namespace litehtml
 		css_units_vmax,
 		css_units_rem,
 		css_units_ch,
+		css_units_dvw,
+		css_units_dvh,
+		css_units_dvmin,
+		css_units_dvmax,
+		css_units_lvw,
+		css_units_lvh,
+		css_units_lvmin,
+		css_units_lvmax,
+		css_units_svw,
+		css_units_svh,
+		css_units_svmin,
+		css_units_svmax,
 	};
 
 #define  background_attachment_strings	_t("scroll;fixed")
@@ -495,7 +517,13 @@ namespace litehtml
 	};
 
 
-#define pseudo_class_strings		_t("only-child;only-of-type;first-child;first-of-type;last-child;last-of-type;nth-child;nth-of-type;nth-last-child;nth-last-of-type;not;lang;root;where;is;has")
+/* NOTE: like css_units_strings, entries here are matched by segment index via
+ * value_index(). New pseudo-classes MUST be appended at the end so existing
+ * enum values do not shift. Entries added here need a corresponding case in
+ * html_tag::select(css_element_selector, bool) — unknown names fall through to
+ * the m_pseudo_classes lookup, which is only for state-driven classes the
+ * engine toggles at runtime (:hover/:active/:focus/:link). */
+#define pseudo_class_strings		_t("only-child;only-of-type;first-child;first-of-type;last-child;last-of-type;nth-child;nth-of-type;nth-last-child;nth-last-of-type;not;lang;root;where;is;has;focus-within;focus-visible;dir;checked;disabled;enabled;required;optional;read-only;read-write;empty;any-link;default")
 
 	enum pseudo_class
 	{
@@ -515,6 +543,19 @@ namespace litehtml
 		pseudo_class_where,
 		pseudo_class_is,
 		pseudo_class_has,
+		pseudo_class_focus_within,
+		pseudo_class_focus_visible,
+		pseudo_class_dir,
+		pseudo_class_checked,
+		pseudo_class_disabled,
+		pseudo_class_enabled,
+		pseudo_class_required,
+		pseudo_class_optional,
+		pseudo_class_read_only,
+		pseudo_class_read_write,
+		pseudo_class_empty,
+		pseudo_class_any_link,
+		pseudo_class_default,
 	};
 
 #define content_property_string		_t("none;normal;open-quote;close-quote;no-open-quote;no-close-quote")

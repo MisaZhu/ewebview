@@ -9,6 +9,7 @@
 #include "stylesheet.h"
 #include "box.h"
 #include "table.h"
+#include "animation.h"
 
 namespace litehtml
 {
@@ -43,6 +44,23 @@ namespace litehtml
 		string_vector			m_class_values;
 		tstring					m_tag;
 		litehtml::style			m_style;
+		/* Animation-driven property overrides (Phase 2). Written by
+		 * document::tick_animations, read by parse_styles AFTER the cascade
+		 * so an in-flight transition/animation wins over authored values.
+		 * Kept as raw CSS strings for symmetry with style::m_properties; the
+		 * set of properties that can be overridden is gated by
+		 * property_is_interpolable() in animation.cpp. */
+		string_map				m_anim_overrides;
+		/* Parsed transition and animation declarations (Phase 2). Populated
+		 * by parse_styles from m_style on every cascade; compared against the
+		 * previous set to detect new transitions (value changes) and new
+		 * animations (animation-name appears). */
+		std::vector<anim_declaration>	m_transitions;
+		std::vector<anim_declaration>	m_animations;
+		/* Last computed transform string (override or CSS), kept so the
+		 * transition trigger in parse_styles can detect a change and fire a
+		 * transform transition. Empty means identity/none. */
+		tstring							m_transform_str;
 		/* Resolved --custom-properties visible to this element (inherited
 		 * from the parent chain plus own declarations), used to expand
 		 * var() references in raw property values at parse_styles time. */
@@ -81,12 +99,18 @@ namespace litehtml
 		int						m_pct_cb_width = 0;
 		/* Parsed CSS `transform` function list, paint-time only: the box's
 		 * borders are drawn through the composed matrix (see draw_background).
-		 * Empty list = identity. Not inherited. */
+		 * Empty list = identity. Not inherited.
+		 * Type codes: 0=rotate 1=translate 2=translateX 3=translateY
+		 *             4=scale 5=scaleX 6=scaleY 7=skew 8=skewX 9=skewY
+		 *             10=matrix(a,b,c,d,e,f) */
 		struct transform_fn
 		{
-			int			type;		// 0 rotate, 1 translate, 2 translateX, 3 translateY
-			float		deg;		// rotate angle in degrees
+			int			type;
+			float		deg;		// rotate/skew angle in degrees
 			css_length	x, y;		// translate lengths (percentages resolve at paint)
+			float		sx, sy;		// scale factors
+			float		mat[6];		// matrix(a,b,c,d,e,f) components
+			transform_fn() : type(0), deg(0), sx(1), sy(1) { mat[0]=1;mat[1]=0;mat[2]=0;mat[3]=1;mat[4]=0;mat[5]=0; }
 		};
 		std::vector<transform_fn>	m_transform;
 		css_length				m_css_width;
@@ -210,6 +234,10 @@ namespace litehtml
 		virtual const tchar_t*		get_cursor() override;
 		virtual void				init_font() override;
 		virtual bool				set_pseudo_class(const tchar_t* pclass, bool add) override;
+		/* Read-only view of the runtime pseudo-class list. Used by the
+		 * :focus-within matcher to walk ancestors looking for a live "focus"
+		 * entry without needing friend access to m_pseudo_classes. */
+		const string_vector&			pseudo_classes() const { return m_pseudo_classes; }
 		virtual bool				set_class(const tchar_t* pclass, bool add) override;
 		virtual bool				is_replaced() const override;
 		virtual int					line_height() const override;
@@ -222,6 +250,34 @@ namespace litehtml
 		virtual visibility			get_visibility() const override;
 		virtual float				get_opacity_cum() const override { return m_opacity_cum; }
 		virtual void				parse_styles(bool is_reparse = false) override;
+		/* ---- CSS animation overrides (Phase 2) ----
+		 * When a transition or @keyframes animation is running on this
+		 * element, document::tick_animations writes the interpolated value
+		 * into m_anim_overrides (keyed by lowercase property name, value is
+		 * the raw CSS string form). parse_styles consults the override map
+		 * AFTER the normal cascade so animated values win over authored
+		 * styles without the animation having to rewrite the stylesheet.
+		 * Cleared when the animation ends without fill-mode:forwards, or
+		 * when the element is detached. */
+		void						set_anim_override(const tchar_t* prop, const tchar_t* value);
+		void						clear_anim_override(const tchar_t* prop);
+		void						clear_anim_overrides();
+		bool						has_anim_overrides() const { return !m_anim_overrides.empty(); }
+		const tchar_t*				anim_override(const tchar_t* prop) const;
+		/* Apply an animated opacity value directly (bypasses parse_styles).
+		 * Sets m_opacity, recomputes m_opacity_cum, and propagates the new
+		 * cumulative value down the subtree so descendants stay correct.
+		 * Called by document::tick_animations every frame. */
+		void						set_animated_opacity(float op);
+		/* Apply an animated transform string directly (bypasses parse_styles).
+		 * Stores the override and re-parses it into m_transform so the next
+		 * draw_background composes the new paint matrix. Called by
+		 * document::tick_animations every frame for transform animations. */
+		void						set_animated_transform(const tchar_t* val);
+		/* Phase 3.1 relayout guard: true when the subtree rooted at this element
+		 * has <= limit nodes. The walk is bounded by `limit` so the check never
+		 * costs more than the per-frame relayout budget it protects. */
+		bool						subtree_within_budget(int limit) const;
 		virtual void				draw(uint_ptr hdc, int x, int y, const position* clip) override;
 		virtual void				draw_background(uint_ptr hdc, int x, int y, const position* clip) override;
 		/* CSS transform subset (rotate/translate*): parse into m_transform and
@@ -291,6 +347,9 @@ namespace litehtml
 	protected:
 		void						draw_children_box(uint_ptr hdc, int x, int y, const position* clip, draw_flag flag, int zindex);
 		void						draw_children_table(uint_ptr hdc, int x, int y, const position* clip, draw_flag flag, int zindex);
+		/* Recompute m_opacity_cum from the parent's cum and own m_opacity,
+		 * then recurse into children. Called by set_animated_opacity. */
+		void						propagate_opacity_cum();
 		int							render_box(int x, int y, int max_width, bool second_pass = false);
 		int											render_flex(int x, int y, int max_width, bool second_pass = false);
 		int											render_grid(int x, int y, int max_width, bool second_pass = false);

@@ -473,6 +473,37 @@ void css::parse_atrule(const tstring& text, const tchar_t* baseurl, document* do
 				parse_stylesheet(body.c_str(), baseurl, doc, media);
 			}
 		}
+	} else if(text.substr(0, 10) == _t("@keyframes") ||
+			  text.substr(0, 18) == _t("-webkit-keyframes") ||
+			  text.substr(0, 17) == _t("-moz-keyframes"))
+	{
+		/* @keyframes NAME { from { ... } 50% { ... } to { ... } }
+		 * Parse the rule body and register it on the document so
+		 * tick_animations can sample it. The name is the token between the
+		 * at-rule keyword and the opening brace. */
+		tstring::size_type b1 = text.find_first_of(_t('{'));
+		if(b1 != tstring::npos && doc)
+		{
+			/* Extract the animation name. */
+			tstring header = text.substr(0, b1);
+			trim(header);
+			/* Strip the at-rule keyword to get the bare name. */
+			tstring::size_type sp = header.find_first_of(_t(" \t"));
+			tstring name = (sp != tstring::npos) ? header.substr(sp + 1) : tstring();
+			trim(name);
+			if(!name.empty())
+			{
+				tstring::size_type b2 = find_close_bracket(text, b1, _t('{'), _t('}'));
+				tstring body = (b2 != tstring::npos && b2 > b1 + 1)
+					? text.substr(b1 + 1, b2 - b1 - 1)
+					: text.substr(b1 + 1);
+				keyframes_rule rule;
+				if(parse_keyframes_body(body, rule))
+				{
+					doc->add_keyframes(name, rule);
+				}
+			}
+		}
 	}
 }
 

@@ -39,6 +39,7 @@
 /* el_text is not pulled in by <litehtml.h>; createTextNode and the text
  * setters build one directly (malloc + placement-new, matching litehtml_alloc). */
 #include <litehtml/el_text.h>
+#include <litehtml/el_comment.h>
 
 #include <string>
 #include <string.h>
@@ -46,12 +47,42 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <new>
+#include <setjmp.h>   /* SEGV recovery checkpoints (see eweb_segv_checkpoint) */
+#include <signal.h>
 
 /* mario entry points that live in libmario.a but are not declared in a public
  * header: the JS bytecode compiler (passed to vm_new) and the all-natives
  * registrar (passed to vm_init so console/Object/Array/... exist). */
 extern "C" bool js_compile(bytecode_t* bc, const char* input);
 extern "C" void reg_all_natives(vm_t* vm);
+
+/* ==================================================================
+ * SIGSEGV recovery checkpoints
+ *
+ * The mario VM is fed large minified third-party bundles; a latent memory
+ * fault inside one script or one timer callback must not take down the whole
+ * browser. Each run boundary (a page script, the timer poll) arms a sigsetjmp
+ * checkpoint; the port's SIGSEGV handler calls eweb_segv_try_recover(), which
+ * siglongjmps back to the innermost armed checkpoint. The caller then resets
+ * the VM and skips the faulting unit instead of aborting the process.
+ * ================================================================== */
+static sigjmp_buf               s_segv_jmp;
+static volatile sig_atomic_t    s_segv_armed = 0;
+
+extern "C" int eweb_segv_checkpoint(void)
+{
+    int r = sigsetjmp(s_segv_jmp, 1);
+    s_segv_armed = (r == 0) ? 1 : 0;
+    return r;   /* 0 = freshly armed, 1 = returning from a fault */
+}
+extern "C" void eweb_segv_disarm(void) { s_segv_armed = 0; }
+extern "C" int eweb_segv_try_recover(void)
+{
+    if(!s_segv_armed) return 0;   /* no checkpoint: let the handler dump+abort */
+    s_segv_armed = 0;
+    siglongjmp(s_segv_jmp, 1);
+    return 1;   /* not reached */
+}
 
 namespace eweb {
 
@@ -93,7 +124,16 @@ static void  js_platform_free(void* p)         { free(p); }
 
 static void  js_platform_out(const char* s)
 {
-    if(s == nullptr || s_js_log_fn == nullptr) return;
+    if(s == nullptr) return;
+    /* TEMP DIAGNOSTIC (taobao): the port routes JS console text through
+     * sys.log -> SDL_Log at INFO priority, which a release build suppresses,
+     * so console.log/warn/error AND the engine's "Uncaught ..." reports are
+     * invisible on stderr. Mirror them to stderr when EWEB_JSMIRROR is set so
+     * a failing bundle can be diagnosed. Remove with the other temp probes. */
+    static int s_mirror = -1;
+    if(s_mirror < 0) s_mirror = (getenv("EWEB_JSMIRROR") != nullptr) ? 1 : 0;
+    if(s_mirror) { fputs("[js] ", stderr); fputs(s, stderr); fflush(stderr); }
+    if(s_js_log_fn == nullptr) return;
     std::string line("[js] ");
     line += s;
     s_js_log_fn(s_js_log_ud, line.c_str());
@@ -279,11 +319,13 @@ void EWebEngine::initJsVm()
     cb.query_all         = jsQueryAll;
     cb.create_element    = jsCreateElement;
     cb.create_text_node  = jsCreateTextNode;
+    cb.create_comment    = jsCreateComment;
     /* Tree walking, mutation, geometry and computed style. */
     cb.el_parent         = jsElParent;
     cb.el_child_count    = jsElChildCount;
     cb.el_child          = jsElChild;
     cb.el_is_tag         = jsElIsTag;
+    cb.el_is_comment     = jsElIsComment;
     cb.el_is_live        = jsElIsLive;
     cb.el_append_child   = jsElAppendChild;
     cb.el_insert_before  = jsElInsertBefore;
@@ -389,6 +431,22 @@ bool EWebEngine::runPageScripts()
          * arms the VM step hook, which enforces the run budget and honours a
          * termination abort; window interaction stays live on its own thread
          * even through this pre-paint (document.write) script run. */
+        /* SEGV checkpoint: a latent memory fault inside this bundle skips the
+         * script instead of aborting the browser (see eweb_segv_checkpoint). */
+        if(eweb_segv_checkpoint() != 0) {
+            fprintf(stderr, "[ewebview] js: script %d faulted (SIGSEGV) - skipping\n", (int)i);
+            vm_terminate(m_jsVm);
+            m_jsVm->terminated = false;
+            m_jsVm->abort_run = false;
+            m_jsVm->propagating_err = nullptr;
+            m_jsVm->call_depth = 0;
+            m_jsInScript = false;
+            m_jsEnterAt = 0;
+            m_jsVm->dbg_tag = nullptr;
+            m_jsCurScriptSrc = nullptr;
+            m_jsCurScriptUrl.clear();
+            continue;
+        }
         jsVmEnter();
         m_jsCurScriptSrc = &src;
         m_jsCurScriptUrl = (i < m_jsScriptSrcs.size()) ? m_jsScriptSrcs[i] : std::string();
@@ -398,6 +456,9 @@ bool EWebEngine::runPageScripts()
             snprintf(s_jsDbgTag, sizeof(s_jsDbgTag), "script_%d", (int)i);
             m_jsVm->dbg_tag = s_jsDbgTag;
         }
+        if(getenv("EWEB_SCRIPTDBG") != NULL)
+            fprintf(stderr, "[ewebview] jsdbg: pre run script %d len=%u url=%.80s\n", (int)i,
+                     (unsigned)src.size(), m_jsCurScriptUrl.c_str());
         /* Same per-run state reset as the post-swap path (see above). */
         m_jsVm->terminated = false;
         m_jsVm->abort_run = false;
@@ -410,10 +471,14 @@ bool EWebEngine::runPageScripts()
         else {
             jsDumpScript(i, src, false);
         }
+        eweb_segv_disarm();
         m_jsVm->dbg_tag = nullptr;
         m_jsCurScriptSrc = nullptr;
         m_jsCurScriptUrl.clear();
         bool terminated = jsVmExit();
+        if(getenv("EWEB_SCRIPTDBG") != NULL)
+            fprintf(stderr, "[ewebview] jsdbg: pc_range script %d = [%u,%u)\n", (int)i,
+                    (unsigned)jsBasePc, (unsigned)m_jsVm->bc.cindex);
         /* Same refund as the post-swap path: a watchdog-cut body must not eat
          * the pre-paint phase budget that decides when the first paint lands. */
         if(terminated && m_jsPrePaintAt != 0)
@@ -462,10 +527,16 @@ bool EWebEngine::runNextPageScript()
          * for tens of seconds. Past the budget stop STARTING new scripts (one
          * already in flight unwinds under its own per-run budget) and let the
          * phase complete: DOMContentLoaded/load fire and the page is usable,
-         * the remaining ad scripts are simply dropped. */
-        if(m_jsPostSwapAt != 0 && (ticMs() - m_jsPostSwapAt) > kJsPostSwapBudgetMs) {
+         * the remaining ad scripts are simply dropped.
+         * While the viewport still shows only the server-side skeleton the
+         * tail of the queue IS the content bundle, so use the much larger
+         * skeleton budget instead (see kJsPostSwapSkeletonBudgetMs). */
+        uint32_t postBudget = pageShowsSkeletonPlaceholder()
+                                  ? kJsPostSwapSkeletonBudgetMs
+                                  : kJsPostSwapBudgetMs;
+        if(m_jsPostSwapAt != 0 && (ticMs() - m_jsPostSwapAt) > postBudget) {
             EWEB_LOG("[ewebview] js: post-swap budget %u ms exhausted at script %d of %d - dropping the rest\n",
-                (unsigned)kJsPostSwapBudgetMs, (int)i, (int)m_jsScripts.size());
+                (unsigned)postBudget, (int)i, (int)m_jsScripts.size());
             m_jsNextScript = m_jsScripts.size();
             m_jsPostSwapAt = 0;
             break;
@@ -505,6 +576,23 @@ bool EWebEngine::runNextPageScript()
          * they are produced. m_jsInScript arms the step hook (run budget +
          * abort). Window interaction is unaffected - it runs on the UI thread. */
         m_jsProgressiveActive = true;
+        /* SEGV checkpoint: a latent memory fault inside this bundle skips the
+         * script instead of aborting the browser (see eweb_segv_checkpoint). */
+        if(eweb_segv_checkpoint() != 0) {
+            fprintf(stderr, "[ewebview] js: post script %d faulted (SIGSEGV) - skipping\n", (int)i);
+            vm_terminate(m_jsVm);
+            m_jsVm->terminated = false;
+            m_jsVm->abort_run = false;
+            m_jsVm->propagating_err = nullptr;
+            m_jsVm->call_depth = 0;
+            m_jsInScript = false;
+            m_jsEnterAt = 0;
+            m_jsVm->dbg_tag = nullptr;
+            m_jsCurScriptSrc = nullptr;
+            m_jsCurScriptUrl.clear();
+            m_jsProgressiveActive = false;
+            continue;
+        }
         jsVmEnter();
         m_jsCurScriptSrc = &src;
         m_jsCurScriptUrl = (i < m_jsScriptSrcs.size()) ? m_jsScriptSrcs[i] : std::string();
@@ -514,6 +602,9 @@ bool EWebEngine::runNextPageScript()
             snprintf(s_jsDbgTag, sizeof(s_jsDbgTag), "script_%d", (int)i);
             m_jsVm->dbg_tag = s_jsDbgTag;
         }
+        if(getenv("EWEB_SCRIPTDBG") != NULL)
+            fprintf(stderr, "[ewebview] jsdbg: post run script %d len=%u url=%.80s\n", (int)i,
+                     (unsigned)src.size(), m_jsCurScriptUrl.c_str());
         /* A prior script may have ended abnormally INSIDE the VM (runaway
          * recursion calls vm_terminate from func_call; a cross-frame throw can
          * leave abort_run/propagating_err set). vm_run loops on !vm->terminated
@@ -532,10 +623,14 @@ bool EWebEngine::runNextPageScript()
         else {
             jsDumpScript(i, src, false);
         }
+        eweb_segv_disarm();
         m_jsVm->dbg_tag = nullptr;
         m_jsCurScriptSrc = nullptr;
         m_jsCurScriptUrl.clear();
         bool terminated = jsVmExit();
+        if(getenv("EWEB_SCRIPTDBG") != NULL)
+            fprintf(stderr, "[ewebview] jsdbg: pc_range script %d = [%u,%u)\n", (int)i,
+                    (unsigned)jsBasePc, (unsigned)m_jsVm->bc.cindex);
         /* A watchdog-cut body's wall time is waste, not page work: refund it to
          * the phase budget so the scripts BEHIND a runaway SDK still get their
          * window (taobao's traceSDK burns a whole cut ahead of the React
@@ -589,6 +684,14 @@ void EWebEngine::jsDynamicScriptInserted(void* script_el)
     const char* tn = sc->get_tagName();
     EWEB_LOG("[ewebview] dynScript entry: el=%p tag=%s\n", script_el, tn != nullptr ? tn : "(null)");
     if(tn == nullptr || strcmp(tn, "script") != 0) return;
+    /* TEMP DIAGNOSTIC (taobao): webpack loads route chunks by splicing
+     * <script src> into <head>; log every such insert so a missing async chunk
+     * (e.g. fdabd03d.js) is visible. Remove with the other temp probes. */
+    if(getenv("EWEB_SCRIPTDBG") != nullptr) {
+        const char* sa = sc->get_attr("src", nullptr);
+        fprintf(stderr, "[ewebview] jsdbg: dynScript insert src=%s\n",
+                (sa != nullptr && sa[0] != 0) ? sa : "(inline)");
+    }
 
     std::string body;
     std::string srcabs;
@@ -872,8 +975,22 @@ int EWebEngine::jsPollTimers()
      * many callbacks fired (a firing may have drawn without touching layout,
      * so the caller marks the content dirty). */
     if(m_jsVm == nullptr || !m_jsEnabled || m_jsPageDisabled) return 0;
+    /* SEGV checkpoint: a faulting timer callback skips this tick instead of
+     * aborting the browser (see eweb_segv_checkpoint). */
+    if(eweb_segv_checkpoint() != 0) {
+        fprintf(stderr, "[ewebview] js: timer poll faulted (SIGSEGV) - skipping tick\n");
+        vm_terminate(m_jsVm);
+        m_jsVm->terminated = false;
+        m_jsVm->abort_run = false;
+        m_jsVm->propagating_err = nullptr;
+        m_jsVm->call_depth = 0;
+        m_jsInScript = false;
+        m_jsEnterAt = 0;
+        return 0;
+    }
     jsVmEnter();
     int fired = js_dom_poll_timers(m_jsVm, ticMs());
+    eweb_segv_disarm();
     jsVmExit();
     return fired;
 }
@@ -1320,6 +1437,25 @@ void* EWebEngine::jsCreateTextNode(void* ctx, const char* text)
     return (void*)t;
 }
 
+void* EWebEngine::jsCreateComment(void* ctx, const char* text)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(self == nullptr) return nullptr;
+    litehtml::document* doc = self->jsActiveDoc();
+    if(doc == nullptr) return nullptr;
+
+    /* React parks Suspense boundaries and hydration markers in the tree as
+     * comment nodes (document.createComment); without them its client render
+     * cannot place boundary markers and bails. el_comment carries m_skip so
+     * layout ignores it, exactly like a parsed comment. */
+    void* mem = malloc(sizeof(litehtml::el_comment));
+    if(mem == nullptr) return nullptr;
+    litehtml::el_comment* c = new (mem) litehtml::el_comment(doc);
+    if(text != nullptr)
+        c->set_data(text);
+    return (void*)c;
+}
+
 void* EWebEngine::jsElCloneNode(void* ctx, void* el, int deep)
 {
     EWebEngine* self = (EWebEngine*)ctx;
@@ -1402,6 +1538,13 @@ bool EWebEngine::jsElIsTag(void* ctx, void* el)
     return true;
 }
 
+bool EWebEngine::jsElIsComment(void* ctx, void* el)
+{
+    (void)ctx;
+    if(el == nullptr) return false;
+    return ((litehtml::element*)el)->is_comment();
+}
+
 bool EWebEngine::jsElIsLive(void* ctx, void* el)
 {
     EWebEngine* self = (EWebEngine*)ctx;
@@ -1420,6 +1563,29 @@ bool EWebEngine::jsElIsLive(void* ctx, void* el)
             !self->m_port.sys.ptr_sane(self->m_port.sys.ud, el))
         return false;
     return ((litehtml::element*)el)->is_live_handle();
+}
+
+/* A <link rel="stylesheet"> spliced in by script (createElement('link');
+ * l.href=...; head.appendChild(l)) never goes through the parser's el_link ->
+ * import_css hook, so its sheet would never load and any component styled
+ * only by that CSS renders unstyled - rokid.com injects the stylesheet that
+ * lays out its nav/footer exactly this way. Mirror the static path here:
+ * record the media attribute and queue the fetch; loadCSSContent() then
+ * applies the sheet to the live document and re-styles it. */
+static void jsMaybeLoadDynamicStylesheet(EWebEngine* self, litehtml::element* c)
+{
+    if(self == nullptr || c == nullptr) return;
+    const char* tn = c->get_tagName();
+    if(tn == nullptr || strcmp(tn, "link") != 0) return;
+    const char* rel = c->get_attr("rel", nullptr);
+    if(rel == nullptr || strcasecmp(rel, "stylesheet") != 0) return;
+    const char* href = c->get_attr("href", nullptr);
+    if(href == nullptr || href[0] == 0) return;
+    std::string full = EWebContainer::getFullURL(&self->m_port, href, self->jsDocumentUrl());
+    if(full.empty()) return;
+    const char* media = c->get_attr("media", nullptr);
+    self->setCSSMedia(full, media ? std::string(media) : std::string());
+    self->loadCSS(full);
 }
 
 bool EWebEngine::jsElAppendChild(void* ctx, void* parent, void* child)
@@ -1461,6 +1627,7 @@ bool EWebEngine::jsElAppendChild(void* ctx, void* parent, void* child)
         EWEB_LOG("[ewebview] appendChild cb tag=%s\n", tn != nullptr ? tn : "(null)");
         if(tn != nullptr && strcmp(tn, "script") == 0)
             self->jsDynamicScriptInserted(c);
+        jsMaybeLoadDynamicStylesheet(self, c);
         self->jsMarkLayoutDirty();
     }
     return true;
@@ -1496,6 +1663,7 @@ bool EWebEngine::jsElInsertBefore(void* ctx, void* parent, void* child, void* re
         const char* tn = c->get_tagName();
         if(tn != nullptr && strcmp(tn, "script") == 0)
             self->jsDynamicScriptInserted(c);
+        jsMaybeLoadDynamicStylesheet(self, c);
         self->jsMarkLayoutDirty();
     }
     return true;
@@ -2286,6 +2454,16 @@ bool EWebEngine::jsDispatchMouseEvent(int mouseState, int button, int cx, int cy
         if(track_hover && target != (litehtml::element*)m_jsHoverElement) {
             litehtml::element* prev = (litehtml::element*)m_jsHoverElement;
             m_jsHoverElement = (void*)target;
+            /* Drive CSS :hover as well as the DOM mouseover/mouseout events.
+             * applyPseudoClassChain() toggles "hover" on the element and every
+             * ancestor and re-runs the cascade, so :hover rules actually
+             * repaint. Order: clear the previous chain first, then set the new
+             * one, so shared ancestors don't briefly lose :hover (they'd just
+             * be re-added, but clearing first keeps the restyle walk cheap).
+             * Skip the whole block when the VM is off since m_jsHoverElement
+             * is only meaningful inside a JS-aware dispatch. */
+            applyPseudoClassChain(prev, "hover", false);
+            applyPseudoClassChain(target, "hover", true);
             if(prev != nullptr) {
                 js_event_dispatch_mouse(m_jsVm, (void*)prev, "mouseout",
                                         cx, cy, m_engineScrollX, m_engineScrollY, domButton, 0);
