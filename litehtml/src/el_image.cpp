@@ -121,11 +121,33 @@ void litehtml::el_image::resolve_effective_src()
 litehtml::el_image::el_image(litehtml::document* doc) : html_tag(doc)
 {
 	m_display = display_inline_block;
+	m_attr_width = 0;
+	m_attr_height = 0;
 }
 
 litehtml::el_image::~el_image( void )
 {
 
+}
+
+void litehtml::el_image::attr_size( size& sz ) const
+{
+	/* The attribute pair sizes the box when no author rule does; a single
+	 * attribute scales the other axis through the natural aspect ratio,
+	 * exactly like a browser's intrinsic-size computation. */
+	if(m_attr_width > 0 && m_attr_height > 0)
+	{
+		sz.width = m_attr_width;
+		sz.height = m_attr_height;
+	} else if(m_attr_width > 0)
+	{
+		if(sz.width > 0) sz.height = (int)((float)sz.height * (float)m_attr_width / (float)sz.width);
+		sz.width = m_attr_width;
+	} else if(m_attr_height > 0)
+	{
+		if(sz.height > 0) sz.width = (int)((float)sz.width * (float)m_attr_height / (float)sz.height);
+		sz.height = m_attr_height;
+	}
 }
 
 void litehtml::el_image::get_content_size( size& sz, int max_width )
@@ -139,6 +161,7 @@ void litehtml::el_image::get_content_size( size& sz, int max_width )
 		sz.width = 0;
 		sz.height = 0;
 	}
+	attr_size(sz);
 }
 
 int litehtml::el_image::line_height() const
@@ -170,6 +193,7 @@ int litehtml::el_image::render( int x, int y, int max_width, bool second_pass )
 		sz.width = 0;
 		sz.height = 0;
 	}
+	attr_size(sz);
 
 	m_pos.width		= sz.width;
 	m_pos.height	= sz.height;
@@ -318,12 +342,12 @@ void litehtml::el_image::parse_attributes()
 	const tchar_t* attr_height = get_attr(_t("height"));
 	if(attr_height)
 	{
-		m_style.add_property(_t("height"), attr_height, 0, false);
+		m_attr_height = atoi(attr_height);
 	}
 	const tchar_t* attr_width = get_attr(_t("width"));
 	if(attr_width)
 	{
-		m_style.add_property(_t("width"), attr_width, 0, false);
+		m_attr_width = atoi(attr_width);
 	}
 }
 
@@ -476,5 +500,45 @@ void litehtml::el_image::parse_styles( bool is_reparse /*= false*/ )
 		{
 			doc->container()->load_image(m_src.c_str(), 0, false);
 		}
+	}
+}
+
+litehtml::el_video::el_video(litehtml::document* doc) : el_image(doc)
+{
+}
+
+litehtml::el_video::~el_video( void )
+{
+}
+
+void litehtml::el_video::parse_attributes()
+{
+	/* No decoder: the poster frame IS the element's payload (a preload=none
+	 * video shows exactly this in a real browser). srcset/picture do not
+	 * apply to <video>. */
+	m_src = get_attr(_t("poster"), _t(""));
+
+	const tchar_t* attr_height = get_attr(_t("height"));
+	if(attr_height)
+	{
+		m_attr_height = atoi(attr_height);
+	}
+	const tchar_t* attr_width = get_attr(_t("width"));
+	if(attr_width)
+	{
+		m_attr_width = atoi(attr_width);
+	}
+}
+
+void litehtml::el_video::parse_styles( bool is_reparse /*= false*/ )
+{
+	el_image::parse_styles(is_reparse);
+	/* The UA sheet hides <video> with !important (no playback, no fallback
+	 * text spill). With a poster to show, lift the element back into flow
+	 * here, after the cascade; without one keep the UA verdict. An author
+	 * display that is not 'none' is respected as written. */
+	if(!m_src.empty() && m_display == display_none)
+	{
+		m_display = display_inline_block;
 	}
 }

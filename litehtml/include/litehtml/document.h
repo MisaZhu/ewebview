@@ -213,4 +213,15 @@ namespace litehtml
 	{
 		return lang == m_lang || lang == m_culture;
 	}
+
+	/* Split a character-data run into line-breakable chunks: browsers may
+	 * break between any two CJK characters, so an ideographic run becomes
+	 * one chunk per character, while ASCII/Latin runs stay whole (they only
+	 * break at spaces, which the caller keeps in separate el_space nodes).
+	 * Two kinsoku rules are honoured: closing punctuation (。，」 etc.) never
+	 * starts a chunk, opening punctuation (「（【 etc.) never ends one.
+	 * Pure-ASCII input yields the input unchanged. Used by the parser's text
+	 * flush and by html_tag::appendChild/insertBefore so script-created text
+	 * nodes (textContent) wrap exactly like parsed ones. */
+	void split_cjk_text(const tstring& in, std::vector<tstring>& out);
 }

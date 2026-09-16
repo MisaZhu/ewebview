@@ -142,6 +142,10 @@ typedef struct js_dom_callbacks {
     js_element_t (*get_root)(void* ctx);
     js_element_t (*get_body)(void* ctx);
     js_element_t (*get_head)(void* ctx);
+    /* document.currentScript: the <script> element whose body is executing
+     * right now, or NULL outside a script run. SDKs use it to insert their
+     * loader next to themselves. OPTIONAL: NULL reports null. */
+    js_element_t (*get_current_script)(void* ctx);
 
     /* CSS selector query - backs querySelector/querySelectorAll on both
      * Document and Element. `root` is NULL for a document-wide query,

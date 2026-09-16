@@ -107,6 +107,11 @@ namespace litehtml
 		float					m_opacity;
 		float					m_opacity_cum;
 		int						m_z_index;
+		/* True when 'z-index' is the keyword auto (or absent). Only an explicit
+		 * integer z-index on a positioned box / flex-grid item turns it into a
+		 * stacking context; z-index:auto leaves it transparent so its z-indexed
+		 * descendants bubble to the nearest real stacking context. */
+		bool						m_z_index_auto;
 		box_sizing				m_box_sizing;
 
 		int_int_cache			m_cahe_line_left;
@@ -168,6 +173,12 @@ namespace litehtml
 		virtual const string_map*	get_custom_props() const override { return &m_custom_props; }
 		virtual element_position	get_element_position(css_offsets* offsets = 0) const override;
 		virtual overflow			get_overflow() const override;
+		box_sizing				get_box_sizing() const { return m_box_sizing; }
+		/* Automatic margins resolve against free space at pack time; they must
+		 * contribute 0 to intrinsic (min/max-content) sizes, so callers computing
+		 * those need to tell an auto margin apart from a resolved length. */
+		bool					margin_left_is_auto() const { return m_css_margins.left.is_predefined(); }
+		bool					margin_right_is_auto() const { return m_css_margins.right.is_predefined(); }
 
 		virtual void				set_attr(const tchar_t* name, const tchar_t* val) override;
 		virtual const tchar_t*		get_attr(const tchar_t* name, const tchar_t* def = 0) override;
@@ -202,6 +213,7 @@ namespace litehtml
 		virtual bool				set_class(const tchar_t* pclass, bool add) override;
 		virtual bool				is_replaced() const override;
 		virtual int					line_height() const override;
+		virtual bool				is_line_height_normal() const override;
 		virtual text_align			get_text_align() const override;
 		virtual text_transform		get_text_transform() const override;
 		virtual white_space			get_white_space() const override;
@@ -258,6 +270,8 @@ namespace litehtml
 		virtual void				add_float(const element::ptr &el, int x, int y) override;
 		virtual void				update_floats(int dy, const element::ptr &parent) override;
 		virtual void				add_positioned(const element::ptr &el) override;
+		virtual bool				is_stacking_participant() const override;
+		virtual bool				is_stacking_context() const override;
 		virtual int					find_next_line_top(int top, int width, int def_right) override;
 		virtual void				apply_vertical_align() override;
 		virtual void				draw_children(uint_ptr hdc, int x, int y, const position* clip, draw_flag flag, int zindex) override;

@@ -619,6 +619,19 @@ int litehtml::document::render( int max_width, render_type rt )
 	 * rules. Refresh every layout so 100vh tracks the live viewport (and window
 	 * resizes) even on pages without @media. */
 	container()->get_media_features(m_media);
+	/* Selectors scoped by @media were evaluated against the features snapshotted
+	 * at document-create time - frequently before the widget had a client size
+	 * (width 0), which makes every max-width breakpoint match and pins the page
+	 * to its narrow layout (apple.com's global nav then paints its 28px mobile
+	 * type at desktop widths). Nothing ever called media_changed() afterwards,
+	 * so re-evaluate the lists now that the viewport is real and restyle if any
+	 * breakpoint flipped. */
+	if(m_root && !m_media_lists.empty() && update_media_lists(m_media))
+	{
+		abort_style_step();
+		m_root->refresh_styles();
+		m_root->parse_styles();
+	}
 	if(m_root)
 	{
 		/* A post-creation style update can flip a cell's computed display; the
@@ -1059,6 +1072,9 @@ litehtml::element::ptr litehtml::document::create_element(const tchar_t* tag_nam
 		} else if(!t_strcmp(tag_name, _t("img")))
 		{
 			newTag = litehtml_alloc<litehtml::el_image>("el_image", this);
+		} else if(!t_strcmp(tag_name, _t("video")))
+		{
+			newTag = litehtml_alloc<litehtml::el_video>("el_video", this);
 		} else if(!t_strcmp(tag_name, _t("svg")))
 		{
 			newTag = litehtml_alloc<litehtml::el_svg>("el_svg", this);
@@ -1330,6 +1346,137 @@ void litehtml::document::register_master_media_lists()
 	}
 }
 
+/* ---- CJK line-break chunking (see declaration in document.h) ---- */
+static bool cjk_lead_byte(unsigned char b)
+{
+	return b == 0xE3 || (b >= 0xE4 && b <= 0xE9) || b == 0xEF;
+}
+static unsigned cjk_cp3(const char* p)
+{
+	return (((unsigned)(unsigned char)p[0]) & 0x0Fu) << 12 |
+	       (((unsigned)(unsigned char)p[1]) & 0x3Fu) << 6 |
+	       (((unsigned)(unsigned char)p[2]) & 0x3Fu);
+}
+static bool cjk_family(unsigned cp)
+{
+	return (cp >= 0x3000 && cp <= 0x303F) || (cp >= 0x3040 && cp <= 0x30FF) ||
+	       (cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0x4E00 && cp <= 0x9FFF) ||
+	       (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFF00 && cp <= 0xFFEF);
+}
+/* closing punctuation: no break before it (never starts a line) */
+static bool cjk_no_start(unsigned cp)
+{
+	switch(cp)
+	{
+	case 0x3001: case 0x3002: case 0x3005: case 0x3009: case 0x300B: case 0x300D:
+	case 0x300F: case 0x3011: case 0x3015: case 0x3017: case 0x3019: case 0x301B:
+	case 0x301D: case 0x301F: case 0x303B: case 0x303D: case 0x3041: case 0x3043:
+	case 0x3045: case 0x3047: case 0x3049: case 0x3063: case 0x3083: case 0x3085:
+	case 0x3087: case 0x308E: case 0x3095: case 0x3096: case 0x309B: case 0x309C:
+	case 0x309D: case 0x309E: case 0x30A0: case 0x30A3: case 0x30A5: case 0x30A7:
+	case 0x30A9: case 0x30C3: case 0x30E3: case 0x30E5: case 0x30E7: case 0x30EE:
+	case 0x30F5: case 0x30F6: case 0x30FB: case 0x30FC: case 0x30FD: case 0x30FE:
+	case 0x30FF: case 0xFF01: case 0xFF02: case 0xFF07: case 0xFF09: case 0xFF0C:
+	case 0xFF0E: case 0xFF1A: case 0xFF1B: case 0xFF1F: case 0xFF3D: case 0xFF40:
+	case 0xFF5C: case 0xFF5D: case 0xFF5E: case 0xFF61: case 0xFF63: case 0xFF64:
+	case 0xFF65:
+		return true;
+	default:
+		return false;
+	}
+}
+/* opening punctuation: no break after it (never ends a line) */
+static bool cjk_no_end(unsigned cp)
+{
+	switch(cp)
+	{
+	case 0x3008: case 0x300A: case 0x300C: case 0x300E: case 0x3010: case 0x3014:
+	case 0x3016: case 0x3018: case 0x301A: case 0xFF08: case 0xFF3B: case 0xFF5B:
+	case 0xFF5F: case 0xFF62:
+		return true;
+	default:
+		return false;
+	}
+}
+
+void litehtml::split_cjk_text(const tstring& in, std::vector<tstring>& out)
+{
+	out.clear();
+	const char* p = in.c_str();
+	const size_t n = in.size();
+	if(n == 0)
+	{
+		return;
+	}
+	bool any = false;
+	for(size_t i = 0; i < n && !any; i++)
+	{
+		any = cjk_lead_byte((unsigned char)p[i]);
+	}
+	if(!any)
+	{
+		out.push_back(in);
+		return;
+	}
+	tstring cur;
+	bool cur_cjk = false;
+	unsigned last_cp = 0;
+	size_t i = 0;
+	while(i < n)
+	{
+		unsigned char b = (unsigned char)p[i];
+		unsigned cp = b;
+		int len = 1;
+		if(b >= 0xE0 && b <= 0xEF && i + 2 < n)
+		{
+			cp = cjk_cp3(p + i);
+			len = 3;
+		}
+		else if(b >= 0xC0 && b <= 0xDF && i + 1 < n)
+		{
+			cp = (((unsigned)b & 0x1Fu) << 6) | ((unsigned)(unsigned char)p[i + 1] & 0x3Fu);
+			len = 2;
+		}
+		else if(b >= 0xF0 && i + 3 < n)
+		{
+			cp = (((unsigned)b & 0x07u) << 18) |
+			     (((unsigned)(unsigned char)p[i + 1] & 0x3Fu) << 12) |
+			     (((unsigned)(unsigned char)p[i + 2] & 0x3Fu) << 6) |
+			     ((unsigned)(unsigned char)p[i + 3] & 0x3Fu);
+			len = 4;
+		}
+		if(cjk_family(cp))
+		{
+			if(!cur.empty())
+			{
+				if(!cur_cjk || (!cjk_no_start(cp) && !cjk_no_end(last_cp)))
+				{
+					out.push_back(cur);
+					cur.clear();
+				}
+			}
+			cur_cjk = true;
+		}
+		else if(cur_cjk && !cur.empty())
+		{
+			out.push_back(cur);
+			cur.clear();
+			cur_cjk = false;
+		}
+		cur.append(p + i, (size_t)len);
+		last_cp = cp;
+		i += (size_t)len;
+	}
+	if(!cur.empty())
+	{
+		out.push_back(cur);
+	}
+	if(out.empty())
+	{
+		out.push_back(in);
+	}
+}
+
 void litehtml::document::create_node(GumboNode* node, elements_vector& elements, int depth)
 {
 	if(!node) return;
@@ -1426,10 +1573,17 @@ void litehtml::document::create_node(GumboNode* node, elements_vector& elements,
 			{
 				if (!str.empty())
 				{
-					element::ptr text = litehtml_alloc<el_text>("el_text", str.c_str(), this);
-					if(text)
+					/* CJK runs carry per-character break opportunities (see
+					 * split_cjk_text); ASCII runs flush as one word node. */
+					std::vector<tstring> chunks;
+					split_cjk_text(str, chunks);
+					for(size_t k = 0; k < chunks.size(); k++)
 					{
-						elements.push_back(text);
+						element::ptr text = litehtml_alloc<el_text>("el_text", chunks[k].c_str(), this);
+						if(text)
+						{
+							elements.push_back(text);
+						}
 					}
 					str.clear();
 				}

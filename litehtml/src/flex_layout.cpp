@@ -115,29 +115,87 @@ static void flex_parse_gap(html_tag* el, int avail, int& row_gap, int& col_gap)
  * justify-content:center flex row stores the centering lead in left(), which
  * would inflate the preferred width by that lead. Inline siblings share one
  * line (widths add up), block-level children stack (widths compete). */
+/* Max-content width of a grid container; -1 when there is no column
+ * template (the generic block loop's max-of-children is correct then). */
+static int grid_max_content_width(litehtml::html_tag* el, int avail);
+
 static int preferred_content_width(const litehtml::element::ptr& el)
 {
 	if(!el) return 0;
-	static int pdbg_on = -1;
-	if(pdbg_on < 0) pdbg_on = getenv("EWEB_PDBG") ? 1 : 0;
-	const tchar_t* pcls = pdbg_on ? el->get_attr(_t("class")) : 0;
-	bool pdbg = pdbg_on && pcls &&
-		(strstr(pcls, "top-nav-item") || strstr(pcls, "nav-link"));
 	litehtml::style_display d = el->get_display();
-	if(pdbg)
-		printf("[pdbg] pcw enter class=%s disp=%d\n", (const char*)pcls, (int)d);
-	if(el->is_replaced() || d == litehtml::display_inline_block ||
-	   d == litehtml::display_inline_text)
+	if(el->is_replaced())
 	{
-		/* Replaced atoms ONLY when they are not flex containers: a replaced
-		 * box with display:flex (w3.org's nav triggers are <button> widgets
-		 * styled display:flex) still flex-lays-out its children in render_flex,
-		 * so its max-content is the children sum. Returning width() for it
-		 * handed back the FILL width of the last pass (the whole nav row),
-		 * which inflated the owning li's flex base to ~1000px and drove the
-		 * row into a catastrophic shrink/wrap ratchet. */
-		if(d != litehtml::display_flex && d != litehtml::display_inline_flex)
-			return el->width();
+		/* A replaced box with a flex display is a form widget styled as a flex
+		 * container (w3.org's nav triggers are <button> styled display:flex):
+		 * the widget places/paints its children itself at draw time, so they
+		 * carry no laid-out width to sum (0 on the first pass, then whatever a
+		 * draw-time placement left on a pseudo - a ratchet that collapsed the
+		 * nav buttons to caret width), and width() is the FILL width of the
+		 * last pass (the whole nav row), which inflates the owning li's flex
+		 * base into a shrink/wrap ratchet. Its max-content is the widget
+		 * intrinsic size, which is context-free. Any other replaced element
+		 * (an <img> the page CSS scales down from a 512px source to 16px, say)
+		 * must keep width(): its intrinsic size ignores the CSS scaling and
+		 * would blow the row budget instead. */
+		if(d == litehtml::display_flex || d == litehtml::display_inline_flex)
+		{
+			litehtml::size sz;
+			sz.width = 0; sz.height = 0;
+			el->get_content_size(sz, 0);
+			return sz.width;
+		}
+		return el->width();
+	}
+	if(d == litehtml::display_grid || d == litehtml::display_inline_grid)
+	{
+		/* A fit-content cross size (column flex align-items:center) built from
+		 * the generic block loop takes the MAX child width, squeezing a
+		 * multi-column grid (apple.com's .tile-ctas CTA pair) to one item
+		 * wide: the track group overflows right and the pair looks
+		 * off-centre. Sum the columns instead. */
+		int gw = grid_max_content_width(static_cast<litehtml::html_tag*>(el), 0x3fffffff);
+		if(gw >= 0) return gw;
+	}
+	if(d == litehtml::display_inline_text)
+	{
+		/* width() is whatever the LAST layout left behind - zero on the first
+		 * pass - so a fit-content cross size built from it collapses the box
+		 * to one word per line (apple.com's hero headline inside
+		 * .tile-content{align-items:center}). Measure the run unwrapped:
+		 * max-content is by definition the single-line width. */
+		litehtml::size sz;
+		sz.width = 0;
+		sz.height = 0;
+		el->get_content_size(sz, 0x3fffffff);
+		return sz.width;
+	}
+	/* A specified definite width IS the box's max-content contribution: a leaf
+	 * box sized by width (the w3.org nav chevron ::after{inline-size:.4375rem},
+	 * mapped onto width) contributes that width, not the sum of its (empty)
+	 * children. Under-counting it shaves a few px off the owning flex item's
+	 * base size, so the shrink step slices into the item's text and the nav
+	 * row wraps/overlaps where real flexbox packs it on one line. Percentages
+	 * stay content-based: against an unknown shrink target they are indefinite.
+	 * border-box widths already include padding and borders. */
+	{
+		litehtml::css_length cw = el->get_css_width();
+		if(!cw.is_predefined() && cw.units() != litehtml::css_units_none &&
+		   cw.units() != litehtml::css_units_percentage)
+		{
+			int wv = el->get_document()->cvt_units(cw, el->get_font_size(), 0);
+			if(wv > 0)
+			{
+				if(static_cast<litehtml::html_tag*>(el)->get_box_sizing() ==
+				   litehtml::box_sizing_content_box)
+					wv += el->padding_left() + el->padding_right() +
+						  el->border_left() + el->border_right();
+				return wv;
+			}
+		}
+	}
+	if(d == litehtml::display_inline_block)
+	{
+		return el->width();
 	}
 	if(d == litehtml::display_flex || d == litehtml::display_inline_flex)
 	{
@@ -165,13 +223,6 @@ static int preferred_content_width(const litehtml::element::ptr& el)
 		if(c->get_element_position() == litehtml::element_position_absolute ||
 		   c->get_element_position() == litehtml::element_position_fixed) continue;
 		int mw = c->margin_left() + c->margin_right();
-		if(pdbg)
-		{
-			const tchar_t* ccls = c->get_attr(_t("class"));
-			printf("[pdbg]   child tag=%s class=%s disp=%d vis=%d w=%d\n",
-					(const char*)c->get_tagName(), ccls ? (const char*)ccls : "",
-					(int)c->get_display(), (int)c->is_visible(), c->width());
-		}
 		if(c->is_break())
 		{
 			if(line > w) w = line;
@@ -283,21 +334,79 @@ static int flex_min_content_inner(const litehtml::element::ptr& el)
 		if(wv > 0) return wv;
 	}
 	litehtml::style_display d = el->get_display();
-	if(el->is_replaced())
+	bool flexd = (d == litehtml::display_flex || d == litehtml::display_inline_flex);
+	if(el->is_replaced() && !flexd)
 	{
-		/* intrinsic, not the last laid-out width: reading m_pos here fed the
+		/* Intrinsic, not the last laid-out width: reading m_pos here fed the
 		 * previous pass' resolved size back into the shrink clamp and ratcheted
-		 * the item wider on every relayout. */
+		 * the item wider on every relayout. But the raw source intrinsic is
+		 * wrong too when the page scales the box through the other axis
+		 * (.icon{height:16px} on a 512x512 source): the shrink floor then blew
+		 * the item past the row budget and pushed the trailing nav items off
+		 * screen. Resolve a definite CSS height through the aspect ratio, the
+		 * way el_image::render does; a definite CSS width is handled above. */
 		litehtml::size sz;
+		sz.width = 0; sz.height = 0;
 		el->get_content_size(sz, 0);
+		litehtml::css_length ch = el->get_css_height();
+		if(!ch.is_predefined() && ch.units() != litehtml::css_units_percentage &&
+		   sz.width > 0 && sz.height > 0)
+		{
+			int hv = el->get_document()->cvt_units(ch, el->get_font_size(), 0);
+			if(hv > 0)
+				return (int)((float)hv * (float)sz.width / (float)sz.height);
+		}
 		return sz.width;
 	}
-	if(d == litehtml::display_inline_block || d == litehtml::display_inline_text)
+	if(d == litehtml::display_inline_text)
+	{
+		/* min-content of a text run is its LONGEST WORD. Reading the laid-out
+		 * run width made every shrink floor equal the current base, so an
+		 * over-budget row could never shrink and overflowed the container
+		 * instead (narrow windows pushed the trailing nav items off screen).
+		 * With white-space:nowrap the run cannot split at all, so its
+		 * min-content IS the full text width (apple.com's CTA pills). */
+		litehtml::tstring t;
+		el->get_text(t);
+		litehtml::uint_ptr f = el->get_font();
+		litehtml::document* doc = el->get_document();
+		if(!f || !doc || !doc->container()) return el->width();
+		litehtml::white_space ws = el->get_white_space();
+		if(ws == litehtml::white_space_nowrap || ws == litehtml::white_space_pre)
+		{
+			return doc->container()->text_width(t.c_str(), f);
+		}
+		int w = 0;
+		std::string cur;
+		for(const char* p = t.c_str(); ; p++)
+		{
+			if(*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == 0)
+			{
+				if(!cur.empty())
+				{
+					int cw = doc->container()->text_width(cur.c_str(), f);
+					if(cw > w) w = cw;
+					cur.clear();
+				}
+				if(*p == 0) break;
+			}
+			else cur += *p;
+		}
+		return w;
+	}
+	if(d == litehtml::display_inline_block)
 	{
 		return el->width();
 	}
 	int w = 0;
 	size_t n = el->get_children_count();
+	/* Under white-space:nowrap the whole inline run stays on ONE line, so the
+	 * floor is the SUM of the inline children, not the widest of them. Splitting
+	 * "Learn more" into text nodes and taking the max measured only the longest
+	 * fragment, which shrank apple.com's min-content CTA tracks below the label
+	 * and let the text spill out of the pill. */
+	litehtml::white_space ws = el->get_white_space();
+	bool one_line = flexd || ws == litehtml::white_space_nowrap || ws == litehtml::white_space_pre;
 	for(size_t i = 0; i < n; i++)
 	{
 		litehtml::element::ptr c = el->get_child((int)i);
@@ -305,7 +414,31 @@ static int flex_min_content_inner(const litehtml::element::ptr& el)
 		if(c->get_element_position() == litehtml::element_position_absolute ||
 		   c->get_element_position() == litehtml::element_position_fixed) continue;
 		int cw = flex_min_content_inner(c);
-		if(cw > w) w = cw;
+		if(one_line)
+		{
+			/* row flex: the items sit side by side even at min-content, so
+			 * their floors add up (a replaced flex box - w3.org's nav button
+			 * widget - reaches here: its label can clip, so its floor is the
+			 * longest label word plus the caret, not the full label) */
+			int ml = c->margin_left(), mr = c->margin_right();
+			/* An automatic margin (w3.org account li margin-inline-start:auto)
+			 * still holds the free space it absorbed on the last pack; feeding
+			 * that back inflated the nav ul's min-content floor above the row
+			 * budget so the row could never shrink and the account item landed
+			 * past the right edge. Auto margins contribute 0 to intrinsics. */
+			const litehtml::tchar_t* tn = c->get_tagName();
+			if(tn && tn[0])
+			{
+				litehtml::html_tag* ct = static_cast<litehtml::html_tag*>(c);
+				if(ct->margin_left_is_auto()) ml = 0;
+				if(ct->margin_right_is_auto()) mr = 0;
+			}
+			w += ml + mr + cw;
+		}
+		else if(cw > w)
+		{
+			w = cw;
+		}
 	}
 	return w;
 }
@@ -364,36 +497,148 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 	const tchar_t* dir_s = get_style_property(_t("flex-direction"), false, _t("row"));
 	if(flex_flag(dir_s, "column", "column-reverse"))
 	{
-		/* A single flex column is block flow for the subset we support, but
-		 * `order` still reorders the stack (w3.org .card__text{order:1} puts
-		 * the card image above its text). Reorder the child list for the
-		 * duration of this render so block flow stacks them in flex order. */
+		/* Real column flex. Degrading to block flow lost BOTH axes' alignment:
+		 * apple.com centres each tile's copy with align-items:center and pins
+		 * the AirPods tile copy to the bottom with justify-content:flex-end,
+		 * neither of which block flow can express (the copy rendered full-width
+		 * at the top, so callouts sat left and overlaid art). Main axis is
+		 * vertical here, cross axis horizontal. */
 		bool col_reverse = flex_flag(dir_s, "column-reverse");
-		bool dirty = col_reverse;
-		std::vector<int> ord(m_children.size(), 0);
-		for(size_t i = 0; i < m_children.size(); i++)
+		const tchar_t* col_jc = get_style_property(_t("justify-content"), false, _t("flex-start"));
+		const tchar_t* col_ai = get_style_property(_t("align-items"), false, _t("stretch"));
+
+		std::vector<element::ptr> kids;
+		std::vector<int> ord;
+		for(auto& el : m_children)
 		{
-			const tchar_t* o = m_children[i]->get_style_property(_t("order"), false, _t("0"));
-			ord[i] = o ? atoi(o) : 0;
-			if(ord[i] != 0) dirty = true;
+			if(!el || !el->is_visible()) continue;
+			element_position ep = el->get_element_position();
+			if(ep == element_position_absolute || ep == element_position_fixed) continue;
+			if(el->is_white_space()) continue;
+			if(el->get_display() == display_contents) continue;
+			const tchar_t* o = el->get_style_property(_t("order"), false, _t("0"));
+			ord.push_back(o ? atoi(o) : 0);
+			kids.push_back(el);
 		}
-		if(dirty)
 		{
-			elements_vector saved = m_children;
-			std::vector<size_t> idx(m_children.size());
+			std::vector<size_t> idx(kids.size());
 			for(size_t i = 0; i < idx.size(); i++) idx[i] = i;
 			std::stable_sort(idx.begin(), idx.end(),
 					[&ord](size_t a, size_t b){ return ord[a] < ord[b]; });
-			if(col_reverse) std::reverse(idx.begin(), idx.end());
-			elements_vector reordered;
-			reordered.reserve(idx.size());
-			for(size_t i = 0; i < idx.size(); i++) reordered.push_back(saved[idx[i]]);
-			m_children = reordered;
-			int rw = render_box(x, y, max_width, second_pass);
-			m_children = saved;
-			return rw;
+			std::vector<element::ptr> sorted;
+			sorted.reserve(idx.size());
+			for(size_t i = 0; i < idx.size(); i++) sorted.push_back(kids[idx[i]]);
+			kids.swap(sorted);
+			if(col_reverse) std::reverse(kids.begin(), kids.end());
 		}
-		return render_box(x, y, max_width, second_pass);
+
+		int row_gap = 0, col_gap = 0;
+		flex_parse_gap(this, avail, row_gap, col_gap);
+		bool ai_stretch = flex_flag(col_ai, "stretch", "normal");
+
+		int n = (int)kids.size();
+		std::vector<int> cw(n, 0), chh(n, 0), mtv(n, 0), mbv(n, 0);
+		int total = 0;
+		for(int i = 0; i < n; i++)
+		{
+			mtv[i] = kids[i]->margin_top();
+			mbv[i] = kids[i]->margin_bottom();
+			int w;
+			if(ai_stretch)
+			{
+				w = avail;
+			}
+			else
+			{
+				/* cross size is fit-content: max-content capped by the line.
+				 * +1px slack: preferred widths truncate float text advances, and
+				 * a box one pixel short of the one-line width wraps the headline
+				 * (apple.com's "iPhone 18 Pro" hero). */
+				w = preferred_content_width(kids[i]) + 1;
+				if(w > avail) w = avail;
+				if(w < 0) w = 0;
+			}
+			kids[i]->render(0, 0, w, second_pass);
+			/* Main size is the child's OUTER height: boxes whose space comes from
+			 * padding alone (the .l-frame aspect-ratio trick: content height 0 +
+			 * padding-bottom, w3.org's card images) otherwise contribute nothing
+			 * and the column collapses over them. */
+			chh[i] = kids[i]->get_position().height + mtv[i] + mbv[i]
+				+ kids[i]->padding_top() + kids[i]->padding_bottom()
+				+ kids[i]->border_top() + kids[i]->border_bottom();
+			/* Cross size is the child's ACTUAL outer width, not the width we
+			 * offered: a child with a declared width of its own but no in-flow
+			 * content (apple.com's gallery strip, .media-gallery-item-container
+			 * with width:calc(var+var) and every tile position:absolute) probes
+			 * preferred_content_width()==0, so the probe was 1px and
+			 * align-items:center then "centred" a 701px strip at (avail-1)/2 -
+			 * the left edge landed on the viewport middle. */
+			cw[i] = kids[i]->get_position().width
+				+ kids[i]->padding_left() + kids[i]->padding_right()
+				+ kids[i]->border_left() + kids[i]->border_right()
+				+ kids[i]->margin_left() + kids[i]->margin_right();
+			if(cw[i] > avail) cw[i] = avail;
+			total += chh[i];
+			if(i + 1 < n) total += row_gap;
+		}
+
+		int fixed_h = 0;
+		bool has_fixed_h = !m_css_height.is_predefined() && m_css_height.units() != css_units_none;
+		if(has_fixed_h)
+		{
+			fixed_h = get_document()->cvt_units(m_css_height, m_font_size, 0);
+			if(m_box_sizing == box_sizing_border_box)
+				fixed_h -= m_padding.top + m_padding.bottom + m_borders.top + m_borders.bottom;
+			if(fixed_h < 0) fixed_h = 0;
+		}
+		int cont_h = has_fixed_h ? std::max(total, fixed_h) : total;
+		if(!m_css_min_height.is_predefined() && m_css_min_height.units() != css_units_none)
+		{
+			int mh = get_document()->cvt_units(m_css_min_height, m_font_size, 0);
+			if(m_box_sizing == box_sizing_border_box)
+				mh -= m_padding.top + m_padding.bottom + m_borders.top + m_borders.bottom;
+			if(mh > cont_h) cont_h = mh;
+		}
+
+		/* main-axis (vertical) packing of leftover space */
+		int lead = 0, jgap = 0;
+		int free = cont_h - total;
+		if(free > 0)
+		{
+			if(flex_flag(col_jc, "center")) lead = free / 2;
+			else if(flex_flag(col_jc, "flex-end", "end")) lead = free;
+			else if(flex_flag(col_jc, "space-between") && n > 1) jgap = free / (n - 1);
+			else if(flex_flag(col_jc, "space-around") && n > 0) { jgap = free / n; lead = jgap / 2; }
+			else if(flex_flag(col_jc, "space-evenly") && n > 0) { jgap = free / (n + 1); lead = jgap; }
+		}
+
+		int yy = lead;
+		for(int i = 0; i < n; i++)
+		{
+			int ix = 0;
+			if(!ai_stretch)
+			{
+				if(flex_flag(col_ai, "center")) ix = (avail - cw[i]) / 2;
+				else if(flex_flag(col_ai, "flex-end", "end")) ix = avail - cw[i];
+			}
+			kids[i]->render(ix, yy, cw[i], second_pass);
+			yy += chh[i] + row_gap + jgap;
+		}
+
+		int used_w = 0;
+		for(int i = 0; i < n; i++) if(cw[i] > used_w) used_w = cw[i];
+		m_pos.width = width_auto ? (m_display == display_inline_flex ? std::min(avail, used_w) : avail) : avail;
+		m_pos.height = cont_h;
+		calc_auto_margins(parent_width);
+		/* No min-height re-clamp here: cont_h above already applied min-height
+		 * unit-converted and, for box-sizing:border-box, shrunk by the padding
+		 * and borders. Re-clamping with the raw value grows the CONTENT box by
+		 * that padding again - apple.com's column-flex tiles came out too tall,
+		 * shoving their bottom:0 artwork down and clipping it. */
+		m_pos.move_to(x, y);
+		m_pos.x += content_margins_left();
+		m_pos.y += content_margins_top();
+		return avail + content_margins_left() + content_margins_right();
 	}
 	bool row_reverse = flex_flag(dir_s, "row-reverse");
 
@@ -401,19 +646,6 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 	bool do_wrap			= flex_flag(wrap_s, "wrap", "wrap-reverse");
 	const tchar_t* jc_s		= get_style_property(_t("justify-content"), false, _t("flex-start"));
 	const tchar_t* ai_s		= get_style_property(_t("align-items"), false, _t("stretch"));
-	static int flexdbg_on = -1;
-	if(flexdbg_on < 0) flexdbg_on = getenv("EWEB_FLEXDBG") ? 1 : 0;
-	const tchar_t* flexdbg_ccls = get_attr(_t("class"));
-	const tchar_t* flexdbg_pcls = parent() ? parent()->get_attr(_t("class")) : 0;
-	bool flexdbg = flexdbg_on &&
-		((flexdbg_ccls &&
-		 (strstr(flexdbg_ccls, "global-nav") || strstr(flexdbg_ccls, "top-nav") ||
-		  strstr(flexdbg_ccls, "nav-link") || strstr(flexdbg_ccls, "icon-link") ||
-		  strstr(flexdbg_ccls, "account") || strstr(flexdbg_ccls, "logo"))) ||
-		 (flexdbg_pcls && strstr(flexdbg_pcls, "global-nav")));
-	if(flexdbg)
-		printf("[flexdbg] container class=%s avail=%d ai=%s wrap=%s\n",
-				flexdbg_ccls, avail, ai_s, wrap_s);
 	int row_gap = 0, col_gap = 0;
 	flex_parse_gap(this, avail, row_gap, col_gap);
 
@@ -505,17 +737,39 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		bool basis_set = false;
 		if(sh)
 		{
-			float g = 0, s = 1, b = -1;
-			int n = sscanf(sh, "%f %f %f", &g, &s, &b);
-			if(n >= 1) it.grow = g;
-			if(n >= 2) it.shrink = s;
-			if(n >= 3 && b >= 0)
+			/* Tokenise instead of sscanf: `%f %f %f` cannot tell `flex:0 0`
+			 * (basis 0%) from `flex:0 0 auto` (basis auto, i.e. fall back to the
+			 * specified width). The w3.org nav avatar is `flex:0 0 auto` +
+			 * `width:2rem`; reading it as basis 0 collapsed the circle to 0px. */
+			tstring ssh = sh;
+			std::vector<tstring> tok;
+			for(size_t p = 0; p < ssh.length();)
 			{
-				it.base = (int)b + it.ml + it.mr;
-				it.has_main = true;
-				basis_set = true;
+				while(p < ssh.length() && (ssh[p] == _t(' ') || ssh[p] == _t('\t'))) p++;
+				size_t q = p;
+				while(q < ssh.length() && ssh[q] != _t(' ') && ssh[q] != _t('\t')) q++;
+				if(q > p) tok.push_back(ssh.substr(p, q - p));
+				p = q;
 			}
-			else if(n >= 1)
+			float g = 0, s = 1;
+			if(tok.size() >= 1) g = (float)atof(tok[0].c_str());
+			if(tok.size() >= 2) s = (float)atof(tok[1].c_str());
+			it.grow = g;
+			it.shrink = s;
+			bool basis_auto = (tok.size() >= 3);
+			if(tok.size() >= 3)
+			{
+				css_length bl;
+				bl.fromString(tok[2].c_str());
+				if(!bl.is_predefined())
+				{
+					it.base = get_document()->cvt_units(bl, el->get_font_size(), avail) + it.ml + it.mr;
+					it.has_main = true;
+					basis_set = true;
+					basis_auto = false;
+				}
+			}
+			if(!basis_set && !basis_auto)
 			{
 				/* The flex shorthand resets flex-basis to 0% when it is omitted
 				 * (`flex:1` == `1 1 0%`), unlike the longhand's auto. Falling back
@@ -630,12 +884,6 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			}
 		}
 		if(it.base < it.ml + it.mr) it.base = it.ml + it.mr;
-		if(flexdbg)
-		{
-			const tchar_t* mcls = it.run.empty() ? it.el->get_attr(_t("class")) : _t("<run>");
-			printf("[flexdbg]   measure class=%s base=%d grow=%g shrink=%g\n",
-					mcls ? (const char*)mcls : "", it.base, it.grow, it.shrink);
-		}
 	}
 
 	/* An inline-flex atom sizes to its content (max-content), so resolve its
@@ -712,6 +960,20 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		}
 		if(fixed_h < 0) fixed_h = 0;
 	}
+	/* min-height is just as definite a cross size as height for a single flex
+	 * line: apple.com's .tile-wrapper{min-height:var(--hero-content-height)}
+	 * must stretch .tile-content to the full tile so the column inside can
+	 * push its copy to the bottom (justify-content:flex-end/space-between). */
+	int cont_min_h = 0;
+	if(!m_css_min_height.is_predefined() && m_css_min_height.units() != css_units_none)
+	{
+		cont_min_h = get_document()->cvt_units(m_css_min_height, m_font_size, 0);
+		if(m_box_sizing == box_sizing_border_box)
+		{
+			cont_min_h -= m_padding.top + m_padding.bottom + m_borders.top + m_borders.bottom;
+		}
+		if(cont_min_h < 0) cont_min_h = 0;
+	}
 
 	for(size_t li = 0; li < lines.size(); li++)
 	{
@@ -761,12 +1023,6 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 					minc = flex_min_content(it.el);
 				}
 				minc += it.ml + it.mr;
-				if(flexdbg)
-				{
-					const tchar_t* scls = it.run.empty() ? it.el->get_attr(_t("class")) : _t("<run>");
-					printf("[flexdbg]   shrink class=%s base=%d sh=%d minc=%d main=%d\n",
-							scls ? (const char*)scls : "", it.base, sh, minc, it.main);
-				}
 				if(it.main < minc) it.main = minc;
 				if(it.main < it.ml + it.mr) it.main = it.ml + it.mr;
 			}
@@ -825,10 +1081,11 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		/* a single line in a definite-height container fills it, so align-items
 		 * centers within the container rather than the tallest item */
 		int line_h = line_cross;
-		if(has_fixed_h && lines.size() == 1 && fixed_h > line_cross) line_h = fixed_h;
-		if(flexdbg)
-			printf("[flexdbg]   line %d line_cross=%d line_h=%d free=%d items=%d\n",
-					(int)li, line_cross, line_h, free, (int)line.size());
+		if(lines.size() == 1)
+		{
+			if(has_fixed_h && fixed_h > line_cross) line_h = fixed_h;
+			if(cont_min_h > line_h) line_h = cont_min_h;
+		}
 
 		// main-axis packing of the leftover space
 		int lead = 0, jgap = 0;
@@ -873,6 +1130,7 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			flex_item& it = items[line[i]];
 			int iy = 0;
 			bool is_run = !it.run.empty();
+			bool placed = false;
 			css_length ch = it.el->get_css_height();
 			if(!is_run && flex_flag(ai_s, "stretch", "normal") && ch.is_predefined())
 			{
@@ -892,10 +1150,11 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				render_item(it, xs[i], bottom + iy);
 				sht->m_css_height = shv;
 				it.cross = line_h;
-				if(flexdbg)
-					printf("[flexdbg]   stretch class=%s forced_h=%d\n",
-							it.el->get_attr(_t("class")) ? (const char*)it.el->get_attr(_t("class")) : "",
-							fh);
+				/* The generic placement render below must NOT run again: it
+				 * would re-layout the item without the forced height and undo
+				 * everything the stretched render arranged (apple.com's column
+				 * .tile-content lost its justify-content:flex-end anchoring). */
+				placed = true;
 			}
 			else if(flex_flag(ai_s, "center"))
 			{
@@ -914,35 +1173,24 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				int inner = it.main - it.ml - it.mr;
 				if(inner < 0) inner = 0;
 				flex_run_wrap(it.run, inner, true, xs[i] + it.ml, bottom + iy + it.mt);
-				if(flexdbg)
-				{
-					tstring ts;
-					it.run[0]->get_text(ts);
-					printf("[flexdbg]     run text=%.20s main=%d cross=%d iy=%d y=%d\n",
-							(const char*)ts.c_str(), it.main, it.cross, iy,
-							it.run[0]->get_position().y);
-				}
 			}
-			else
+			else if(!placed)
 			{
 				render_item(it, xs[i], bottom + iy);
-				if(flexdbg)
-				{
-					const tchar_t* icls = it.el->get_attr(_t("class"));
-					printf("[flexdbg]     item tag=%s class=%s main=%d cross=%d iy=%d y=%d h=%d css_h=%s\n",
-							(const char*)it.el->get_tagName(), icls ? (const char*)icls : "",
-							it.main, it.cross, iy, it.el->get_position().y,
-							it.el->get_position().height,
-							ch.is_predefined() ? "auto" : "set");
-				}
 			}
 		}
 
-		int line_used = lead;
+		/* The line's contribution to the container's used width is the packed
+		 * content only: the justify-content lead (and the extra space-around /
+		 * space-evenly gaps) is free space inside THIS container, so reporting
+		 * it would inflate every shrink-to-fit ancestor (rokid.com's absolutely
+		 * positioned hero copy box sized to avail/2 + content/2 instead of to
+		 * its content, throwing the centred button row off the logo axis). */
+		int line_used = 0;
 		for(size_t i = 0; i < line.size(); i++)
 		{
 			line_used += items[line[i]].main;
-			if(i + 1 < line.size()) line_used += col_gap + jgap;
+			if(i + 1 < line.size()) line_used += col_gap;
 		}
 		if(line_used > used_width) used_width = line_used;
 
@@ -957,13 +1205,30 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 	 * only set `avail`, so without this an explicit-width flex container renders 0
 	 * wide (e.g. a nested `.global-nav ul { width:100% }`). */
 	m_pos.width = width_auto ? (m_display == display_inline_flex ? std::min(avail, used_width) : avail) : avail;
-	m_pos.height = has_fixed_h ? std::max(bottom, fixed_h) : bottom;
+	/* A declared height is the box height: content that does not fit overflows
+	 * (and is clipped by overflow:hidden), it must NOT stretch the box. Taking
+	 * max(bottom, fixed_h) let apple.com's global nav links (height:44px,
+	 * white-space:nowrap) grow to 90-117px around an oversized inner icon,
+	 * which stacked the nav into overlapping bands instead of one 44px row. */
+	m_pos.height = has_fixed_h ? fixed_h : bottom;
 	calc_auto_margins(parent_width);
 
+	/* m_pos.height is the CONTENT height, so min-height has to be unit-converted
+	 * and - for box-sizing:border-box - shrunk by the padding and borders before
+	 * it is compared. Clamping with the raw value made apple.com's .tile-wrapper
+	 * (min-height:var(--hero-content-height); box-sizing:border-box;
+	 * padding:61px 0 69px) 130px too tall: its absolutely positioned bottom:0
+	 * hero art then sat 130px lower than in Safari and was clipped by the tile's
+	 * overflow:clip, and every section below shifted down with it. */
 	int min_height = 0;
-	if(!m_css_min_height.is_predefined())
+	if(!m_css_min_height.is_predefined() && m_css_min_height.units() != css_units_none)
 	{
-		min_height = (int)m_css_min_height.val();
+		min_height = get_document()->cvt_units(m_css_min_height, m_font_size, 0);
+		if(m_box_sizing == box_sizing_border_box)
+		{
+			min_height -= m_padding.top + m_padding.bottom + m_borders.top + m_borders.bottom;
+		}
+		if(min_height < 0) min_height = 0;
 	}
 	if(min_height > m_pos.height)
 	{
@@ -991,10 +1256,12 @@ namespace litehtml
 {
 	struct grid_track
 	{
-		bool	is_fixed;
-		int		fixed_w;
-		float	fr;
-		int		min_w;		// minmax() lower bound, used by repeat(auto-fill)
+		bool	is_fixed = false;
+		int		fixed_w = 0;
+		float	fr = 1;
+		int		min_w = 0;			// minmax() lower bound, used by repeat(auto-fill)
+		bool	is_content = false;	// min-content / max-content track
+		bool	content_min = false;	// true = min-content, false = max-content
 	};
 }
 
@@ -1147,6 +1414,14 @@ static void grid_parse_tracks(const tchar_t* spec, int avail, int font_size, doc
 			tr.fixed_w = avail * atoi(t.c_str()) / 100;
 			tr.min_w = tr.fixed_w;
 		}
+		else if(t == _t("min-content") || t == _t("max-content"))
+		{
+			tr.is_fixed = false;
+			tr.fixed_w = 0;
+			tr.fr = 0;
+			tr.is_content = true;
+			tr.content_min = (t == _t("min-content"));
+		}
 		else
 		{
 			css_length l;
@@ -1252,6 +1527,23 @@ static void grid_item_placement(html_tag* el, int n, int& col, int& span, int& r
 		return;
 	}
 	tstring start_s, end_s;
+	/* grid-area: row-start / col-start / row-end / col-end. apple.com stacks a
+	 * card's artwork and its overlay with "grid-area:1/1" on both; without the
+	 * shorthand the overlay auto-flows into a second row and the clip hides
+	 * it. Explicit lines win over the longhands parsed below. */
+	if(const tchar_t* ga = el->get_style_property(_t("grid-area"), false, 0))
+	{
+		string_vector tk;
+		split_string(ga, tk, _t("/"));
+		for(size_t i = 0; i < tk.size(); i++) trim(tk[i]);
+		if(tk.size() >= 1)
+		{
+			int rv = 0;
+			if(tk[0].find(_t("span")) != 0 && grid_place_calc(tk[0], rv) && rv >= 1) row = rv - 1;
+		}
+		if(tk.size() >= 2 && tk[1].find(_t("span")) != 0) start_s = tk[1];
+		if(tk.size() >= 4 && tk[3].find(_t("span")) != 0) end_s = tk[3];
+	}
 	const tchar_t* gc = el->get_style_property(_t("grid-column"), false, 0);
 	if(gc)
 	{
@@ -1314,6 +1606,104 @@ static void grid_item_placement(html_tag* el, int n, int& col, int& span, int& r
 	}
 }
 
+static int grid_max_content_width(litehtml::html_tag* el, int avail)
+{
+using namespace litehtml;
+int row_gap = 0, col_gap = 0;
+flex_parse_gap(el, avail, row_gap, col_gap);
+const tchar_t* tc = el->get_style_property(_t("grid-template-columns"), false, 0);
+if(!tc) return -1;
+std::vector<grid_track> tracks;
+grid_parse_tracks(tc, avail, el->get_font_size(), el->get_document(), tracks, col_gap);
+int n = (int)tracks.size();
+if(n < 2) return -1;
+
+std::vector<element::ptr> items;
+for(size_t i = 0; i < el->get_children_count(); i++)
+{
+element::ptr c = el->get_child((int)i);
+if(!c || !c->is_visible()) continue;
+element_position ep = c->get_element_position();
+if(ep == element_position_absolute || ep == element_position_fixed) continue;
+if(c->is_white_space()) continue;
+if(c->get_display() == display_contents) continue;
+items.push_back(c);
+}
+
+/* Same auto-flow cursor as render_grid so items land in the columns the
+ * layout pass will actually use. */
+std::vector<std::vector<char>> occ;
+auto fits = [&](int r, int c, int sp) -> bool {
+if(c < 0 || c + sp > n) return false;
+if(r >= (int)occ.size()) return true;
+for(int cc = c; cc < c + sp; cc++)
+if(occ[r][cc]) return false;
+return true;
+};
+auto mark = [&](int r, int c, int sp) {
+while((int)occ.size() <= r) occ.push_back(std::vector<char>(n, 0));
+for(int cc = c; cc < c + sp; cc++) occ[r][cc] = 1;
+};
+std::vector<int> colw(n, 0);
+int cursor_r = 0, cursor_c = 0;
+for(size_t k = 0; k < items.size(); k++)
+{
+int col = -1, span = 1, row = -1;
+if(items[k]->get_display() != display_inline_text)
+grid_item_placement(static_cast<html_tag*>(items[k]), n, col, span, row);
+if(span < 1) span = 1;
+if(span > n) span = n;
+int r;
+if(col >= 0)
+{
+r = (row >= 0) ? row : 0;
+while(!fits(r, col, span)) r++;
+cursor_r = r;
+cursor_c = col + span;
+if(cursor_c >= n) cursor_c = 0;
+}
+else
+{
+r = cursor_r;
+int c = cursor_c;
+while(true)
+{
+if(c + span > n) { r++; c = 0; }
+if(fits(r, c, span)) break;
+c++;
+if(c >= n) { r++; c = 0; }
+}
+col = c;
+cursor_r = r;
+cursor_c = c + span;
+if(cursor_c >= n) cursor_c = 0;
+}
+mark(r, col, span);
+int iw = preferred_content_width(items[k]) + items[k]->margin_left() + items[k]->margin_right();
+if(span == 1)
+{
+if(iw > colw[col]) colw[col] = iw;
+}
+else
+{
+int per = iw / span;
+for(int c = col; c < col + span && c < n; c++)
+if(per > colw[c]) colw[c] = per;
+}
+}
+int total = 0;
+for(int i = 0; i < n; i++)
+{
+int w = colw[i];
+if(tracks[i].is_fixed && tracks[i].fixed_w > w) w = tracks[i].fixed_w;
+total += w;
+}
+total += col_gap * (n - 1);
+total += el->padding_left() + el->padding_right() +
+ el->border_left() + el->border_right();
+return total;
+}
+
 int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pass /*= false*/ )
 {
 	int parent_width = max_width;
@@ -1352,28 +1742,45 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 	if(tc)
 		grid_parse_tracks(tc, avail, m_font_size, get_document(), tracks, col_gap);
 	if(tracks.empty())
-		return render_box(x, y, max_width, second_pass);
+	{
+		/* A grid with no grid-template-columns still gets ONE implicit column,
+		 * but only when a child actually places itself: apple.com's gallery
+		 * cards are display:grid with no template and stack artwork + overlay
+		 * via grid-area:1/1, which block flow pushes below the clip. A template
+		 * less grid whose children do NOT place themselves keeps the block
+		 * fallback: apple's .tile-ctas gets its two button columns from
+		 * ":has(:nth-child(2))", which the selector engine cannot match, and
+		 * strict single-column auto-flow would stack the pills vertically. */
+		bool placed = false;
+		for(auto& el : m_children)
+		{
+			if(!el || !el->is_visible() || el->get_display() == display_inline_text) continue;
+			if(el->get_style_property(_t("grid-area"), false, 0) ||
+			   el->get_style_property(_t("grid-row"), false, 0) ||
+			   el->get_style_property(_t("grid-row-start"), false, 0) ||
+			   el->get_style_property(_t("grid-column"), false, 0) ||
+			   el->get_style_property(_t("grid-column-start"), false, 0))
+			{
+				placed = true;
+				break;
+			}
+		}
+		if(!placed)
+			return render_box(x, y, max_width, second_pass);
+		grid_track one;
+		one.is_fixed = false;
+		one.fixed_w = 0;
+		one.fr = 1;
+		one.is_content = false;
+		one.content_min = false;
+		tracks.push_back(one);
+	}
 
 	int n = (int)tracks.size();
 	int gaps = col_gap * (n - 1);
-	int fixed_sum = 0;
-	float fr_sum = 0;
+	bool have_content_track = false;
 	for(int i = 0; i < n; i++)
-	{
-		if(tracks[i].is_fixed) fixed_sum += tracks[i].fixed_w;
-		else fr_sum += tracks[i].fr;
-	}
-	int flex_avail = avail - gaps - fixed_sum;
-	if(flex_avail < 0) flex_avail = 0;
-	std::vector<int> col_w(n);
-	for(int i = 0; i < n; i++)
-	{
-		if(tracks[i].is_fixed)
-			col_w[i] = tracks[i].fixed_w;
-		else
-			col_w[i] = fr_sum > 0 ? (int)((float)flex_avail * tracks[i].fr / fr_sum) : 0;
-		if(col_w[i] < 0) col_w[i] = 0;
-	}
+		if(tracks[i].is_content) have_content_track = true;
 
 	std::vector<element::ptr> items;
 	for(auto& el : m_children)
@@ -1459,8 +1866,18 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 		int r;
 		if(col >= 0)
 		{
-			r = (row >= 0) ? row : 0;
-			while(!fits(r, col, span)) r++;
+			/* An explicit row is taken verbatim: grid items MAY overlap (that
+			 * is how grid-area:1/1 stacks a card and its overlay); only auto
+			 * placement searches for a free row. */
+			if(row >= 0)
+			{
+				r = row;
+			}
+			else
+			{
+				r = 0;
+				while(!fits(r, col, span)) r++;
+			}
 			cursor_r = r;
 			cursor_c = col + span;
 			if(cursor_c >= n) cursor_c = 0;
@@ -1487,10 +1904,131 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 	}
 	if(row_count == 0) row_count = 1;
 
+	/* Track sizing happens AFTER placement: a min-content/max-content track is
+	 * sized from the items actually placed in it, so the occupancy map must be
+	 * complete first. apple.com's CTA row is
+	 * 'grid-template-columns:min-content min-content' - previously the tokens
+	 * fell through to fr=1 and the two pills each got half the container. */
+	int fixed_sum = 0, content_sum = 0;
+	float fr_sum = 0;
+	for(int i = 0; i < n; i++)
+	{
+		if(tracks[i].is_fixed) fixed_sum += tracks[i].fixed_w;
+		else if(tracks[i].is_content) content_sum += 0;	/* measured below */
+		else fr_sum += tracks[i].fr;
+	}
+	std::vector<int> col_w(n, 0);
+	for(int i = 0; i < n; i++)
+		if(tracks[i].is_fixed) col_w[i] = tracks[i].fixed_w;
+	if(have_content_track)
+	{
+		for(int i = 0; i < n; i++)
+		{
+			if(!tracks[i].is_content) continue;
+			int w = 0;
+			for(size_t k = 0; k < items.size(); k++)
+			{
+				if(place[k].col != i || place[k].span != 1) continue;
+				element::ptr el = items[k];
+				int iw = 0;
+				if(el->get_display() == display_inline_text)
+				{
+					litehtml::size sz;
+					el->get_content_size(sz, avail);
+					iw = sz.width;
+				}
+				else
+				{
+					/* Measuring at the full available width lets a wrapping
+					 * item lay out once instead of iteratively growing the
+					 * track; the preferred width is then read back from the
+					 * children (positions ignored, see preferred_content_width).
+					 * With white-space:nowrap (apple's .button) the laid-out
+					 * width already IS the max-content width. */
+					static_cast<html_tag*>(el)->m_css_height = orig_h[k];
+					static_cast<html_tag*>(el)->m_css_width = orig_w[k];
+					el->render(0, 0, avail, second_pass);
+					iw = tracks[i].content_min ? flex_min_content(el)
+												: preferred_content_width(el);
+					if(iw < (int)el->get_position().width && !tracks[i].content_min)
+						iw = (int)el->get_position().width;
+				}
+				iw += el->margin_left() + el->margin_right();
+				if(iw > w) w = iw;
+			}
+			/* Items spanning several tracks distribute their contribution over
+			 * the spanned content tracks (rare; keeps the tracks from
+			 * collapsing to zero under a spanning item). */
+			for(size_t k = 0; k < items.size(); k++)
+			{
+				if(place[k].span < 2) continue;
+				if(i < place[k].col || i >= place[k].col + place[k].span) continue;
+				int outer = 0, ctracks = 0;
+				for(int c = place[k].col; c < place[k].col + place[k].span && c < n; c++)
+				{
+					if(c + 1 < place[k].col + place[k].span) outer += col_gap;
+					if(tracks[c].is_content) ctracks++;
+				}
+				if(ctracks == 0) continue;
+				element::ptr el = items[k];
+				int iw = 0;
+				if(el->get_display() != display_inline_text)
+				{
+					el->render(0, 0, avail, second_pass);
+					iw = tracks[i].content_min ? flex_min_content(el)
+												: preferred_content_width(el);
+				}
+				iw += el->margin_left() + el->margin_right() - outer;
+				if(iw < 0) iw = 0;
+				iw /= ctracks;
+				if(iw > w) w = iw;
+			}
+			col_w[i] = w;
+			content_sum += w;
+		}
+	}
+	int flex_avail = avail - gaps - fixed_sum - content_sum;
+	if(flex_avail < 0) flex_avail = 0;
+	for(int i = 0; i < n; i++)
+	{
+		if(tracks[i].is_fixed || tracks[i].is_content) continue;
+		col_w[i] = fr_sum > 0 ? (int)((float)flex_avail * tracks[i].fr / fr_sum) : 0;
+	}
+
+	/* justify-content shifts/grows the whole track group inside the container:
+	 * apple.com centres its CTA pills with 'justify-content:center'. Without
+	 * this the track group always hugged the inline-start edge. */
+	int lead = 0, jgap = 0;
+	int used = content_sum + fixed_sum + gaps;
+	for(int i = 0; i < n; i++)
+		if(!tracks[i].is_fixed && !tracks[i].is_content) used += col_w[i];
+	int leftover = avail - used;
+	if(leftover > 0)
+	{
+		const tchar_t* jc = get_style_property(_t("justify-content"), false, 0);
+		if(jc)
+		{
+			tstring j = jc;
+			trim(j);
+			if(j == _t("center")) lead = leftover / 2;
+			else if(j == _t("flex-end") || j == _t("end") || j == _t("right")) lead = leftover;
+			else if(j == _t("space-between") && n > 1) jgap = leftover / (n - 1);
+			else if(j == _t("space-around")) { jgap = leftover / n; lead = jgap / 2; }
+			else if(j == _t("space-evenly")) { jgap = leftover / (n + 1); lead = jgap; }
+		}
+	}
+	std::vector<int> col_xpos(n, 0);
+	{
+		int ix = lead;
+		for(int i = 0; i < n; i++)
+		{
+			col_xpos[i] = ix;
+			ix += col_w[i] + col_gap + jgap;
+		}
+	}
+
 	auto col_x = [&](int col) -> int {
-		int ix = 0;
-		for(int c = 0; c < col; c++) ix += col_w[c] + col_gap;
-		return ix;
+		return col_xpos[col];
 	};
 	auto col_span_w = [&](int col, int span) -> int {
 		int w = 0;
@@ -1546,11 +2084,19 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 			}
 			else
 			{
-				static_cast<html_tag*>(el)->m_css_height = orig_h[k];
-				static_cast<html_tag*>(el)->m_css_width = orig_w[k];
+				html_tag* git = static_cast<html_tag*>(el);
+				git->m_css_height = orig_h[k];
+				git->m_css_width = orig_w[k];
 				stretch_item_width(el, outer);
 				el->render(ix, bottom, outer, second_pass);
-				cross = el->get_position().height + el->margin_top() + el->margin_bottom();
+				/* A row track is sized by the item's OUTER box. Measuring the
+				 * content height alone dropped each tile's vertical padding -
+				 * apple.com's .section grids (gap:12px, one tile per row,
+				 * .tile-wrapper padding up to 69px) then stacked every row inside
+				 * the previous tile, overlapping the whole page top to bottom. */
+				cross = el->get_position().height + el->padding_top() + el->padding_bottom()
+					+ el->border_top() + el->border_bottom()
+					+ el->margin_top() + el->margin_bottom();
 			}
 			crossv[k] = cross;
 			if(cross > cur_row_h) cur_row_h = cross;
@@ -1566,9 +2112,20 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 			if(crossv[k] >= row_h) continue;
 			int ix = col_x(place[k].col);
 			int outer = col_span_w(place[k].col, place[k].span);
+			html_tag* gst = static_cast<html_tag*>(el);
+			int inner = row_h - el->margin_top() - el->margin_bottom();
 			css_length h;
-			h = (float)(row_h - el->margin_top() - el->margin_bottom());
-			static_cast<html_tag*>(el)->m_css_height = h;
+			/* The forced height is interpreted per the item's box-sizing: a
+			 * border-box item keeps its padding inside the row, a content-box
+			 * item outside it - one raw value made stretched tiles either fall
+			 * short of the row or overflow it by their padding. */
+			if(gst->m_box_sizing != box_sizing_border_box)
+			{
+				inner -= el->padding_top() + el->padding_bottom() + el->border_top() + el->border_bottom();
+			}
+			if(inner < 0) inner = 0;
+			h = (float)inner;
+			gst->m_css_height = h;
 			stretch_item_width(el, outer);
 			el->render(ix, bottom, outer, second_pass);
 		}

@@ -204,6 +204,10 @@ protected:
 		virtual bool				set_class(const tchar_t* pclass, bool add);
 		virtual bool				is_replaced() const;
 		virtual int					line_height() const;
+		/* True when the element's line-height is the 'normal' keyword, i.e. it
+		 * is resolved from the element's OWN font metrics and must NOT be
+		 * inherited as a pixel value by descendants (CSS 2.1 10.8.1). */
+		virtual bool				is_line_height_normal() const;
 		virtual text_align			get_text_align() const;
 		virtual text_transform		get_text_transform() const;
 		virtual white_space			get_white_space() const;
@@ -254,6 +258,15 @@ protected:
 		virtual void				add_positioned(const ptr &el);
 		virtual int					find_next_line_top(int top, int width, int def_right);
 		virtual int					get_zindex() const;
+		/* Stacking model (CSS 2.1 Appendix E + flexbox/grid):
+		 * is_stacking_participant() - the element takes part in its stacking
+		 *   context's positioned painting phase (positioned, or a flex/grid item
+		 *   with an explicit z-index).
+		 * is_stacking_context() - the element is a real painting boundary; only
+		 *   these collect positioned descendants. A positioned element with
+		 *   z-index:auto is NOT one, so its z-indexed descendants bubble up. */
+		virtual bool				is_stacking_participant() const;
+		virtual bool				is_stacking_context() const;
 		virtual void				draw_stacking_context(uint_ptr hdc, int x, int y, const position* clip, bool with_positioned);
 		virtual void				draw_children( uint_ptr hdc, int x, int y, const position* clip, draw_flag flag, int zindex );
 		virtual bool				is_nth_child(const element::ptr& el, int num, int off, bool of_type) const;

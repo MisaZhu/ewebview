@@ -1425,8 +1425,16 @@ static bool browser_init(browser_t* b, int argc, char** argv) {
         return false;
     }
 
-    b->renderer = SDL_CreateRenderer(b->window, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    b->renderer = NULL;
+    /* EWEB_SOFTWARE_RENDER=1: skip the accelerated renderer entirely. Headless
+     * --shot runs and CI boxes have no business on the GPU path, and macOS's
+     * GLEngine has segfaulted mid-present under taobao-scale repaint load
+     * (sdlbrowser-2026-09-16-010105.ips: EXC_BAD_ACCESS inside
+     * GLRendererFloat). Software blits are plenty for screenshot capture. */
+    if(SDL_getenv("EWEB_SOFTWARE_RENDER") == NULL) {
+        b->renderer = SDL_CreateRenderer(b->window, -1,
+            SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    }
     if(!b->renderer) {
         b->renderer = SDL_CreateRenderer(b->window, -1, SDL_RENDERER_SOFTWARE);
     }
@@ -1596,15 +1604,12 @@ static void browser_destroy(browser_t* b) {
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char** argv) {
-    fprintf(stderr, "[MARK] sdlbrowser main start\n");
     browser_t browser;
     browser_detect_color_scheme();
     if(!browser_init(&browser, argc, argv)) {
-        fprintf(stderr, "[MARK] browser_init failed\n");
         browser_destroy(&browser);
         return 1;
     }
-    fprintf(stderr, "[MARK] browser_init ok\n");
 
     browser_t* b = &browser;
     const uint32_t TICK_MS = 16;   /* ~60 Hz UI pump */

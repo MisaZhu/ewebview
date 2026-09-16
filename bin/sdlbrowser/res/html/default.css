@@ -68,7 +68,12 @@ center
 	display:block;
 }
 
-a:link
+/* Element-level selector on purpose: this master sheet is injected as an
+   AUTHOR sheet, so a pseudo-class here (a:link, specificity 0,1,1) would
+   out-specify page rules like .button{color:...} (0,1,0) - in a real browser
+   the UA sheet always loses to author rules. Keep it at (0,0,1) so any
+   author class/compound rule wins, matching UA behaviour. */
+a
 {
 	text-decoration: underline;
 	color: #00f;

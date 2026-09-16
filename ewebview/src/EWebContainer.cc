@@ -1030,6 +1030,190 @@ void EWebContainer::get_image_size(const litehtml::tchar_t* src, const litehtml:
     }
 }
 
+/* CSS linear-gradient() background support. Tailwind-driven pages paint
+ * hero fields and pill buttons with background:linear-gradient(...); the
+ * HAL has no gradient primitive, so the gradient is rasterised into a temp
+ * surface (0xAARRGGBB, same as every decoded image) and composited with the
+ * ordinary src-over blit, masked by the element's own border-radius. */
+struct GradientStop {
+    float off;
+    float r, g, b, a;
+};
+
+struct LinearGradient {
+    float angle_deg;
+    std::vector<GradientStop> stops;
+};
+
+static bool eweb_starts_with_ci(const std::string& s, const char* pre)
+{
+    size_t n = strlen(pre);
+    if (s.size() < n)
+        return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z')
+            c = (char)(c - 'A' + 'a');
+        if (c != pre[i])
+            return false;
+    }
+    return true;
+}
+
+static std::string eweb_trim(const std::string& s)
+{
+    size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos)
+        return std::string();
+    size_t e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+/* Split on commas that are not nested inside parentheses (rgba(0, 0, 0, .1)). */
+static void split_top_level_commas(const std::string& s, std::vector<std::string>& out)
+{
+    int depth = 0;
+    size_t start = 0;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '(') depth++;
+        else if (s[i] == ')') depth--;
+        else if (s[i] == ',' && depth == 0) {
+            out.push_back(s.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    out.push_back(s.substr(start));
+}
+
+static bool parse_gradient_angle(const std::string& tok, float& deg)
+{
+    if (tok.size() > 3 && tok.compare(tok.size() - 3, 3, "deg") == 0) {
+        deg = (float)atof(tok.c_str());
+        return true;
+    }
+    if (tok.size() > 4 && tok.compare(tok.size() - 4, 4, "turn") == 0) {
+        deg = (float)atof(tok.c_str()) * 360.0f;
+        return true;
+    }
+    if (tok.size() > 3 && tok.compare(tok.size() - 3, 3, "rad") == 0) {
+        deg = (float)atof(tok.c_str()) * 57.2957795f;
+        return true;
+    }
+    if (tok.compare(0, 3, "to ") != 0)
+        return false;
+    std::string dir = eweb_trim(tok.substr(3));
+    if (dir == "top") deg = 0.0f;
+    else if (dir == "right") deg = 90.0f;
+    else if (dir == "bottom") deg = 180.0f;
+    else if (dir == "left") deg = 270.0f;
+    else if (dir == "top right" || dir == "right top") deg = 45.0f;
+    else if (dir == "bottom right" || dir == "right bottom") deg = 135.0f;
+    else if (dir == "bottom left" || dir == "left bottom") deg = 225.0f;
+    else if (dir == "top left" || dir == "left top") deg = 315.0f;
+    else return false;
+    return true;
+}
+
+static bool parse_linear_gradient(const std::string& val, LinearGradient& out)
+{
+    size_t open = val.find('(');
+    size_t close = val.rfind(')');
+    if (open == std::string::npos || close == std::string::npos || close < open)
+        return false;
+    std::vector<std::string> parts;
+    split_top_level_commas(val.substr(open + 1, close - open - 1), parts);
+    out.angle_deg = 180.0f;
+    out.stops.clear();
+    size_t first_stop = 0;
+    if (!parts.empty()) {
+        float deg = 0.0f;
+        std::string head = eweb_trim(parts[0]);
+        if (parse_gradient_angle(head, deg)) {
+            out.angle_deg = deg;
+            first_stop = 1;
+        }
+    }
+    for (size_t i = first_stop; i < parts.size(); i++) {
+        std::string tok = eweb_trim(parts[i]);
+        if (tok.empty())
+            continue;
+        std::string color_str;
+        std::string rest;
+        size_t paren = tok.find('(');
+        if (paren != std::string::npos) {
+            size_t cp = tok.rfind(')');
+            if (cp == std::string::npos)
+                continue;
+            color_str = tok.substr(0, cp + 1);
+            rest = eweb_trim(tok.substr(cp + 1));
+        } else {
+            size_t sp = tok.find(' ');
+            if (sp == std::string::npos) {
+                color_str = tok;
+            } else {
+                color_str = tok.substr(0, sp);
+                rest = eweb_trim(tok.substr(sp + 1));
+            }
+        }
+        GradientStop st;
+        st.off = -1.0f;
+        litehtml::web_color clr = litehtml::web_color::from_string(color_str.c_str(), 0);
+        st.r = clr.red;
+        st.g = clr.green;
+        st.b = clr.blue;
+        st.a = clr.alpha;
+        if (!rest.empty())
+            st.off = (float)atof(rest.c_str()) / 100.0f;
+        out.stops.push_back(st);
+    }
+    if (out.stops.size() < 2)
+        return false;
+    /* Fill missing offsets: first 0, last 1, middles evenly between the
+     * nearest specified neighbours, as the spec requires. */
+    if (out.stops.front().off < 0.0f)
+        out.stops.front().off = 0.0f;
+    if (out.stops.back().off < 0.0f)
+        out.stops.back().off = 1.0f;
+    for (size_t i = 0; i < out.stops.size();) {
+        if (out.stops[i].off >= 0.0f) {
+            i++;
+            continue;
+        }
+        size_t j = i;
+        while (j < out.stops.size() && out.stops[j].off < 0.0f)
+            j++;
+        float lo = out.stops[i - 1].off;
+        float hi = (j < out.stops.size()) ? out.stops[j].off : 1.0f;
+        for (size_t k = i; k < j; k++)
+            out.stops[k].off = lo + (hi - lo) * (float)(k - i + 1) / (float)(j - i + 1);
+        i = j;
+    }
+    for (size_t i = 1; i < out.stops.size(); i++)
+        if (out.stops[i].off < out.stops[i - 1].off)
+            out.stops[i].off = out.stops[i - 1].off;
+    return true;
+}
+
+static uint32_t sample_linear_gradient(const LinearGradient& grad, float t)
+{
+    if (t <= 0.0f) t = 0.0f;
+    if (t >= 1.0f) t = 1.0f;
+    size_t i = 1;
+    while (i + 1 < grad.stops.size() && grad.stops[i].off < t)
+        i++;
+    const GradientStop& a = grad.stops[i - 1];
+    const GradientStop& b = grad.stops[i];
+    float span = b.off - a.off;
+    float f = (span > 1e-6f) ? (t - a.off) / span : 0.0f;
+    if (f < 0.0f) f = 0.0f;
+    if (f > 1.0f) f = 1.0f;
+    uint32_t r = (uint32_t)(a.r + (b.r - a.r) * f);
+    uint32_t g = (uint32_t)(a.g + (b.g - a.g) * f);
+    uint32_t bl = (uint32_t)(a.b + (b.b - a.b) * f);
+    uint32_t al = (uint32_t)(a.a + (b.a - a.a) * f);
+    return (al << 24) | (r << 16) | (g << 8) | bl;
+}
+
 void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::background_paint& bg)
 {
     eweb_surface_t* s = (eweb_surface_t*)hdc;
@@ -1037,6 +1221,72 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
     if (!s)
         return;
     const eweb_gfx_t* gfx = &m_port->gfx;
+
+    if (eweb_starts_with_ci(bg.image, "linear-gradient(")) {
+        const litehtml::position& cb = bg.clip_box;
+        LinearGradient grad;
+        if (cb.width <= 0 || cb.height <= 0 || !parse_linear_gradient(bg.image, grad))
+            return;
+        if (!gfx->surface_new || !gfx->surface_pixels || !gfx->surface_free || !gfx->blit_fit_alpha)
+            return;
+        eweb_surface_t* tmp = gfx->surface_new(gfx->ud, cb.width, cb.height);
+        if (!tmp)
+            return;
+        int tw = 0, th = 0;
+        uint32_t* px = gfx->surface_pixels(gfx->ud, tmp, &tw, &th);
+        if (px && tw > 0 && th > 0) {
+            const float kPi = 3.14159265f;
+            float ang = grad.angle_deg * kPi / 180.0f;
+            float dx = sinf(ang), dy = -cosf(ang);
+            float W = (float)cb.width, H = (float)cb.height;
+            float L = fabsf(W * dx) + fabsf(H * dy);
+            if (L <= 1e-6f) L = 1.0f;
+            float sx = W * 0.5f - dx * L * 0.5f;
+            float sy = H * 0.5f - dy * L * 0.5f;
+            float kx = W / (float)tw, ky = H / (float)th;
+            /* CSS border-radius clamping: overlapping corner radii shrink
+             * proportionally so a 30rem radius on a 55rem-tall pill becomes
+             * the stadium shape the button shows in a real browser. */
+            float rtl_x = (float)bg.border_radius.top_left_x, rtl_y = (float)bg.border_radius.top_left_y;
+            float rtr_x = (float)bg.border_radius.top_right_x, rtr_y = (float)bg.border_radius.top_right_y;
+            float rbl_x = (float)bg.border_radius.bottom_left_x, rbl_y = (float)bg.border_radius.bottom_left_y;
+            float rbr_x = (float)bg.border_radius.bottom_right_x, rbr_y = (float)bg.border_radius.bottom_right_y;
+            float f = 1.0f;
+            if (rtl_x + rtr_x > 0) f = std::min(f, W / (rtl_x + rtr_x));
+            if (rbl_x + rbr_x > 0) f = std::min(f, W / (rbl_x + rbr_x));
+            if (rtl_y + rbl_y > 0) f = std::min(f, H / (rtl_y + rbl_y));
+            if (rtr_y + rbr_y > 0) f = std::min(f, H / (rtr_y + rbr_y));
+            if (f < 1.0f) {
+                rtl_x *= f; rtl_y *= f; rtr_x *= f; rtr_y *= f;
+                rbl_x *= f; rbl_y *= f; rbr_x *= f; rbr_y *= f;
+            }
+            bool rounded = (rtl_x > 0 || rtl_y > 0 || rtr_x > 0 || rbr_x > 0 || rbl_x > 0);
+            for (int yy = 0; yy < th; yy++) {
+                float Y = (yy + 0.5f) * ky;
+                for (int xx = 0; xx < tw; xx++) {
+                    float X = (xx + 0.5f) * kx;
+                    uint32_t c = sample_linear_gradient(grad, ((X - sx) * dx + (Y - sy) * dy) / L);
+                    if (rounded) {
+                        float ex = 0, ey = 0, rx = 0, ry = 0;
+                        bool in_corner = false;
+                        if (X < rtl_x && Y < rtl_y) { ex = rtl_x; ey = rtl_y; rx = rtl_x; ry = rtl_y; in_corner = true; }
+                        else if (X > W - rtr_x && Y < rtr_y) { ex = W - rtr_x; ey = rtr_y; rx = rtr_x; ry = rtr_y; in_corner = true; }
+                        else if (X < rbl_x && Y > H - rbl_y) { ex = rbl_x; ey = H - rbl_y; rx = rbl_x; ry = rbl_y; in_corner = true; }
+                        else if (X > W - rbr_x && Y > H - rbr_y) { ex = W - rbr_x; ey = H - rbr_y; rx = rbr_x; ry = rbr_y; in_corner = true; }
+                        if (in_corner && rx > 0 && ry > 0) {
+                            float nx = (X - ex) / rx, ny = (Y - ey) / ry;
+                            if (nx * nx + ny * ny > 1.0f)
+                                c = 0;
+                        }
+                    }
+                    px[yy * tw + xx] = c;
+                }
+            }
+            gfx->blit_fit_alpha(gfx->ud, tmp, 0, 0, tw, th, s, cb.x, cb.y, cb.width, cb.height, 0xFF);
+        }
+        gfx->surface_free(gfx->ud, tmp);
+        return;
+    }
 
     bool do_image = false;
     if (!bg.image.empty() && bg.image_size.width > 0 && bg.image_size.height > 0) {

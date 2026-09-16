@@ -39,6 +39,45 @@ const litehtml::tchar_t* litehtml::el_script::get_tagName() const
 	return _t("script");
 }
 
+/* el_script derives from element (not html_tag), whose select_all is a no-op,
+ * so a <script> node was invisible to getElementsByTagName("script") and
+ * document.scripts. Match the selector's right-hand tag against our fixed tag
+ * name plus exact/exists attribute tests (enough for script[src] style
+ * lookups); pseudo classes are ignored, and scripts have no element children
+ * to recurse into (appendChild captures text). */
+void litehtml::el_script::select_all(const css_selector& selector, elements_vector& res)
+{
+	const css_element_selector& right = selector.m_right;
+	if(!right.m_tag.empty() && right.m_tag != _t("*") && right.m_tag != get_tagName())
+	{
+		return;
+	}
+	for(const auto& attr_sel : right.m_attrs)
+	{
+		const tchar_t* own = get_attr(attr_sel.attribute.c_str());
+		if(attr_sel.condition == select_exists)
+		{
+			if(own == nullptr) return;
+		}
+		else if(attr_sel.condition == select_equal)
+		{
+			if(own == nullptr || t_strcasecmp(own, attr_sel.val.c_str()) != 0) return;
+		}
+		else
+		{
+			return; /* unsupported condition: do not claim a match */
+		}
+	}
+	res.push_back(this);
+}
+
+litehtml::element::ptr litehtml::el_script::select_one(const css_selector& selector)
+{
+	elements_vector res;
+	select_all(selector, res);
+	return res.empty() ? nullptr : res.front();
+}
+
 void litehtml::el_script::set_attr(const tchar_t* name, const tchar_t* val)
 {
 	if(name && val)

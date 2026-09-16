@@ -366,6 +366,8 @@ void litehtml::element::draw_stacking_context( uint_ptr hdc, int x, int y, const
 void litehtml::element::render_positioned(render_type rt)							LITEHTML_EMPTY_FUNC
 int litehtml::element::get_zindex() const											LITEHTML_RETURN_FUNC(0)
 bool litehtml::element::fetch_positioned()											LITEHTML_RETURN_FUNC(false)
+bool litehtml::element::is_stacking_participant() const								LITEHTML_RETURN_FUNC(is_positioned())
+bool litehtml::element::is_stacking_context() const									LITEHTML_RETURN_FUNC(false)
 litehtml::visibility litehtml::element::get_visibility() const						LITEHTML_RETURN_FUNC(visibility_visible)
 float litehtml::element::get_opacity_cum() const									LITEHTML_RETURN_FUNC(1.0f)
 void litehtml::element::apply_vertical_align()										LITEHTML_EMPTY_FUNC
@@ -443,6 +445,7 @@ bool litehtml::element::set_class( const tchar_t* pclass, bool add )				LITEHTML
 litehtml::element_position litehtml::element::get_element_position(css_offsets* offsets) const			LITEHTML_RETURN_FUNC(element_position_static)
 bool litehtml::element::is_replaced() const											LITEHTML_RETURN_FUNC(false)
 int litehtml::element::line_height() const											LITEHTML_RETURN_FUNC(0)
+bool litehtml::element::is_line_height_normal() const							LITEHTML_RETURN_FUNC(false)
 litehtml::text_align litehtml::element::get_text_align() const						LITEHTML_RETURN_FUNC(text_align_left)
 litehtml::text_transform litehtml::element::get_text_transform() const				LITEHTML_RETURN_FUNC(text_transform_none)
 void litehtml::element::draw( uint_ptr hdc, int x, int y, const position* clip )	LITEHTML_EMPTY_FUNC

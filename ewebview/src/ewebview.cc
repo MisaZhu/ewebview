@@ -97,6 +97,11 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
 {
     if(has_inline_handlers != nullptr) *has_inline_handlers = false;
     if(has_module_scripts != nullptr) *has_module_scripts = false;
+    /* EWEB_RUN_MODULES opts in to executing type="module" scripts: "1" runs
+     * them all, any other value runs only modules whose src contains it (so a
+     * single bundle can be exercised while the rest stay skipped). */
+    static const char* run_modules_env = ::getenv("EWEB_RUN_MODULES");
+    const bool run_modules_all = (run_modules_env != nullptr && run_modules_env[0] == '1');
     if(html.empty()) {
         return html;
     }
@@ -164,18 +169,31 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
 
         std::string src_val = script_attr_value(open_tag, open_tag_orig, "src");
         bool external = !src_val.empty();
-        /* A type= that is present and not a JS mime means "do not execute". */
+        /* A type= that is present and not a JS mime means "do not execute".
+         * type="module" is executable in principle (the mario VM parses the
+         * ES2015+ syntax these bundles use and implements import/export), but
+         * apple.com's homepage bundles still abort midway (missing stdlib
+         * pieces) after mutating the DOM, which loses the stylesheet links and
+         * paints an unstyled page. So modules stay skipped unless the operator
+         * opts in with EWEB_RUN_MODULES=1 while those VM gaps are closed. */
         bool non_js = false;
-        size_t tp = open_tag.find("type=");
-        if(tp != std::string::npos) {
-            non_js = (open_tag.find("javascript", tp) == std::string::npos);
+        std::string type_val = script_attr_value(open_tag, open_tag_orig, "type");
+        for(char& ch : type_val) ch = (char)::tolower((unsigned char)ch);
+        if(!type_val.empty()) {
+            bool js_mime = (type_val.find("javascript") != std::string::npos ||
+                            type_val == "text/ecmascript" ||
+                            type_val == "application/ecmascript");
+            bool module_ok = false;
+            if(type_val == "module" && run_modules_env != nullptr) {
+                module_ok = run_modules_all ||
+                            (src_val.find(run_modules_env) != std::string::npos);
+            }
+            non_js = !(js_mime || module_ok);
         }
-        /* Remember a skipped type="module": the VM cannot parse ES2020 module
-         * bundles, so a page whose content lives in one renders blank; the
-         * engine arms a plain notice for that case (decideModuleNotice). */
+        /* Remember a skipped type="module": if the VM still fails to parse one,
+         * a page whose content lives in it renders blank; the engine arms a
+         * plain notice for that case (decideModuleNotice). */
         if(has_module_scripts != nullptr && !*has_module_scripts) {
-            std::string type_val = script_attr_value(open_tag, open_tag_orig, "type");
-            for(char& ch : type_val) ch = (char)::tolower((unsigned char)ch);
             if(type_val == "module") *has_module_scripts = true;
         }
         if(scripts != nullptr && !non_js) {
@@ -289,6 +307,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_styleNeedSince(0)
     , m_needsLayout(false)
     , m_pendingCss(0)
+    , m_firstPaintCssWaitSince(0)
     , m_styleStepInFlight(false)
     , m_pressX(0)
     , m_pressY(0)
@@ -322,6 +341,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_jsPageHasModules(false)
     , m_moduleNoticeDecided(false)
     , m_showModuleNotice(false)
+    , m_noticeKind(0)
     , m_swapAtMs(0)
     , m_noticeFont(nullptr)
     , m_jsProgressiveActive(false)
@@ -623,6 +643,13 @@ void EWebEngine::engineLoop()
              * the body still holds no text, say so on the page instead of
              * leaving an unexplained white viewport. */
             decideModuleNotice();
+        } else if(!m_moduleNoticeDecided && !m_jsPostSwapRun &&
+                  (ticMs() - m_swapAtMs) > 2500) {
+            /* Client-rendered shell: the whole classic-script phase had its
+             * chance (or was dropped by a budget) and what still paints is the
+             * server-side skeleton placeholder the app was meant to replace.
+             * Explain instead of letting grey blocks stand in for content. */
+            decideCsrNotice();
         }
 
         /* 6. a navigation/scroll a script or an anchor click asked for. Runs
@@ -1966,6 +1993,8 @@ void EWebEngine::cleanupBuildResources()
     m_jsScriptSrcs.clear();
     m_jsScriptDone.clear();
     m_jsHasInlineHandlers = false;
+    m_jsCurScriptEl = nullptr;
+    m_jsCurScriptElUrl.clear();
     m_jsReparseCount = 0;
     m_jsRunBeforePaint = false;
     m_jsNextScript = 0;
@@ -2023,6 +2052,7 @@ void EWebEngine::cleanupBuildResources()
     m_defaultCssLoading = false;
     m_deferBuildStep = false;
     m_styleStepInFlight = false;
+    m_firstPaintCssWaitSince = 0;
     m_layoutDirtyAt = 0;
     m_buildLayoutDirtyAt = 0;
     m_layoutDirtySince = 0;
@@ -2713,6 +2743,8 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     m_jsScriptSrcs.clear();
     m_jsScriptDone.clear();
     m_jsHasInlineHandlers = false;
+    m_jsCurScriptEl = nullptr;
+    m_jsCurScriptElUrl.clear();
     m_jsBuildHasModules = false;
     m_buildHtmlContent = extract_scripts(content, m_jsEnabled ? &m_jsScripts : nullptr,
                                          m_jsEnabled ? &m_jsScriptSrcs : nullptr,
@@ -2803,12 +2835,23 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
             if(i < m_jsScriptDone.size()) m_jsScriptDone[i] = 1;   /* unresolvable: skip, never block */
             continue;
         }
-        m_jsScriptSrcs[i] = abs;   /* results are matched by this absolute URL */
-        EWebTask task;
-        task.url = abs;
-        task.type = EWEB_TASK_SCRIPT;
-        task.loading = false;
-        addTask(task);
+        /* CDN combo ("/??a,b,c"): one slot per component so a watchdog cut on a
+         * hanging middle component cannot discard the ones after it. */
+        std::vector<std::string> parts = ewebSplitComboUrl(abs);
+        m_jsScriptSrcs[i] = parts[0];
+        for(size_t k = 1; k < parts.size(); ++k) {
+            m_jsScriptSrcs.insert(m_jsScriptSrcs.begin() + (long)(i + k), parts[k]);
+            m_jsScripts.insert(m_jsScripts.begin() + (long)(i + k), std::string());
+            m_jsScriptDone.insert(m_jsScriptDone.begin() + (long)(i + k), 0);
+        }
+        i += parts.size() - 1;
+        for(size_t k = 0; k < parts.size(); ++k) {
+            EWebTask task;
+            task.url = parts[k];
+            task.type = EWEB_TASK_SCRIPT;
+            task.loading = false;
+            addTask(task);
+        }
     }
 
     setBuildStatus("preparing document", 5);
@@ -2862,19 +2905,15 @@ bool EWebEngine::processResults()
     }
 
     /* A post-swap script run (m_jsPostSwapRun) is not a build for results:
-     * the page on screen owns the caches, so CSS/images must keep landing in
-     * it instead of stalling behind a script that may run for many ticks. */
+     * the page on screen owns the caches, so images must keep landing in it
+     * instead of stalling behind a script that may run for many ticks.
+     * Stylesheets are NOT deferred: loadCSSContent() routes them into the
+     * build context while a build is in flight, and BUILD_RENDER_DOC waits
+     * for them to drain so the first paint carries the author CSS instead
+     * of an unstyled skeleton that restyles live seconds later. */
     if(result.type == EWEB_TASK_IMAGE && m_buildPhase != BUILD_IDLE && !m_jsPostSwapRun) {
         EWEB_LOG("[ewebview] process image deferred by build: size=%d phase=%d\n",
             (int)result.content.size(), (int)m_buildPhase);
-        pthread_mutex_lock(&m_resultMutex);
-        m_resultQueue.insert(m_resultQueue.begin(), result);
-        pthread_mutex_unlock(&m_resultMutex);
-        return false;
-    }
-    if(result.type == EWEB_TASK_CSS &&
-            m_buildPhase != BUILD_IDLE && !m_jsPostSwapRun &&
-            !(m_buildPhase == BUILD_PRELOAD_CSS && result.url == m_defaultCSSUrl)) {
         pthread_mutex_lock(&m_resultMutex);
         m_resultQueue.insert(m_resultQueue.begin(), result);
         pthread_mutex_unlock(&m_resultMutex);
@@ -2911,6 +2950,11 @@ bool EWebEngine::processResults()
         }
         if(result.type == EWEB_TASK_CSS) {
             forgetCSS(result.url);
+            /* Release the pending-sheet slot on failure too: the first-paint
+             * gate and the visible doc's style walk both wait on m_pendingCss,
+             * and a 404'd sheet must not make them wait out their caps. */
+            if(m_pendingCss > 0)
+                m_pendingCss--;
             if(result.url == m_defaultCSSUrl) {
                 m_defaultCssLoading = false;
                 m_defaultCssPrepared = true;
@@ -3324,6 +3368,22 @@ void EWebEngine::advanceBuildStep()
 
     if(m_buildPhase == BUILD_RENDER_DOC) {
         setBuildStatus("layout and first paint", 80);
+        /* Render-blocking stylesheets: the <link> fetches queued during the
+         * parse land in the build context now that processResults no longer
+         * defers them, so hold the swap until they drain - the previous page
+         * and the progress overlay stay on screen, which beats painting an
+         * unstyled skeleton and restyling it live. The cap keeps a stuck
+         * fetch from holding the view; whatever landed by then is painted. */
+        if(m_pendingCss > 0) {
+            if(m_firstPaintCssWaitSince == 0) {
+                m_firstPaintCssWaitSince = ticMs();
+                EWEB_LOG("[ewebview] first paint waits for %d stylesheet(s)\n", m_pendingCss);
+            }
+            if(ticMs() - m_firstPaintCssWaitSince < kFirstPaintCssWaitMs)
+                return;
+            EWEB_LOG("[ewebview] first paint css wait timed out with %d pending\n", m_pendingCss);
+        }
+        m_firstPaintCssWaitSince = 0;
         if(m_buildDoc) {
             /* The DOM was created in fast mode, whose parse_styles path skips
              * the whole box model (height/width stay predef(0)), so layout
@@ -3344,6 +3404,12 @@ void EWebEngine::advanceBuildStep()
             while(!styles_done && !m_buildAbort) {
                 styles_done = m_buildDoc->update_master_styles_step(
                         ticMs() + kStyleBudgetIdleMs);
+            }
+            if(styles_done) {
+                /* The monolithic walk finished: no chunked step remains in
+                 * flight and no build style debt survives into the swap. */
+                m_buildNeedsStyleUpdate = false;
+                m_styleStepInFlight = false;
             }
             uint64_t render_start = ticMs();
             if(!m_buildAbort)
@@ -3411,6 +3477,7 @@ void EWebEngine::advanceBuildStep()
         m_swapAtMs = ticMs();
         m_moduleNoticeDecided = false;
         m_showModuleNotice = false;
+        m_noticeKind = 0;
         m_defaultCssPrepared = false;
         m_defaultCssLoading = false;
         m_buildTargetContext = nullptr;
@@ -3423,6 +3490,17 @@ void EWebEngine::advanceBuildStep()
         m_engineScrollX = 0;
         m_engineScrollY = 0;
         m_cacheValid = false;
+        /* A sheet that landed on the tick before the swap left the handed-
+         * over document style-dirty under the BUILD flags; carry the debt
+         * into the visible-doc flags, or the next applyPendingLayoutUpdates
+         * (build doc now null) drops it and the fresh master CSS is never
+         * walked on the page on screen. */
+        if(m_buildNeedsStyleUpdate) {
+            m_buildNeedsStyleUpdate = false;
+            if(!m_needsStyleUpdate)
+                m_styleNeedSince = ticMs();
+            m_needsStyleUpdate = true;
+        }
 
         // Defer deletion of the old page to a later loop iteration to prevent
         // re-entrant corruption (the engine loop flushes these at its top).
@@ -3556,7 +3634,86 @@ void EWebEngine::decideModuleNotice()
             return;   /* real content on screen: nothing to explain */
     }
     m_showModuleNotice = true;
+    m_noticeKind = 1;
     EWEB_LOG("[ewebview] module-only page paints blank: notice armed url=%s\n",
+        m_currentHtmlUrl.c_str());
+    markContentDirty();
+}
+
+/* Case-insensitive substring test (strcasestr is not portable across the
+ * libcs the ports build against). */
+static bool ewebContainsNoCase(const char* hay, const char* needle)
+{
+    if(hay == nullptr || needle == nullptr || needle[0] == 0)
+        return false;
+    size_t n = strlen(needle);
+    for(size_t i = 0; hay[i] != 0; ++i) {
+        size_t k = 0;
+        while(k < n && hay[i + k] != 0 &&
+              tolower((unsigned char)hay[i + k]) == tolower((unsigned char)needle[k]))
+            ++k;
+        if(k == n)
+            return true;
+    }
+    return false;
+}
+
+/* True when a laid-out subtree still shows a "skeleton" loading placeholder:
+ * a VISIBLE element whose id/class carries "skeleton" and whose border box
+ * covers at least minArea px2. Such placeholders are painted by the server
+ * shell and faded out by the app once it boots; one still on screen after the
+ * script phase ended means the app never replaced it. */
+static bool pageHasVisibleSkeleton(litehtml::element* el, int minArea)
+{
+    if(el == nullptr)
+        return false;
+    const litehtml::tchar_t* tag = el->get_tagName();
+    if(tag != nullptr &&
+       (t_strcasecmp(tag, _t("style")) == 0 ||
+        t_strcasecmp(tag, _t("script")) == 0 ||
+        t_strcasecmp(tag, _t("head")) == 0))
+        return false;
+    if(el->is_visible()) {
+        if(ewebContainsNoCase(el->get_attr(_t("id"), nullptr), "skeleton") ||
+           ewebContainsNoCase(el->get_attr(_t("class"), nullptr), "skeleton")) {
+            if(el->width() * el->height() >= minArea)
+                return true;
+        }
+    }
+    size_t n = el->get_children_count();
+    for(size_t i = 0; i < n; ++i) {
+        if(pageHasVisibleSkeleton(el->get_child((int)i), minArea))
+            return true;
+    }
+    return false;
+}
+
+bool EWebEngine::pageShowsSkeletonPlaceholder() const
+{
+    if(m_doc == nullptr || m_clientWidth <= 0 || m_clientHeight <= 0)
+        return false;
+    litehtml::element::ptr root = m_doc->root();
+    if(root == nullptr)
+        return false;
+    /* A placeholder only misleads when it is most of the viewport; a small
+     * spinner beside real content must never arm the notice. */
+    return pageHasVisibleSkeleton(root, m_clientWidth * m_clientHeight * 3 / 10);
+}
+
+void EWebEngine::decideCsrNotice()
+{
+    /* ENGINE-THREAD ONLY. Classic-script client-rendered shell (taobao.com):
+     * every script ran or was dropped, the phase went idle, and what paints is
+     * still the server-side skeleton placeholder - the VM cannot run the
+     * site's bundle chain (core-js polyfill dies first, so the React app entry
+     * never loads) and the data APIs are unreachable by design. Arm the notice
+     * instead of leaving grey blocks standing in for content forever. */
+    m_moduleNoticeDecided = true;
+    if(!pageShowsSkeletonPlaceholder())
+        return;
+    m_showModuleNotice = true;
+    m_noticeKind = 2;
+    EWEB_LOG("[ewebview] client-rendered shell stuck on its skeleton: notice armed url=%s\n",
         m_currentHtmlUrl.c_str());
     markContentDirty();
 }
@@ -3578,15 +3735,36 @@ void EWebEngine::drawModuleNotice(eweb_surface_t* cache, int cacheW, int cacheH)
         "\xe6\x9c\xac\xe9\xa1\xb5\xe9\x9d\xa2\xe5\x86\x85\xe5\xae\xb9\xe5\xae\x8c\xe5\x85\xa8\xe7\x94\xb1 ES \xe6\xa8\xa1\xe5\x9d\x97\xe8\x84\x9a\xe6\x9c\xac (type=\"module\") \xe7\x94\x9f\xe6\x88\x90",
         "\xe5\xb5\x8c\xe5\x85\xa5\xe5\xbc\x8f JS \xe5\xbc\x95\xe6\x93\x8e\xe4\xb8\x8d\xe6\x94\xaf\xe6\x8c\x81 ES \xe6\xa8\xa1\xe5\x9d\x97\xef\xbc\x8c\xe5\x86\x85\xe5\xae\xb9\xe6\x97\xa0\xe6\xb3\x95\xe6\x98\xbe\xe7\xa4\xba"
     };
+    static const char* CLINES[2] = {
+        "\xe6\x9c\xac\xe9\xa1\xb5\xe9\x9d\xa2\xe4\xb8\xbb\xe4\xbd\x93\xe5\x86\x85\xe5\xae\xb9\xe7\x94\xb1\xe5\xae\xa2\xe6\x88\xb7\xe7\xab\xaf\xe8\x84\x9a\xe6\x9c\xac\xe8\xbf\x90\xe8\xa1\x8c\xe6\x97\xb6\xe7\x94\x9f\xe6\x88\x90\xef\xbc\x88" "CSR" "\xef\xbc\x89",
+        "\xe5\xb5\x8c\xe5\x85\xa5\xe5\xbc\x8f JS \xe5\xbc\x95\xe6\x93\x8e\xe6\x97\xa0\xe6\xb3\x95\xe6\x89\xa7\xe8\xa1\x8c\xe5\x85\xb6\xe4\xbe\x9d\xe8\xb5\x96\xef\xbc\x8c\xe4\xbb\x85\xe6\x98\xbe\xe7\xa4\xba\xe6\x9c\x8d\xe5\x8a\xa1\xe5\x99\xa8\xe9\x9d\x99\xe6\x80\x81\xe5\x86\x85\xe5\xae\xb9"
+    };
+    const char** lines = LINES;
+    if(m_noticeKind == 2) {
+        /* The app may still boot after we armed (a timer-driven late render):
+         * if the skeleton placeholder is gone the page shows real content
+         * again - drop the notice instead of covering it. */
+        if(!pageShowsSkeletonPlaceholder()) {
+            m_showModuleNotice = false;
+            m_noticeKind = 0;
+            return;
+        }
+        /* Opaque panel over the viewport: the skeleton is a loading artefact
+         * the app never replaced, so grey blocks must not stand in for
+         * content. The caller's strip clip keeps partial repaints tiling. */
+        if(m_port.gfx.fill_rect != nullptr)
+            m_port.gfx.fill_rect(m_port.gfx.ud, cache, 0, 0, cacheW, cacheH, 0xFFFFFFFFu);
+        lines = CLINES;
+    }
     const int size = 16;
     eweb_font_metrics_t fm;
     m_port.font.metrics(m_port.font.ud, m_noticeFont, size, &fm);
     int y = cacheH / 2 - (fm.height + 4);
     for(int i = 0; i < 2; i++) {
         int w = 0, h = 0;
-        m_port.font.text_size(m_port.font.ud, m_noticeFont, size, LINES[i], &w, &h);
+        m_port.font.text_size(m_port.font.ud, m_noticeFont, size, lines[i], &w, &h);
         m_port.font.draw_text(m_port.font.ud, cache, (cacheW - w) / 2, y,
-                              LINES[i], m_noticeFont, size, 0xFF606060u);
+                              lines[i], m_noticeFont, size, 0xFF606060u);
         y += fm.height + 8;
     }
 }

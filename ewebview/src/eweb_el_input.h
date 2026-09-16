@@ -46,6 +46,14 @@ public:
     virtual int      render(int x, int y, int max_width, bool second_pass = false) override;
     virtual void     draw(litehtml::uint_ptr hdc, int x, int y, const litehtml::position* clip) override;
     virtual void     draw_stacking_context(litehtml::uint_ptr hdc, int x, int y, const litehtml::position* clip, bool with_positioned) override;
+    /* Widget-mode controls paint everything themselves (face, centred label,
+     * centred svg glyph, placed pseudos). The generic html_tag child recursion
+     * would repaint un-laid-out text children at the box origin (a ghost label
+     * at the top-left corner), because draw_children_box descends into any
+     * child whose display is not inline-block - and form controls resolve to
+     * block/flex from the UA sheet. Container-mode buttons keep the normal
+     * recursion so their laid-out content paints. */
+    virtual void     draw_children(litehtml::uint_ptr hdc, int x, int y, const litehtml::position* clip, litehtml::draw_flag flag, int zindex) override;
     virtual void     parse_styles(bool is_reparse) override;
     virtual void     add_widget_part_style(const litehtml::tstring& part, const litehtml::style& st) override;
     /* Hand the engine an opaque handle to this control so a mouse hit on the
@@ -204,6 +212,23 @@ private:
     int  part_dim(bool thumb, const char* prop, int defval) const;
     float range_fraction();
     void extra_box_size(int& w, int& h) const;
+    /* The page cascade declares padding/border on the axis, i.e. it replaces
+     * the UA control chrome there; gates the +24/24 intrinsic emulation in
+     * get_content_size (a styled button sizes from its label alone). */
+    bool styled_horizontal() const;
+    bool styled_vertical() const;
+    /* Font line height: the single-line content height of a styled control
+     * (the UA 24px face height only applies to unstyled ones). */
+    int  content_line_height() const;
+    /* True when a <button> carries real element children (an <img> thumbnail,
+     * an inline <svg> glyph): such a control is a layout CONTAINER, not an
+     * atomic replaced widget - the children need boxes and paint, and the
+     * button's height must come from them (a history thumb sized only by
+     * aspect-ratio/children would otherwise collapse to the UA 24px face and
+     * clip its <img> to nothing). Text-only buttons stay on the widget path.
+     * When true, is_replaced/render/draw/get_content_size delegate to
+     * html_tag so flex/block layout and child paint run normally. */
+    bool container_mode() const;
 
     /* The user-visible label: value/placeholder attribute for <input>, the
      * selected <option> text for <select>, the element text otherwise. */

@@ -52,9 +52,9 @@ extern "C" {
 
 /* Fallbacks for the identity strings, so feature detection that reads
  * navigator.userAgent unconditionally always sees something sane. */
-#define DEFAULT_UA      "Mozilla/5.0 (EwokOS) AppleWebKit/537.36 (KHTML, like Gecko) xBrowser/1.0 Safari/537.36"
+#define DEFAULT_UA      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 MyEwokoBrowser/1.0"
 #define DEFAULT_LANG    "en-US"
-#define DEFAULT_PLATFORM "EwokOS"
+#define DEFAULT_PLATFORM "Linux x86_64"
 
 typedef struct {
     vm_t*              vm;
@@ -577,6 +577,187 @@ static var_t* native_queueMicrotask(vm_t* vm, var_t* env, void* data) {
     (void)data;
     var_t* fn = js_arg_func(env, 0);
     if(fn != NULL) js_dom_add_timer(vm, fn, 0, false);
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* MessageChannel / MessagePort                                        */
+/*                                                                     */
+/* React's scheduler and taobao's lib-promise polyfill both flush      */
+/* microtasks through a MessageChannel loop (port1.postMessage() ->    */
+/* port2.onmessage); with the constructor missing the polyfill's asap  */
+/* path degrades and every promise chain stalls, so the mtop bundle    */
+/* never finishes init. Posts ride the DOM timer table at 0 ms like    */
+/* queueMicrotask(). GC anchoring: the in-flight message lives in a    */
+/* hidden @@mc_pending array on the target port, the port itself in    */
+/* the bridge's @@mcports array, and the trampoline closure in the     */
+/* timer table's @@timers anchor - all three rooted until dispatch.    */
+/* ------------------------------------------------------------------ */
+#define CLS_MSGPORT   "MessagePort"
+#define CLS_MSGCHAN   "MessageChannel"
+#define MC_PENDING    "@@mc_pending"
+#define MC_PEER       "@@mc_peer"
+#define MC_PORTS_KEY  "@@mcports"
+
+typedef struct mc_disp { var_t* port; var_t* bridge; } mc_disp_t;
+
+static void mc_hide(node_t* n) {
+    if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+}
+
+static var_t* mc_pending_of(vm_t* vm, var_t* port, bool create) {
+    var_t* pend = var_find_own_member_var(port, MC_PENDING);
+    if(pend == NULL && create)
+        mc_hide(var_add(port, MC_PENDING, var_new_array(vm)));
+    return var_find_own_member_var(port, MC_PENDING);
+}
+
+static void mc_anchor(vm_t* vm, var_t* bridge, var_t* port) {
+    if(bridge == NULL) return;
+    var_t* arr = var_find_own_member_var(bridge, MC_PORTS_KEY);
+    if(arr == NULL) {
+        mc_hide(var_add(bridge, MC_PORTS_KEY, var_new_array(vm)));
+        arr = var_find_own_member_var(bridge, MC_PORTS_KEY);
+    }
+    if(arr == NULL) return;
+    uint32_t sz = var_array_size(arr);
+    uint32_t i;
+    for(i = 0; i < sz; ++i) {
+        node_t* nd = var_array_get(arr, (int32_t)i);
+        if(nd != NULL && nd->var == port) return;
+    }
+    vm->gc.gc_defer++;
+    var_array_add(arr, port);
+    vm->gc.gc_defer--;
+}
+
+/* Rebuild the anchor array without `port` (mirrors js_reanchor_timers). */
+static void mc_unanchor(vm_t* vm, var_t* bridge, var_t* port) {
+    if(bridge == NULL) return;
+    var_t* arr = var_find_own_member_var(bridge, MC_PORTS_KEY);
+    if(arr == NULL) return;
+    vm->gc.gc_defer++;
+    var_t* fresh = var_new_array(vm);
+    uint32_t sz = var_array_size(arr);
+    uint32_t i;
+    for(i = 0; i < sz; ++i) {
+        node_t* nd = var_array_get(arr, (int32_t)i);
+        if(nd != NULL && nd->var != NULL && nd->var != port)
+            var_array_add(fresh, nd->var);
+    }
+    mc_hide(var_add(bridge, MC_PORTS_KEY, fresh));
+    vm->gc.gc_defer--;
+}
+
+/* Timer trampoline: deliver one queued message to the port's onmessage. */
+static var_t* native_mc_dispatch(vm_t* vm, var_t* env, void* data) {
+    (void)env;
+    mc_disp_t* d = (mc_disp_t*)data;
+    if(d == NULL) return NULL;
+    var_t* port = d->port;
+    var_t* bridge = d->bridge;
+    mario_free(d);
+    if(port == NULL || port->status <= V_ST_GC_FREE) return NULL;
+    var_t* pend = mc_pending_of(vm, port, false);
+    var_t* msg = NULL;
+    if(pend != NULL && var_array_size(pend) > 0) {
+        node_t* nd = var_array_get(pend, 0);
+        msg = (nd != NULL) ? nd->var : NULL;
+    }
+    var_t* handler = var_find_own_member_var(port, "onmessage");
+    if(handler != NULL && handler->is_func) {
+        var_t* ev = var_new_obj_no_proto(vm, NULL, NULL);
+        var_add(ev, "type", var_new_str(vm, "message"));
+        var_add(ev, "data", (msg != NULL) ? msg : var_new(vm));
+        var_add(ev, "origin", var_new_str(vm, ""));
+        var_add(ev, "source", var_new_null(vm));
+        var_add(ev, "ports", var_new_array(vm));
+        var_t* args = var_new_array(vm);
+        var_array_add(args, ev);
+        var_t* r = call_m_func(vm, port, handler, args);
+        if(r != NULL) var_unref(r);
+        var_unref(args);
+    }
+    if(pend != NULL) {
+        if(var_array_size(pend) > 0) var_array_del(pend, 0);
+        if(var_array_size(pend) == 0) mc_unanchor(vm, bridge, port);
+    }
+    return NULL;
+}
+
+static var_t* native_mc_postMessage(vm_t* vm, var_t* env, void* data) {
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    var_t* closed = var_find_own_member_var(self, "@@mc_closed");
+    if(closed != NULL && var_get_int(closed) != 0) return NULL;
+    var_t* peer = var_find_own_member_var(self, MC_PEER);
+    if(peer == NULL || peer->status <= V_ST_GC_FREE) return NULL;
+    var_t* msg = get_func_arg(env, 0);
+    var_t* pend = mc_pending_of(vm, peer, true);
+    if(pend == NULL) return NULL;
+    var_array_add(pend, (msg != NULL) ? msg : var_new(vm));
+    mc_anchor(vm, (var_t*)data, peer);
+    mc_disp_t* d = (mc_disp_t*)mario_malloc(sizeof(mc_disp_t));
+    if(d == NULL) return NULL;
+    d->port = peer;
+    d->bridge = (var_t*)data;
+    var_t* tr = var_new_native_func(vm, native_mc_dispatch, d);
+    if(js_dom_add_timer(vm, tr, 0, false) == 0)
+        mario_free(d);   /* table full: no dispatch, drop the capture */
+    var_unref(tr);
+    return NULL;
+}
+
+static var_t* native_mc_close(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    mc_hide(var_add(self, "@@mc_closed", var_new_int(vm, 1)));
+    return NULL;
+}
+
+static var_t* native_mc_noop(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)env; (void)data;
+    return NULL;
+}
+
+/* addEventListener("message", f): the single-slot onmessage covers the
+ * scheduler/polyfill usage; a second listener on the same port is rare. */
+static var_t* native_mc_addEventListener(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    var_t* type = get_func_arg(env, 0);
+    var_t* fn = js_arg_func(env, 1);
+    if(type == NULL || fn == NULL) return NULL;
+    const char* t = var_get_str(type);
+    if(t != NULL && strcmp(t, "message") == 0) {
+        var_t* cur = var_find_own_member_var(self, "onmessage");
+        if(cur == NULL || cur->type == V_NULL)
+            var_add(self, "onmessage", fn);
+    }
+    return NULL;
+}
+
+static var_t* mc_new_port(vm_t* vm) {
+    var_t* p = new_obj(vm, CLS_MSGPORT, 0);
+    if(p == NULL) return NULL;
+    var_add(p, "onmessage", var_new_null(vm));
+    mc_hide(var_add(p, MC_PENDING, var_new_array(vm)));
+    return p;
+}
+
+static var_t* native_mc_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    var_t* p1 = mc_new_port(vm);
+    var_t* p2 = mc_new_port(vm);
+    if(p1 == NULL || p2 == NULL) return NULL;
+    mc_hide(var_add(p1, MC_PEER, p2));
+    mc_hide(var_add(p2, MC_PEER, p1));
+    var_add(self, "port1", p1);
+    var_add(self, "port2", p2);
     return NULL;
 }
 
@@ -2705,6 +2886,20 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
     }
 
     /* ---- Response / Headers (fetch) ---- */
+    /* ---- MessageChannel / MessagePort: React's scheduler and the mtop
+     * bundle's promise polyfill flush microtasks through a port pair. ---- */
+    cls = vm_new_class(vm, CLS_MSGPORT);
+    if(cls != NULL) {
+        vm_reg_native(vm, cls, "postMessage(m)",            native_mc_postMessage,      bridge);
+        vm_reg_native(vm, cls, "start()",                   native_mc_noop,             bridge);
+        vm_reg_native(vm, cls, "close()",                   native_mc_close,            bridge);
+        vm_reg_native(vm, cls, "addEventListener(t, f)",    native_mc_addEventListener, bridge);
+        vm_reg_native(vm, cls, "removeEventListener(t, f)", native_mc_noop,             bridge);
+    }
+    cls = vm_new_class(vm, CLS_MSGCHAN);
+    if(cls != NULL)
+        vm_reg_native(vm, cls, "constructor()", native_mc_ctor, bridge);
+
     cls = vm_new_class(vm, CLS_RESPONSE);
     if(cls != NULL) {
         vm_reg_native(vm, cls, "text()", native_resp_text, bridge);

@@ -588,6 +588,23 @@ int litehtml::el_svg::render(int x, int y, int max_width, bool /*second_pass*/)
 		if(!get_predefined_height(m_pos.height))
 			m_pos.height = (int)m_css_height.val();
 	}
+	else
+	{
+		/* Auto width AND auto height: an SVG with a viewBox has an intrinsic
+		 * size, and like any replaced element it is used as-is, only constrained
+		 * by the available width (ratio-preserving). Filling max_width instead
+		 * blew up apple.com's global nav: every section link carries a bare
+		 * <svg viewBox> wordmark icon whose span is sized by the icon, so the
+		 * icon grew to the link's offered width and stacked the nav row into
+		 * overlapping bands. The gallery service logos still come out right
+		 * because their 449px-wide viewBox is constrained to the card width. */
+		if(sz.width > 0 && max_width > 0 && sz.width > max_width)
+		{
+			m_pos.width = max_width;
+			if(sz.height > 0)
+				m_pos.height = (int)((float)max_width * (float)sz.height / (float)sz.width);
+		}
+	}
 
 	calc_auto_margins(max_width);
 	m_pos.x += content_margins_left();
