@@ -37,6 +37,7 @@
 #include <tinyhttpsc/tinyhttpsc.h>
 #include <tinyhttpsc/BearHttpsClientOne.h>
 #include <x/x.h>
+#include <clipboard/clipboard.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -344,6 +345,22 @@ static void ek_sys_log(void* ud, const char* text) {
     if(text) klog("%s", text);
 }
 
+/* System clipboard: EwokOS keeps one global text clipboard at /tmp/.clipboard
+ * (libclipboard). clipboard_get_text() already returns a malloc'd
+ * NUL-terminated copy the core free()s; the HAL wants NULL when empty, so fold
+ * the "" case away. clipboard_set_text() overwrites the whole clipboard. */
+static char* ek_sys_clipboard_get(void* ud) {
+    char* text;
+    (void)ud;
+    text = clipboard_get_text();
+    if(text && text[0] == 0) { free(text); return NULL; }
+    return text;
+}
+static void ek_sys_clipboard_set(void* ud, const char* text) {
+    (void)ud;
+    if(text) clipboard_set_text(text);
+}
+
 /* ------------------------------------------------------------------ */
 /* Bundle                                                              */
 /* ------------------------------------------------------------------ */
@@ -404,7 +421,9 @@ void eweb_port_ewokos(eweb_port_t* port, void* ud) {
     port->clock.tic_ms   = ek_clock_tic_ms;
     port->clock.sleep_ms = ek_clock_sleep_ms;
 
-    port->sys.ud       = ud;
-    port->sys.ptr_sane = ek_sys_ptr_sane;
-    port->sys.log      = ek_sys_log;
+    port->sys.ud           = ud;
+    port->sys.ptr_sane     = ek_sys_ptr_sane;
+    port->sys.log          = ek_sys_log;
+    port->sys.clipboard_get = ek_sys_clipboard_get;
+    port->sys.clipboard_set = ek_sys_clipboard_set;
 }
