@@ -2,6 +2,7 @@
 #include "media_query.h"
 #include "document.h"
 #include <math.h>
+#include <stdlib.h>
 
 /* Numeric value of a media range-syntax operand: a <length> in px
  * ("1012px", "87.5rem", ".02px"), a <resolution> in dpi ("192dpi", "2x",

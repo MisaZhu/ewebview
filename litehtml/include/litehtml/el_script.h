@@ -23,6 +23,15 @@ namespace litehtml
 		virtual void			parse_attributes() override;
 		virtual bool			appendChild(const ptr &el) override;
 		virtual const tchar_t*	get_tagName() const override;
+		/* el_script derives from element (not html_tag), whose select_all is a
+		 * no-op, so a createElement'd/stand-in <script> was invisible to
+		 * document.getElementsByTagName("script") and document.scripts: SDKs that
+		 * locate their own tag that way (taobao baxia) dereferenced undefined and
+		 * aborted before installing their request signer. Match the right-hand tag
+		 * (plus exact/exists attribute tests) against our fixed tag name; scripts
+		 * have no element children to recurse into (appendChild captures text). */
+		virtual void			select_all(const css_selector& selector, elements_vector& res) override;
+		virtual element::ptr	select_one(const css_selector& selector) override;
 
 		virtual void			set_attr(const tchar_t* name, const tchar_t* val) override;
 		virtual const tchar_t*	get_attr(const tchar_t* name, const tchar_t* def = 0) override;

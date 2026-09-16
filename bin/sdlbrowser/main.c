@@ -1425,8 +1425,16 @@ static bool browser_init(browser_t* b, int argc, char** argv) {
         return false;
     }
 
-    b->renderer = SDL_CreateRenderer(b->window, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    b->renderer = NULL;
+    /* EWEB_SOFTWARE_RENDER=1: skip the accelerated renderer entirely. Headless
+     * --shot runs and CI boxes have no business on the GPU path, and macOS's
+     * GLEngine has segfaulted mid-present under taobao-scale repaint load
+     * (sdlbrowser-2026-09-16-010105.ips: EXC_BAD_ACCESS inside
+     * GLRendererFloat). Software blits are plenty for screenshot capture. */
+    if(SDL_getenv("EWEB_SOFTWARE_RENDER") == NULL) {
+        b->renderer = SDL_CreateRenderer(b->window, -1,
+            SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    }
     if(!b->renderer) {
         b->renderer = SDL_CreateRenderer(b->window, -1, SDL_RENDERER_SOFTWARE);
     }

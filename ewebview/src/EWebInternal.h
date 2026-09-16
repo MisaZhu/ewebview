@@ -63,15 +63,17 @@ static const uint32_t kJsFlushMaxGapMs   = 1500;
  * an event handler). Past it the step hook terminates the VM; after
  * kJsRunAbortMax violations the page's JS is dropped until the next
  * navigation, so no script - broken or hostile - can pin the engine. */
-static const uint32_t kJsRunBudgetMs     = 10000;
-static const int      kJsRunAbortMax     = 3;
+static const uint32_t kJsRunBudgetMs     = 8000;  /* TEMP taobao iteration */
+static const int      kJsRunAbortMax     = 100;   /* TEMP taobao iteration */
 /* Per-run budget OUTSIDE the pre-paint phase (post-swap scripts, timer
  * callbacks, event handlers): those run against a live page whose input queue
  * the engine thread cannot drain while a VM run is in flight, so a runaway
  * body freezes clicks and scrolls for the whole budget. The pre-paint phase
  * keeps kJsRunBudgetMs because its own wall clock (kJsPrePaintBudgetMs) cuts
  * the run long before this one would. */
-static const uint32_t kJsRunBudgetLiveMs = 3000;
+static const uint32_t kJsRunBudgetLiveMs = 7000;  /* TEMP taobao iteration: the
+ * slowest legitimate taobao bundle (pegasus 444.js) runs ~4.9 s, so 7 s keeps
+ * the app chain intact while a runaway SDK body costs half what 15 s did. */
 
 /* Wall-clock budget for the WHOLE pre-paint script phase (the document.write()
  * pages that must run their scripts before the first paint). Past it the build
@@ -91,7 +93,38 @@ static const uint32_t kJsPrePaintBudgetMs = 4000;
  * phase stops STARTING new scripts (one already in flight still unwinds under
  * its own per-run budget), fires the load events and goes idle, exactly like
  * the pre-paint budget paints first and defers the rest. */
-static const uint32_t kJsPostSwapBudgetMs = 8000;
+static const uint32_t kJsPostSwapBudgetMs = 120000; /* TEMP taobao iteration */
+
+/* Expand a CDN combo URL ("https://host/path/??a.js,b.js,c.js") into one URL
+ * per component. A combo downloads as ONE script body, so a watchdog cut on a
+ * hanging middle component (taobao's jstracker telemetry spins forever between
+ * lib-mtop and lib-env in the same bundle) discards every component after it
+ * and starves the page's data path. Queueing the components as separate slots
+ * keeps document order while giving each its own run budget. Non-combo URLs
+ * pass through untouched. */
+inline std::vector<std::string> ewebSplitComboUrl(const std::string& url) {
+    std::vector<std::string> out;
+    size_t q = url.find("/??");
+    if(q == std::string::npos) { out.push_back(url); return out; }
+    std::string base = url.substr(0, q + 1);   /* through the trailing '/' */
+    std::string rest = url.substr(q + 3);
+    size_t start = 0;
+    while(start <= rest.size()) {
+        size_t comma = rest.find(',', start);
+        std::string part = (comma == std::string::npos)
+            ? rest.substr(start) : rest.substr(start, comma - start);
+        if(!part.empty()) {
+            if(part.compare(0, 7, "http://") == 0 || part.compare(0, 8, "https://") == 0)
+                out.push_back(part);
+            else
+                out.push_back(base + part);
+        }
+        if(comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    if(out.empty()) out.push_back(url);
+    return out;
+}
 
 /* Layout debounce / force caps (see applyPendingLayoutUpdates). */
 static const uint32_t kLayoutDebounceMs    = 30;
@@ -101,6 +134,14 @@ static const uint32_t kLayoutBehindStyleMs = 500;
  * <link> sheets (m_pendingCss) while subresources keep re-dirtying layout:
  * past it the walk starts anyway (new sheets restart it from scratch). */
 static const uint32_t kStyleMaxWaitMs      = 1500;
+/* How long BUILD_RENDER_DOC holds the first paint while the <link> sheets
+ * queued during the parse (m_pendingCss) are still in flight: the previous
+ * page and the progress overlay stay on screen instead of an unstyled
+ * skeleton frame (default bullets/link colours, every normally-hidden
+ * responsive duplicate visible) that would then restyle live for seconds.
+ * Past the cap the paint proceeds with whatever landed - a stuck fetch must
+ * not black the view out - and late sheets restyle the visible page. */
+static const uint32_t kFirstPaintCssWaitMs = 6000;
 /* Wall-clock budget for ONE chunk of a master-style pass, so the engine loop
  * returns to drain commands (STOP/NAVIGATE) and render frames even mid-walk. */
 static const uint64_t kStyleBudgetIdleMs   = 25;
@@ -441,6 +482,20 @@ public:
     static void  jsElFocus(void* ctx, void* el);
     static void  jsElBlur(void* ctx, void* el);
     static void* jsGetActiveElement(void* ctx);
+    /* document.currentScript backend: the <script> element whose body is
+     * executing right now (nullptr outside a script run). */
+    static void* jsGetCurrentScript(void* ctx);
+    void*        jsCurrentScriptEl();
+    /* Stand-in <script src> element for a stripped static script tag: searches
+     * the live tree for a <script> carrying this src, else materialises one in
+     * <head> and returns it (nullptr if the doc/host is gone). Pre-materialising
+     * every queued external script makes document.getElementsByTagName("script")
+     * and document.scripts see real attached nodes - SDKs that locate themselves
+     * via the script list otherwise get an empty list and dereference undefined
+     * (taobao baxia: `ref.parentNode.insertBefore(...)` -> "can not find
+     * function 'insertBefore'"). */
+    void*        jsScriptStandInEl(const std::string& url);
+    void         jsMaterializeScriptStandIns();
     /* selectionStart/End + setSelectionRange()/select() backends: codepoint
      * offsets into the focused text control's live value. */
     static bool  jsElGetSel(void* ctx, void* el, int* s, int* e);
@@ -587,6 +642,9 @@ public:
     uint64_t                    m_styleNeedSince;
     bool                        m_needsLayout;
     int                         m_pendingCss;
+    /* Wall-clock anchor of the BUILD_RENDER_DOC render-blocking stylesheet
+     * wait (kFirstPaintCssWaitMs); 0 = not waiting yet. */
+    uint64_t                    m_firstPaintCssWaitSince;
     bool                        m_styleStepInFlight;
     /* Click-vs-drag bookkeeping (ECMD_INPUT). */
     int                         m_pressX;
@@ -653,7 +711,17 @@ public:
     bool                        m_jsAbortPrePaint; /* last termination was the pre-paint budget */
     bool                        m_jsPrePaintCut;  /* pre-paint phase ended on the budget, not on completion */
     const std::string*          m_jsCurScriptSrc; /* body in flight, for runaway bookkeeping */
+    /* Resolved src of the <script> body in flight ("" for inline): backs
+     * document.currentScript, which security SDKs use to insert their loader
+     * next to themselves. */
+    std::string                 m_jsCurScriptUrl;
+    /* Stand-in element handed out as document.currentScript for a stripped
+     * static <script src> (see jsCurrentScriptEl): the URL it was built for
+     * and the cached node, so repeated reads see one stable element. */
+    std::string                 m_jsCurScriptElUrl;
+    void*                       m_jsCurScriptEl = nullptr;
     std::vector<std::string>    m_jsRunawaySrcs;  /* bodies the run budget terminated: never re-run */
+    std::vector<std::string>    m_jsRequeuedSrcs; /* bodies already requeued once after a watchdog cut (see runNextPageScript) */
     uint32_t                    m_jsEnterGen;
     int                         m_jsAbortCount;
     bool                        m_jsPageDisabled;

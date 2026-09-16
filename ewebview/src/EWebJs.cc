@@ -28,6 +28,7 @@
 #include "EWebInternal.h"
 #include "EWebLog.h"
 #include "EWebCookies.h"
+#include <algorithm>   /* std::find (runaway/requeue bookkeeping) */
 #include "eweb_el_input.h"
 
 #include <mario/mario.h>
@@ -294,6 +295,7 @@ void EWebEngine::initJsVm()
     cb.el_focus          = jsElFocus;
     cb.el_blur           = jsElBlur;
     cb.get_active_element = jsGetActiveElement;
+    cb.get_current_script = jsGetCurrentScript;
     cb.el_get_sel        = jsElGetSel;
     cb.el_set_sel        = jsElSetSel;
     cb.el_get_dataset    = jsElGetDataset;
@@ -377,6 +379,10 @@ bool EWebEngine::runPageScripts()
             continue;
         }
         uint64_t run_start = ticMs();
+        /* DIAG: record this script's base pc in the shared bytecode so a
+         * MARIO_THROWDBG pc from an uncaught throw can be mapped onto the
+         * MARIO_DUMPC disassembly of the same dumped script file. */
+        PC jsBasePc = m_jsVm->bc.cindex;
         /* vm_load_run appends this script's bytecode after the previous one and
          * runs it; globals persist in vm->root across scripts, matching
          * separate <script> blocks that share one global scope. m_jsInScript
@@ -385,12 +391,18 @@ bool EWebEngine::runPageScripts()
          * even through this pre-paint (document.write) script run. */
         jsVmEnter();
         m_jsCurScriptSrc = &src;
+        m_jsCurScriptUrl = (i < m_jsScriptSrcs.size()) ? m_jsScriptSrcs[i] : std::string();
         {   /* Tag uncaught VM errors with the script index so a failing
              * minified bundle can be matched to its EWEB_DUMP_SCRIPTS file. */
             static char s_jsDbgTag[64];
             snprintf(s_jsDbgTag, sizeof(s_jsDbgTag), "script_%d", (int)i);
             m_jsVm->dbg_tag = s_jsDbgTag;
         }
+        /* Same per-run state reset as the post-swap path (see above). */
+        m_jsVm->terminated = false;
+        m_jsVm->abort_run = false;
+        m_jsVm->propagating_err = nullptr;
+        m_jsVm->call_depth = 0;
         if(!vm_load_run(m_jsVm, src.c_str())) {
             EWEB_LOG("[ewebview] js: script %d failed to compile\n", (int)i);
             jsDumpScript(i, src, true);
@@ -400,11 +412,14 @@ bool EWebEngine::runPageScripts()
         }
         m_jsVm->dbg_tag = nullptr;
         m_jsCurScriptSrc = nullptr;
+        m_jsCurScriptUrl.clear();
         jsVmExit();
         EWEB_LOG("[ewebview] js: script %d ran %u ms url=%s\n", (int)i,
             (uint32_t)(ticMs() - run_start),
             (i < m_jsScriptSrcs.size() && !m_jsScriptSrcs[i].empty())
                 ? m_jsScriptSrcs[i].c_str() : "(inline)");
+        EWEB_LOG("[ewebview] js: script %d pc_range=[%u,%u)\n", (int)i,
+            (unsigned)jsBasePc, (unsigned)m_jsVm->bc.cindex);
         /* The watchdog dropped this page's JS (three run-budget timeouts): stop
          * at once. The entry guard above is only evaluated once per call, so
          * without this the loop keeps spending a run budget per remaining
@@ -460,6 +475,10 @@ bool EWebEngine::runNextPageScript()
          * fetch is still marked done with an empty body, so a 404 never wedges
          * the ordered run. */
         if(i < m_jsScriptDone.size() && !m_jsScriptDone[i]) return true;
+        /* First script of this page: pre-materialise a stand-in <script src>
+         * element for every queued external script so the DOM script list is
+         * populated BEFORE any SDK reads it (see jsScriptStandInEl). */
+        if(m_jsNextScript == 0) jsMaterializeScriptStandIns();
         m_jsNextScript++;
         /* Copy by value: this script may inject another (appendChild of a
          * <script>), which push_backs to m_jsScripts and can realloc - a
@@ -472,6 +491,10 @@ bool EWebEngine::runNextPageScript()
             continue;
         }
         uint64_t run_start = ticMs();
+        /* DIAG: base pc of this script in the shared bytecode (pairs with the
+         * pc_range log below) so a MARIO_THROWDBG frame pc can be mapped onto
+         * the MARIO_DUMPC disassembly of the same dumped script file. */
+        PC jsBasePc = m_jsVm->bc.cindex;
         /* Bracket vm_load_run so the DOM-bridge mutation callbacks push the
          * page to the screen mid-script (jsMarkLayoutDirty -> jsProgressiveFlush
          * -> engineRenderFrame): a long test script then shows its results as
@@ -480,12 +503,24 @@ bool EWebEngine::runNextPageScript()
         m_jsProgressiveActive = true;
         jsVmEnter();
         m_jsCurScriptSrc = &src;
+        m_jsCurScriptUrl = (i < m_jsScriptSrcs.size()) ? m_jsScriptSrcs[i] : std::string();
         m_jsLastFlushAt = run_start;
         {
             static char s_jsDbgTag[64];
             snprintf(s_jsDbgTag, sizeof(s_jsDbgTag), "script_%d", (int)i);
             m_jsVm->dbg_tag = s_jsDbgTag;
         }
+        /* A prior script may have ended abnormally INSIDE the VM (runaway
+         * recursion calls vm_terminate from func_call; a cross-frame throw can
+         * leave abort_run/propagating_err set). vm_run loops on !vm->terminated
+         * and bails on abort_run, so any residue here makes THIS script's body
+         * no-op silently - one bad script must never suppress the rest of the
+         * page's JS (taobao: script_3 stack-overflow killed scripts 4..32).
+         * Reset the per-run state; jsVmExit below re-detects a fresh cut. */
+        m_jsVm->terminated = false;
+        m_jsVm->abort_run = false;
+        m_jsVm->propagating_err = nullptr;
+        m_jsVm->call_depth = 0;
         if(!vm_load_run(m_jsVm, src.c_str())) {
             EWEB_LOG("[ewebview] js: script %d failed to compile\n", (int)i);
             jsDumpScript(i, src, true);
@@ -495,12 +530,33 @@ bool EWebEngine::runNextPageScript()
         }
         m_jsVm->dbg_tag = nullptr;
         m_jsCurScriptSrc = nullptr;
-        jsVmExit();
+        m_jsCurScriptUrl.clear();
+        bool terminated = jsVmExit();
         m_jsProgressiveActive = false;
+        /* A watchdog cut only proved this body cannot finish within the run
+         * budget - but in document order it blocks everything behind it until
+         * it burns the budget (taobao's telemetry SDK spins for minutes ahead
+         * of the mtop/React bundles that render the page). Requeue the cut
+         * body ONCE at the tail of the queue so the app chain gets its turn
+         * first; the slow body retries last and, cut again, stays marked
+         * runaway exactly as before. */
+        if(terminated &&
+           std::find(m_jsRequeuedSrcs.begin(), m_jsRequeuedSrcs.end(), src) ==
+               m_jsRequeuedSrcs.end()) {
+            m_jsRequeuedSrcs.push_back(src);
+            m_jsScripts.push_back(src);
+            m_jsScriptDone.push_back(1);
+            for(auto it = m_jsRunawaySrcs.begin(); it != m_jsRunawaySrcs.end(); ++it) {
+                if(*it == src) { m_jsRunawaySrcs.erase(it); break; }
+            }
+            EWEB_LOG("[ewebview] js: script %d requeued at tail (watchdog cut)\n", (int)i);
+        }
         EWEB_LOG("[ewebview] js: script %d ran %u ms (post-swap) url=%s\n",
             (int)i, (uint32_t)(ticMs() - run_start),
             (i < m_jsScriptSrcs.size() && !m_jsScriptSrcs[i].empty())
                 ? m_jsScriptSrcs[i].c_str() : "(inline)");
+        EWEB_LOG("[ewebview] js: script %d pc_range=[%u,%u)\n", (int)i,
+            (unsigned)jsBasePc, (unsigned)m_jsVm->bc.cindex);
         /* Paint what this script produced before the next one runs. */
         jsProgressiveFlush(true);
         break;
@@ -541,17 +597,26 @@ void EWebEngine::jsDynamicScriptInserted(void* script_el)
     /* Append a new slot. m_jsScripts holds the body (empty until an external
      * fetch fills it), m_jsScriptSrcs the absolute URL ("" for inline), and
      * m_jsScriptDone whether the body is ready (inline: now; external: not
-     * until processResults lands the EWEB_TASK_SCRIPT result). */
-    m_jsScripts.push_back(body);
-    m_jsScriptSrcs.push_back(srcabs);
-    m_jsScriptDone.push_back(srcabs.empty() ? 1 : 0);
-
-    if(!srcabs.empty()) {
-        EWebTask task;
-        task.url = srcabs;
-        task.type = EWEB_TASK_SCRIPT;
-        task.loading = false;
-        addTask(task);
+     * until processResults lands the EWEB_TASK_SCRIPT result).
+     *
+     * An external CDN combo ("/??a,b,c") downloads as ONE body, so a watchdog
+     * cut on a hanging middle component discards everything after it. Split it
+     * into one slot + one fetch per component, exactly like the initial
+     * <script src> queue does, so each part gets its own run budget. The inline
+     * body (srcabs empty) passes through ewebSplitComboUrl untouched. */
+    std::vector<std::string> parts = ewebSplitComboUrl(srcabs);
+    for(size_t k = 0; k < parts.size(); ++k) {
+        bool external = !parts[k].empty();
+        m_jsScripts.push_back(external ? std::string() : body);
+        m_jsScriptSrcs.push_back(parts[k]);
+        m_jsScriptDone.push_back(external ? 0 : 1);
+        if(external) {
+            EWebTask task;
+            task.url = parts[k];
+            task.type = EWEB_TASK_SCRIPT;
+            task.loading = false;
+            addTask(task);
+        }
     }
 
     /* Re-arm only if the run already finished (BUILD_IDLE): during a normal
@@ -683,6 +748,8 @@ bool EWebEngine::applyJsWriteBuffer()
     if(m_buildDoc) { delete m_buildDoc; m_buildDoc = nullptr; }
     if(m_buildContainer) { delete m_buildContainer; m_buildContainer = nullptr; }
     m_jsScripts.clear();
+    m_jsCurScriptEl = nullptr;
+    m_jsCurScriptElUrl.clear();
     EWEB_LOG("[ewebview] js: document.write spliced %d byte(s), reparse #%d\n",
         (int)written.size(), m_jsReparseCount);
     return true;
@@ -1060,10 +1127,12 @@ void* EWebEngine::jsGetBody(void* ctx)
     EWebEngine* self = (EWebEngine*)ctx;
     if(self == nullptr) return nullptr;
     litehtml::document* doc = self->jsActiveDoc();
-    if(doc == nullptr) return nullptr;
+    if(doc == nullptr) { EWEB_LOG("jsGetBody: no active doc"); return nullptr; }
     litehtml::element::ptr root = doc->root();
-    if(root == nullptr) return nullptr;
-    return (void*)root->select_one("body");
+    if(root == nullptr) { EWEB_LOG("jsGetBody: no root"); return nullptr; }
+    void* b = (void*)root->select_one("body");
+    if(b == nullptr) EWEB_LOG("jsGetBody: body NOT FOUND in tree");
+    return b;
 }
 
 void* EWebEngine::jsGetHead(void* ctx)
@@ -1075,6 +1144,86 @@ void* EWebEngine::jsGetHead(void* ctx)
     litehtml::element::ptr root = doc->root();
     if(root == nullptr) return nullptr;
     return (void*)root->select_one("head");
+}
+
+/* document.currentScript: the <script> element whose body is executing right
+ * now. Security SDKs (taobao's baxia) insert their loader next to themselves
+ * via currentScript.parentNode.insertBefore(...); without the property they
+ * fall back to parsing Error().stack, whose format never matches here, so the
+ * SDK dereferences null and never installs its request signer. */
+void* EWebEngine::jsGetCurrentScript(void* ctx)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(self == nullptr) return nullptr;
+    void* r = self->jsCurrentScriptEl();
+    EWEB_LOG("[ewebview] currentScript: url=%s -> %p\n",
+        self->m_jsCurScriptUrl.c_str(), r);
+    return r;
+}
+
+void* EWebEngine::jsCurrentScriptEl()
+{
+    if(m_jsCurScriptUrl.empty()) return nullptr;
+    void* el = jsScriptStandInEl(m_jsCurScriptUrl);
+    if(el != nullptr) {
+        m_jsCurScriptEl = el;
+        m_jsCurScriptElUrl = m_jsCurScriptUrl;
+    }
+    return el;
+}
+
+/* Stand-in <script src> for a stripped static script tag. Static <script src>
+ * tags are removed from the markup before parsing (their bodies run from the
+ * ordered queue), so the live tree holds no element for them and the DOM script
+ * list (getElementsByTagName("script")/document.scripts) comes back empty. SDKs
+ * that locate themselves through that list then dereference undefined and abort
+ * (taobao baxia: `ref.parentNode.insertBefore(...)`). Search first so a real or
+ * previously materialised node is reused; otherwise create one in <head>. */
+void* EWebEngine::jsScriptStandInEl(const std::string& url)
+{
+    if(url.empty()) return nullptr;
+    litehtml::document* doc = jsActiveDoc();
+    if(doc == nullptr) return nullptr;
+    litehtml::element::ptr root = doc->root();
+    if(root == nullptr) return nullptr;
+    /* Compare scheme-less: markup often carries "//g.alicdn.com/..." while the
+     * run queue stores the resolved absolute URL. */
+    auto norm = [](const std::string& u) -> std::string {
+        if(u.compare(0, 6, "https:") == 0) return u.substr(6);
+        if(u.compare(0, 5, "http:") == 0) return u.substr(5);
+        return u;
+    };
+    std::string want = norm(url);
+    size_t n = root->get_children_count();
+    for(size_t i = 0; i < n; ++i) {
+        litehtml::element::ptr c = root->get_child((int)i);
+        if(c == nullptr) continue;
+        litehtml::elements_vector part = c->select_all(litehtml::tstring("script"));
+        for(size_t j = 0; j < part.size(); ++j) {
+            if(part[j] == nullptr) continue;
+            const char* sa = part[j]->get_attr("src", nullptr);
+            if(sa == nullptr || sa[0] == 0) continue;
+            if(norm(std::string(sa)) == want) return (void*)part[j];
+        }
+    }
+    litehtml::string_map attrs;
+    litehtml::element::ptr el = doc->create_element("script", attrs);
+    if(el == nullptr) return nullptr;
+    el->set_attr("src", url.c_str());
+    litehtml::element::ptr host = root->select_one("head");
+    if(host == nullptr) host = root->select_one("body");
+    if(host == nullptr) return nullptr;
+    host->appendChild(el);
+    EWEB_LOG("[ewebview] script stand-in created el=%p src=%s\n", (void*)el, url.c_str());
+    return (void*)el;
+}
+
+void EWebEngine::jsMaterializeScriptStandIns()
+{
+    for(size_t i = 0; i < m_jsScriptSrcs.size(); ++i) {
+        if(m_jsScriptSrcs[i].empty()) continue;
+        jsScriptStandInEl(m_jsScriptSrcs[i]);
+    }
 }
 
 int EWebEngine::jsQueryAll(void* ctx, void* root, const char* selector,

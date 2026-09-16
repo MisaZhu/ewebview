@@ -1433,6 +1433,178 @@ static bool eval_length_expr(const tstring& expr, document* doc, int font_size, 
 	return true;
 }
 
+/* One multiplicative term of a calc(): factors joined by top-level '*'/'/'.
+ * Exactly one factor may be a length (length*length is meaningless); the rest
+ * must be plain numbers, which covers the idioms real sheets emit such as
+ * "calc(var(--x) * 2)" and "calc(2 * var(--x))". */
+static bool eval_term_px(const tstring& in, document* doc, int font_size, int& out_px)
+{
+	tstring s = in;
+	trim(s);
+	if(s.empty() || s.find(_t('(')) != tstring::npos)
+	{
+		return false;
+	}
+	/* split into (op, factor) pairs */
+	std::vector<tchar_t> ops;
+	std::vector<tstring> facs;
+	tstring cur;
+	for(size_t k = 0; k <= s.length(); k++)
+	{
+		tchar_t c = (k < s.length()) ? s[k] : 0;
+		if(c == _t('*') || c == _t('/') || c == 0)
+		{
+			tstring f = cur;
+			trim(f);
+			if(f.empty()) return false;
+			facs.push_back(f);
+			ops.push_back(c == 0 ? _t('*') : c);
+			cur.clear();
+			if(c == 0) break;
+			continue;
+		}
+		cur += c;
+	}
+	double acc = 0;
+	bool have = false;
+	bool saw_len = false;
+	for(size_t k = 0; k < facs.size(); k++)
+	{
+		int px = 0;
+		if(eval_one_length(facs[k], doc, font_size, px))
+		{
+			if(saw_len) return false;		/* length * length */
+			saw_len = true;
+			if(!have) { acc = px; have = true; }
+			else if(ops[k] == _t('*')) acc *= px;
+			else return false;			/* dividing by a length is not a length */
+		}
+		else
+		{
+			/* plain number */
+			const tchar_t* st = facs[k].c_str();
+			tchar_t* end = 0;
+			double n = strtod((const char*)st, (char**)&end);
+			if(!end || *end != 0) return false;
+			if(!have) { acc = n; have = true; }
+			else if(ops[k] == _t('*')) acc *= n;
+			else acc /= n;
+		}
+	}
+	if(!have || !saw_len) return false;
+	out_px = (int)(acc + (acc >= 0 ? 0.5 : -0.5));
+	return true;
+}
+
+/* Rewrite every resolvable bare calc() in 'val' to a px literal. apple.com
+ * sizes its buttons with "padding-inline:calc(var(--pad) - var(--border))";
+ * after var() expansion that is a plain additive calc() which nothing else
+ * evaluated, so the length parsed to zero and the pill lost its padding.
+ * Unlike clamp()/min()/max(), an unresolvable calc() is LEFT UNTOUCHED rather
+ * than dropping the whole declaration: percent-bearing calc() (e.g.
+ * "calc(50% - 8px)") is legitimate and must reach the layout code as-is. */
+static void eval_calc_funcs(tstring& val, document* doc, int font_size)
+{
+	size_t from = 0;
+	for(int guard = 0; guard < 16; guard++)
+	{
+		tstring fname;
+		/* innermost-first: reuse the clamp/min/max scanner by looking for a
+		 * calc( at or after 'from' with the greatest position. */
+		size_t f = tstring::npos;
+		{
+			size_t p = val.find(_t("calc("), from);
+			while(p != tstring::npos && p > 0)
+			{
+				tchar_t prev = val[p - 1];
+				if((prev >= _t('a') && prev <= _t('z')) || (prev >= _t('A') && prev <= _t('Z')) || prev == _t('-'))
+				{
+					p = val.find(_t("calc("), p + 1);
+					continue;
+				}
+				break;
+			}
+			f = p;
+		}
+		if(f == tstring::npos)
+		{
+			return;
+		}
+		(void)fname;
+		size_t args_start = f + 5;
+		int paren = 1;
+		size_t j = args_start;
+		while(j < val.length() && paren > 0)
+		{
+			if(val[j] == _t('(')) paren++;
+			else if(val[j] == _t(')'))
+			{
+				paren--;
+				if(paren == 0) break;
+			}
+			j++;
+		}
+		if(j >= val.length())
+		{
+			return;	/* unbalanced */
+		}
+		tstring body = val.substr(args_start, j - args_start);
+		int px = 0;
+		bool ok = false;
+		if(body.find(_t(',')) == tstring::npos)
+		{
+			/* additive over top-level '+'/'-' of multiplicative terms */
+			int total = 0;
+			int sign = 1;
+			bool any = false;
+			tstring term;
+			bool fail = false;
+			for(size_t k = 0; k <= body.length(); k++)
+			{
+				tchar_t c = (k < body.length()) ? body[k] : 0;
+				if((c == _t('+') || c == _t('-')) && k > 0)
+				{
+					int t = 0;
+					if(!term.empty())
+					{
+						if(!eval_term_px(term, doc, font_size, t)) { fail = true; break; }
+						total += sign * t;
+						any = true;
+					}
+					term.clear();
+					sign = (c == _t('-')) ? -1 : 1;
+				}
+				else if(c == 0)
+				{
+					if(!term.empty())
+					{
+						int t = 0;
+						if(!eval_term_px(term, doc, font_size, t)) { fail = true; }
+						else { total += sign * t; any = true; }
+					}
+					break;
+				}
+				else term += c;
+			}
+			if(!fail && any)
+			{
+				px = total;
+				ok = true;
+			}
+		}
+		if(ok)
+		{
+			tstring repl = std::to_string(px) + _t("px");
+			val.replace(f, (j - f) + 1, repl);
+			from = f + repl.length();
+		}
+		else
+		{
+			from = j + 1;	/* leave this calc() alone, scan past it */
+		}
+	}
+}
+
 /* Rewrite every clamp()/min()/max() in 'val' to a px literal. clamp(MIN,PREF,
  * MAX) applies real clamping max(MIN, min(PREF,MAX)); each argument may be an
  * additive length expression (Xrem + Yvw). Percent/calc()/nested-func arguments
@@ -1552,6 +1724,49 @@ void litehtml::html_tag::resolve_custom_properties()
 	}
 }
 
+/* env() substitutions for the safe-area insets desktop ports have none of:
+ * every env() collapses to its fallback (or 0px), so idioms like
+ * padding-left:max(12px, env(safe-area-inset-left) - 12px) still evaluate
+ * instead of dropping the declaration (apple.com's section gutters). */
+static void eval_env_funcs(tstring& val)
+{
+	size_t from = 0;
+	for(int guard = 0; guard < 16; guard++)
+	{
+		size_t i = val.find(_t("env("), from);
+		if(i == tstring::npos) break;
+		if(i && (val[i - 1] == _t('-') || val[i - 1] == _t('_') ||
+			   (val[i - 1] >= _t('a') && val[i - 1] <= _t('z')) ||
+			   (val[i - 1] >= _t('A') && val[i - 1] <= _t('Z')) ||
+			   (val[i - 1] >= _t('0') && val[i - 1] <= _t('9'))))
+		{
+			from = i + 4;
+			continue;
+		}
+		int depth = 0;
+		size_t j = i + 3;
+		for(; j < val.size(); j++)
+		{
+			if(val[j] == _t('(')) depth++;
+			else if(val[j] == _t(')'))
+			{
+				if(--depth == 0) break;
+			}
+		}
+		if(j >= val.size()) break;
+		tstring repl = _t("0px");
+		size_t comma = val.find(_t(','), i + 4);
+		if(comma != tstring::npos && comma < j)
+		{
+			tstring fb = val.substr(comma + 1, j - comma - 1);
+			trim(fb);
+			if(!fb.empty()) repl = fb;
+		}
+		val.replace(i, j - i + 1, repl);
+		from = i + repl.size();
+	}
+}
+
 void litehtml::html_tag::expand_css_functions()
 {
 	bool has_func = false;
@@ -1559,7 +1774,8 @@ void litehtml::html_tag::expand_css_functions()
 	{
 		const tstring& v = it->second.m_value;
 		if(v.find(_t("var(")) != tstring::npos || v.find(_t("clamp(")) != tstring::npos ||
-		   v.find(_t("min(")) != tstring::npos || v.find(_t("max(")) != tstring::npos)
+		   v.find(_t("min(")) != tstring::npos || v.find(_t("max(")) != tstring::npos ||
+		   v.find(_t("calc(")) != tstring::npos || v.find(_t("env(")) != tstring::npos)
 		{
 			has_func = true;
 			break;
@@ -1592,11 +1808,25 @@ void litehtml::html_tag::expand_css_functions()
 			}
 			v = exp;
 		}
-		if(v.find(_t("clamp(")) != tstring::npos || v.find(_t("min(")) != tstring::npos || v.find(_t("max(")) != tstring::npos)
+		if(v.find(_t("env(")) != tstring::npos)
 		{
-			if(doc && !eval_math_funcs(v, doc, m_font_size))
+			eval_env_funcs(v);
+		}
+		if(v.find(_t("clamp(")) != tstring::npos || v.find(_t("min(")) != tstring::npos || v.find(_t("max(")) != tstring::npos ||
+		   v.find(_t("calc(")) != tstring::npos)
+		{
+			/* calc() first so nested calc() inside clamp() arguments collapses
+			 * to a literal the clamp() evaluator can consume. */
+			if(doc && v.find(_t("calc(")) != tstring::npos)
 			{
-				continue;
+				eval_calc_funcs(v, doc, m_font_size);
+			}
+			if(v.find(_t("clamp(")) != tstring::npos || v.find(_t("min(")) != tstring::npos || v.find(_t("max(")) != tstring::npos)
+			{
+				if(doc && !eval_math_funcs(v, doc, m_font_size))
+				{
+					continue;
+				}
 			}
 		}
 		m_style.add_property(name.c_str(), v.c_str(), NULL, it->second.m_important);
@@ -1694,16 +1924,6 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	 * full-bleed tile artwork inside its tile. */
 	if(own_overflow && !t_strcasecmp(own_overflow, _t("clip")))
 	{
-		static const bool dbg_clip = getenv("EWEB_DBG_CLIP") != 0;
-		if(dbg_clip)
-		{
-			fprintf(stderr, "[clip] tag=%s class=%s parent=%s pdisplay=%d owndisplay=%d\n",
-					(const char*)m_tag.c_str(),
-					(const char*)(get_attr(_t("class")) ? get_attr(_t("class")) : "-"),
-					(el_parent && el_parent->get_tagName()) ? (const char*)el_parent->get_tagName() : "-",
-					el_parent ? (int)el_parent->get_display() : -1,
-					(int)m_display);
-		}
 		own_overflow = _t("hidden");
 	}
 	m_overflow		= (overflow)			value_index((own_overflow && t_strcasecmp(own_overflow, _t("inherit"))) ? own_overflow : _t("visible"),		overflow_strings,			overflow_visible);
@@ -2546,40 +2766,22 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 
 int litehtml::html_tag::render( int x, int y, int max_width, bool second_pass )
 {
-	static int rdbg_on = -1;
-	if(rdbg_on < 0) rdbg_on = getenv("EWEB_RDBG") ? 1 : 0;
-	const tchar_t* rcls = rdbg_on ? get_attr(_t("class")) : 0;
-	bool rdbg = rdbg_on && rcls &&
-		(strstr(rcls, "nav-link") || strstr(rcls, "top-nav-item") ||
-		 strstr(rcls, "tile-subhead") || strstr(rcls, "tile-callout") ||
-		 strstr(rcls, "tile-ctas") || strstr(rcls, "tile-copy-wrapper") ||
-		 strstr(rcls, "tile-headline") || strstr(rcls, "ribbon-content") ||
-		 strstr(rcls, "tile-content"));
-	if(rdbg)
-		printf("[rdbg] enter class=%s disp=%d maxw=%d h=%d skip=%d opac=%g cum=%g\n",
-				(const char*)rcls, (int)m_display, max_width, m_pos.height, (int)m_skip,
-				(double)m_opacity, (double)m_opacity_cum);
-	int rret = 0;
 	if (m_display == display_table || m_display == display_inline_table)
 	{
-		rret = render_table(x, y, max_width, second_pass);
+		return render_table(x, y, max_width, second_pass);
 	}
 	else if (m_display == display_flex || m_display == display_inline_flex)
 	{
-		rret = render_flex(x, y, max_width, second_pass);
+		return render_flex(x, y, max_width, second_pass);
 	}
 	else if (m_display == display_grid || m_display == display_inline_grid)
 	{
-		rret = render_grid(x, y, max_width, second_pass);
+		return render_grid(x, y, max_width, second_pass);
 	}
 	else
 	{
-		rret = render_box(x, y, max_width, second_pass);
+		return render_box(x, y, max_width, second_pass);
 	}
-	if(rdbg)
-		printf("[rdbg] exit class=%s disp=%d x=%d y=%d h=%d w=%d\n",
-				(const char*)rcls, (int)m_display, m_pos.x, m_pos.y, m_pos.height, m_pos.width);
-	return rret;
 }
 
 bool litehtml::html_tag::is_white_space() const
@@ -2780,6 +2982,70 @@ static bool match_selector_list(litehtml::html_tag* el, const litehtml::tstring&
 	return false;
 }
 
+/* :has() subset. The argument is a relative selector list anchored at `el`.
+ * We support the two forms pages actually ship:
+ *   :has(> SEL)  - a direct child matching SEL
+ *   :has(SEL)    - any descendant matching SEL (implicit descendant combinator)
+ * Each list member is matched with the normal css_selector engine, so compound
+ * arguments like :has(:nth-child(2)) or :has(a.button) work. apple.com drives
+ * its CTA grid with '.tile-ctas:has(:nth-child(2))'. */
+static bool has_matching_descendant(litehtml::html_tag* el, const litehtml::tstring& param, bool apply_pseudo)
+{
+	litehtml::tstring arg = param;
+	litehtml::trim(arg);
+	bool child_only = false;
+	if(arg.size() && arg[0] == _t('>'))
+	{
+		child_only = true;
+		arg = arg.substr(1);
+		litehtml::trim(arg);
+	}
+	/* Strip other leading combinators we don't model (+, ~): fall back to a
+	 * descendant search rather than dropping the whole rule. */
+	while(arg.size() && (arg[0] == _t('+') || arg[0] == _t('~')))
+	{
+		arg = arg.substr(1);
+		litehtml::trim(arg);
+	}
+	if(arg.empty()) return false;
+
+	/* Iterative DFS over descendants (no recursion: live trees can be deep). */
+	std::vector<litehtml::element::ptr> stack;
+	for(size_t i = 0; i < el->get_children_count(); i++)
+	{
+		litehtml::element::ptr c = el->get_child((int)i);
+		if(c) stack.push_back(c);
+	}
+	int guard = 0;
+	while(!stack.empty() && guard++ < 4096)
+	{
+		litehtml::element::ptr cur = stack.back();
+		stack.pop_back();
+		if(cur->is_html_tag())
+		{
+			litehtml::html_tag* t = static_cast<litehtml::html_tag*>(cur);
+			if(match_selector_list(t, arg, apply_pseudo)) return true;
+			if(!child_only)
+			{
+				for(size_t i = 0; i < cur->get_children_count(); i++)
+				{
+					litehtml::element::ptr c = cur->get_child((int)i);
+					if(c) stack.push_back(c);
+				}
+			}
+		}
+		else if(!child_only)
+		{
+			for(size_t i = 0; i < cur->get_children_count(); i++)
+			{
+				litehtml::element::ptr c = cur->get_child((int)i);
+				if(c) stack.push_back(c);
+			}
+		}
+	}
+	return false;
+}
+
 int litehtml::html_tag::select(const css_element_selector& selector, bool apply_pseudo)
 {
 	select_element_scope_t scope;
@@ -2926,8 +3192,9 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 				int selector = value_index(selector_name.c_str(), pseudo_class_strings);
 
 				/* Structural pseudo-classes need a parent; :root is the
-				 * opposite - it matches exactly the parentless element. */
-				if(!el_parent && selector != pseudo_class_root)
+				 * opposite - it matches exactly the parentless element. :has()
+				 * inspects descendants, not the parent, so it is exempt too. */
+				if(!el_parent && selector != pseudo_class_root && selector != pseudo_class_has)
 				{
 					return select_no_match;
 				}
@@ -3029,6 +3296,16 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 						 * they match when any member matches (the two differ
 						 * only in specificity contribution). */
 						if(!match_selector_list(this, selector_param, apply_pseudo))
+						{
+							return select_no_match;
+						}
+					}
+					break;
+				case pseudo_class_has:
+					{
+						/* :has() matches when a relative selector in its list
+						 * matches some descendant (or child, for '> SEL'). */
+						if(!has_matching_descendant(this, selector_param, apply_pseudo))
 						{
 							return select_no_match;
 						}
@@ -4337,10 +4614,12 @@ void litehtml::html_tag::set_tagName( const tchar_t* tag )
 }
 
 /* Supported CSS transform subset: a list of rotate()/translate()/translateX()/
- * translateY() functions - enough for the border-trick chevrons modern design
- * systems rotate into place (w3.org breadcrumb separators and nav carets). Any
- * other function (scale/matrix/skew/...) aborts the parse and leaves the
- * identity, which beats drawing a half-understood transform. */
+ * translateY()/translate3d() functions - enough for the border-trick chevrons
+ * modern design systems rotate into place (w3.org breadcrumb separators and nav
+ * carets) and for translate3d-positioned carousels (apple.com home gallery),
+ * which we project to 2D by dropping Z. Any other function
+ * (scale/matrix/skew/...) aborts the parse and leaves the identity, which beats
+ * drawing a half-understood transform. */
 void litehtml::html_tag::parse_transform_list(const tchar_t* val)
 {
 	const tchar_t* p = val;
@@ -4352,6 +4631,12 @@ void litehtml::html_tag::parse_transform_list(const tchar_t* val)
 		if(!t_strncmp(p, _t("rotate("), 7))			{ type = 0; p += 7; }
 		else if(!t_strncmp(p, _t("translateX("), 11))	{ type = 2; p += 11; }
 		else if(!t_strncmp(p, _t("translateY("), 11))	{ type = 3; p += 11; }
+		/* translate3d(x,y,z): carousels (apple.com home gallery) position slides
+		 * with translate3d. We are a 2D engine, so take x,y and drop z; that is
+		 * far better than clearing the transform (which left every slide stacked
+		 * at the origin). The earlier paint crash blamed on translate3d was in
+		 * fact a mario VM use-after-free, unrelated to this parser. */
+		else if(!t_strncmp(p, _t("translate3d("), 12))	{ type = 1; p += 12; }
 		else if(!t_strncmp(p, _t("translate("), 10))	{ type = 1; p += 10; }
 		else { m_transform.clear(); return; }
 		tstring args;
@@ -4611,17 +4896,7 @@ int litehtml::html_tag::render_inline(const element::ptr &container, int max_wid
 
 int litehtml::html_tag::place_element(const element::ptr &el, int max_width)
 {
-	static int pdbg_on = -1;
-	if(pdbg_on < 0) pdbg_on = getenv("EWEB_PDBG") ? 1 : 0;
 	if(!el) return 0;
-	const tchar_t* pdbg_cls = pdbg_on ? el->get_attr(_t("class")) : 0;
-	bool pdbg = pdbg_on && pdbg_cls && strstr(pdbg_cls, "nav-link") && !strstr(pdbg_cls, "icon-link");
-	if(pdbg)
-	{
-		printf("[pdbg] place enter class=%s disp=%d float=%d posn=%d repl=%d maxw=%d\n",
-				(const char*)pdbg_cls, (int)el->get_display(), (int)el->get_float(),
-				(int)el->get_element_position(), (int)el->is_replaced(), max_width);
-	}
 	if(el->get_display() == display_none) return 0;
 
 	if(el->get_display() == display_inline)
@@ -4849,7 +5124,6 @@ int litehtml::html_tag::place_element(const element::ptr &el, int max_width)
 			case display_table_row:
 				if(el->is_replaced() || el->is_floats_holder())
 				{
-					if(pdbg) printf("[pdbg] replaced-block render lw=%d\n", line_ctx.width());
 					ret_width = el->render(line_ctx.left, line_ctx.top, line_ctx.width()) + line_ctx.left + (max_width - line_ctx.right);
 				} else
 				{
@@ -5571,6 +5845,31 @@ void litehtml::html_tag::render_positioned(render_type rt)
 				}
 			}
 
+			/* An absolute box is anchored to its CONTAINING BLOCK - the padding
+			 * box of the nearest positioned ancestor - which is NOT necessarily
+			 * the stacking context that owns this positioned list (a z-index:auto
+			 * position:relative wrapper is transparent for stacking). Anchoring
+			 * to `this` instead placed apple.com's bottom:0 hero art thousands of
+			 * pixels off (the chain-offset subtraction below then double-counted
+			 * the distance). Walk to the real containing block and use its box. */
+			element::ptr cb = this;
+			if(el_position == element_position_absolute)
+			{
+				cb = el->parent();
+				while(cb && cb->get_element_position() == element_position_static)
+				{
+					cb = cb->parent();
+				}
+				if(!cb) cb = this;
+			}
+			int cb_pw = cb->m_pos.width + cb->padding_left() + cb->padding_right();
+			int cb_ph = cb->m_pos.height + cb->padding_top() + cb->padding_bottom();
+			if(el_position == element_position_absolute)
+			{
+				parent_width	= cb_pw;
+				parent_height	= cb_ph;
+			}
+
 			css_length	css_left	= el->get_css_left();
 			css_length	css_right	= el->get_css_right();
 			css_length	css_top		= el->get_css_top();
@@ -5665,18 +5964,25 @@ void litehtml::html_tag::render_positioned(render_type rt)
 				}
 			} else 
 			{
+				/* CSS offsets are measured from the containing block's PADDING
+				 * box, and the draw path consumes m_pos relative to the direct
+				 * parent's border-box origin - so for a direct child of the cb
+				 * the padding-box-relative value IS the right m_pos (no padding
+				 * term either way). The old code subtracted cb->padding_* which
+				 * shifted bottom:0 boxes (apple.com hero art) down by exactly
+				 * padding-bottom, clipping them at the tile edge. */
 				if(!css_left.is_predefined() || !css_right.is_predefined())
 				{
 					if(!css_left.is_predefined() && css_right.is_predefined())
 					{
-						el->m_pos.x = css_left.calc_percent(parent_width) + el->content_margins_left() - m_padding.left;
+						el->m_pos.x = css_left.calc_percent(cb_pw) + el->content_margins_left();
 					} else if(css_left.is_predefined() && !css_right.is_predefined())
 					{
-						el->m_pos.x = m_pos.width + m_padding.right - css_right.calc_percent(parent_width) - el->m_pos.width - el->content_margins_right();
+						el->m_pos.x = cb_pw - css_right.calc_percent(cb_pw) - el->m_pos.width - el->content_margins_right();
 					} else
 					{
-						el->m_pos.x		= css_left.calc_percent(parent_width) + el->content_margins_left() - m_padding.left;
-						el->m_pos.width	= m_pos.width + m_padding.left + m_padding.right - css_left.calc_percent(parent_width) - css_right.calc_percent(parent_width) - (el->content_margins_left() + el->content_margins_right());
+						el->m_pos.x		= css_left.calc_percent(cb_pw) + el->content_margins_left();
+						el->m_pos.width	= cb_pw - css_left.calc_percent(cb_pw) - css_right.calc_percent(cb_pw) - (el->content_margins_left() + el->content_margins_right());
                         if (new_width != -1)
                         {
                             el->m_pos.x += (el->m_pos.width - new_width) / 2;
@@ -5691,14 +5997,14 @@ void litehtml::html_tag::render_positioned(render_type rt)
 				{
 					if(!css_top.is_predefined() && css_bottom.is_predefined())
 					{
-						el->m_pos.y = css_top.calc_percent(parent_height) + el->content_margins_top() - m_padding.top;
+						el->m_pos.y = css_top.calc_percent(cb_ph) + el->content_margins_top();
 					} else if(css_top.is_predefined() && !css_bottom.is_predefined())
 					{
-						el->m_pos.y = m_pos.height + m_padding.bottom - css_bottom.calc_percent(parent_height) - el->m_pos.height - el->content_margins_bottom();
+						el->m_pos.y = cb_ph - css_bottom.calc_percent(cb_ph) - el->m_pos.height - el->content_margins_bottom();
 					} else
 					{
-						el->m_pos.y			= css_top.calc_percent(parent_height) + el->content_margins_top() - m_padding.top;
-						el->m_pos.height	= m_pos.height + m_padding.top + m_padding.bottom - css_top.calc_percent(parent_height) - css_bottom.calc_percent(parent_height) - (el->content_margins_top() + el->content_margins_bottom());
+						el->m_pos.y			= css_top.calc_percent(cb_ph) + el->content_margins_top();
+						el->m_pos.height	= cb_ph - css_top.calc_percent(cb_ph) - css_bottom.calc_percent(cb_ph) - (el->content_margins_top() + el->content_margins_bottom());
                         if (new_height != -1)
                         {
                             el->m_pos.y += (el->m_pos.height - new_height) / 2;
@@ -5712,10 +6018,16 @@ void litehtml::html_tag::render_positioned(render_type rt)
 
 			if(cvt_x || cvt_y)
 			{
-				int offset_x = 0;
-				int offset_y = 0;
+				/* m_pos is now padding-box-relative to the cb; the draw path
+				 * adds it to the DIRECT parent's border-box origin, so convert
+				 * through the intermediate chain. Intermediates are in-flow (a
+				 * positioned box in between would be the cb), and in-flow m_pos
+				 * already includes each box's own border+padding, so only the
+				 * cb's border+padding has to be added explicitly. */
+				int offset_x = cb->m_borders.left + cb->m_padding.left;
+				int offset_y = cb->m_borders.top + cb->m_padding.top;
 				element::ptr cur_el = el->parent();
-				element::ptr this_el = this;
+				element::ptr this_el = cb;
 				while(cur_el && cur_el != this_el)
 				{
 					offset_x += cur_el->m_pos.x;
@@ -5726,10 +6038,88 @@ void litehtml::html_tag::render_positioned(render_type rt)
 				if(cvt_y)	el->m_pos.y -= offset_y;
 			}
 
+			/* apple.com home-gallery fallback: the carousel slides
+			 * (.media-gallery-item) are position:absolute siblings that Apple's JS
+			 * spreads with translate3d; when the bundle cannot run they all collapse
+			 * onto the containing block's origin and only the topmost tile is visible.
+			 * Lay them out as a horizontal row instead: x = running sum of the
+			 * preceding slides' widths. Contained to slides whose containing block is
+			 * the .media-gallery flex column, and to the exact class token so the
+			 * inner .media-gallery-item-container is not matched. */
+			{
+				auto is_gal_slide = [](const tchar_t* cls) -> bool {
+					if(!cls) return false;
+					for(const tchar_t* q = cls; (q = strstr(q, "media-gallery-item")) != 0; q += 18) {
+						if((q == cls || q[-1] == ' ') && (q[18] == 0 || q[18] == ' '))
+							return true;
+					}
+					return false;
+				};
+				const tchar_t* ccls = cb->get_attr(_t("class"));
+				if(ccls && strstr(ccls, "media-gallery") && is_gal_slide(el->get_attr(_t("class")))) {
+					/* Absolute x of the containing block (sum the in-flow chain);
+					 * the UL is centered at one-tile width, so anchoring slides at
+					 * its left edge left a big empty gap before the first visible
+					 * tile. Left-align the whole filmstrip to the page's left edge
+					 * instead so the row reads as a full-bleed strip. */
+					int cb_abs_x = 0;
+					for(element::ptr a = cb; a; a = a->parent())
+						cb_abs_x += a->m_pos.x;
+					int run_x = 0;
+					element::ptr p = el->parent();
+					if(p) {
+						for(size_t i = 0, n = p->get_children_count(); i < n; ++i) {
+							element::ptr s = p->get_child((int)i);
+							if(!s || s == el) break;
+							if(is_gal_slide(s->get_attr(_t("class"))))
+								run_x += (s->m_pos.width > 0 ? s->m_pos.width : el->m_pos.width);
+						}
+					}
+					el->m_pos.x = run_x - cb_abs_x;
+					el->m_pos.y = 0;
+				}
+			}
+			
+			/* A replaced element (an <img>) sizes an auto width/height from its
+			 * intrinsic content, which arrives asynchronously when the image
+			 * decodes - possibly long after this positioned box was first laid
+			 * out at 0 because the load was deferred during the build. The
+			 * CSS-offset logic above only ever sets DEFINITE dimensions, so an
+			 * auto-width image keeps its stale 0 box: need_render never fires
+			 * (nothing about the CSS changed) and el_image::draw skips a
+			 * zero-width box, so apple.com's absolutely-positioned hero art never
+			 * paints once its bitmap lands. When the box is still missing an auto
+			 * dimension but the intrinsic size is now known, force a re-render and
+			 * keep the freshly computed auto dimension instead of restoring the
+			 * stale one. */
+			bool replaced_autosize = false;
+			if(el->is_replaced() &&
+			   ((el_w.is_predefined() && el->m_pos.width <= 0) ||
+			    (el_h.is_predefined() && el->m_pos.height <= 0)))
+			{
+				litehtml::size intr;
+				intr.width = 0;
+				intr.height = 0;
+				el->get_content_size(intr, parent_width);
+				if(intr.width > 0 || intr.height > 0)
+				{
+					need_render = true;
+					replaced_autosize = true;
+				}
+			}
+
 			if(need_render)
 			{
 				position pos = el->m_pos;
 				el->render(el->left(), el->top(), el->width(), true);
+				if(replaced_autosize)
+				{
+					/* Preserve the CSS-driven position and any definite dimension,
+					 * but take the auto dimension(s) from the fresh intrinsic layout
+					 * rather than the stale (0) saved box. */
+					if(el_w.is_predefined()) pos.width = el->m_pos.width;
+					if(el_h.is_predefined()) pos.height = el->m_pos.height;
+				}
 				el->m_pos = pos;
 			}
 
@@ -6604,21 +6994,8 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 
 	bool was_space = false;
 
-	static int cdbg_on = -1;
-	if(cdbg_on < 0) cdbg_on = getenv("EWEB_CDBG") ? 1 : 0;
-	const tchar_t* cdbg_cls = cdbg_on ? get_attr(_t("class")) : 0;
-	bool cdbg = cdbg_on && cdbg_cls && strstr(cdbg_cls, "top-nav-item");
-
 	for (auto el : m_children)
 	{
-		if(cdbg)
-		{
-			printf("[cdbg] li child tag=%s class=%s disp=%d skip=%d vis=%d posn=%d\n",
-					(const char*)el->get_tagName(),
-					el->get_attr(_t("class")) ? (const char*)el->get_attr(_t("class")) : "",
-					(int)el->get_display(), (int)el->m_skip, (int)el->is_visible(),
-					(int)el->get_element_position());
-		}
 		// display:contents elements generate no box of their own
 		if (el->get_display() == display_contents) continue;
 

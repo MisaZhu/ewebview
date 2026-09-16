@@ -1569,34 +1569,6 @@ int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
 {
     using namespace litehtml;
 
-    static int idbg_on = -1;
-    if (idbg_on < 0) idbg_on = getenv("EWEB_IDBG") ? 1 : 0;
-    if (idbg_on) {
-        const litehtml::tchar_t* icls = get_attr(_t("class"));
-        if (icls && strstr(icls, "nav-link") && !strstr(icls, "icon-link")) {
-            std::string kids;
-            for (size_t i = 0; i < get_children_count(); i++) {
-                litehtml::element::ptr ch = get_child((int)i);
-                const litehtml::tchar_t* tn = ch ? ch->get_tagName() : 0;
-                if (tn && tn[0]) {
-                    kids += tn;
-                } else if (ch) {
-                    litehtml::tstring tt;
-                    ch->get_text(tt);
-                    std::string s(tt.c_str());
-                    if (s.size() > 14) s = s.substr(0, 14);
-                    kids += "[" + s + "]";
-                } else {
-                    kids += ".";
-                }
-                kids += ",";
-            }
-            fprintf(stderr, "[idbg] btn render mode=%d kids=%s label=[%s] lw=%d font=%d maxw=%d\n",
-                    (int)container_mode(), kids.c_str(), label().c_str(),
-                    label_width(label()), get_font() ? 1 : 0, max_width);
-        }
-    }
-
     /* A button with real element children lays out like any other container:
      * html_tag::render runs the flex/block algorithm and gives the children
      * (a history-thumb <img>) boxes, and derives the button height from them.

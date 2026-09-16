@@ -227,7 +227,34 @@ void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, con
 			a = _t("padding-top"); b = _t("padding-bottom");
 		}
 		string_vector tokens;
-		split_string(val, tokens, _t(" "));
+		/* Split on spaces OUTSIDE parentheses only: apple.com's buttons set
+		 * "padding-inline:calc(var(--sk-button-padding-horizontal) - var(--sk-button-border-width))",
+		 * a SINGLE value whose calc() contains spaces. A naive space split
+		 * shredded it into unbalanced fragments ("calc(var(--x)", "-",
+		 * "var(--y))") that all parse to zero, leaving the pill with no
+		 * horizontal padding so the label touched the rounded ends. */
+		{
+			tstring cur;
+			int depth = 0;
+			for(const tchar_t* p = val; ; p++)
+			{
+				tchar_t c = *p;
+				if(c == _t('(')) depth++;
+				else if(c == _t(')')) depth--;
+				if(c == 0 || (depth == 0 && (c == _t(' ') || c == _t('\t'))))
+				{
+					if(!cur.empty())
+					{
+						tokens.push_back(cur);
+						cur.clear();
+					}
+					if(c == 0) break;
+					continue;
+				}
+				cur += c;
+			}
+		}
+		if(tokens.empty()) return;
 		add_property(a, tokens[0].c_str(), baseurl, important);
 		add_property(b, (tokens.size() >= 2 ? tokens[1] : tokens[0]).c_str(), baseurl, important);
 		return;

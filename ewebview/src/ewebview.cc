@@ -97,6 +97,11 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
 {
     if(has_inline_handlers != nullptr) *has_inline_handlers = false;
     if(has_module_scripts != nullptr) *has_module_scripts = false;
+    /* EWEB_RUN_MODULES opts in to executing type="module" scripts: "1" runs
+     * them all, any other value runs only modules whose src contains it (so a
+     * single bundle can be exercised while the rest stay skipped). */
+    static const char* run_modules_env = ::getenv("EWEB_RUN_MODULES");
+    const bool run_modules_all = (run_modules_env != nullptr && run_modules_env[0] == '1');
     if(html.empty()) {
         return html;
     }
@@ -164,18 +169,31 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
 
         std::string src_val = script_attr_value(open_tag, open_tag_orig, "src");
         bool external = !src_val.empty();
-        /* A type= that is present and not a JS mime means "do not execute". */
+        /* A type= that is present and not a JS mime means "do not execute".
+         * type="module" is executable in principle (the mario VM parses the
+         * ES2015+ syntax these bundles use and implements import/export), but
+         * apple.com's homepage bundles still abort midway (missing stdlib
+         * pieces) after mutating the DOM, which loses the stylesheet links and
+         * paints an unstyled page. So modules stay skipped unless the operator
+         * opts in with EWEB_RUN_MODULES=1 while those VM gaps are closed. */
         bool non_js = false;
-        size_t tp = open_tag.find("type=");
-        if(tp != std::string::npos) {
-            non_js = (open_tag.find("javascript", tp) == std::string::npos);
+        std::string type_val = script_attr_value(open_tag, open_tag_orig, "type");
+        for(char& ch : type_val) ch = (char)::tolower((unsigned char)ch);
+        if(!type_val.empty()) {
+            bool js_mime = (type_val.find("javascript") != std::string::npos ||
+                            type_val == "text/ecmascript" ||
+                            type_val == "application/ecmascript");
+            bool module_ok = false;
+            if(type_val == "module" && run_modules_env != nullptr) {
+                module_ok = run_modules_all ||
+                            (src_val.find(run_modules_env) != std::string::npos);
+            }
+            non_js = !(js_mime || module_ok);
         }
-        /* Remember a skipped type="module": the VM cannot parse ES2020 module
-         * bundles, so a page whose content lives in one renders blank; the
-         * engine arms a plain notice for that case (decideModuleNotice). */
+        /* Remember a skipped type="module": if the VM still fails to parse one,
+         * a page whose content lives in it renders blank; the engine arms a
+         * plain notice for that case (decideModuleNotice). */
         if(has_module_scripts != nullptr && !*has_module_scripts) {
-            std::string type_val = script_attr_value(open_tag, open_tag_orig, "type");
-            for(char& ch : type_val) ch = (char)::tolower((unsigned char)ch);
             if(type_val == "module") *has_module_scripts = true;
         }
         if(scripts != nullptr && !non_js) {
@@ -289,6 +307,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_styleNeedSince(0)
     , m_needsLayout(false)
     , m_pendingCss(0)
+    , m_firstPaintCssWaitSince(0)
     , m_styleStepInFlight(false)
     , m_pressX(0)
     , m_pressY(0)
@@ -1966,6 +1985,8 @@ void EWebEngine::cleanupBuildResources()
     m_jsScriptSrcs.clear();
     m_jsScriptDone.clear();
     m_jsHasInlineHandlers = false;
+    m_jsCurScriptEl = nullptr;
+    m_jsCurScriptElUrl.clear();
     m_jsReparseCount = 0;
     m_jsRunBeforePaint = false;
     m_jsNextScript = 0;
@@ -2023,6 +2044,7 @@ void EWebEngine::cleanupBuildResources()
     m_defaultCssLoading = false;
     m_deferBuildStep = false;
     m_styleStepInFlight = false;
+    m_firstPaintCssWaitSince = 0;
     m_layoutDirtyAt = 0;
     m_buildLayoutDirtyAt = 0;
     m_layoutDirtySince = 0;
@@ -2713,6 +2735,8 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     m_jsScriptSrcs.clear();
     m_jsScriptDone.clear();
     m_jsHasInlineHandlers = false;
+    m_jsCurScriptEl = nullptr;
+    m_jsCurScriptElUrl.clear();
     m_jsBuildHasModules = false;
     m_buildHtmlContent = extract_scripts(content, m_jsEnabled ? &m_jsScripts : nullptr,
                                          m_jsEnabled ? &m_jsScriptSrcs : nullptr,
@@ -2803,12 +2827,23 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
             if(i < m_jsScriptDone.size()) m_jsScriptDone[i] = 1;   /* unresolvable: skip, never block */
             continue;
         }
-        m_jsScriptSrcs[i] = abs;   /* results are matched by this absolute URL */
-        EWebTask task;
-        task.url = abs;
-        task.type = EWEB_TASK_SCRIPT;
-        task.loading = false;
-        addTask(task);
+        /* CDN combo ("/??a,b,c"): one slot per component so a watchdog cut on a
+         * hanging middle component cannot discard the ones after it. */
+        std::vector<std::string> parts = ewebSplitComboUrl(abs);
+        m_jsScriptSrcs[i] = parts[0];
+        for(size_t k = 1; k < parts.size(); ++k) {
+            m_jsScriptSrcs.insert(m_jsScriptSrcs.begin() + (long)(i + k), parts[k]);
+            m_jsScripts.insert(m_jsScripts.begin() + (long)(i + k), std::string());
+            m_jsScriptDone.insert(m_jsScriptDone.begin() + (long)(i + k), 0);
+        }
+        i += parts.size() - 1;
+        for(size_t k = 0; k < parts.size(); ++k) {
+            EWebTask task;
+            task.url = parts[k];
+            task.type = EWEB_TASK_SCRIPT;
+            task.loading = false;
+            addTask(task);
+        }
     }
 
     setBuildStatus("preparing document", 5);
@@ -2862,19 +2897,15 @@ bool EWebEngine::processResults()
     }
 
     /* A post-swap script run (m_jsPostSwapRun) is not a build for results:
-     * the page on screen owns the caches, so CSS/images must keep landing in
-     * it instead of stalling behind a script that may run for many ticks. */
+     * the page on screen owns the caches, so images must keep landing in it
+     * instead of stalling behind a script that may run for many ticks.
+     * Stylesheets are NOT deferred: loadCSSContent() routes them into the
+     * build context while a build is in flight, and BUILD_RENDER_DOC waits
+     * for them to drain so the first paint carries the author CSS instead
+     * of an unstyled skeleton that restyles live seconds later. */
     if(result.type == EWEB_TASK_IMAGE && m_buildPhase != BUILD_IDLE && !m_jsPostSwapRun) {
         EWEB_LOG("[ewebview] process image deferred by build: size=%d phase=%d\n",
             (int)result.content.size(), (int)m_buildPhase);
-        pthread_mutex_lock(&m_resultMutex);
-        m_resultQueue.insert(m_resultQueue.begin(), result);
-        pthread_mutex_unlock(&m_resultMutex);
-        return false;
-    }
-    if(result.type == EWEB_TASK_CSS &&
-            m_buildPhase != BUILD_IDLE && !m_jsPostSwapRun &&
-            !(m_buildPhase == BUILD_PRELOAD_CSS && result.url == m_defaultCSSUrl)) {
         pthread_mutex_lock(&m_resultMutex);
         m_resultQueue.insert(m_resultQueue.begin(), result);
         pthread_mutex_unlock(&m_resultMutex);
@@ -2911,6 +2942,11 @@ bool EWebEngine::processResults()
         }
         if(result.type == EWEB_TASK_CSS) {
             forgetCSS(result.url);
+            /* Release the pending-sheet slot on failure too: the first-paint
+             * gate and the visible doc's style walk both wait on m_pendingCss,
+             * and a 404'd sheet must not make them wait out their caps. */
+            if(m_pendingCss > 0)
+                m_pendingCss--;
             if(result.url == m_defaultCSSUrl) {
                 m_defaultCssLoading = false;
                 m_defaultCssPrepared = true;
@@ -3324,6 +3360,22 @@ void EWebEngine::advanceBuildStep()
 
     if(m_buildPhase == BUILD_RENDER_DOC) {
         setBuildStatus("layout and first paint", 80);
+        /* Render-blocking stylesheets: the <link> fetches queued during the
+         * parse land in the build context now that processResults no longer
+         * defers them, so hold the swap until they drain - the previous page
+         * and the progress overlay stay on screen, which beats painting an
+         * unstyled skeleton and restyling it live. The cap keeps a stuck
+         * fetch from holding the view; whatever landed by then is painted. */
+        if(m_pendingCss > 0) {
+            if(m_firstPaintCssWaitSince == 0) {
+                m_firstPaintCssWaitSince = ticMs();
+                EWEB_LOG("[ewebview] first paint waits for %d stylesheet(s)\n", m_pendingCss);
+            }
+            if(ticMs() - m_firstPaintCssWaitSince < kFirstPaintCssWaitMs)
+                return;
+            EWEB_LOG("[ewebview] first paint css wait timed out with %d pending\n", m_pendingCss);
+        }
+        m_firstPaintCssWaitSince = 0;
         if(m_buildDoc) {
             /* The DOM was created in fast mode, whose parse_styles path skips
              * the whole box model (height/width stay predef(0)), so layout
@@ -3344,6 +3396,12 @@ void EWebEngine::advanceBuildStep()
             while(!styles_done && !m_buildAbort) {
                 styles_done = m_buildDoc->update_master_styles_step(
                         ticMs() + kStyleBudgetIdleMs);
+            }
+            if(styles_done) {
+                /* The monolithic walk finished: no chunked step remains in
+                 * flight and no build style debt survives into the swap. */
+                m_buildNeedsStyleUpdate = false;
+                m_styleStepInFlight = false;
             }
             uint64_t render_start = ticMs();
             if(!m_buildAbort)
@@ -3423,6 +3481,17 @@ void EWebEngine::advanceBuildStep()
         m_engineScrollX = 0;
         m_engineScrollY = 0;
         m_cacheValid = false;
+        /* A sheet that landed on the tick before the swap left the handed-
+         * over document style-dirty under the BUILD flags; carry the debt
+         * into the visible-doc flags, or the next applyPendingLayoutUpdates
+         * (build doc now null) drops it and the fresh master CSS is never
+         * walked on the page on screen. */
+        if(m_buildNeedsStyleUpdate) {
+            m_buildNeedsStyleUpdate = false;
+            if(!m_needsStyleUpdate)
+                m_styleNeedSince = ticMs();
+            m_needsStyleUpdate = true;
+        }
 
         // Defer deletion of the old page to a later loop iteration to prevent
         // re-entrant corruption (the engine loop flushes these at its top).
