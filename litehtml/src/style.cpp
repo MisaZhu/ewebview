@@ -684,6 +684,12 @@ void litehtml::style::parse_short_background( const tstring& val, const tchar_t*
 				add_parsed_property(_t("background-image-baseurl"), baseurl, important);
 			}
 
+		} else if( !t_strncasecmp(tok->c_str(), _t("linear-gradient("), 16) )
+		{
+			/* Gradient paint syntax must reach background-image; the colour
+			 * branch below would swallow it as an unresolvable colour and the
+			 * hero fields of Tailwind pages would paint transparent. */
+			add_parsed_property(_t("background-image"), *tok, important);
 		} else if( value_in_list(tok->c_str(), background_repeat_strings) )
 		{
 			add_parsed_property(_t("background-repeat"), *tok, important);

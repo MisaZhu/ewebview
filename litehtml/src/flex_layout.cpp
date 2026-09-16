@@ -169,6 +169,30 @@ static int preferred_content_width(const litehtml::element::ptr& el)
 		el->get_content_size(sz, 0x3fffffff);
 		return sz.width;
 	}
+	/* A specified definite width IS the box's max-content contribution: a leaf
+	 * box sized by width (the w3.org nav chevron ::after{inline-size:.4375rem},
+	 * mapped onto width) contributes that width, not the sum of its (empty)
+	 * children. Under-counting it shaves a few px off the owning flex item's
+	 * base size, so the shrink step slices into the item's text and the nav
+	 * row wraps/overlaps where real flexbox packs it on one line. Percentages
+	 * stay content-based: against an unknown shrink target they are indefinite.
+	 * border-box widths already include padding and borders. */
+	{
+		litehtml::css_length cw = el->get_css_width();
+		if(!cw.is_predefined() && cw.units() != litehtml::css_units_none &&
+		   cw.units() != litehtml::css_units_percentage)
+		{
+			int wv = el->get_document()->cvt_units(cw, el->get_font_size(), 0);
+			if(wv > 0)
+			{
+				if(static_cast<litehtml::html_tag*>(el)->get_box_sizing() ==
+				   litehtml::box_sizing_content_box)
+					wv += el->padding_left() + el->padding_right() +
+						  el->border_left() + el->border_right();
+				return wv;
+			}
+		}
+	}
 	if(d == litehtml::display_inline_block)
 	{
 		return el->width();
@@ -396,7 +420,20 @@ static int flex_min_content_inner(const litehtml::element::ptr& el)
 			 * their floors add up (a replaced flex box - w3.org's nav button
 			 * widget - reaches here: its label can clip, so its floor is the
 			 * longest label word plus the caret, not the full label) */
-			w += c->margin_left() + c->margin_right() + cw;
+			int ml = c->margin_left(), mr = c->margin_right();
+			/* An automatic margin (w3.org account li margin-inline-start:auto)
+			 * still holds the free space it absorbed on the last pack; feeding
+			 * that back inflated the nav ul's min-content floor above the row
+			 * budget so the row could never shrink and the account item landed
+			 * past the right edge. Auto margins contribute 0 to intrinsics. */
+			const litehtml::tchar_t* tn = c->get_tagName();
+			if(tn && tn[0])
+			{
+				litehtml::html_tag* ct = static_cast<litehtml::html_tag*>(c);
+				if(ct->margin_left_is_auto()) ml = 0;
+				if(ct->margin_right_is_auto()) mr = 0;
+			}
+			w += ml + mr + cw;
 		}
 		else if(cw > w)
 		{
@@ -700,17 +737,39 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		bool basis_set = false;
 		if(sh)
 		{
-			float g = 0, s = 1, b = -1;
-			int n = sscanf(sh, "%f %f %f", &g, &s, &b);
-			if(n >= 1) it.grow = g;
-			if(n >= 2) it.shrink = s;
-			if(n >= 3 && b >= 0)
+			/* Tokenise instead of sscanf: `%f %f %f` cannot tell `flex:0 0`
+			 * (basis 0%) from `flex:0 0 auto` (basis auto, i.e. fall back to the
+			 * specified width). The w3.org nav avatar is `flex:0 0 auto` +
+			 * `width:2rem`; reading it as basis 0 collapsed the circle to 0px. */
+			tstring ssh = sh;
+			std::vector<tstring> tok;
+			for(size_t p = 0; p < ssh.length();)
 			{
-				it.base = (int)b + it.ml + it.mr;
-				it.has_main = true;
-				basis_set = true;
+				while(p < ssh.length() && (ssh[p] == _t(' ') || ssh[p] == _t('\t'))) p++;
+				size_t q = p;
+				while(q < ssh.length() && ssh[q] != _t(' ') && ssh[q] != _t('\t')) q++;
+				if(q > p) tok.push_back(ssh.substr(p, q - p));
+				p = q;
 			}
-			else if(n >= 1)
+			float g = 0, s = 1;
+			if(tok.size() >= 1) g = (float)atof(tok[0].c_str());
+			if(tok.size() >= 2) s = (float)atof(tok[1].c_str());
+			it.grow = g;
+			it.shrink = s;
+			bool basis_auto = (tok.size() >= 3);
+			if(tok.size() >= 3)
+			{
+				css_length bl;
+				bl.fromString(tok[2].c_str());
+				if(!bl.is_predefined())
+				{
+					it.base = get_document()->cvt_units(bl, el->get_font_size(), avail) + it.ml + it.mr;
+					it.has_main = true;
+					basis_set = true;
+					basis_auto = false;
+				}
+			}
+			if(!basis_set && !basis_auto)
 			{
 				/* The flex shorthand resets flex-basis to 0% when it is omitted
 				 * (`flex:1` == `1 1 0%`), unlike the longhand's auto. Falling back
@@ -1121,11 +1180,17 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			}
 		}
 
-		int line_used = lead;
+		/* The line's contribution to the container's used width is the packed
+		 * content only: the justify-content lead (and the extra space-around /
+		 * space-evenly gaps) is free space inside THIS container, so reporting
+		 * it would inflate every shrink-to-fit ancestor (rokid.com's absolutely
+		 * positioned hero copy box sized to avail/2 + content/2 instead of to
+		 * its content, throwing the centred button row off the logo axis). */
+		int line_used = 0;
 		for(size_t i = 0; i < line.size(); i++)
 		{
 			line_used += items[line[i]].main;
-			if(i + 1 < line.size()) line_used += col_gap + jgap;
+			if(i + 1 < line.size()) line_used += col_gap;
 		}
 		if(line_used > used_width) used_width = line_used;
 

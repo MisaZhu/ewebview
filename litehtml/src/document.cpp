@@ -1072,6 +1072,9 @@ litehtml::element::ptr litehtml::document::create_element(const tchar_t* tag_nam
 		} else if(!t_strcmp(tag_name, _t("img")))
 		{
 			newTag = litehtml_alloc<litehtml::el_image>("el_image", this);
+		} else if(!t_strcmp(tag_name, _t("video")))
+		{
+			newTag = litehtml_alloc<litehtml::el_video>("el_video", this);
 		} else if(!t_strcmp(tag_name, _t("svg")))
 		{
 			newTag = litehtml_alloc<litehtml::el_svg>("el_svg", this);

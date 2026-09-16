@@ -341,6 +341,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_jsPageHasModules(false)
     , m_moduleNoticeDecided(false)
     , m_showModuleNotice(false)
+    , m_noticeKind(0)
     , m_swapAtMs(0)
     , m_noticeFont(nullptr)
     , m_jsProgressiveActive(false)
@@ -642,6 +643,13 @@ void EWebEngine::engineLoop()
              * the body still holds no text, say so on the page instead of
              * leaving an unexplained white viewport. */
             decideModuleNotice();
+        } else if(!m_moduleNoticeDecided && !m_jsPostSwapRun &&
+                  (ticMs() - m_swapAtMs) > 2500) {
+            /* Client-rendered shell: the whole classic-script phase had its
+             * chance (or was dropped by a budget) and what still paints is the
+             * server-side skeleton placeholder the app was meant to replace.
+             * Explain instead of letting grey blocks stand in for content. */
+            decideCsrNotice();
         }
 
         /* 6. a navigation/scroll a script or an anchor click asked for. Runs
@@ -3469,6 +3477,7 @@ void EWebEngine::advanceBuildStep()
         m_swapAtMs = ticMs();
         m_moduleNoticeDecided = false;
         m_showModuleNotice = false;
+        m_noticeKind = 0;
         m_defaultCssPrepared = false;
         m_defaultCssLoading = false;
         m_buildTargetContext = nullptr;
@@ -3625,7 +3634,86 @@ void EWebEngine::decideModuleNotice()
             return;   /* real content on screen: nothing to explain */
     }
     m_showModuleNotice = true;
+    m_noticeKind = 1;
     EWEB_LOG("[ewebview] module-only page paints blank: notice armed url=%s\n",
+        m_currentHtmlUrl.c_str());
+    markContentDirty();
+}
+
+/* Case-insensitive substring test (strcasestr is not portable across the
+ * libcs the ports build against). */
+static bool ewebContainsNoCase(const char* hay, const char* needle)
+{
+    if(hay == nullptr || needle == nullptr || needle[0] == 0)
+        return false;
+    size_t n = strlen(needle);
+    for(size_t i = 0; hay[i] != 0; ++i) {
+        size_t k = 0;
+        while(k < n && hay[i + k] != 0 &&
+              tolower((unsigned char)hay[i + k]) == tolower((unsigned char)needle[k]))
+            ++k;
+        if(k == n)
+            return true;
+    }
+    return false;
+}
+
+/* True when a laid-out subtree still shows a "skeleton" loading placeholder:
+ * a VISIBLE element whose id/class carries "skeleton" and whose border box
+ * covers at least minArea px2. Such placeholders are painted by the server
+ * shell and faded out by the app once it boots; one still on screen after the
+ * script phase ended means the app never replaced it. */
+static bool pageHasVisibleSkeleton(litehtml::element* el, int minArea)
+{
+    if(el == nullptr)
+        return false;
+    const litehtml::tchar_t* tag = el->get_tagName();
+    if(tag != nullptr &&
+       (t_strcasecmp(tag, _t("style")) == 0 ||
+        t_strcasecmp(tag, _t("script")) == 0 ||
+        t_strcasecmp(tag, _t("head")) == 0))
+        return false;
+    if(el->is_visible()) {
+        if(ewebContainsNoCase(el->get_attr(_t("id"), nullptr), "skeleton") ||
+           ewebContainsNoCase(el->get_attr(_t("class"), nullptr), "skeleton")) {
+            if(el->width() * el->height() >= minArea)
+                return true;
+        }
+    }
+    size_t n = el->get_children_count();
+    for(size_t i = 0; i < n; ++i) {
+        if(pageHasVisibleSkeleton(el->get_child((int)i), minArea))
+            return true;
+    }
+    return false;
+}
+
+bool EWebEngine::pageShowsSkeletonPlaceholder() const
+{
+    if(m_doc == nullptr || m_clientWidth <= 0 || m_clientHeight <= 0)
+        return false;
+    litehtml::element::ptr root = m_doc->root();
+    if(root == nullptr)
+        return false;
+    /* A placeholder only misleads when it is most of the viewport; a small
+     * spinner beside real content must never arm the notice. */
+    return pageHasVisibleSkeleton(root, m_clientWidth * m_clientHeight * 3 / 10);
+}
+
+void EWebEngine::decideCsrNotice()
+{
+    /* ENGINE-THREAD ONLY. Classic-script client-rendered shell (taobao.com):
+     * every script ran or was dropped, the phase went idle, and what paints is
+     * still the server-side skeleton placeholder - the VM cannot run the
+     * site's bundle chain (core-js polyfill dies first, so the React app entry
+     * never loads) and the data APIs are unreachable by design. Arm the notice
+     * instead of leaving grey blocks standing in for content forever. */
+    m_moduleNoticeDecided = true;
+    if(!pageShowsSkeletonPlaceholder())
+        return;
+    m_showModuleNotice = true;
+    m_noticeKind = 2;
+    EWEB_LOG("[ewebview] client-rendered shell stuck on its skeleton: notice armed url=%s\n",
         m_currentHtmlUrl.c_str());
     markContentDirty();
 }
@@ -3647,15 +3735,36 @@ void EWebEngine::drawModuleNotice(eweb_surface_t* cache, int cacheW, int cacheH)
         "\xe6\x9c\xac\xe9\xa1\xb5\xe9\x9d\xa2\xe5\x86\x85\xe5\xae\xb9\xe5\xae\x8c\xe5\x85\xa8\xe7\x94\xb1 ES \xe6\xa8\xa1\xe5\x9d\x97\xe8\x84\x9a\xe6\x9c\xac (type=\"module\") \xe7\x94\x9f\xe6\x88\x90",
         "\xe5\xb5\x8c\xe5\x85\xa5\xe5\xbc\x8f JS \xe5\xbc\x95\xe6\x93\x8e\xe4\xb8\x8d\xe6\x94\xaf\xe6\x8c\x81 ES \xe6\xa8\xa1\xe5\x9d\x97\xef\xbc\x8c\xe5\x86\x85\xe5\xae\xb9\xe6\x97\xa0\xe6\xb3\x95\xe6\x98\xbe\xe7\xa4\xba"
     };
+    static const char* CLINES[2] = {
+        "\xe6\x9c\xac\xe9\xa1\xb5\xe9\x9d\xa2\xe4\xb8\xbb\xe4\xbd\x93\xe5\x86\x85\xe5\xae\xb9\xe7\x94\xb1\xe5\xae\xa2\xe6\x88\xb7\xe7\xab\xaf\xe8\x84\x9a\xe6\x9c\xac\xe8\xbf\x90\xe8\xa1\x8c\xe6\x97\xb6\xe7\x94\x9f\xe6\x88\x90\xef\xbc\x88" "CSR" "\xef\xbc\x89",
+        "\xe5\xb5\x8c\xe5\x85\xa5\xe5\xbc\x8f JS \xe5\xbc\x95\xe6\x93\x8e\xe6\x97\xa0\xe6\xb3\x95\xe6\x89\xa7\xe8\xa1\x8c\xe5\x85\xb6\xe4\xbe\x9d\xe8\xb5\x96\xef\xbc\x8c\xe4\xbb\x85\xe6\x98\xbe\xe7\xa4\xba\xe6\x9c\x8d\xe5\x8a\xa1\xe5\x99\xa8\xe9\x9d\x99\xe6\x80\x81\xe5\x86\x85\xe5\xae\xb9"
+    };
+    const char** lines = LINES;
+    if(m_noticeKind == 2) {
+        /* The app may still boot after we armed (a timer-driven late render):
+         * if the skeleton placeholder is gone the page shows real content
+         * again - drop the notice instead of covering it. */
+        if(!pageShowsSkeletonPlaceholder()) {
+            m_showModuleNotice = false;
+            m_noticeKind = 0;
+            return;
+        }
+        /* Opaque panel over the viewport: the skeleton is a loading artefact
+         * the app never replaced, so grey blocks must not stand in for
+         * content. The caller's strip clip keeps partial repaints tiling. */
+        if(m_port.gfx.fill_rect != nullptr)
+            m_port.gfx.fill_rect(m_port.gfx.ud, cache, 0, 0, cacheW, cacheH, 0xFFFFFFFFu);
+        lines = CLINES;
+    }
     const int size = 16;
     eweb_font_metrics_t fm;
     m_port.font.metrics(m_port.font.ud, m_noticeFont, size, &fm);
     int y = cacheH / 2 - (fm.height + 4);
     for(int i = 0; i < 2; i++) {
         int w = 0, h = 0;
-        m_port.font.text_size(m_port.font.ud, m_noticeFont, size, LINES[i], &w, &h);
+        m_port.font.text_size(m_port.font.ud, m_noticeFont, size, lines[i], &w, &h);
         m_port.font.draw_text(m_port.font.ud, cache, (cacheW - w) / 2, y,
-                              LINES[i], m_noticeFont, size, 0xFF606060u);
+                              lines[i], m_noticeFont, size, 0xFF606060u);
         y += fm.height + 8;
     }
 }

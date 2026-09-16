@@ -413,7 +413,11 @@ bool EWebEngine::runPageScripts()
         m_jsVm->dbg_tag = nullptr;
         m_jsCurScriptSrc = nullptr;
         m_jsCurScriptUrl.clear();
-        jsVmExit();
+        bool terminated = jsVmExit();
+        /* Same refund as the post-swap path: a watchdog-cut body must not eat
+         * the pre-paint phase budget that decides when the first paint lands. */
+        if(terminated && m_jsPrePaintAt != 0)
+            m_jsPrePaintAt += (ticMs() - run_start);
         EWEB_LOG("[ewebview] js: script %d ran %u ms url=%s\n", (int)i,
             (uint32_t)(ticMs() - run_start),
             (i < m_jsScriptSrcs.size() && !m_jsScriptSrcs[i].empty())
@@ -532,6 +536,14 @@ bool EWebEngine::runNextPageScript()
         m_jsCurScriptSrc = nullptr;
         m_jsCurScriptUrl.clear();
         bool terminated = jsVmExit();
+        /* A watchdog-cut body's wall time is waste, not page work: refund it to
+         * the phase budget so the scripts BEHIND a runaway SDK still get their
+         * window (taobao's traceSDK burns a whole cut ahead of the React
+         * bundles that would render the page). A body that finished on its own
+         * keeps its cost charged, so a portal of slow-but-legit scripts still
+         * hits the phase cap. */
+        if(terminated && m_jsPostSwapAt != 0)
+            m_jsPostSwapAt += (ticMs() - run_start);
         m_jsProgressiveActive = false;
         /* A watchdog cut only proved this body cannot finish within the run
          * budget - but in document order it blocks everything behind it until

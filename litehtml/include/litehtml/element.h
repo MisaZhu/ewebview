@@ -204,6 +204,10 @@ protected:
 		virtual bool				set_class(const tchar_t* pclass, bool add);
 		virtual bool				is_replaced() const;
 		virtual int					line_height() const;
+		/* True when the element's line-height is the 'normal' keyword, i.e. it
+		 * is resolved from the element's OWN font metrics and must NOT be
+		 * inherited as a pixel value by descendants (CSS 2.1 10.8.1). */
+		virtual bool				is_line_height_normal() const;
 		virtual text_align			get_text_align() const;
 		virtual text_transform		get_text_transform() const;
 		virtual white_space			get_white_space() const;

@@ -1543,6 +1543,15 @@ bool eweb_el_input::container_mode() const
     if (m_inputType != EWEB_INPUT_BUTTON) {
         return false;
     }
+    /* A button the page styles as a flex container (w3.org's nav triggers:
+     * `[data-trigger=sub-nav]{display:flex}` + label + a ::after chevron) must
+     * lay out through html_tag: the replaced-widget path sizes the face from
+     * label metrics only (dropping the page padding, so neighbouring items
+     * overlap) and never gives the ::after child a box (chevron lost). */
+    litehtml::style_display d = get_display();
+    if (d == litehtml::display_flex || d == litehtml::display_inline_flex) {
+        return true;
+    }
     for (size_t i = 0; i < get_children_count(); i++) {
         litehtml::element::ptr ch = get_child((int)i);
         if (!ch) {

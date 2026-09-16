@@ -2180,8 +2180,15 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		m_bg.m_position.height.predef(background_size_auto);
 		if(el_parent)
 		{
-			m_line_height = el_parent->line_height();
-			m_lh_predefined = false;
+			if(el_parent->is_line_height_normal())
+			{
+				m_line_height = m_font_metrics.height;
+				m_lh_predefined = true;
+			} else
+			{
+				m_line_height = el_parent->line_height();
+				m_lh_predefined = false;
+			}
 		}
 		else
 		{
@@ -2696,8 +2703,19 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	}
 	else if(el_parent)
 	{
-		m_line_height = el_parent->line_height();
-		m_lh_predefined = false;
+		/* 'normal' is not an inherited pixel value: every element resolves it
+		 * from its OWN font (CSS 2.1 10.8.1). Inheriting the parent's computed
+		 * height made rokid.com's html{font-size:1px} rem trick collapse every
+		 * normal line box in the page to a 1px line. */
+		if(el_parent->is_line_height_normal())
+		{
+			m_line_height = m_font_metrics.height;
+			m_lh_predefined = true;
+		} else
+		{
+			m_line_height = el_parent->line_height();
+			m_lh_predefined = false;
+		}
 	}
 	else
 	{
@@ -4034,14 +4052,22 @@ void litehtml::html_tag::parse_background()
 	// parse background-image
 	if(bg_image && bg_image[0])
 	{
-		css::parse_css_url(bg_image, m_bg.m_image);
-		if(bg_baseurl)
+		if(!t_strncasecmp(bg_image, _t("linear-gradient("), 16))
 		{
-			m_bg.m_baseurl = bg_baseurl;
+			/* Paint syntax, not a URL: keep the whole function string so the
+			 * container can rasterise it; parse_css_url would drop it. */
+			m_bg.m_image = bg_image;
+		} else
+		{
+			css::parse_css_url(bg_image, m_bg.m_image);
+			if(bg_baseurl)
+			{
+				m_bg.m_baseurl = bg_baseurl;
+			}
 		}
 	}
 
-	if(!m_bg.m_image.empty())
+	if(!m_bg.m_image.empty() && t_strncasecmp(m_bg.m_image.c_str(), _t("linear-gradient("), 16))
 	{
 		doc->container()->load_image(m_bg.m_image.c_str(), m_bg.m_baseurl.empty() ? 0 : m_bg.m_baseurl.c_str(), true);
 	}
@@ -4901,7 +4927,16 @@ int litehtml::html_tag::place_element(const element::ptr &el, int max_width)
 
 	if(el->get_display() == display_inline)
 	{
-		return el->render_inline(this, max_width);
+		/* A replaced element with display:inline (Tailwind's `inline` on the
+		 * rokid.com hero <img>) is still an atomic inline-level box per CSS 2.1
+		 * 9.2.2: it takes part in the line layout like an inline-block. The
+		 * generic render_inline only walks children, and element::render_inline
+		 * is an empty stub for leaves, so routing a replaced leaf there left it
+		 * zero-sized forever. Fall through to the line placement below. */
+		if(!el->is_replaced())
+		{
+			return el->render_inline(this, max_width);
+		}
 	}
 
 	element_position el_position = el->get_element_position();
@@ -5028,6 +5063,7 @@ int litehtml::html_tag::place_element(const element::ptr &el, int max_width)
 			case display_inline_block:
 			case display_inline_grid:
 			case display_inline_flex:
+			case display_inline:	/* replaced inline only, see place_element head */
 				ret_width = el->render(line_ctx.left, line_ctx.top, line_ctx.right);
 				break;
 			case display_block:		
@@ -5219,6 +5255,11 @@ bool litehtml::html_tag::set_class( const tchar_t* pclass, bool add )
 int litehtml::html_tag::line_height() const
 {
 	return m_line_height;
+}
+
+bool litehtml::html_tag::is_line_height_normal() const
+{
+	return m_lh_predefined;
 }
 
 bool litehtml::html_tag::is_replaced() const

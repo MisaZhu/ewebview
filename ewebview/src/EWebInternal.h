@@ -63,17 +63,15 @@ static const uint32_t kJsFlushMaxGapMs   = 1500;
  * an event handler). Past it the step hook terminates the VM; after
  * kJsRunAbortMax violations the page's JS is dropped until the next
  * navigation, so no script - broken or hostile - can pin the engine. */
-static const uint32_t kJsRunBudgetMs     = 8000;  /* TEMP taobao iteration */
-static const int      kJsRunAbortMax     = 100;   /* TEMP taobao iteration */
+static const uint32_t kJsRunBudgetMs     = 10000;
+static const int      kJsRunAbortMax     = 3;
 /* Per-run budget OUTSIDE the pre-paint phase (post-swap scripts, timer
  * callbacks, event handlers): those run against a live page whose input queue
  * the engine thread cannot drain while a VM run is in flight, so a runaway
  * body freezes clicks and scrolls for the whole budget. The pre-paint phase
  * keeps kJsRunBudgetMs because its own wall clock (kJsPrePaintBudgetMs) cuts
  * the run long before this one would. */
-static const uint32_t kJsRunBudgetLiveMs = 7000;  /* TEMP taobao iteration: the
- * slowest legitimate taobao bundle (pegasus 444.js) runs ~4.9 s, so 7 s keeps
- * the app chain intact while a runaway SDK body costs half what 15 s did. */
+static const uint32_t kJsRunBudgetLiveMs = 3000;
 
 /* Wall-clock budget for the WHOLE pre-paint script phase (the document.write()
  * pages that must run their scripts before the first paint). Past it the build
@@ -93,7 +91,7 @@ static const uint32_t kJsPrePaintBudgetMs = 4000;
  * phase stops STARTING new scripts (one already in flight still unwinds under
  * its own per-run budget), fires the load events and goes idle, exactly like
  * the pre-paint budget paints first and defers the rest. */
-static const uint32_t kJsPostSwapBudgetMs = 120000; /* TEMP taobao iteration */
+static const uint32_t kJsPostSwapBudgetMs = 8000;
 
 /* Expand a CDN combo URL ("https://host/path/??a.js,b.js,c.js") into one URL
  * per component. A combo downloads as ONE script body, so a watchdog cut on a
@@ -317,6 +315,8 @@ public:
     void markContentDirty();
     void drawPageToCacheLocked(int stripY, int stripH);
     void decideModuleNotice();
+    void decideCsrNotice();
+    bool pageShowsSkeletonPlaceholder() const;
     void drawModuleNotice(eweb_surface_t* cache, int cacheW, int cacheH);
     void clampScrollLocked(int docWidth, int docHeight);
     void postScrollClamp();
@@ -699,6 +699,11 @@ public:
     bool                        m_jsPageHasModules;
     bool                        m_moduleNoticeDecided;
     bool                        m_showModuleNotice;
+    /* Which explanation drawModuleNotice() paints: 1 = the page's content is
+     * entirely ES-module generated, 2 = a client-rendered shell whose classic
+     * scripts ran (or were dropped) without ever replacing the server-side
+     * skeleton placeholder. 0 while no notice is armed. */
+    int                         m_noticeKind;
     uint64_t                    m_swapAtMs;
     eweb_font_t*                m_noticeFont;
     bool                        m_jsProgressiveActive;
