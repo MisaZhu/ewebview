@@ -385,6 +385,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_jsReparseCount(0)
     , m_jsRunBeforePaint(false)
     , m_jsNextScript(0)
+    , m_jsInjectDone(false)
     , m_jsScriptWaitSince(0)
     , m_jsPostSwapRun(false)
     , m_jsPostSwapAt(0)
@@ -407,6 +408,8 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_jsCurScriptSrc(nullptr)
     , m_jsEnterGen(0)
     , m_jsAbortCount(0)
+    , m_jsSkeletonProbeAt(0)
+    , m_jsSkeletonProbeVal(false)
     , m_jsPageDisabled(false)
     , m_buildAbort(false)
     , m_buildAbortGen(0)
@@ -2138,6 +2141,7 @@ void EWebEngine::cleanupBuildResources()
     m_jsReparseCount = 0;
     m_jsRunBeforePaint = false;
     m_jsNextScript = 0;
+    m_jsInjectDone = false;
     m_jsScriptWaitSince = 0;
     m_jsPostSwapRun = false;
     m_jsPostSwapAt = 0;
@@ -2153,6 +2157,8 @@ void EWebEngine::cleanupBuildResources()
     m_jsCurScriptSrc = nullptr;
     m_jsRunawaySrcs.clear();
     m_jsAbortCount = 0;
+    m_jsSkeletonProbeAt = 0;   /* new document: re-probe the skeleton state */
+    m_jsSkeletonProbeVal = false;
     m_jsPageDisabled = false;
     m_jsMutations.clear();
     /* Nodes removeChild() parked belong to the page being torn down, so they
@@ -2922,6 +2928,7 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     m_jsPrePaintCut = false;
     m_jsRunawaySrcs.clear();
     m_jsNextScript = 0;
+    m_jsInjectDone = false;
     m_jsScriptWaitSince = 0;
     m_jsPostSwapRun = false;
     m_jsPostSwapAt = 0;
@@ -3845,6 +3852,16 @@ bool EWebEngine::pageShowsSkeletonPlaceholder() const
     return pageHasVisibleSkeleton(root, m_clientWidth * m_clientHeight * 3 / 10);
 }
 
+bool EWebEngine::jsSkeletonProbeCached()
+{
+    uint64_t now = ticMs();
+    if(m_jsSkeletonProbeAt == 0 || (now - m_jsSkeletonProbeAt) >= kJsSkeletonProbeTtlMs) {
+        m_jsSkeletonProbeAt = now;
+        m_jsSkeletonProbeVal = pageShowsSkeletonPlaceholder();
+    }
+    return m_jsSkeletonProbeVal;
+}
+
 /* TEMP DIAGNOSTIC (taobao): count elements in a subtree and locate the app's
  * mount point (#ice-container) so we can tell whether the React entry actually
  * wrote DOM or bailed before rendering. Gated by EWEB_DOMDBG. Remove with the
@@ -3869,6 +3886,42 @@ static void ewebDumpMountDiag(litehtml::element* el, const char* wantId,
     size_t c = el->get_children_count();
     for(size_t i = 0; i < c; ++i)
         ewebDumpMountDiag(el->get_child((int)i), wantId, foundCount, total);
+}
+
+/* TEMP DIAGNOSTIC (taobao): find an element by id and dump its text. The page's
+ * production bundles stub console.log, so an EWEB_INJECT_JS probe cannot report
+ * through the console; it writes its findings into #__inject_diag__ instead and
+ * we read them back here (engine-side, console-independent). */
+static litehtml::element* ewebFindById(litehtml::element* el, const char* wantId)
+{
+    if(el == nullptr) return nullptr;
+    const litehtml::tchar_t* id = el->get_attr(_t("id"), nullptr);
+    if(id != nullptr && t_strcasecmp(id, _t(wantId)) == 0)
+        return el;
+    size_t c = el->get_children_count();
+    for(size_t i = 0; i < c; ++i) {
+        litehtml::element* hit = ewebFindById(el->get_child((int)i), wantId);
+        if(hit != nullptr) return hit;
+    }
+    return nullptr;
+}
+
+/* Per-script mount diagnostic (EWEB_DOMDBG): report whether the React entry
+ * has populated #ice-container yet, so a silent CSR bail is distinguishable
+ * from a render that is merely hidden behind the skeleton overlay. */
+void EWebEngine::jsDomMountDiag()
+{
+    if(m_doc == nullptr) return;
+    int iceCount = 0, total = 0;
+    ewebDumpMountDiag(m_doc->root(), "ice-container", &iceCount, &total);
+    fprintf(stderr, "[domdbg] total_elements=%d ice-container_subtree=%d\n", total, iceCount);
+    litehtml::element* diag = ewebFindById(m_doc->root(), "__inject_diag__");
+    if(diag != nullptr) {
+        litehtml::tstring txt;
+        diag->get_text(txt);
+        fprintf(stderr, "[injectdiag] %s\n", txt.empty() ? "(empty)" : txt.c_str());
+    }
+    fflush(stderr);
 }
 
 void EWebEngine::decideCsrNotice()

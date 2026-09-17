@@ -113,10 +113,30 @@ static void browser_install_crash_handler(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = browser_crash_handler;
-    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    /* SA_ONSTACK: the intermittent taobao fault is a stack overflow (runaway
+     * recursion), and on the blown stack the handler itself faults again, so
+     * the process dies with no backtrace at all. An alternate signal stack
+     * lets the handler run and report the overflowing frames. */
+    static stack_t altstack;
+    if(altstack.ss_sp == NULL) {
+        altstack.ss_sp = malloc(SIGSTKSZ * 4);
+        if(altstack.ss_sp != NULL) {
+            altstack.ss_size = SIGSTKSZ * 4;
+            altstack.ss_flags = 0;
+            if(sigaltstack(&altstack, NULL) != 0) {
+                free(altstack.ss_sp);
+                altstack.ss_sp = NULL;
+            }
+        }
+    }
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND | (altstack.ss_sp != NULL ? SA_ONSTACK : 0);
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+    /* SIGTRAP too: the intermittent taobao fault arrives as Trace/BPT trap
+     * (a BRK from libmalloc's corruption path or a __builtin_trap), which the
+     * SEGV/BUS pair never sees, so the run dies with no backtrace at all. */
+    sigaction(SIGTRAP, &sa, NULL);
 }
 #else
 static void browser_install_crash_handler(void) {}

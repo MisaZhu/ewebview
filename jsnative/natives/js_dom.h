@@ -260,6 +260,10 @@ char* js_dom_take_write_buffer(vm_t* vm);
  * from a UI tick at any cadence. */
 int js_dom_poll_timers(vm_t* vm, uint64_t now_ms);
 
+/* Non-zero while any timer (or queued MessageChannel post) is still armed;
+ * lets an await-spin hook distinguish "idle, more work coming" from "empty". */
+int js_dom_has_pending_timers(vm_t* vm);
+
 /* Drop every cached handle -> Element-wrapper mapping.
  *
  * Element handles are raw pointers into the embedder's document tree, and the
@@ -278,6 +282,12 @@ int js_dom_poll_timers(vm_t* vm, uint64_t now_ms);
  * Pair this with js_event_clear_listeners(), which drops the listeners keyed
  * by the same handles. Safe to call when the bridge is not installed. */
 void js_dom_reset_element_cache(vm_t* vm);
+
+/* Mark the document as loaded so document.readyState flips from "loading" to
+ * "complete". js_event.c calls this immediately before dispatching
+ * DOMContentLoaded, matching the browser lifecycle that pages (e.g. Next.js's
+ * flight-stream bootstrap) gate on. Safe when the bridge is not installed. */
+void js_dom_mark_dom_loaded(vm_t* vm);
 
 /* ------------------------------------------------------------------ */
 /* Accessors for sibling bridges (js_event.c, js_web.c, js_canvas.c)   */

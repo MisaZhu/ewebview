@@ -49,12 +49,15 @@
 #include <new>
 #include <setjmp.h>   /* SEGV recovery checkpoints (see eweb_segv_checkpoint) */
 #include <signal.h>
+#include <unistd.h>   /* usleep (await spin tick idle wait) */
 
 /* mario entry points that live in libmario.a but are not declared in a public
  * header: the JS bytecode compiler (passed to vm_new) and the all-natives
  * registrar (passed to vm_init so console/Object/Array/... exist). */
 extern "C" bool js_compile(bytecode_t* bc, const char* input);
 extern "C" void reg_all_natives(vm_t* vm);
+/* Promise debug ledger (native_Promise.h is not on the ewebview include path). */
+extern "C" void mario_promise_ledger_dump(vm_t* vm);
 
 /* ==================================================================
  * SIGSEGV recovery checkpoints
@@ -292,6 +295,9 @@ void EWebEngine::initJsVm()
     m_jsVm->step_interval = 32768;
     m_jsVm->on_step       = jsVmStepHook;
     m_jsVm->on_step_data  = this;
+    /* Let __await() pump the event loop for a not-yet-settled promise instead
+     * of yielding undefined (see jsAwaitPendingTick). */
+    m_jsVm->on_await_pending = jsAwaitPendingTick;
 
     js_dom_callbacks_t cb;
     memset(&cb, 0, sizeof(cb));
@@ -479,6 +485,10 @@ bool EWebEngine::runPageScripts()
         if(getenv("EWEB_SCRIPTDBG") != NULL)
             fprintf(stderr, "[ewebview] jsdbg: pc_range script %d = [%u,%u)\n", (int)i,
                     (unsigned)jsBasePc, (unsigned)m_jsVm->bc.cindex);
+        if(getenv("MARIO_PROMLEDGER") != NULL) {
+            fprintf(stderr, "[promledger] --- after script %d ---\n", (int)i);
+            mario_promise_ledger_dump(m_jsVm);
+        }
         /* Same refund as the post-swap path: a watchdog-cut body must not eat
          * the pre-paint phase budget that decides when the first paint lands. */
         if(terminated && m_jsPrePaintAt != 0)
@@ -548,8 +558,22 @@ bool EWebEngine::runNextPageScript()
          * preserves document order without busy-spinning (the loop parks on a
          * 4ms tick; pushResult signals it the instant bytes arrive). A failed
          * fetch is still marked done with an empty body, so a 404 never wedges
-         * the ordered run. */
-        if(i < m_jsScriptDone.size() && !m_jsScriptDone[i]) return true;
+         * the ordered run.
+         * DEADLINE-SKIP (mirrors the pre-paint path above): a slot whose fetch
+         * result URL never matches its src exactly (double-slash normalisation,
+         * a redirect, a query-string rewrite) stays pending forever, and because
+         * the run is strictly ordered it would wedge EVERY slot behind it - the
+         * app bundle, lazy route chunks, all of it - so the page never paints.
+         * Past the deadline skip the unresolvable slot exactly like a 404. */
+        if(i < m_jsScriptDone.size() && !m_jsScriptDone[i]) {
+            if(m_jsScriptWaitSince == 0) m_jsScriptWaitSince = ticMs();
+            if(ticMs() - m_jsScriptWaitSince < 10000) return true;
+            EWEB_LOG("[ewebview] js: post-swap script %d fetch never resolved (src=%.80s) - skipping past deadline\n",
+                (int)i, (i < m_jsScriptSrcs.size() ? m_jsScriptSrcs[i].c_str() : "?"));
+            m_jsScriptDone[i] = 1;
+            if(i < m_jsScripts.size()) m_jsScripts[i].clear();
+        }
+        m_jsScriptWaitSince = 0;
         /* First script of this page: pre-materialise a stand-in <script src>
          * element for every queued external script so the DOM script list is
          * populated BEFORE any SDK reads it (see jsScriptStandInEl). */
@@ -664,8 +688,55 @@ bool EWebEngine::runNextPageScript()
                 ? m_jsScriptSrcs[i].c_str() : "(inline)");
         EWEB_LOG("[ewebview] js: script %d pc_range=[%u,%u)\n", (int)i,
             (unsigned)jsBasePc, (unsigned)m_jsVm->bc.cindex);
+        if(getenv("MARIO_PROMLEDGER") != NULL) {
+            fprintf(stderr, "[promledger] --- after script %d (post-swap) ---\n", (int)i);
+            mario_promise_ledger_dump(m_jsVm);
+        }
+        if(getenv("EWEB_DOMDBG") != NULL) jsDomMountDiag();
         /* Paint what this script produced before the next one runs. */
         jsProgressiveFlush(true);
+        /* DIAGNOSTIC HOOK (EWEB_INJECT_JS=<file>): run the file's body in the
+         * page's global scope right after an early anchor bundle executes, so
+         * its XHR/fetch/error hooks are installed BEFORE the app-entry bundle
+         * (main.js) runs and fires the route-loader data requests - hooking
+         * after the entry races those requests and misses them. The anchor is
+         * matched by "react-dom" in the src (React is loaded, XMLHttpRequest
+         * and fetch exist, the webpack app chunks have not run yet). Fires once
+         * per page. */
+        if(!m_jsInjectDone && i < m_jsScriptSrcs.size()) {
+            /* TEMP: anchor substring overridable so sites whose react-dom chunk
+             * is hash-named (rokid: fd9d1056-*.js) can still be hooked. */
+            const char* anchor = getenv("EWEB_INJECT_ANCHOR");
+            if(anchor == nullptr || anchor[0] == 0) anchor = "react-dom";
+            if(m_jsScriptSrcs[i].find(anchor) != std::string::npos) {
+            const char* injPath = getenv("EWEB_INJECT_JS");
+            if(injPath != nullptr && injPath[0] != 0) {
+                m_jsInjectDone = true;
+                std::string body;
+                FILE* f = fopen(injPath, "rb");
+                if(f != nullptr) {
+                    char buf[4096];
+                    size_t n;
+                    while((n = fread(buf, 1, sizeof(buf), f)) > 0) body.append(buf, n);
+                    fclose(f);
+                }
+                if(!body.empty()) {
+                    EWEB_LOG("[ewebview] js: running EWEB_INJECT_JS=%s (%u bytes) after entry script %d\n",
+                        injPath, (unsigned)body.size(), (int)i);
+                    m_jsVm->terminated = false;
+                    m_jsVm->abort_run = false;
+                    m_jsVm->propagating_err = nullptr;
+                    m_jsVm->call_depth = 0;
+                    jsVmEnter();
+                    if(!vm_load_run(m_jsVm, body.c_str()))
+                        EWEB_LOG("[ewebview] js: inject body failed to compile\n");
+                    jsVmExit();
+                    if(getenv("EWEB_DOMDBG") != NULL) jsDomMountDiag();
+                    jsProgressiveFlush(true);
+                }
+            }
+            }
+        }
         break;
     }
     return m_jsNextScript < m_jsScripts.size();
@@ -884,9 +955,15 @@ void EWebEngine::jsVmEnter()
     m_jsEnterAt = ticMs();
     /* The pre-paint phase answers to its own wall clock, so a single run may
      * keep the (larger) legacy budget; every run against a live page gets the
-     * short one, because the engine thread cannot serve input while it lasts. */
+     * short one, because the engine thread cannot serve input while it lasts.
+     * While only the server-side skeleton paints, the app entry that replaces
+     * it is one long top-level body, so it gets the skeleton run budget instead
+     * (see kJsRunBudgetSkeletonMs). */
     m_jsRunDeadline = m_jsEnterAt +
-        ((m_jsPrePaintAt != 0) ? kJsRunBudgetMs : kJsRunBudgetLiveMs);
+        ((m_jsPrePaintAt != 0) ? kJsRunBudgetMs
+                               : (jsSkeletonProbeCached()
+                                      ? kJsRunBudgetSkeletonMs
+                                      : kJsRunBudgetLiveMs));
     m_jsEnterGen = m_buildAbortGen;
     m_jsAbortPrePaint = false;
     m_jsInScript = true;
@@ -937,10 +1014,61 @@ void EWebEngine::jsVmStepHook(struct st_vm* vm, void* data)
     ((EWebEngine*)data)->jsOnVmStep(vm);
 }
 
+/* Await spin tick (mario vm->on_await_pending). mario's __await() has no
+ * suspension: without this hook an await on a promise that settles later
+ * (timer / MessageChannel microtask) yields undefined and the async function
+ * ploughs on with garbage - which is exactly how ice.js's runApp "completed"
+ * yet never reached React's render. Here we let the awaited promise settle by
+ * pumping the DOM timer table (setTimeout/setInterval AND queued
+ * MessageChannel posts, which ride it at 0 ms). When nothing is due but timers
+ * are still armed we sleep ~1 ms so delayed callbacks get real wall-clock
+ * time; when the table is empty the promise can never settle and we return 0
+ * so the await degrades to undefined as before. Per-promise wall-clock cap
+ * keeps a genuinely stuck await from hanging the run. Must not load/compile
+ * bytecode (same restriction as on_step). */
+int EWebEngine::jsAwaitPendingTick(struct st_vm* vm, var_t* promise)
+{
+    if(vm == nullptr) return 0;
+    EWebEngine* self = (EWebEngine*)vm->on_step_data;
+    if(self == nullptr) return 0;
+    static var_t* s_last = nullptr;
+    static uint64_t s_deadline = 0;
+    if(promise != s_last) { s_last = promise; s_deadline = self->ticMs() + 3000; }
+    if(self->ticMs() >= s_deadline) return 0;
+    int fired = js_dom_poll_timers(vm, self->ticMs());
+    if(fired > 0) return 1;
+    if(js_dom_has_pending_timers(vm)) {
+        usleep(1000);
+        return 1;
+    }
+    return 0;
+}
+
 void EWebEngine::jsOnVmStep(struct st_vm* vm)
 {
     if(vm == nullptr || vm->terminated)
         return;
+    /* DIAG (temp, taobao): a body that burns the whole live run budget without
+     * touching the DOM is spinning in pure JS; sampling vm->pc at a fixed
+     * interval while EWEB_SPINDBG is set exposes the hot loop's pc range so it
+     * can be matched against a MARIO_DUMPC disassembly of the dumped script.
+     * Remove with the other temp probes. */
+    {
+        static int s_spin = -1;
+        static uint64_t s_spin_last = 0;
+        if(s_spin < 0) s_spin = (getenv("EWEB_SPINDBG") != nullptr) ? 1 : 0;
+        if(s_spin) {
+            uint64_t t = ticMs();
+            if(t - s_spin_last >= 400) {
+                s_spin_last = t;
+                fprintf(stderr, "[spindbg] t=%llu pc=%u depth=%d tag=%s\n",
+                        (unsigned long long)t, (unsigned)vm->pc,
+                        (int)vm->call_depth,
+                        vm->dbg_tag != nullptr ? vm->dbg_tag : "-");
+                fflush(stderr);
+            }
+        }
+    }
     /* A termination request (stop / back / reload / exit) bumps m_buildAbortGen
      * from the UI thread; if the generation moved past this run's jsVmEnter
      * snapshot the abort arrived DURING this run, so unwind at once instead of
@@ -992,6 +1120,14 @@ int EWebEngine::jsPollTimers()
     int fired = js_dom_poll_timers(m_jsVm, ticMs());
     eweb_segv_disarm();
     jsVmExit();
+    /* TEMP DIAGNOSTIC (EWEB_DOMDBG): React mounts from these timer/message
+     * callbacks, i.e. AFTER the last page script, so sample the mount point
+     * here (throttled) rather than only per-script. */
+    if(getenv("EWEB_DOMDBG") != nullptr && fired > 0) {
+        static uint64_t s_domdbg_last = 0;
+        uint64_t t = ticMs();
+        if(t - s_domdbg_last >= 2000) { s_domdbg_last = t; jsDomMountDiag(); }
+    }
     return fired;
 }
 
