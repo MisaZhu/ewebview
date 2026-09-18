@@ -49,8 +49,13 @@ extern "C" {
 #define DOM_ELCACHE_KEY  "@@elcache"
 
 /* Upper bound on concurrently scheduled timers. A fixed table keeps the hot
- * path allocation-free; 32 is far beyond what any real page schedules. */
-#define JS_TIMER_MAX 32
+ * path allocation-free. It must be LARGE: queueMicrotask()/MessageChannel/
+ * MutationObserver all ride this table at 0 ms, and a single synchronous
+ * script burst (core-js + React flight on rokid.com) arms hundreds of them
+ * before the loop gets a chance to poll and drain - with a small cap the
+ * overflow adds return 0 and the callbacks are silently DROPPED, which
+ * strands the flight read-loop and stalls the whole page. */
+#define JS_TIMER_MAX 2048
 
 /* Element wrapper identity cache. Handing back the SAME var for the same
  * embedder handle is what makes `e.target === el` and `a === b` behave like a
@@ -87,6 +92,7 @@ typedef struct {
     js_el_cache_t*        el_cache;       /* growable, never evicted (see above) */
     int                   el_cache_len;
     int                   el_cache_cap;
+    bool                  dom_loaded;     /* false until DOMContentLoaded fires */
 } js_dom_state;
 
 /* ------------------------------------------------------------------ */
@@ -486,6 +492,11 @@ static var_t* native_el_get_nodeType(vm_t* vm, var_t* env, void* data) {
     return var_new_int(vm, 1);     /* ELEMENT_NODE */
 }
 
+/* MutationObserver delivery hook (defined with the observer natives below):
+ * after a characterData (.data/.nodeValue) or attribute write, asynchronously
+ * fire any observer watching this node. is_cd: 1 = characterData, 0 = attributes. */
+static void mo_notify_charattr(vm_t* vm, js_element_t el, int is_cd, const char* attr);
+
 /* Node.nodeValue / CharacterData.data: the text of a text node, null on
  * elements. React's hydration diff reads nodeValue off every hydrated text
  * instance; without it every text node compares undefined against the server
@@ -514,6 +525,7 @@ static var_t* native_el_set_nodeValue(vm_t* vm, var_t* env, void* data) {
     const char* s = (n != NULL) ? var_get_str(n->var) : "";
     if(st->cb.el_set_text != NULL)
         st->cb.el_set_text(st->ctx, el, s ? s : "");
+    mo_notify_charattr(vm, el, 1, NULL);   /* MutationObserver: characterData */
     return NULL;
 }
 
@@ -538,6 +550,7 @@ static var_t* native_el_setAttribute(vm_t* vm, var_t* env, void* data) {
     const char* value = (vn != NULL) ? var_get_str(vn->var) : "";
     if(st != NULL && el != NULL && name != NULL && st->cb.el_set_attr != NULL) {
         st->cb.el_set_attr(st->ctx, el, name, value ? value : "");
+        mo_notify_charattr(vm, el, 0, name);   /* MutationObserver: attributes */
     }
     return NULL;
 }
@@ -764,7 +777,11 @@ static int js_add_timer(vm_t* vm, js_dom_state* st, var_t* cb, uint32_t ms, bool
     int slot = -1;
     for(int i = 0; i < JS_TIMER_MAX; ++i)
         if(!st->timers[i].active) { slot = i; break; }
-    if(slot < 0) return 0;                       /* table full: report failure */
+    if(slot < 0) {                                /* table full: report failure */
+        if(getenv("MARIO_TIMERDBG") != NULL)
+            fprintf(stderr, "[timerdbg] ADD_FAIL table full cb=%p\n", (void*)cb);
+        return 0;
+    }
     st->timer_next_id++;
     if(st->timer_next_id <= 0) st->timer_next_id = 1;
     js_timer_t* t = &st->timers[slot];
@@ -774,6 +791,9 @@ static int js_add_timer(vm_t* vm, js_dom_state* st, var_t* cb, uint32_t ms, bool
     t->remaining_ms = (int64_t)t->period_ms;
     t->repeat       = repeat;
     t->active       = true;
+    if(getenv("MARIO_TIMERDBG") != NULL)
+        fprintf(stderr, "[timerdbg] add id=%d cb=%p ms=%u repeat=%d\n",
+            t->id, (void*)cb, (unsigned)ms, repeat ? 1 : 0);
     js_reanchor_timers(vm, st);
     return t->id;
 }
@@ -839,7 +859,7 @@ int js_dom_poll_timers(vm_t* vm, uint64_t now_ms) {
      * one-shot stays anchored in the OLD @@timers array until the rebuild below,
      * so the GC can not sweep its callback mid-call. */
     int fired = 0;
-    for(int guard = 0; guard < 64; ++guard) {
+    for(int guard = 0; guard < 512; ++guard) {
         int due = -1;
         for(int i = 0; i < JS_TIMER_MAX; ++i)
             if(st->timers[i].active && st->timers[i].remaining_ms <= 0) { due = i; break; }
@@ -853,9 +873,13 @@ int js_dom_poll_timers(vm_t* vm, uint64_t now_ms) {
             t->cb = NULL;
         }
         if(cb != NULL && cb->is_func) {
-            if(getenv("MARIO_TIMERDBG") != NULL)
-                fprintf(stderr, "[timerdbg] fire id=%d cb=%p scope_top=%d stack_top=%d call_depth=%d\n",
-                    t->id, (void*)cb, (int)vm->scope_stack_top, (int)vm->stack_top, (int)vm->call_depth);
+            if(getenv("MARIO_TIMERDBG") != NULL) {
+                func_t* cf = (func_t*)cb->value;
+                fprintf(stderr, "[timerdbg] fire id=%d cb=%p entrypc=%u native=%d scope_top=%d stack_top=%d call_depth=%d\n",
+                    t->id, (void*)cb, (unsigned)(cf != NULL ? cf->pc : 0),
+                    (cf != NULL && cf->native != NULL) ? 1 : 0,
+                    (int)vm->scope_stack_top, (int)vm->stack_top, (int)vm->call_depth);
+            }
             var_t* args = var_new_array(vm);
             extern int mario_scopedbg_arm;
             mario_scopedbg_arm = 1;
@@ -868,6 +892,18 @@ int js_dom_poll_timers(vm_t* vm, uint64_t now_ms) {
     }
     js_reanchor_timers(vm, st);   /* drop fired one-shots from the GC anchor */
     return fired;
+}
+
+/* Non-zero when at least one timer (incl. a queued MessageChannel post, which
+ * rides this table at 0 ms) is still armed. The await-spin hook uses it to tell
+ * "idle but more work coming" from "event loop empty, nothing can settle the
+ * awaited promise". */
+int js_dom_has_pending_timers(vm_t* vm) {
+    js_dom_state* st = state_from_vm(vm);
+    if(vm == NULL || st == NULL) return 0;
+    for(int i = 0; i < JS_TIMER_MAX; ++i)
+        if(st->timers[i].active) return 1;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2408,9 +2444,29 @@ static var_t* native_document_get_url(vm_t* vm, var_t* env, void* data) {
 
 /* Constant, but pages probe them to decide whether they are in a browser. */
 static var_t* native_document_get_readyState(vm_t* vm, var_t* env, void* data) {
-    (void)env; (void)data;
-    /* Scripts only ever run once the document exists and is rendered. */
+    (void)env;
+    /* Scripts run during the build phase, BEFORE jsFireLoadEvents dispatches
+     * DOMContentLoaded/load. Reporting "complete" that early is a lie: pages
+     * gate lifecycle work on it. Next.js's flight bootstrap does
+     *   "loading"===readyState ? addEventListener("DOMContentLoaded",j) : j();
+     * and j() closes the ReadableStream feeding the RSC parser. With a constant
+     * "complete", j() runs before the stream's controller exists, so the stream
+     * is never closed, React's reader parks forever on read(), the root render
+     * suspends and nothing commits (the top nav never mounts). Report "loading"
+     * until DOMContentLoaded actually fires, then "complete", so j() defers to
+     * the event we dispatch at the end of the build - matching a real browser. */
+    js_dom_state* st = state_any(vm, data);
+    if(st != NULL && !st->dom_loaded)
+        return var_new_str(vm, "loading");
     return var_new_str(vm, "complete");
+}
+
+/* Flip the document to the loaded phase. Called by js_event right before
+ * DOMContentLoaded is dispatched so any handler that reads readyState (and the
+ * flight bootstrap's deferred j()) sees the post-load value. */
+void js_dom_mark_dom_loaded(vm_t* vm) {
+    js_dom_state* st = state_from_vm(vm);
+    if(st != NULL) st->dom_loaded = true;
 }
 
 static var_t* native_document_get_empty_str(vm_t* vm, var_t* env, void* data) {
@@ -2453,6 +2509,268 @@ static var_t* native_requestAnimationFrame(vm_t* vm, var_t* env, void* data) {
 
 static var_t* native_cancelAnimationFrame(vm_t* vm, var_t* env, void* data) {
     return native_clearTimeout(vm, env, data);
+}
+
+/* ------------------------------------------------------------------ */
+/* DOM observers (Mutation / Intersection / Resize)                    */
+/*                                                                     */
+/* Bundles construct these and immediately call observe(); with the    */
+/* classes left empty that call throws "can not find function" and     */
+/* aborts the whole boot chain. MutationObserver additionally DELIVERS */
+/* its callback asynchronously when an observed node's characterData   */
+/* (.data / .nodeValue) or an observed attribute is written: core-js's */
+/* queueMicrotask polyfill re-arms through exactly this - a text node  */
+/* whose .data it toggles - so without delivery every microtask, and   */
+/* thus every React Server-Component flight reaction, is stranded and  */
+/* the RSC stream stalls after its first chunk. Delivery rides the DOM */
+/* timer table at 0 ms like MessageChannel/queueMicrotask, coalesced   */
+/* to one callback per observer per turn. Intersection/Resize have no  */
+/* layout events to deliver, so their observe() still only accepts the */
+/* target and never fires.                                            */
+/* ------------------------------------------------------------------ */
+#define OB_REG    "@@obreg"    /* root hidden array of live MutationObservers */
+#define OB_CB     "@@obcb"     /* observer -> callback function */
+#define OB_TG     "@@obtg"     /* observer -> array of observed target wrappers */
+#define OB_OPT    "@@obopt"    /* observer -> array of options, parallel to OB_TG */
+#define OB_PEND   "@@obpend"   /* observer -> pending records (coalescing buffer) */
+#define OB_TIMER  "@@obtimer"  /* observer -> armed 0 ms dispatch timer id (0 = none) */
+#define OB_DEAD   "@@obdead"   /* observer -> disconnected flag */
+
+static void ob_hide(node_t* n) { if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; } }
+
+static var_t* ob_reg(vm_t* vm) {
+    var_t* arr = var_find_own_member_var(vm->root, OB_REG);
+    if(arr == NULL) {
+        ob_hide(var_add(vm->root, OB_REG, var_new_array(vm)));
+        arr = var_find_own_member_var(vm->root, OB_REG);
+    }
+    return arr;
+}
+
+static var_t* ob_arr(vm_t* vm, var_t* observer, const char* key) {
+    var_t* arr = var_find_own_member_var(observer, key);
+    if(arr == NULL) {
+        ob_hide(var_add(observer, key, var_new_array(vm)));
+        arr = var_find_own_member_var(observer, key);
+    }
+    return arr;
+}
+
+/* Rebuild @@obreg without `observer` (mirrors mc_unanchor). */
+static void mo_unanchor(vm_t* vm, var_t* observer) {
+    var_t* reg = var_find_own_member_var(vm->root, OB_REG);
+    if(reg == NULL) return;
+    vm->gc.gc_defer++;
+    var_t* fresh = var_new_array(vm);
+    uint32_t sz = var_array_size(reg);
+    for(uint32_t i = 0; i < sz; ++i) {
+        node_t* nd = var_array_get(reg, (int32_t)i);
+        if(nd != NULL && nd->var != NULL && nd->var != observer)
+            var_array_add(fresh, nd->var);
+    }
+    ob_hide(var_add(vm->root, OB_REG, fresh));
+    vm->gc.gc_defer--;
+}
+
+typedef struct mo_disp { var_t* observer; } mo_disp_t;
+
+/* 0 ms timer trampoline: deliver the coalesced records to the observer's cb. */
+static var_t* native_mo_dispatch(vm_t* vm, var_t* env, void* data) {
+    (void)env;
+    mo_disp_t* d = (mo_disp_t*)data;
+    if(d == NULL) return NULL;
+    var_t* observer = d->observer;
+    mario_free(d);
+    if(observer == NULL || observer->status <= V_ST_GC_FREE) return NULL;
+    var_add(observer, OB_TIMER, var_new_int(vm, 0));   /* no longer armed */
+    var_t* pend = var_find_own_member_var(observer, OB_PEND);
+    var_t* records = (pend != NULL) ? pend : var_new_array(vm);
+    /* Swap in a fresh buffer BEFORE the callback so a write the callback itself
+     * causes schedules a clean next delivery instead of appending to the list
+     * we are about to hand out. */
+    ob_hide(var_add(observer, OB_PEND, var_new_array(vm)));
+    var_t* dead = var_find_own_member_var(observer, OB_DEAD);
+    int is_dead = (dead != NULL && var_get_int(dead) != 0);
+    if(getenv("MARIO_MODBG") != NULL)
+        fprintf(stderr, "[modbg] dispatch observer=%p records=%u dead=%d\n",
+            (void*)observer, (unsigned)var_array_size(records), is_dead);
+    if(!is_dead) {
+        var_t* cb = var_find_own_member_var(observer, OB_CB);
+        if(cb != NULL && cb->is_func) {
+            var_t* args = var_new_array(vm);
+            var_array_add(args, records);
+            var_array_add(args, observer);
+            var_array_reverse(args);   /* call_m_func wants the last arg at index 0 */
+            var_t* r = call_m_func(vm, observer, cb, args);
+            if(r != NULL) var_unref(r);
+            var_unref(args);
+        }
+    }
+    /* A disconnect() that arrived while this dispatch was armed deferred the
+     * unanchor to here (it kept the observer rooted so d->observer stayed
+     * valid); drop it from the registry now that we are done with it. */
+    if(is_dead) mo_unanchor(vm, observer);
+    return NULL;
+}
+
+/* Append a record and ensure exactly one 0 ms dispatch is armed for observer. */
+static void mo_schedule(vm_t* vm, var_t* observer, var_t* record) {
+    var_t* pend = ob_arr(vm, observer, OB_PEND);
+    if(pend != NULL && record != NULL) var_array_add(pend, record);
+    var_t* tid = var_find_own_member_var(observer, OB_TIMER);
+    if(tid != NULL && var_get_int(tid) != 0) return;   /* already armed: coalesce */
+    mo_disp_t* d = (mo_disp_t*)mario_malloc(sizeof(mo_disp_t));
+    if(d == NULL) return;
+    d->observer = observer;
+    var_t* tr = var_new_native_func(vm, native_mo_dispatch, d);
+    int id = js_dom_add_timer(vm, tr, 0, false);
+    if(getenv("MARIO_MODBG") != NULL)
+        fprintf(stderr, "[modbg] schedule observer=%p timer=%d\n", (void*)observer, id);
+    if(id == 0) { mario_free(d); var_unref(tr); return; }  /* table full: retried next write */
+    var_add(observer, OB_TIMER, var_new_int(vm, id));
+    /* tr is owned solely by the timer table's @@timers anchor (var_new_* starts
+     * at refs==0): do NOT unref it here or it is freed before it fires (the
+     * exact MessageChannel trap). d->observer stays valid because the observer
+     * is rooted in @@obreg from observe() until dispatch/disconnect. */
+}
+
+/* Fire observers watching `el`. is_cd: 1 = characterData write, 0 = attribute. */
+static void mo_notify_charattr(vm_t* vm, js_element_t el, int is_cd, const char* attr) {
+    if(vm == NULL || el == NULL) return;
+    var_t* reg = var_find_own_member_var(vm->root, OB_REG);
+    if(reg == NULL) return;   /* no observers: the overwhelmingly common case */
+    uint32_t sz = var_array_size(reg);
+    for(uint32_t i = 0; i < sz; ++i) {
+        node_t* nd = var_array_get(reg, (int32_t)i);
+        if(nd == NULL || nd->var == NULL) continue;
+        var_t* observer = nd->var;
+        var_t* dead = var_find_own_member_var(observer, OB_DEAD);
+        if(dead != NULL && var_get_int(dead) != 0) continue;
+        var_t* tg = var_find_own_member_var(observer, OB_TG);
+        var_t* op = var_find_own_member_var(observer, OB_OPT);
+        if(tg == NULL) continue;
+        uint32_t tn = var_array_size(tg);
+        for(uint32_t j = 0; j < tn; ++j) {
+            node_t* tnd = var_array_get(tg, (int32_t)j);
+            if(tnd == NULL || tnd->var == NULL) continue;
+            if(handle_from_this(tnd->var) != el) continue;
+            node_t* ond = (op != NULL) ? var_array_get(op, (int32_t)j) : NULL;
+            var_t* opts = (ond != NULL) ? ond->var : NULL;
+            const char* key = is_cd ? "characterData" : "attributes";
+            var_t* flag = (opts != NULL) ? var_find_member_var(opts, key) : NULL;
+            if(flag == NULL || !var_get_bool(flag)) continue;
+            var_t* rec = var_new_obj_no_proto(vm, NULL, NULL);
+            var_add(rec, "type", var_new_str(vm, is_cd ? "characterData" : "attributes"));
+            var_add(rec, "target", tnd->var);
+            var_add(rec, "addedNodes", var_new_array(vm));
+            var_add(rec, "removedNodes", var_new_array(vm));
+            var_add(rec, "previousSibling", var_new_null(vm));
+            var_add(rec, "nextSibling", var_new_null(vm));
+            var_add(rec, "attributeName", is_cd ? var_new_null(vm) : var_new_str(vm, attr != NULL ? attr : ""));
+            var_add(rec, "attributeNamespace", var_new_null(vm));
+            var_add(rec, "oldValue", var_new_null(vm));
+            if(getenv("MARIO_MODBG") != NULL)
+                fprintf(stderr, "[modbg] notify observer=%p target=%p %s\n",
+                    (void*)observer, (void*)tnd->var, is_cd ? "characterData" : "attributes");
+            mo_schedule(vm, observer, rec);
+            break;   /* one record per observer per write */
+        }
+    }
+}
+
+static var_t* native_observer_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = get_obj(env, THIS);
+    if(self == NULL) return NULL;
+    /* Keep the callback alive on the instance so delivery/takeRecords can reach
+     * it; hidden name keeps it off JS eyes. */
+    var_t* cb = js_arg_func(env, 0);
+    var_add(self, OB_CB, cb != NULL ? cb : var_new(vm));
+    return NULL;
+}
+
+static var_t* native_observer_observe(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = get_obj(env, THIS);
+    if(self == NULL) return NULL;
+    var_t* args = get_func_args(env);
+    node_t* tn = var_array_get(args, 0);
+    node_t* on = var_array_get(args, 1);
+    var_t* target = (tn != NULL) ? tn->var : NULL;
+    var_t* options = (on != NULL) ? on->var : NULL;
+    if(target == NULL) return NULL;
+    var_add(self, OB_DEAD, var_new_int(vm, 0));   /* (re)observing clears a prior disconnect */
+    var_t* tg = ob_arr(vm, self, OB_TG);
+    var_t* op = ob_arr(vm, self, OB_OPT);
+    if(tg != NULL) var_array_add(tg, target);
+    if(op != NULL) var_array_add(op, options != NULL ? options : var_new(vm));
+    var_t* reg = ob_reg(vm);
+    if(reg != NULL) {
+        uint32_t sz = var_array_size(reg);
+        bool present = false;
+        for(uint32_t i = 0; i < sz; ++i) {
+            node_t* nd = var_array_get(reg, (int32_t)i);
+            if(nd != NULL && nd->var == self) { present = true; break; }
+        }
+        if(!present) { vm->gc.gc_defer++; var_array_add(reg, self); vm->gc.gc_defer--; }
+    }
+    if(getenv("MARIO_MODBG") != NULL)
+        fprintf(stderr, "[modbg] observe self=%p target=%p opts=%p\n",
+            (void*)self, (void*)target, (void*)options);
+    return NULL;   /* undefined */
+}
+
+static var_t* native_observer_unobserve(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = get_obj(env, THIS);
+    if(self == NULL) return NULL;
+    var_t* args = get_func_args(env);
+    node_t* tn = var_array_get(args, 0);
+    var_t* target = (tn != NULL) ? tn->var : NULL;
+    var_t* tg = var_find_own_member_var(self, OB_TG);
+    var_t* op = var_find_own_member_var(self, OB_OPT);
+    if(tg == NULL || target == NULL) return NULL;
+    vm->gc.gc_defer++;
+    var_t* ftg = var_new_array(vm);
+    var_t* fop = var_new_array(vm);
+    uint32_t sz = var_array_size(tg);
+    for(uint32_t i = 0; i < sz; ++i) {
+        node_t* nd = var_array_get(tg, (int32_t)i);
+        node_t* od = (op != NULL) ? var_array_get(op, (int32_t)i) : NULL;
+        if(nd != NULL && nd->var != NULL && nd->var != target) {
+            var_array_add(ftg, nd->var);
+            var_array_add(fop, (od != NULL && od->var != NULL) ? od->var : var_new(vm));
+        }
+    }
+    ob_hide(var_add(self, OB_TG, ftg));
+    ob_hide(var_add(self, OB_OPT, fop));
+    vm->gc.gc_defer--;
+    return NULL;
+}
+
+static var_t* native_observer_disconnect(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = get_obj(env, THIS);
+    if(self == NULL) return NULL;
+    var_add(self, OB_DEAD, var_new_int(vm, 1));
+    ob_hide(var_add(self, OB_TG, var_new_array(vm)));   /* stop matching writes */
+    ob_hide(var_add(self, OB_OPT, var_new_array(vm)));
+    var_t* tid = var_find_own_member_var(self, OB_TIMER);
+    /* No dispatch armed -> unroot now. Otherwise stay rooted so the in-flight
+     * trampoline's d->observer remains valid; native_mo_dispatch unanchors. */
+    if(tid == NULL || var_get_int(tid) == 0) mo_unanchor(vm, self);
+    return NULL;
+}
+
+static var_t* native_observer_takeRecords(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = get_obj(env, THIS);
+    if(self == NULL) return var_new_array(vm);
+    var_t* pend = var_find_own_member_var(self, OB_PEND);
+    if(pend == NULL) return var_new_array(vm);
+    /* Hand out the buffered records and reset, per spec. */
+    ob_hide(var_add(self, OB_PEND, var_new_array(vm)));
+    return pend;
 }
 
 int64_t js_dom_monotonic_ms(void) {
@@ -2652,6 +2970,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     st->el_cache       = NULL;
     st->el_cache_len   = 0;
     st->el_cache_cap   = 0;
+    st->dom_loaded     = false;
 
     var_t* bridge = var_new_obj_no_proto(vm, st, dom_state_free);
     if(bridge == NULL) {
@@ -2732,9 +3051,25 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
      * elsewhere (e.g. Event/CustomEvent in js_event.c). */
     vm_new_class(vm, "SVGElement");
     var_t* frag_cls   = vm_new_class(vm, "DocumentFragment");
-    vm_new_class(vm, "MutationObserver");
-    vm_new_class(vm, "IntersectionObserver");
-    vm_new_class(vm, "ResizeObserver");
+    /* Observers ship a working method surface (see native_observer_*): an
+     * empty class makes observe() throw and kills the calling boot chain. */
+    var_t* mo_cls = vm_new_class(vm, "MutationObserver");
+    vm_reg_native(vm, mo_cls, "constructor(cb)", native_observer_ctor, bridge);
+    vm_reg_native(vm, mo_cls, "observe(target, options)", native_observer_observe, bridge);
+    vm_reg_native(vm, mo_cls, "disconnect()", native_observer_disconnect, bridge);
+    vm_reg_native(vm, mo_cls, "takeRecords()", native_observer_takeRecords, bridge);
+    var_t* io_cls = vm_new_class(vm, "IntersectionObserver");
+    vm_reg_native(vm, io_cls, "constructor(cb, options)", native_observer_ctor, bridge);
+    vm_reg_native(vm, io_cls, "observe(target, options)", native_observer_observe, bridge);
+    vm_reg_native(vm, io_cls, "unobserve(target)", native_observer_unobserve, bridge);
+    vm_reg_native(vm, io_cls, "disconnect()", native_observer_disconnect, bridge);
+    vm_reg_native(vm, io_cls, "takeRecords()", native_observer_takeRecords, bridge);
+    var_t* ro_cls = vm_new_class(vm, "ResizeObserver");
+    vm_reg_native(vm, ro_cls, "constructor(cb)", native_observer_ctor, bridge);
+    vm_reg_native(vm, ro_cls, "observe(target, options)", native_observer_observe, bridge);
+    vm_reg_native(vm, ro_cls, "unobserve(target)", native_observer_unobserve, bridge);
+    vm_reg_native(vm, ro_cls, "disconnect()", native_observer_disconnect, bridge);
+    vm_reg_native(vm, ro_cls, "takeRecords()", native_observer_takeRecords, bridge);
     reg_accessor(vm, el_cls, "textContent", native_el_get_textContent, native_el_set_textContent, bridge);
     reg_accessor(vm, el_cls, "nodeValue", native_el_get_nodeValue, native_el_set_nodeValue, bridge);
     reg_accessor(vm, el_cls, "data", native_el_get_nodeValue, native_el_set_nodeValue, bridge);

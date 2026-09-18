@@ -41,6 +41,7 @@
 /* mario JavaScript VM handle; the full definition lives in <mario/mario.h>
  * (a C header) and is only pulled in by the .cc files that touch the VM. */
 struct st_vm;
+struct st_var;   /* mario var_t; full definition lives in <mario/mario.h> */
 
 namespace eweb {
 
@@ -72,6 +73,20 @@ static const int      kJsRunAbortMax     = 3;
  * keeps kJsRunBudgetMs because its own wall clock (kJsPrePaintBudgetMs) cuts
  * the run long before this one would. */
 static const uint32_t kJsRunBudgetLiveMs = 3000;
+
+/* Per-run budget while the viewport still shows ONLY the server-side skeleton
+ * placeholder (client-rendered shells such as taobao.com). The bundle that
+ * replaces the skeleton (the React/ice.js app entry: webpack bootstrap plus the
+ * first synchronous render pass) is one single top-level body that legitimately
+ * needs several seconds on this VM; cutting it at kJsRunBudgetLiveMs discards
+ * the whole boot and the skeleton stays forever. Once real content paints the
+ * ordinary short live budget applies again so input stays responsive. */
+static const uint32_t kJsRunBudgetSkeletonMs = 15000;
+
+/* Re-evaluation interval for jsSkeletonProbeCached(): short enough that the
+ * budget drops back to the live one promptly once real content paints, long
+ * enough that a timer-driven page does not re-walk the DOM every tick. */
+static const uint32_t kJsSkeletonProbeTtlMs = 500;
 
 /* Wall-clock budget for the WHOLE pre-paint script phase (the document.write()
  * pages that must run their scripts before the first paint). Past it the build
@@ -327,6 +342,11 @@ public:
     void decideModuleNotice();
     void decideCsrNotice();
     bool pageShowsSkeletonPlaceholder() const;
+    /* TTL-cached pageShowsSkeletonPlaceholder(): the probe is a full DOM walk,
+     * and jsVmEnter() consults it on EVERY VM run (timer ticks included), so an
+     * uncached call would re-walk the whole tree per tick on non-skeleton
+     * pages. Re-evaluate at most once per kJsSkeletonProbeTtlMs. */
+    bool jsSkeletonProbeCached();
     void drawModuleNotice(eweb_surface_t* cache, int cacheW, int cacheH);
     void clampScrollLocked(int docWidth, int docHeight);
     void postScrollClamp();
@@ -374,6 +394,10 @@ public:
     bool jsVmExit();
     void jsOnVmStep(struct st_vm* vm);
     static void jsVmStepHook(struct st_vm* vm, void* data);
+    /* Await spin tick (mario vm->on_await_pending): pump the DOM timer /
+     * message-queue so a promise awaited by __await() settles instead of
+     * degrading to undefined. See EWebJs.cc. */
+    static int  jsAwaitPendingTick(struct st_vm* vm, struct st_var* promise);
     void registerEventNatives(struct st_vm* vm);
     void registerWebNatives(struct st_vm* vm);
 
@@ -395,6 +419,8 @@ public:
      * poll with jsVmEnter/jsVmExit and returns how many timers fired (0 when
      * the VM is off/disabled/page-disabled). */
     int  jsPollTimers();
+    /* TEMP DIAGNOSTIC (EWEB_DOMDBG): print #ice-container subtree size. */
+    void jsDomMountDiag();
     /* Dispatch the DOM mouse events for one pointer gesture (state/button are
      * the public EWEB_MOUSE_x / EWEB_BUTTON_x values). Returns false when a
      * listener cancelled it. */
@@ -706,6 +732,7 @@ public:
     int                         m_jsReparseCount;
     bool                        m_jsRunBeforePaint;
     size_t                      m_jsNextScript;
+    bool                        m_jsInjectDone;   /* EWEB_INJECT_JS diagnostic ran once */
     uint64_t                    m_jsScriptWaitSince;
     bool                        m_jsPostSwapRun;
     /* Wall-clock anchor for the post-swap script phase (kJsPostSwapBudgetMs).
@@ -735,6 +762,8 @@ public:
     bool                        m_jsInScript;
     uint64_t                    m_jsEnterAt;
     uint64_t                    m_jsRunDeadline;  /* wall clock at which the step hook cuts this run */
+    uint64_t                    m_jsSkeletonProbeAt;   /* last jsSkeletonProbeCached() evaluation, 0 = never */
+    bool                        m_jsSkeletonProbeVal;  /* cached result of the above */
     uint64_t                    m_jsPrePaintAt;   /* pre-paint phase start (0 = not in it) */
     bool                        m_jsAbortPrePaint; /* last termination was the pre-paint budget */
     bool                        m_jsPrePaintCut;  /* pre-paint phase ended on the budget, not on completion */

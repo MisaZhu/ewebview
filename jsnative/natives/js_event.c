@@ -1076,6 +1076,11 @@ static void ev_fire_global(vm_t* vm, int kind, const char* type, bool bubbles) {
 }
 
 void js_event_fire_dom_content_loaded(vm_t* vm) {
+    /* Flip document.readyState to "complete" before dispatching, so handlers
+     * (and Next.js's flight bootstrap, whose j() closes the RSC ReadableStream)
+     * observe the post-load lifecycle state exactly as a real browser does. */
+    extern void js_dom_mark_dom_loaded(vm_t* vm);
+    js_dom_mark_dom_loaded(vm);
     ev_fire_global(vm, JS_EVENT_ON_DOCUMENT, "DOMContentLoaded", true);
 }
 

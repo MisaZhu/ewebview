@@ -576,7 +576,11 @@ static var_t* native_atob(vm_t* vm, var_t* env, void* data) {
 static var_t* native_queueMicrotask(vm_t* vm, var_t* env, void* data) {
     (void)data;
     var_t* fn = js_arg_func(env, 0);
-    if(fn != NULL) js_dom_add_timer(vm, fn, 0, false);
+    if(fn != NULL) {
+        int id = js_dom_add_timer(vm, fn, 0, false);
+        if(getenv("MARIO_TIMERDBG") != NULL)
+            fprintf(stderr, "[timerdbg] qmt fn=%p -> id=%d\n", (void*)fn, id);
+    }
     return NULL;
 }
 
@@ -3501,8 +3505,14 @@ static void web_mirror_globals(vm_t* vm, var_t* window) {
         "Navigator", "Screen", "Performance", "XMLHttpRequest",
         "Response", "Headers", "URL", "URLSearchParams"
     };
-    for(size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); ++i)
+    /* A/B knob (MARIO_NOQMT): withhold the native queueMicrotask so polyfills
+     * (core-js) install their own - on rokid.com the engine-backed microtask
+     * loses React-flight reactions, the MutationObserver-backed one does not. */
+    bool no_qmt = (getenv("MARIO_NOQMT") != NULL);
+    for(size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); ++i) {
+        if(no_qmt && strcmp(kNames[i], "queueMicrotask") == 0) continue;
         web_link_global(vm, window, kNames[i]);
+    }
 
     /* window's own value properties live on the global scope as accessors; the
      * mirror above would miss them because they are not in kNames. */
@@ -3585,7 +3595,8 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
     vm_reg_static(vm, NULL, "unescape(v)",              native_unescape,           bridge);
     vm_reg_static(vm, NULL, "atob(v)",                  native_atob,               bridge);
     vm_reg_static(vm, NULL, "btoa(v)",                  native_btoa,               bridge);
-    vm_reg_static(vm, NULL, "queueMicrotask(f)",        native_queueMicrotask,     bridge);
+    if(getenv("MARIO_NOQMT") == NULL)
+        vm_reg_static(vm, NULL, "queueMicrotask(f)",        native_queueMicrotask,     bridge);
     vm_reg_static(vm, NULL, "getComputedStyle(e, p)",   native_getComputedStyle,   bridge);
     vm_reg_static(vm, NULL, "matchMedia(q)",            native_matchMedia,         bridge);
     vm_reg_static(vm, NULL, "fetch(i, init)",           native_fetch,              bridge);
