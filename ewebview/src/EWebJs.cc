@@ -66,12 +66,31 @@ extern "C" void reg_all_natives(vm_t* vm);
  * siglongjmps back to the innermost armed checkpoint. The caller then resets
  * the VM and skips the faulting unit instead of aborting the process.
  * ================================================================== */
-static sigjmp_buf               s_segv_jmp;
+#ifdef __ewokos__
+/* EwokOS libc has no sigjmp_buf/sigsetjmp; and plain setjmp/longjmp must not
+ * be called by name from compiled code - GCC intercepts those identifiers and
+ * emits __builtin_setjmp/__builtin_longjmp, whose minimal buffer layout
+ * disagrees with the libc assembly implementations. libewoksys ships the same
+ * save/restore code under the gumbo_* names (setjmp_<arch>.S), which GCC
+ * leaves alone. The signal-mask save the sig* variants would do is a no-op on
+ * EwokOS anyway: the kernel only delivers STOP/KILL. */
+extern "C" int  gumbo_setjmp(jmp_buf env);
+extern "C" void gumbo_longjmp(jmp_buf env, int val);
+#define eweb_jmp_buf         jmp_buf
+#define eweb_setjmp(env)     gumbo_setjmp(env)
+#define eweb_longjmp(env, v) gumbo_longjmp((env), (v))
+#else
+#define eweb_jmp_buf         sigjmp_buf
+#define eweb_setjmp(env)     sigsetjmp((env), 1)
+#define eweb_longjmp(env, v) siglongjmp((env), (v))
+#endif
+
+static eweb_jmp_buf             s_segv_jmp;
 static volatile sig_atomic_t    s_segv_armed = 0;
 
 extern "C" int eweb_segv_checkpoint(void)
 {
-    int r = sigsetjmp(s_segv_jmp, 1);
+    int r = eweb_setjmp(s_segv_jmp);
     s_segv_armed = (r == 0) ? 1 : 0;
     return r;   /* 0 = freshly armed, 1 = returning from a fault */
 }
@@ -80,7 +99,7 @@ extern "C" int eweb_segv_try_recover(void)
 {
     if(!s_segv_armed) return 0;   /* no checkpoint: let the handler dump+abort */
     s_segv_armed = 0;
-    siglongjmp(s_segv_jmp, 1);
+    eweb_longjmp(s_segv_jmp, 1);
     return 1;   /* not reached */
 }
 
