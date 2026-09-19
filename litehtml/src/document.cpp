@@ -758,14 +758,18 @@ int litehtml::document::cvt_units( css_length& val, int fontSize, int size ) con
 		break;
 	case css_units_rem:
 		/* root element font size; fall back to the container default while the
-		 * root box has not been styled yet */
+		 * root box has not been styled yet. Prefer the sub-pixel-precise value
+		 * (m_root_font_size_px): a viewport-scaled root like "font-size:0.67px"
+		 * truncates to 0 in the int m_font_size, which would wrongly trip the
+		 * "unstyled -> 16px default" fallback and blow every rem length up ~16x. */
 		{
-			int root_sz = m_root ? m_root->get_font_size() : 0;
-			if(root_sz <= 0)
+			double root_sz = m_root_font_size_px;
+			if(root_sz <= 0.0)
 			{
-				root_sz = m_container->get_default_font_size();
+				int irs = m_root ? m_root->get_font_size() : 0;
+				root_sz = (irs > 0) ? (double)irs : (double)m_container->get_default_font_size();
 			}
-			ret = round_f(val.val() * root_sz);
+			ret = round_f((float)(val.val() * root_sz));
 			val.set_value((float) ret, css_units_px);
 		}
 		break;

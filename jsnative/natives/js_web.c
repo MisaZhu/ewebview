@@ -1258,6 +1258,15 @@ static void web_navigate(vm_t* vm, const char* url) {
     if(st->cb.navigate != NULL) st->cb.navigate(web_ctx(vm), url);
 }
 
+/* history.pushState/replaceState URL adoption: updates the URL location.*
+ * reports WITHOUT navigating (no refetch, no document teardown). Falls back
+ * to a no-op when the embedder provides no soft-update hook. */
+static void web_update_url(vm_t* vm, const char* url) {
+    js_web_state* st = web_state(vm);
+    if(st == NULL || url == NULL || url[0] == 0) return;
+    if(st->cb.update_url != NULL) st->cb.update_url(web_ctx(vm), url);
+}
+
 static var_t* loc_set_href(vm_t* vm, var_t* env, void* data) {
     (void)data;
     mstr_t* s = mstr_new("");
@@ -1401,7 +1410,7 @@ static var_t* native_history_pushState(vm_t* vm, var_t* env, void* data) {
     st->history_state = state;
     mstr_t* s = mstr_new("");
     const char* url = (js_arg_count(env) > 2) ? js_arg_cstr(env, 2, s) : "";
-    if(url[0] != 0) web_navigate(vm, url);
+    if(url[0] != 0) web_update_url(vm, url);
     mstr_free(s);
     return NULL;
 }

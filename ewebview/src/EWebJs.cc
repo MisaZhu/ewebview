@@ -2273,6 +2273,24 @@ void EWebEngine::jsWebReload(void* ctx)
     EWEB_LOG("[ewebview] js: reload queued -> %s\n", self->m_currentHtmlUrl.c_str());
 }
 
+void EWebEngine::jsWebUpdateUrl(void* ctx, const char* url)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(self == nullptr || url == nullptr || url[0] == 0) return;
+    /* history.pushState/replaceState: adopt the new URL WITHOUT refetching.
+     * Resolve a bare path against the current document, then publish it so
+     * location.* and the address bar track the SPA route. A full navigation
+     * here would tear the running VM down and reload the page - exactly the
+     * loop app-router's post-hydration replaceState("/zh-CN") would cause. */
+    std::string full = EWebContainer::normalizeURL(&self->m_port, std::string(url),
+                                                   self->jsDocumentUrl());
+    if(full.empty()) full = url;
+    self->m_currentHtmlUrl = full;
+    if(!self->m_buildHtmlUrl.empty()) self->m_buildHtmlUrl = full;
+    { EWebUiEvent uev; uev.kind = EUET_URL; uev.text = full; self->postUiEvent(uev); }
+    EWEB_LOG("[ewebview] js: history url -> %s\n", full.c_str());
+}
+
 /* First value of one response header, case-insensitively matched, or NULL.
  * Same scan EWebContainer.cc applies to its own responses. */
 static const char* js_resp_header(const eweb_http_response_t* resp, const char* name)
@@ -2525,6 +2543,7 @@ void EWebEngine::registerWebNatives(struct st_vm* vm)
      * report. */
     cb.navigate     = jsWebNavigate;
     cb.reload       = jsWebReload;
+    cb.update_url   = jsWebUpdateUrl;
 
     /* document.cookie goes to the process-wide EWebCookieJar, scoped to this
      * document's URL: get_cookie sees the non-HttpOnly entries matching it,

@@ -562,6 +562,7 @@ public:
     static void  jsWebScrollTo(void* ctx, int x, int y);
     static void  jsWebNavigate(void* ctx, const char* url);
     static void  jsWebReload(void* ctx);
+    static void  jsWebUpdateUrl(void* ctx, const char* url);
     static char* jsWebGetCookie(void* ctx);
     static void  jsWebSetCookie(void* ctx, const char* cookie);
     static char* jsWebStorageLoad(void* ctx, bool session);

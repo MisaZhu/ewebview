@@ -5134,6 +5134,31 @@ void litehtml::html_tag::init_font(const tchar_t* own_font_size, const tchar_t* 
 	m_font = 0;
 	if (doc)
 	{
+		if(!el_parent && doc->root() == this)
+		{
+			/* Root element: remember a sub-pixel-precise font size for the rem
+			 * unit resolver. m_font_size is an int, so a viewport-scaled root
+			 * like "font-size:0.67px" would truncate to 0 and make every rem
+			 * length fall back to the 16px default (blowing layouts up ~16x). */
+			double precise = (double)m_font_size;
+			if(str)
+			{
+				css_length rfs;
+				rfs.fromString(str, font_size_strings);
+				if(!rfs.is_predefined())
+				{
+					switch(rfs.units())
+					{
+					case css_units_px:         precise = rfs.val(); break;
+					case css_units_pt:         precise = rfs.val() * 96.0 / 72.0; break;
+					case css_units_percentage: precise = rfs.val() / 100.0 * (double)parent_sz; break;
+					case css_units_em:         precise = rfs.val() * (double)parent_sz; break;
+					default: break; /* other units: keep the int-derived value */
+					}
+				}
+			}
+			doc->set_root_font_size(precise);
+		}
 		const tchar_t* name			= get_style_property(_t("font-family"),		true,	_t("inherit"));
 		const tchar_t* weight		= get_style_property(_t("font-weight"),		true,	_t("normal"));
 		const tchar_t* style		= get_style_property(_t("font-style"),		true,	_t("normal"));

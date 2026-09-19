@@ -92,6 +92,11 @@ typedef struct js_web_callbacks {
      * current document URL (the DOM bridge's get_url). */
     void  (*navigate)(void* ctx, const char* url);
     void  (*reload)(void* ctx);
+    /* Soft URL replacement for history.pushState/replaceState: adopts the new
+     * URL reported by location.* and the address bar WITHOUT refetching or
+     * tearing down the document. NULL => pushState/replaceState only remember
+     * the state object and leave the reported URL unchanged. */
+    void  (*update_url)(void* ctx, const char* url);
     void  (*history_back)(void* ctx);
     void  (*history_forward)(void* ctx);
     int   (*history_length)(void* ctx);

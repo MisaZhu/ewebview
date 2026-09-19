@@ -121,7 +121,17 @@ namespace litehtml
 		 * them (animation-driven relayout). Elements whose subtree exceeds the
 		 * relayout node budget are skipped (degraded to a discrete switch). */
 		std::vector<html_tag*>				m_anim_relayout;
+		/* Sub-pixel-precise computed font-size (in px) of the root element,
+		 * refreshed whenever the root's font is (re)initialised. m_font_size is
+		 * an int, so a viewport-scaled root like "font-size:0.67px" (common in
+		 * mobile-first rem layouts) would truncate to 0 and make every rem
+		 * length fall back to the 16px default; this keeps the fraction for the
+		 * rem unit resolver. 0 means "not set yet". */
+		double								m_root_font_size_px = 0.0;
 	public:
+		void							set_root_font_size(double px) { m_root_font_size_px = px; }
+		double							get_root_font_size() const { return m_root_font_size_px; }
+
 		document(litehtml::document_container* objContainer, litehtml::context* ctx);
 		virtual ~document();
 
