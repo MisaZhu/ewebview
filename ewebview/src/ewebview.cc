@@ -105,10 +105,9 @@ static std::string html_decode_attr(const std::string& in)
         i = semi + 1;
     }
     /* A decoded value still wrapped in one quote pair (the &quot;-escaped form)
-     * is not a URL: drop the quotes so the asset resolves absolutely.
-     * operator[] rather than front()/back(): ewokstl's std::string has neither. */
+     * is not a URL: drop the quotes so the asset resolves absolutely. */
     if(out.size() >= 2 &&
-       ((out[0] == '"' && out[out.size() - 1] == '"') || (out[0] == '\'' && out[out.size() - 1] == '\'')))
+       ((out.front() == '"' && out.back() == '"') || (out.front() == '\'' && out.back() == '\'')))
         out = out.substr(1, out.size() - 2);
     return out;
 }
@@ -1317,6 +1316,26 @@ void EWebEngine::engineRenderFrame(bool full)
     pthread_mutex_unlock(&m_uiMutex);
     if(pending)
         return;   /* UI has not adopted the last frame yet */
+
+    /* Committing a frame must never paint a tree whose layout is still pending.
+     * The paint walk dereferences every stacking context's m_positioned - a
+     * list of raw, non-owning element pointers that only fetch_positioned()
+     * (inside render()) rebuilds. A script can detach positioned elements
+     * mid-tick (React's hydration-recovery root re-render does exactly this
+     * inside jsPollTimers): removeChild unlinks them and jsMarkLayoutDirty sets
+     * m_needsLayout + m_contentDirty, but the debounced re-layout in
+     * applyPendingLayoutUpdates() has not run yet, so m_positioned still points
+     * at elements no longer in the tree and this tick's rasterization walks
+     * them -> SIGSEGV. Apply the pending layout FIRST so fetch_positioned()
+     * rebuilds m_positioned against the live tree (and width()/height() below
+     * are current). jsProgressiveFlush() already renders before it draws; this
+     * closes the engine-loop draw path the same way. */
+    if(m_needsLayout) {
+        m_doc->render(m_clientWidth);
+        m_needsLayout = false;
+        m_layoutDirtyAt = 0;
+        m_layoutDirtySince = 0;
+    }
 
     engineEnsureFramePool();
 
