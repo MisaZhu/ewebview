@@ -325,6 +325,12 @@ var_t* js_dom_element_class(vm_t* vm);
  * positive timer id, or 0 when the callback is not a function / the table is
  * full. `cb` is anchored against the GC by the bridge. */
 int  js_dom_add_timer(vm_t* vm, var_t* cb, uint32_t ms, bool repeat);
+/* Queue a microtask (promise reaction / queueMicrotask / process.nextTick): due
+ * immediately and drained ahead of every 0-ms macrotask by js_dom_poll_timers,
+ * restoring the spec's microtask-before-macrotask ordering. Returns a positive
+ * id, or 0 when cb is not a function / the table is full (the CLI build always
+ * returns 0 so callers run the reaction inline). */
+int  js_dom_add_microtask(vm_t* vm, var_t* cb);
 void js_dom_clear_timer(vm_t* vm, int id);
 
 /* Raw CLOCK_MONOTONIC milliseconds (not relative to VM creation - it is a

@@ -570,14 +570,14 @@ static var_t* native_atob(vm_t* vm, var_t* env, void* data) {
     return r;
 }
 
-/* queueMicrotask(fn): there is no microtask queue, so this rides the DOM
- * bridge's timer table at 0 ms - the callback still runs after the current
- * script finishes, which is the observable behaviour pages depend on. */
+/* queueMicrotask(fn): rides the DOM bridge's timer table flagged as a microtask,
+ * so js_dom_poll_timers drains it ahead of every 0-ms macrotask (setTimeout /
+ * MessageChannel) - the spec microtask-checkpoint ordering pages depend on. */
 static var_t* native_queueMicrotask(vm_t* vm, var_t* env, void* data) {
     (void)data;
     var_t* fn = js_arg_func(env, 0);
     if(fn != NULL) {
-        int id = js_dom_add_timer(vm, fn, 0, false);
+        int id = js_dom_add_microtask(vm, fn);
         if(getenv("MARIO_TIMERDBG") != NULL)
             fprintf(stderr, "[timerdbg] qmt fn=%p -> id=%d\n", (void*)fn, id);
     }
@@ -658,12 +658,16 @@ static var_t* native_mc_dispatch(vm_t* vm, var_t* env, void* data) {
     (void)env;
     mc_disp_t* d = (mc_disp_t*)data;
     if(d == NULL) return NULL;
-    if(getenv("MARIO_MCDBG") != NULL)
+    bool mcdbg = getenv("MARIO_MCDBG") != NULL;
+    if(mcdbg)
         fprintf(stderr, "[mcdbg] dispatch port=%p\n", (void*)d->port);
     var_t* port = d->port;
     var_t* bridge = d->bridge;
     mario_free(d);
-    if(port == NULL || port->status <= V_ST_GC_FREE) return NULL;
+    if(port == NULL || port->status <= V_ST_GC_FREE) {
+        if(mcdbg) fprintf(stderr, "[mcdbg] dispatch DROP dead-port\n");
+        return NULL;
+    }
     var_t* pend = mc_pending_of(vm, port, false);
     var_t* msg = NULL;
     if(pend != NULL && var_array_size(pend) > 0) {
@@ -671,6 +675,10 @@ static var_t* native_mc_dispatch(vm_t* vm, var_t* env, void* data) {
         msg = (nd != NULL) ? nd->var : NULL;
     }
     var_t* handler = var_find_own_member_var(port, "onmessage");
+    if(mcdbg)
+        fprintf(stderr, "[mcdbg] dispatch handler=%p isfunc=%d pendLeft=%u\n",
+            (void*)handler, (handler != NULL && handler->is_func) ? 1 : 0,
+            (unsigned)(pend != NULL ? var_array_size(pend) : 0));
     if(handler != NULL && handler->is_func) {
         var_t* ev = var_new_obj_no_proto(vm, NULL, NULL);
         var_add(ev, "type", var_new_str(vm, "message"));
@@ -692,15 +700,29 @@ static var_t* native_mc_dispatch(vm_t* vm, var_t* env, void* data) {
 }
 
 static var_t* native_mc_postMessage(vm_t* vm, var_t* env, void* data) {
+    bool mcdbg = getenv("MARIO_MCDBG") != NULL;
     var_t* self = js_this(env);
-    if(self == NULL) return NULL;
+    if(self == NULL) {
+        if(mcdbg) fprintf(stderr, "[mcdbg] post DROP no-self\n");
+        return NULL;
+    }
     var_t* closed = var_find_own_member_var(self, "@@mc_closed");
-    if(closed != NULL && var_get_int(closed) != 0) return NULL;
+    if(closed != NULL && var_get_int(closed) != 0) {
+        if(mcdbg) fprintf(stderr, "[mcdbg] post DROP closed self=%p\n", (void*)self);
+        return NULL;
+    }
     var_t* peer = var_find_own_member_var(self, MC_PEER);
-    if(peer == NULL || peer->status <= V_ST_GC_FREE) return NULL;
+    if(peer == NULL || peer->status <= V_ST_GC_FREE) {
+        if(mcdbg) fprintf(stderr, "[mcdbg] post DROP dead-peer self=%p peer=%p\n",
+            (void*)self, (void*)peer);
+        return NULL;
+    }
     var_t* msg = get_func_arg(env, 0);
     var_t* pend = mc_pending_of(vm, peer, true);
-    if(pend == NULL) return NULL;
+    if(pend == NULL) {
+        if(mcdbg) fprintf(stderr, "[mcdbg] post DROP no-pend peer=%p\n", (void*)peer);
+        return NULL;
+    }
     var_array_add(pend, (msg != NULL) ? msg : var_new(vm));
     mc_anchor(vm, (var_t*)data, peer);
     mc_disp_t* d = (mc_disp_t*)mario_malloc(sizeof(mc_disp_t));
@@ -708,10 +730,14 @@ static var_t* native_mc_postMessage(vm_t* vm, var_t* env, void* data) {
     d->port = peer;
     d->bridge = (var_t*)data;
     var_t* tr = var_new_native_func(vm, native_mc_dispatch, d);
-    if(getenv("MARIO_MCDBG") != NULL)
-        fprintf(stderr, "[mcdbg] post self=%p peer=%p tr=%p\n", (void*)self, (void*)peer, (void*)tr);
+    if(mcdbg) {
+        var_t* h = var_find_own_member_var(peer, "onmessage");
+        fprintf(stderr, "[mcdbg] post self=%p peer=%p tr=%p pend=%u handler=%d\n",
+            (void*)self, (void*)peer, (void*)tr,
+            (unsigned)var_array_size(pend), (h != NULL && h->is_func) ? 1 : 0);
+    }
     int mc_id = js_dom_add_timer(vm, tr, 0, false);
-    if(getenv("MARIO_MCDBG") != NULL)
+    if(mcdbg)
         fprintf(stderr, "[mcdbg] add_timer -> %d\n", mc_id);
     if(mc_id == 0) {
         mario_free(d);   /* table full: no dispatch, drop the capture */

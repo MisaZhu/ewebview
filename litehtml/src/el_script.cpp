@@ -30,8 +30,18 @@ void litehtml::el_script::parse_attributes()
 
 bool litehtml::el_script::appendChild(const ptr &el)
 {
-	el->get_text(m_text);
+	/* REPLACE, not accumulate: js_set_element_text() drops the old children and
+	 * appends a single fresh el_text per textContent assignment, so a re-assigned
+	 * body must not concatenate onto the previous one. */
+	tstring t;
+	el->get_text(t);
+	m_text = t;
 	return true;
+}
+
+void litehtml::el_script::get_text( tstring& text )
+{
+	text += m_text;
 }
 
 const litehtml::tchar_t* litehtml::el_script::get_tagName() const

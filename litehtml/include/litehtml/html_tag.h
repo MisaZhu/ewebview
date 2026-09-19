@@ -152,7 +152,7 @@ namespace litehtml
 		void					resolve_custom_properties();
 		void					expand_css_functions();
 
-		virtual void			select_all(const css_selector& selector, elements_vector& res);
+		virtual void			select_all(const css_selector& selector, elements_vector& res) override;
 
 	public:
 		html_tag(litehtml::document* doc);

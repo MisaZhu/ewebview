@@ -60,7 +60,7 @@ public:
      * element (or any ancestor-walk from a text child) can drive focus and
      * activation. Returns `this`. */
     virtual void*    eweb_form_widget() override { return this; }
-    virtual void     on_click();
+    virtual void     on_click() override;
 
     /* ---- interaction state (driven by the engine) ---- */
     /* True when this control currently holds keyboard focus. draw() renders

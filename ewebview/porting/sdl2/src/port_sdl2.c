@@ -1483,6 +1483,9 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
      * own error string/code here (same stderr stream as the [ewebview] logs) on
      * a transport error or a non-2xx status, so a failed fetch is diagnosable
      * without a rebuild. */
+    if(getenv("EWEB_NETDBG") != NULL)
+        fprintf(stderr, "[netdbg] url=%s status=%d body=%d\n", url,
+                (int)resp->status, (int)resp->body_size);
     if(resp->error || resp->status < 200 || resp->status > 299) {
         fprintf(stderr,
             "[ewebview] net.request diag: url=%s status=%d error=%d code=%d "

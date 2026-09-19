@@ -23,6 +23,13 @@ namespace litehtml
 		virtual void			parse_attributes() override;
 		virtual bool			appendChild(const ptr &el) override;
 		virtual const tchar_t*	get_tagName() const override;
+		/* appendChild() captures the script body into the private m_text and keeps no
+		 * children, so the inherited element::get_text (a no-op) handed
+		 * jsDynamicScriptInserted an EMPTY body: every dynamically inserted INLINE
+		 * <script> (next/script `children` payloads, e.g. rokid's renderComponents
+		 * bootstrap that constructs the site Header) was silently dropped. Expose
+		 * the captured body through get_text. */
+		virtual void			get_text(tstring& text) override;
 		/* el_script derives from element (not html_tag), whose select_all is a
 		 * no-op, so a createElement'd/stand-in <script> was invisible to
 		 * document.getElementsByTagName("script") and document.scripts: SDKs that

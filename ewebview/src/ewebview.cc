@@ -402,14 +402,14 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_jsInScript(false)
     , m_jsEnterAt(0)
     , m_jsRunDeadline(0)
+    , m_jsSkeletonProbeAt(0)
+    , m_jsSkeletonProbeVal(false)
     , m_jsPrePaintAt(0)
     , m_jsAbortPrePaint(false)
     , m_jsPrePaintCut(false)
     , m_jsCurScriptSrc(nullptr)
     , m_jsEnterGen(0)
     , m_jsAbortCount(0)
-    , m_jsSkeletonProbeAt(0)
-    , m_jsSkeletonProbeVal(false)
     , m_jsPageDisabled(false)
     , m_buildAbort(false)
     , m_buildAbortGen(0)
@@ -2135,6 +2135,7 @@ void EWebEngine::cleanupBuildResources()
     m_jsScripts.clear();
     m_jsScriptSrcs.clear();
     m_jsScriptDone.clear();
+    m_jsScriptEls.clear();
     m_jsHasInlineHandlers = false;
     m_jsCurScriptEl = nullptr;
     m_jsCurScriptElUrl.clear();
@@ -2888,6 +2889,7 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     m_jsScripts.clear();
     m_jsScriptSrcs.clear();
     m_jsScriptDone.clear();
+    m_jsScriptEls.clear();
     m_jsHasInlineHandlers = false;
     m_jsCurScriptEl = nullptr;
     m_jsCurScriptElUrl.clear();
@@ -3403,6 +3405,16 @@ void EWebEngine::advanceBuildStep()
          * m_buildAbort from the UI thread, and the container's
          * create_element/text_width callbacks poll it (buildAbortRequested)
          * so the parse unwinds fast. */
+        if(getenv("MARIO_HTTPDBG") != nullptr) {
+            const std::string& h = m_buildHtmlContent;
+            fprintf(stderr, "[httpdbg] DOC len=%u tail=%.120s\n", (unsigned)h.size(),
+                    h.size() > 120 ? h.c_str() + h.size() - 120 : h.c_str());
+            const char* dp = getenv("MARIO_DOCDUMP");
+            if(dp != nullptr) {
+                FILE* f = fopen(dp, "wb");
+                if(f != nullptr) { fwrite(h.data(), 1, h.size(), f); fclose(f); }
+            }
+        }
         m_buildDoc = litehtml::document::createFromString(m_buildHtmlContent.c_str(), m_buildContainer, build_ctx);
         uint32_t create_ms = (uint32_t)(ticMs() - create_start);
         if(m_buildAbort) {
@@ -3909,6 +3921,23 @@ static litehtml::element* ewebFindById(litehtml::element* el, const char* wantId
 /* Per-script mount diagnostic (EWEB_DOMDBG): report whether the React entry
  * has populated #ice-container yet, so a silent CSR bail is distinguishable
  * from a render that is merely hidden behind the skeleton overlay. */
+static void ewebDumpTreeFile(FILE* f, litehtml::element* el, int depth)
+{
+    if(el == nullptr || depth > 14) return;
+    for(int d = 0; d < depth; ++d) fputc(' ', f);
+    const litehtml::tchar_t* tag = el->get_tagName();
+    fprintf(f, "<%s", tag ? tag : _t("?"));
+    const litehtml::tchar_t* id = el->get_attr(_t("id"), nullptr);
+    if(id != nullptr) fprintf(f, " id=%s", id);
+    const litehtml::tchar_t* src = el->get_attr(_t("src"), nullptr);
+    if(src != nullptr) fprintf(f, " src=%.90s", src);
+    const litehtml::tchar_t* cls = el->get_attr(_t("class"), nullptr);
+    if(cls != nullptr) fprintf(f, " class=%.40s", cls);
+    fprintf(f, ">\n");
+    size_t c = el->get_children_count();
+    for(size_t i = 0; i < c; ++i)
+        ewebDumpTreeFile(f, el->get_child((int)i), depth + 1);
+}
 void EWebEngine::jsDomMountDiag()
 {
     if(m_doc == nullptr) return;
@@ -3920,6 +3949,10 @@ void EWebEngine::jsDomMountDiag()
         litehtml::tstring txt;
         diag->get_text(txt);
         fprintf(stderr, "[injectdiag] %s\n", txt.empty() ? "(empty)" : txt.c_str());
+    }
+    if(getenv("EWEB_DOMDUMP") != nullptr) {
+        FILE* df = fopen(".tmp_repro/rokid/domdump.txt", "w");
+        if(df != nullptr) { ewebDumpTreeFile(df, m_doc->root(), 0); fclose(df); }
     }
     fflush(stderr);
 }

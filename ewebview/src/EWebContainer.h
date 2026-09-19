@@ -91,13 +91,13 @@ public:
     int                                top_clip_radius() const;
     litehtml::position                 top_clip_rect() const;
 
-    void                               get_client_rect(litehtml::position& client) const;
+    void                               get_client_rect(litehtml::position& client) const override;
     void                               set_client_size(int width, int height);
-    void                               on_anchor_click(const litehtml::tchar_t* url, const litehtml::element::ptr& el);
-    void                               set_cursor(const litehtml::tchar_t* cursor);
-    void                               import_css(litehtml::tstring& text, const litehtml::tstring& url, litehtml::tstring& baseurl);
-    void                               set_caption(const litehtml::tchar_t* caption);
-    void                               set_base_url(const litehtml::tchar_t* base_url);
+    void                               on_anchor_click(const litehtml::tchar_t* url, const litehtml::element::ptr& el) override;
+    void                               set_cursor(const litehtml::tchar_t* cursor) override;
+    void                               import_css(litehtml::tstring& text, const litehtml::tstring& url, litehtml::tstring& baseurl) override;
+    void                               set_caption(const litehtml::tchar_t* caption) override;
+    void                               set_base_url(const litehtml::tchar_t* base_url) override;
     void                               setDeferImageLoad(bool defer);
     void                               flushPendingImages();
 

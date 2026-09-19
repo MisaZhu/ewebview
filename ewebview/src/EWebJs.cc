@@ -36,6 +36,10 @@
 #include <mario/js_event.h>
 #include <mario/js_web.h>
 
+/* mario's bcdump.h is not exported into the installed include tree; declare the
+ * one diagnostic entry point we need (EWEB_SPINDBG cut-point disassembly). */
+extern "C" void bc_dump_window(bytecode_t* bc, PC center, PC radius);
+
 /* el_text is not pulled in by <litehtml.h>; createTextNode and the text
  * setters build one directly (malloc + placement-new, matching litehtml_alloc). */
 #include <litehtml/el_text.h>
@@ -465,6 +469,8 @@ bool EWebEngine::runPageScripts()
         if(getenv("EWEB_SCRIPTDBG") != NULL)
             fprintf(stderr, "[ewebview] jsdbg: pre run script %d len=%u url=%.80s\n", (int)i,
                      (unsigned)src.size(), m_jsCurScriptUrl.c_str());
+        if(getenv("MARIO_FLIGHTDBG") != NULL && src.find("__next_f") != std::string::npos)
+            fprintf(stderr, "[flightdbg] script %d inline flight row:\n%s\n", (int)i, src.c_str());
         /* Same per-run state reset as the post-swap path (see above). */
         m_jsVm->terminated = false;
         m_jsVm->abort_run = false;
@@ -572,6 +578,7 @@ bool EWebEngine::runNextPageScript()
                 (int)i, (i < m_jsScriptSrcs.size() ? m_jsScriptSrcs[i].c_str() : "?"));
             m_jsScriptDone[i] = 1;
             if(i < m_jsScripts.size()) m_jsScripts[i].clear();
+            jsFireScriptElEvent(i, "error");   /* webpack d.l waits on onerror */
         }
         m_jsScriptWaitSince = 0;
         /* First script of this page: pre-materialise a stand-in <script src>
@@ -583,10 +590,11 @@ bool EWebEngine::runNextPageScript()
          * <script>), which push_backs to m_jsScripts and can realloc - a
          * reference held across vm_load_run below would then dangle. */
         std::string src = m_jsScripts[i];
-        if(src.empty()) continue;
+        if(src.empty()) { jsFireScriptElEvent(i, "error"); continue; }
         if(jsIsRunaway(src)) {
             EWEB_LOG("[ewebview] js: script %d skipped (runaway body, %u bytes)\n",
                 (int)i, (unsigned)src.size());
+            jsFireScriptElEvent(i, "error");
             continue;
         }
         uint64_t run_start = ticMs();
@@ -629,6 +637,8 @@ bool EWebEngine::runNextPageScript()
         if(getenv("EWEB_SCRIPTDBG") != NULL)
             fprintf(stderr, "[ewebview] jsdbg: post run script %d len=%u url=%.80s\n", (int)i,
                      (unsigned)src.size(), m_jsCurScriptUrl.c_str());
+        if(getenv("MARIO_FLIGHTDBG") != NULL && src.find("__next_f") != std::string::npos)
+            fprintf(stderr, "[flightdbg] post script %d inline flight row:\n%s\n", (int)i, src.c_str());
         /* A prior script may have ended abnormally INSIDE the VM (runaway
          * recursion calls vm_terminate from func_call; a cross-frame throw can
          * leave abort_run/propagating_err set). vm_run loops on !vm->terminated
@@ -677,6 +687,7 @@ bool EWebEngine::runNextPageScript()
             m_jsRequeuedSrcs.push_back(src);
             m_jsScripts.push_back(src);
             m_jsScriptDone.push_back(1);
+            m_jsScriptEls.push_back(nullptr);   /* keep the vectors aligned */
             for(auto it = m_jsRunawaySrcs.begin(); it != m_jsRunawaySrcs.end(); ++it) {
                 if(*it == src) { m_jsRunawaySrcs.erase(it); break; }
             }
@@ -693,6 +704,11 @@ bool EWebEngine::runNextPageScript()
             mario_promise_ledger_dump(m_jsVm);
         }
         if(getenv("EWEB_DOMDBG") != NULL) jsDomMountDiag();
+        /* The body ran (or was cut after running): fire the element's load
+         * event so webpack's d.l chunk loader resolves its promise. A cut or
+         * faulted body reports error instead - the loader must settle either
+         * way or the chunk pipeline wedges. */
+        jsFireScriptElEvent(i, terminated ? "error" : "load");
         /* Paint what this script produced before the next one runs. */
         jsProgressiveFlush(true);
         /* DIAGNOSTIC HOOK (EWEB_INJECT_JS=<file>): run the file's body in the
@@ -742,6 +758,24 @@ bool EWebEngine::runNextPageScript()
     return m_jsNextScript < m_jsScripts.size();
 }
 
+/* Fire "load"/"error" on the dynamic <script> element behind slot i (see
+ * m_jsScriptEls). webpack's d.l loader parks the chunk promise on the
+ * element's onload/onerror property handlers; without this dispatch a
+ * dynamically loaded chunk never settles its promise and everything awaiting
+ * it (Next.js RSC module deps -> hydration -> next/script injection) stalls.
+ * The element handle may have died since the insert (removeChild + page
+ * teardown), so validate it before dispatching. */
+void EWebEngine::jsFireScriptElEvent(size_t i, const char* type)
+{
+    if(m_jsVm == nullptr || i >= m_jsScriptEls.size()) return;
+    void* el = m_jsScriptEls[i];
+    m_jsScriptEls[i] = nullptr;   /* fire at most once per element */
+    if(el == nullptr || !jsElIsLive(this, el)) return;
+    jsVmEnter();
+    js_event_dispatch_simple(m_jsVm, el, type, false);
+    jsVmExit();
+}
+
 void EWebEngine::jsDynamicScriptInserted(void* script_el)
 {
     /* ENGINE-THREAD ONLY. Called from jsElAppendChild/jsElInsertBefore when a
@@ -771,12 +805,22 @@ void EWebEngine::jsDynamicScriptInserted(void* script_el)
         src_attr != nullptr ? src_attr : "(null)", jsDocumentUrl().c_str());
     if(src_attr != nullptr && src_attr[0] != 0) {
         /* External: resolve against the document URL and fetch it. An
-         * unresolvable src is dropped so it can never block the ordered run. */
+         * unresolvable src is dropped so it can never block the ordered run -
+         * but the element still gets its error event: webpack's d.l parks the
+         * chunk promise on script.onerror and a silent drop wedges it. */
         srcabs = EWebContainer::getFullURL(&m_port, src_attr, jsDocumentUrl());
-        if(srcabs.empty()) return;
+        if(srcabs.empty()) {
+            js_event_dispatch_simple(m_jsVm, script_el, "error", false);
+            return;
+        }
     } else {
         /* Inline: the body is the element's text; skip a blank one. */
         sc->get_text(body);
+        if(getenv("EWEB_SCRIPTDBG") != nullptr)
+            fprintf(stderr, "[ewebview] jsdbg: dynScript inline body.len=%u head=%.60s\n",
+                    (unsigned)body.size(), body.c_str());
+        if(getenv("MARIO_FLIGHTDBG") != nullptr && body.find("__next_f") != std::string::npos)
+            fprintf(stderr, "[flightdbg] dyn inline flight row:\n%s\n", body.c_str());
         if(body.empty()) return;
     }
 
@@ -796,6 +840,10 @@ void EWebEngine::jsDynamicScriptInserted(void* script_el)
         m_jsScripts.push_back(external ? std::string() : body);
         m_jsScriptSrcs.push_back(parts[k]);
         m_jsScriptDone.push_back(external ? 0 : 1);
+        /* Remember the element so the ordered run can fire load/error on it
+         * (see m_jsScriptEls). Only part 0 of a split combo owns the element;
+         * its load fires when that first part runs. */
+        m_jsScriptEls.push_back(k == 0 ? script_el : nullptr);
         if(external) {
             EWebTask task;
             task.url = parts[k];
@@ -934,6 +982,7 @@ bool EWebEngine::applyJsWriteBuffer()
     if(m_buildDoc) { delete m_buildDoc; m_buildDoc = nullptr; }
     if(m_buildContainer) { delete m_buildContainer; m_buildContainer = nullptr; }
     m_jsScripts.clear();
+    m_jsScriptEls.clear();
     m_jsCurScriptEl = nullptr;
     m_jsCurScriptElUrl.clear();
     EWEB_LOG("[ewebview] js: document.write spliced %d byte(s), reparse #%d\n",
@@ -1053,10 +1102,10 @@ void EWebEngine::jsOnVmStep(struct st_vm* vm)
      * interval while EWEB_SPINDBG is set exposes the hot loop's pc range so it
      * can be matched against a MARIO_DUMPC disassembly of the dumped script.
      * Remove with the other temp probes. */
+    static int s_spin = -1;
+    if(s_spin < 0) s_spin = (getenv("EWEB_SPINDBG") != nullptr) ? 1 : 0;
     {
-        static int s_spin = -1;
         static uint64_t s_spin_last = 0;
-        if(s_spin < 0) s_spin = (getenv("EWEB_SPINDBG") != nullptr) ? 1 : 0;
         if(s_spin) {
             uint64_t t = ticMs();
             if(t - s_spin_last >= 400) {
@@ -1083,6 +1132,40 @@ void EWebEngine::jsOnVmStep(struct st_vm* vm)
     if(m_jsRunDeadline != 0 && now > m_jsRunDeadline) {
         EWEB_LOG("[ewebview] js: run budget %u ms exceeded - terminating\n",
              (unsigned)(m_jsRunDeadline - m_jsEnterAt));
+        /* DIAG (EWEB_SPINDBG): a cut run is either genuinely slow or wedged in a
+         * tight loop. Dump the instruction window at the cut point ONCE so the
+         * two can be told apart (a spin shows the same handful of pcs across
+         * every sample above). Remove with the other temp probes. */
+        if(s_spin) {
+            static bool s_cut_dumped = false;
+            if(!s_cut_dumped) {
+                s_cut_dumped = true;
+                PC rad = 40;
+                if(getenv("MARIO_PCRAD") != nullptr) rad = (PC)atoi(getenv("MARIO_PCRAD"));
+                fprintf(stderr, "[spindbg] BUDGET CUT pc=%u depth=%d tag=%s\n",
+                        (unsigned)vm->pc, (int)vm->call_depth,
+                        vm->dbg_tag != nullptr ? vm->dbg_tag : "-");
+                /* Walk the func-scope stack so the JS caller chain of the hot
+                 * loop is visible (each frame's function-start pc maps to a
+                 * script via the EWEB_SCRIPTDBG pc_range table). */
+                fprintf(stderr, "[spindbg] BACKTRACE top=%d:\n", (int)vm->scope_stack_top);
+                for(int si = vm->scope_stack_top - 1, shown = 0;
+                    si >= 0 && shown < 48; --si) {
+                    scope_t* sc = vm->scope_stack[si];
+                    if(sc == nullptr || !sc->is_func) continue;
+                    PC fpc = (sc->func != nullptr) ? sc->func->pc : 0;
+                    const char* nm = (sc->func != nullptr && sc->func->nfe_name != nullptr)
+                                     ? sc->func->nfe_name : "-";
+                    fprintf(stderr, "[spindbg]  f#%d fpc=%u retpc=%d name=%s\n",
+                            shown++, (unsigned)fpc, (int)sc->pc, nm);
+                    /* Dump the call site (retpc-2) so the CALL opcode names the
+                     * method each frame invoked (split/replace/exec/...). */
+                    if(sc->pc > 2) bc_dump_window(&vm->bc, (PC)(sc->pc - 2), 4);
+                }
+                bc_dump_window(&vm->bc, vm->pc, rad);
+                fflush(stderr);
+            }
+        }
         vm->terminated = true;   /* unwind every nested vm_run frame */
         return;
     }
@@ -1127,6 +1210,19 @@ int EWebEngine::jsPollTimers()
         static uint64_t s_domdbg_last = 0;
         uint64_t t = ticMs();
         if(t - s_domdbg_last >= 2000) { s_domdbg_last = t; jsDomMountDiag(); }
+    }
+    /* TEMP DIAGNOSTIC (MARIO_PROMLEDGER): periodic dump so a stall that begins
+     * after the last script (React scheduler suspended on a never-settling
+     * promise) is visible during the idle timer phase. */
+    if(getenv("MARIO_PROMLEDGER") != nullptr) {
+        static uint64_t s_ledger_last = 0;
+        uint64_t t = ticMs();
+        if(t - s_ledger_last >= 5000) {
+            s_ledger_last = t;
+            fprintf(stderr, "[promledger] --- timer phase ---\n");
+            mario_promise_ledger_dump(m_jsVm);
+            fflush(stderr);
+        }
     }
     return fired;
 }

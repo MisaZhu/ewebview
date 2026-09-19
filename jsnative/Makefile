@@ -41,7 +41,6 @@ NATIVE_OBJS = \
 	$(ARCH)/vm/lang/js/native/builtin/ArrayBuffer/native_ArrayBuffer.o \
 	$(ARCH)/vm/lang/js/native/builtin/DataView/native_DataView.o \
 	$(ARCH)/vm/lang/js/native/builtin/TypedArray/native_TypedArray.o \
-	$(ARCH)/vm/lang/js/native/builtin/Console/native_Console.o \
 	$(ARCH)/vm/lang/js/native/builtin/String/native_String.o \
 	$(ARCH)/vm/lang/js/native/builtin/Array/native_Array.o \
 	$(ARCH)/vm/lang/js/native/builtin/Promise/native_Promise.o \
@@ -55,14 +54,22 @@ NATIVE_OBJS = \
 	$(ARCH)/vm/lang/js/native/builtin/SharedArrayBuffer/native_SharedArrayBuffer.o \
 	$(ARCH)/vm/lang/js/native/builtin/Atomics/native_Atomics.o \
 	$(ARCH)/vm/lang/js/native/builtin/RegExp/native_RegExp.o \
-	$(ARCH)/vm/lang/js/native/builtin/TextEncoder/native_TextEncoder.o \
-	$(ARCH)/vm/lang/js/native/builtin/Stream/native_Stream.o \
+	$(ARCH)/vm/lang/js/native/builtin/Math/native_Math.o \
+	$(ARCH)/vm/lang/js/native/builtin/Date/native_Date.o \
+	$(ARCH)/vm/lang/js/native/builtin/JSON/JSON.o \
+	$(ARCH)/vm/lang/js/native/builtin/JSON/native_JSON.o \
 	\
 	$(ARCH)/vm/lang/js/native/natives/natives.o \
-	$(ARCH)/vm/lang/js/native/natives/JSON/JSON.o \
-	$(ARCH)/vm/lang/js/native/natives/JSON/native_JSON.o \
-	$(ARCH)/vm/lang/js/native/natives/Date/native_Date.o \
-	$(ARCH)/vm/lang/js/native/natives/Math/native_Math.o
+	$(ARCH)/vm/lang/js/native/natives/Console/native_Console.o \
+	$(ARCH)/vm/lang/js/native/natives/TextEncoder/native_TextEncoder.o \
+	$(ARCH)/vm/lang/js/native/natives/Stream/native_Stream.o \
+	$(ARCH)/vm/lang/js/native/natives/Process/native_Process.o \
+	$(ARCH)/vm/lang/js/native/natives/Buffer/native_Buffer.o \
+	$(ARCH)/vm/lang/js/native/natives/URL/native_URL.o \
+	$(ARCH)/vm/lang/js/native/natives/EventTarget/native_EventTarget.o \
+	$(ARCH)/vm/lang/js/native/natives/AbortController/native_AbortController.o \
+	$(ARCH)/vm/lang/js/native/natives/EventEmitter/native_EventEmitter.o \
+	$(ARCH)/vm/lang/js/native/natives/Web/native_Web.o
 
 # Browser natives: DOM/event/web/canvas bridges consumed by WidgetWebview.
 BROWSER_NATIVE_OBJS = \

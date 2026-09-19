@@ -421,6 +421,9 @@ public:
     int  jsPollTimers();
     /* TEMP DIAGNOSTIC (EWEB_DOMDBG): print #ice-container subtree size. */
     void jsDomMountDiag();
+    /* Fire "load"/"error" on the dynamic <script> element of slot i so
+     * webpack's d.l chunk loader settles (see m_jsScriptEls). */
+    void jsFireScriptElEvent(size_t i, const char* type);
     /* Dispatch the DOM mouse events for one pointer gesture (state/button are
      * the public EWEB_MOUSE_x / EWEB_BUTTON_x values). Returns false when a
      * listener cancelled it. */
@@ -727,6 +730,14 @@ public:
      * blocks on a pending slot so classic scripts run in document order. */
     std::vector<std::string>    m_jsScriptSrcs;
     std::vector<char>           m_jsScriptDone;
+    /* Parallel to m_jsScripts (kept the same length at every mutation):
+     * the litehtml element of a dynamically inserted <script>, nullptr for
+     * parser-extracted slots. The ordered run fires "load"/"error" on it so
+     * webpack's d.l chunk loader (script.onload = resolve) settles - without
+     * it a chunk promise stays pending forever and e.g. Next.js RSC module
+     * deps never resolve, stalling hydration (rokid.com's Header). Validate
+     * with jsElIsLive before use: the node may have been removed. */
+    std::vector<void*>          m_jsScriptEls;
     bool                        m_jsHasInlineHandlers;
     bool                        m_jsEnabled;
     int                         m_jsReparseCount;

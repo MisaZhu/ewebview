@@ -79,6 +79,15 @@ typedef struct {
     int64_t               remaining_ms; /* counts down each poll; due at <= 0 */
     bool                  repeat;       /* setInterval vs setTimeout */
     bool                  active;       /* slot in use */
+    /* A microtask (promise reaction, queueMicrotask, process.nextTick) is due
+     * IMMEDIATELY (remaining_ms 0) and the poll loop drains every pending one
+     * before - and again after - each macrotask (setTimeout/MessageChannel).
+     * Without this priority the engine fired 0-ms macrotasks ahead of promise
+     * reactions, inverting the spec's microtask-before-macrotask ordering and
+     * deadlocking React 18's concurrent scheduler (its MessageChannel work
+     * loop ran before the flight ping microtask, re-suspended, then reused a
+     * spent task forever). */
+    bool                  microtask;
 } js_timer_t;
 
 typedef struct {
@@ -773,7 +782,7 @@ static void js_reanchor_timers(vm_t* vm, js_dom_state* st) {
     vm->gc.gc_defer--;
 }
 
-static int js_add_timer(vm_t* vm, js_dom_state* st, var_t* cb, uint32_t ms, bool repeat) {
+static int js_add_timer(vm_t* vm, js_dom_state* st, var_t* cb, uint32_t ms, bool repeat, bool microtask) {
     int slot = -1;
     for(int i = 0; i < JS_TIMER_MAX; ++i)
         if(!st->timers[i].active) { slot = i; break; }
@@ -787,13 +796,24 @@ static int js_add_timer(vm_t* vm, js_dom_state* st, var_t* cb, uint32_t ms, bool
     js_timer_t* t = &st->timers[slot];
     t->id           = st->timer_next_id;
     t->cb           = cb;
-    t->period_ms    = (ms < 1) ? 1 : ms;
-    t->remaining_ms = (int64_t)t->period_ms;
-    t->repeat       = repeat;
+    t->microtask    = microtask;
+    if(microtask) {
+        /* Due on the very next poll (remaining_ms 0) and never repeats: a promise
+         * reaction / queueMicrotask / process.nextTick runs once, ahead of any
+         * 0-ms macrotask, then frees its slot. period_ms 0 keeps js_fire_timer on
+         * the one-shot path (repeat forced false). */
+        t->period_ms    = 0;
+        t->remaining_ms = 0;
+        t->repeat       = false;
+    } else {
+        t->period_ms    = (ms < 1) ? 1 : ms;
+        t->remaining_ms = (int64_t)t->period_ms;
+        t->repeat       = repeat;
+    }
     t->active       = true;
     if(getenv("MARIO_TIMERDBG") != NULL)
-        fprintf(stderr, "[timerdbg] add id=%d cb=%p ms=%u repeat=%d\n",
-            t->id, (void*)cb, (unsigned)ms, repeat ? 1 : 0);
+        fprintf(stderr, "[timerdbg] add id=%d cb=%p ms=%u repeat=%d micro=%d\n",
+            t->id, (void*)cb, (unsigned)ms, repeat ? 1 : 0, microtask ? 1 : 0);
     js_reanchor_timers(vm, st);
     return t->id;
 }
@@ -819,7 +839,7 @@ static var_t* js_set_timer(vm_t* vm, var_t* env, void* data, bool repeat) {
     if(st == NULL || cn == NULL || cn->var == NULL || !cn->var->is_func)
         return var_new_int(vm, 0);
     uint32_t ms = (mn != NULL && mn->var != NULL) ? (uint32_t)var_get_float(mn->var) : 0;
-    return var_new_int(vm, js_add_timer(vm, st, cn->var, ms, repeat));
+    return var_new_int(vm, js_add_timer(vm, st, cn->var, ms, repeat, false));
 }
 
 static var_t* js_clear_timer_native(vm_t* vm, var_t* env, void* data) {
@@ -835,6 +855,39 @@ static var_t* native_setInterval(vm_t* vm, var_t* env, void* data)   { return js
 static var_t* native_setTimeout(vm_t* vm, var_t* env, void* data)    { return js_set_timer(vm, env, data, false); }
 static var_t* native_clearInterval(vm_t* vm, var_t* env, void* data) { return js_clear_timer_native(vm, env, data); }
 static var_t* native_clearTimeout(vm_t* vm, var_t* env, void* data)  { return js_clear_timer_native(vm, env, data); }
+
+/* Fire one due timer slot: a repeat timer re-arms for the next period (one fire
+ * per poll, no catch-up burst); a one-shot (incl. every microtask) is deactivated
+ * and its cb cleared. The callback then runs. Returns 1 when a function actually
+ * ran, 0 when the slot held no callable. The fired one-shot stays anchored in the
+ * OLD @@timers array until the caller's js_reanchor_timers, so the GC can not
+ * sweep its callback mid-call. */
+static int js_fire_timer(vm_t* vm, js_dom_state* st, int idx) {
+    js_timer_t* t = &st->timers[idx];
+    var_t* cb = t->cb;
+    if(t->repeat)
+        t->remaining_ms = (int64_t)t->period_ms;
+    else {
+        t->active = false;
+        t->cb = NULL;
+    }
+    if(cb == NULL || !cb->is_func) return 0;
+    if(getenv("MARIO_TIMERDBG") != NULL) {
+        func_t* cf = (func_t*)cb->value;
+        fprintf(stderr, "[timerdbg] fire id=%d cb=%p micro=%d entrypc=%u native=%d scope_top=%d stack_top=%d call_depth=%d\n",
+            t->id, (void*)cb, t->microtask ? 1 : 0, (unsigned)(cf != NULL ? cf->pc : 0),
+            (cf != NULL && cf->native != NULL) ? 1 : 0,
+            (int)vm->scope_stack_top, (int)vm->stack_top, (int)vm->call_depth);
+    }
+    var_t* args = var_new_array(vm);
+    extern int mario_scopedbg_arm;
+    mario_scopedbg_arm = 1;
+    var_t* r = call_m_func(vm, NULL, cb, args);
+    mario_scopedbg_arm = 0;
+    if(r != NULL) var_unref(r);
+    var_unref(args);
+    return 1;
+}
 
 int js_dom_poll_timers(vm_t* vm, uint64_t now_ms) {
     js_dom_state* st = state_from_vm(vm);
@@ -854,40 +907,53 @@ int js_dom_poll_timers(vm_t* vm, uint64_t now_ms) {
         if(st->timers[i].active)
             st->timers[i].remaining_ms -= (int64_t)delta;
 
-    /* Phase 2: fire due timers. Re-scan from the top after each fire because a
-     * callback may add/clear timers; bounded to avoid a runaway loop. A fired
-     * one-shot stays anchored in the OLD @@timers array until the rebuild below,
-     * so the GC can not sweep its callback mid-call. */
+    /* Phase 2: fire due timers, MICROTASKS FIRST. The spec runs a microtask
+     * checkpoint after every macrotask, so drain EVERY due microtask (promise
+     * reaction / queueMicrotask / process.nextTick) before firing a single
+     * macrotask (setTimeout / MessageChannel), then loop back to drain again - a
+     * macrotask or reaction may queue more microtasks, which must run before the
+     * next macrotask. Microtasks are picked in id (insertion) order so promise
+     * chains run FIFO; macrotasks keep the old lowest-slot scan. iters (not fires)
+     * is bounded so a slot holding no callable still progresses toward the break.
+     * Without this priority the engine fired 0-ms macrotasks ahead of promise
+     * reactions, inverting the spec ordering and deadlocking React 18's
+     * concurrent scheduler (its MessageChannel work loop ran before the flight
+     * ping microtask, re-suspended, then reused a spent task forever). */
     int fired = 0;
-    for(int guard = 0; guard < 512; ++guard) {
-        int due = -1;
+    int iters = 0;
+    int n_micro = 0, n_macro = 0;
+    const int ITER_CAP = 100000;
+    while(iters++ < ITER_CAP) {
+        int due = -1, best = 0;
         for(int i = 0; i < JS_TIMER_MAX; ++i)
-            if(st->timers[i].active && st->timers[i].remaining_ms <= 0) { due = i; break; }
+            if(st->timers[i].active && st->timers[i].microtask && st->timers[i].remaining_ms <= 0 &&
+               (due < 0 || st->timers[i].id < best)) { due = i; best = st->timers[i].id; }
+        if(due >= 0) { fired += js_fire_timer(vm, st, due); n_micro++; continue; }
+        due = -1;
+        for(int i = 0; i < JS_TIMER_MAX; ++i)
+            if(st->timers[i].active && !st->timers[i].microtask && st->timers[i].remaining_ms <= 0) { due = i; break; }
         if(due < 0) break;
-        js_timer_t* t = &st->timers[due];
-        var_t* cb = t->cb;
-        if(t->repeat)
-            t->remaining_ms = (int64_t)t->period_ms;   /* one fire per poll, no catch-up burst */
-        else {
-            t->active = false;
-            t->cb = NULL;
-        }
-        if(cb != NULL && cb->is_func) {
-            if(getenv("MARIO_TIMERDBG") != NULL) {
-                func_t* cf = (func_t*)cb->value;
-                fprintf(stderr, "[timerdbg] fire id=%d cb=%p entrypc=%u native=%d scope_top=%d stack_top=%d call_depth=%d\n",
-                    t->id, (void*)cb, (unsigned)(cf != NULL ? cf->pc : 0),
-                    (cf != NULL && cf->native != NULL) ? 1 : 0,
-                    (int)vm->scope_stack_top, (int)vm->stack_top, (int)vm->call_depth);
-            }
-            var_t* args = var_new_array(vm);
-            extern int mario_scopedbg_arm;
-            mario_scopedbg_arm = 1;
-            var_t* r = call_m_func(vm, NULL, cb, args);
-            mario_scopedbg_arm = 0;
-            if(r != NULL) var_unref(r);
-            var_unref(args);
-            fired++;
+        fired += js_fire_timer(vm, st, due); n_macro++;
+    }
+    /* DIAG (temp, MARIO_MTDRAIN): confirm/deny microtask starvation of the
+     * macrotask queue. capHit means the drain loop ran to ITER_CAP without
+     * exhausting due microtasks - if that repeats every poll, macrotasks
+     * (React's scheduler MessageChannel, page setTimeout) never run. actMicro
+     * shows the live microtask backlog (table pressure). Remove with probes. */
+    if(getenv("MARIO_MTDRAIN") != NULL) {
+        bool capped = (iters > ITER_CAP);
+        int act_micro = 0, act_macro = 0;
+        for(int i = 0; i < JS_TIMER_MAX; ++i)
+            if(st->timers[i].active) { if(st->timers[i].microtask) act_micro++; else act_macro++; }
+        static long c_micro = 0, c_macro = 0, c_cap = 0, c_poll = 0;
+        static uint64_t s_last = 0;
+        c_micro += n_micro; c_macro += n_macro; c_poll++;
+        if(capped) c_cap++;
+        uint64_t nm = js_dom_monotonic_ms();
+        if(capped || nm - s_last >= 500) {
+            s_last = nm;
+            fprintf(stderr, "[mtdrain] poll=%ld this(micro=%d macro=%d capped=%d) act(micro=%d macro=%d) cum(micro=%ld macro=%ld capHit=%ld)\n",
+                c_poll, n_micro, n_macro, capped ? 1 : 0, act_micro, act_macro, c_micro, c_macro, c_cap);
         }
     }
     js_reanchor_timers(vm, st);   /* drop fired one-shots from the GC anchor */
@@ -2410,6 +2476,45 @@ static var_t* native_document_get_body(vm_t* vm, var_t* env, void* data) {
     (void)env; return doc_node_get(vm, data, 2);
 }
 
+/* Document child traversal. The Document singleton carries no element handle
+ * (this_handle() is NULL for it), so the generic Element/Node child walk it
+ * inherits returns an empty list - but React's hydrateRoot(document) locates
+ * the host tree to hydrate by walking document.firstChild / childNodes, and an
+ * empty list makes it hydrate nothing: a silent empty commit with no fibers on
+ * any SSR node (rokid's client header never mounts). Expose the document
+ * element as the document's sole child so the walk sees the real tree. */
+static var_t* native_document_get_firstChild(vm_t* vm, var_t* env, void* data) {
+    (void)env; return doc_node_get(vm, data, 0);
+}
+static var_t* native_document_get_lastChild(vm_t* vm, var_t* env, void* data) {
+    (void)env; return doc_node_get(vm, data, 0);
+}
+static var_t* native_document_get_firstElementChild(vm_t* vm, var_t* env, void* data) {
+    (void)env; return doc_node_get(vm, data, 0);
+}
+static var_t* native_document_get_lastElementChild(vm_t* vm, var_t* env, void* data) {
+    (void)env; return doc_node_get(vm, data, 0);
+}
+static var_t* native_document_get_childNodes(vm_t* vm, var_t* env, void* data) {
+    (void)env;
+    js_dom_state* st = state_any(vm, data);
+    var_t* arr = var_new_array(vm);
+    js_element_t de = doc_node(st, 0);
+    if(de != NULL) {
+        vm->gc.gc_defer++;
+        arr_add_element(vm, arr, de);
+        vm->gc.gc_defer--;
+    }
+    return arr;
+}
+static var_t* native_document_get_children(vm_t* vm, var_t* env, void* data) {
+    return native_document_get_childNodes(vm, env, data);
+}
+static var_t* native_document_get_childElementCount(vm_t* vm, var_t* env, void* data) {
+    (void)env;
+    return var_new_int(vm, (doc_node(state_any(vm, data), 0) != NULL) ? 1 : 0);
+}
+
 /* document.activeElement: the focused element, or <body> when nothing is. */
 static var_t* native_document_get_activeElement(vm_t* vm, var_t* env, void* data) {
     (void)env;
@@ -2504,7 +2609,7 @@ static var_t* native_requestAnimationFrame(vm_t* vm, var_t* env, void* data) {
     js_dom_state* st = state_any(vm, data);
     var_t* cb = js_arg_func(env, 0);
     if(st == NULL || cb == NULL) return var_new_int(vm, 0);
-    return var_new_int(vm, js_add_timer(vm, st, cb, JS_FRAME_MS, false));
+    return var_new_int(vm, js_add_timer(vm, st, cb, JS_FRAME_MS, false, false));
 }
 
 static var_t* native_cancelAnimationFrame(vm_t* vm, var_t* env, void* data) {
@@ -2623,7 +2728,11 @@ static void mo_schedule(vm_t* vm, var_t* observer, var_t* record) {
     if(d == NULL) return;
     d->observer = observer;
     var_t* tr = var_new_native_func(vm, native_mo_dispatch, d);
-    int id = js_dom_add_timer(vm, tr, 0, false);
+    /* MutationObserver callbacks are microtasks per the DOM spec: they run at the
+     * microtask checkpoint, after the current task and before the next macrotask.
+     * Several polyfills (core-js included) rely on MO as a microtask drain, so it
+     * must ride the microtask priority, not the 0-ms macrotask slot. */
+    int id = js_dom_add_microtask(vm, tr);
     if(getenv("MARIO_MODBG") != NULL)
         fprintf(stderr, "[modbg] schedule observer=%p timer=%d\n", (void*)observer, id);
     if(id == 0) { mario_free(d); var_unref(tr); return; }  /* table full: retried next write */
@@ -2901,18 +3010,20 @@ static var_t* native_el_get_dataset(vm_t* vm, var_t* env, void* data) {
     return var_ref(ds);
 }
 
-/* Element.attributes: a snapshot NamedNodeMap - length plus indexed
- * {name, value} attribute nodes. w3.org's convertLinkToButton() copies every
- * non-href attribute of the top-level nav link onto the button it creates,
- * so without this the nav enhancement dies mid-loop. */
-static var_t* native_el_get_attributes(vm_t* vm, var_t* env, void* data) {
-    js_dom_state* st = state_any(vm, data);
-    js_element_t el = this_handle(env);
-    if(st == NULL || el == NULL) return var_new_null(vm);
-    var_t* map = var_new_obj_no_proto(vm, NULL, NULL);
-    vm->gc.gc_defer++;
+/* Element.attributes: a per-element NamedNodeMap stand-in - `length` plus
+ * indexed {name, value} Attr nodes. The map object is CACHED on the bridge
+ * (keyed by the element handle, exactly like dataset) so every `.attributes`
+ * read of an element returns the SAME object, and it is refilled from the live
+ * element on each read. removeAttributeNode/setAttributeNode also refill it, so
+ * a script that caches the map and mutates through it terminates: React's
+ * hydration/host-reset clear loop `e = node.attributes; for(; e.length;)
+ * node.removeAttributeNode(e[0])` relies on `e.length` shrinking as attributes
+ * go, which a one-shot snapshot would never do (infinite loop). */
+static void attr_map_fill(vm_t* vm, js_dom_state* st, js_element_t el, var_t* map) {
+    var_remove_all(map);
     int n = 0;
-    if(st->cb.el_attr_snapshot != NULL) {
+    vm->gc.gc_defer++;
+    if(st != NULL && el != NULL && st->cb.el_attr_snapshot != NULL) {
         char* raw = st->cb.el_attr_snapshot(st->ctx, el);
         if(raw != NULL) {
             char* p = raw;
@@ -2924,7 +3035,10 @@ static var_t* native_el_get_attributes(vm_t* vm, var_t* env, void* data) {
                 *end = 0;
                 var_t* a = var_new_obj_no_proto(vm, NULL, NULL);
                 var_add(a, "name", var_new_str(vm, p));
+                var_add(a, "nodeName", var_new_str(vm, p));
                 var_add(a, "value", var_new_str(vm, sep + 1));
+                var_add(a, "nodeValue", var_new_str(vm, sep + 1));
+                var_add(a, "specified", var_new_bool(vm, true));
                 char idx[16];
                 snprintf(idx, sizeof(idx), "%d", n);
                 var_add(map, idx, a);
@@ -2936,7 +3050,129 @@ static var_t* native_el_get_attributes(vm_t* vm, var_t* env, void* data) {
     }
     var_add(map, "length", var_new_int(vm, n));
     vm->gc.gc_defer--;
+}
+
+/* The cached NamedNodeMap for `el` (created on first use), refilled to match
+ * the element's current attributes. Shared by the .attributes accessor and the
+ * Attr-node mutators so they all hand back the one live object. */
+static var_t* attr_map_for(vm_t* vm, js_dom_state* st, js_element_t el, var_t* bridge) {
+    /* The .attributes accessor can be invoked through the GET path where a
+     * native's `data` is NULL (only method-call paths hand it the bridge), so
+     * never trust the caller's bridge - fall back to the one anchored on
+     * vm->root. Caching is load-bearing: React's clear loop captures the map
+     * once (e = node.attributes) then relies on e.length shrinking as
+     * removeAttributeNode refills THAT SAME object; a non-cached map would spin
+     * forever. st != NULL implies the bridge exists on the root, so this only
+     * degrades if the root was somehow torn down mid-call. */
+    if(bridge == NULL) bridge = dom_bridge_var(vm);
+    if(bridge == NULL) {
+        var_t* m = var_new_obj_no_proto(vm, NULL, NULL);
+        attr_map_fill(vm, st, el, m);
+        return m;
+    }
+    var_t* bag = var_find_own_member_var(bridge, "@@attrmaps");
+    if(bag == NULL) {
+        bag = var_new_obj_no_proto(vm, NULL, NULL);
+        var_add(bridge, "@@attrmaps", bag);
+    }
+    char key[32];
+    snprintf(key, sizeof(key), "%p", el);
+    var_t* map = var_find_own_member_var(bag, key);
+    if(map == NULL) {
+        map = var_new_obj_no_proto(vm, NULL, NULL);
+        var_add(bag, key, map);
+    }
+    attr_map_fill(vm, st, el, map);
     return map;
+}
+
+static var_t* native_el_get_attributes(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL) return var_new_null(vm);
+    return var_ref(attr_map_for(vm, st, el, dom_bridge_var(vm)));
+}
+
+/* Element.removeAttributeNode(attr): drop the attribute the Attr node names
+ * (accepting one of our snapshot nodes, or a bare string), refresh the cached
+ * NamedNodeMap so its length shrinks, and return the removed node. */
+static var_t* native_el_removeAttributeNode(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    var_t* attr = js_arg(env, 0);
+    if(st == NULL || el == NULL || attr == NULL) return var_new_null(vm);
+    mstr_t* s = mstr_new("");
+    const char* name = NULL;
+    var_t* nm = var_find_member_var(attr, "name");
+    if(nm == NULL) nm = var_find_member_var(attr, "nodeName");
+    if(nm != NULL) name = js_cstr(nm, s);
+    else name = js_cstr(attr, s);   /* a bare string argument */
+    if(name != NULL && name[0] != 0 && st->cb.el_remove_attr != NULL)
+        st->cb.el_remove_attr(st->ctx, el, name);
+    mstr_free(s);
+    attr_map_for(vm, st, el, dom_bridge_var(vm));   /* refresh the live map React holds */
+    return var_ref(attr);
+}
+
+/* Element.getAttributeNode(name): an Attr node {name, value, ...} or null. */
+static var_t* native_el_getAttributeNode(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    mstr_t* s = mstr_new("");
+    const char* name = js_arg_cstr(env, 0, s);
+    var_t* r = var_new_null(vm);
+    if(st != NULL && el != NULL && name[0] != 0 && st->cb.el_get_attr != NULL) {
+        char* v = st->cb.el_get_attr(st->ctx, el, name);
+        if(v != NULL) {
+            r = var_new_obj_no_proto(vm, NULL, NULL);
+            var_add(r, "name", var_new_str(vm, name));
+            var_add(r, "nodeName", var_new_str(vm, name));
+            var_add(r, "value", var_new_str(vm, v));
+            var_add(r, "nodeValue", var_new_str(vm, v));
+            var_add(r, "specified", var_new_bool(vm, true));
+            mario_free(v);
+        }
+    }
+    mstr_free(s);
+    return r;
+}
+
+/* Element.setAttributeNode(attr): set the attribute from the node's name/value,
+ * refresh the cached map, and return the previous Attr node (or null). */
+static var_t* native_el_setAttributeNode(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    var_t* attr = js_arg(env, 0);
+    if(st == NULL || el == NULL || attr == NULL) return var_new_null(vm);
+    mstr_t* ns = mstr_new("");
+    mstr_t* vs = mstr_new("");
+    var_t* nm = var_find_member_var(attr, "name");
+    if(nm == NULL) nm = var_find_member_var(attr, "nodeName");
+    var_t* vv = var_find_member_var(attr, "value");
+    if(vv == NULL) vv = var_find_member_var(attr, "nodeValue");
+    if(nm != NULL) var_to_str(nm, ns);
+    if(vv != NULL) var_to_str(vv, vs);
+    var_t* prev = var_new_null(vm);
+    if(ns->cstr[0] != 0 && st->cb.el_get_attr != NULL) {
+        char* old = st->cb.el_get_attr(st->ctx, el, ns->cstr);
+        if(old != NULL) {
+            prev = var_new_obj_no_proto(vm, NULL, NULL);
+            var_add(prev, "name", var_new_str(vm, ns->cstr));
+            var_add(prev, "nodeName", var_new_str(vm, ns->cstr));
+            var_add(prev, "value", var_new_str(vm, old));
+            var_add(prev, "nodeValue", var_new_str(vm, old));
+            var_add(prev, "specified", var_new_bool(vm, true));
+            mario_free(old);
+        }
+    }
+    if(ns->cstr[0] != 0 && st->cb.el_set_attr != NULL) {
+        st->cb.el_set_attr(st->ctx, el, ns->cstr, vs->cstr);
+        mo_notify_charattr(vm, el, 0, ns->cstr);   /* MutationObserver: attributes */
+    }
+    mstr_free(ns);
+    mstr_free(vs);
+    attr_map_for(vm, st, el, dom_bridge_var(vm));
+    return prev;
 }
 
 /* `new Image()` is the classic preloader idiom; per the constructor-override
@@ -3009,6 +3245,16 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     reg_accessor(vm, doc_cls, "scripts", native_document_get_scripts, NULL, bridge);
     reg_accessor(vm, doc_cls, "head", native_document_get_head, NULL, bridge);
     reg_accessor(vm, doc_cls, "documentElement", native_document_get_documentElement, NULL, bridge);
+    /* Child traversal on the Document itself (see the natives above): without
+     * these the inherited Element walk yields an empty list and React hydrates
+     * nothing. */
+    reg_accessor(vm, doc_cls, "firstChild", native_document_get_firstChild, NULL, bridge);
+    reg_accessor(vm, doc_cls, "lastChild", native_document_get_lastChild, NULL, bridge);
+    reg_accessor(vm, doc_cls, "firstElementChild", native_document_get_firstElementChild, NULL, bridge);
+    reg_accessor(vm, doc_cls, "lastElementChild", native_document_get_lastElementChild, NULL, bridge);
+    reg_accessor(vm, doc_cls, "childNodes", native_document_get_childNodes, NULL, bridge);
+    reg_accessor(vm, doc_cls, "children", native_document_get_children, NULL, bridge);
+    reg_accessor(vm, doc_cls, "childElementCount", native_document_get_childElementCount, NULL, bridge);
     reg_accessor(vm, doc_cls, "URL", native_document_get_url, NULL, bridge);
     reg_accessor(vm, doc_cls, "documentURI", native_document_get_url, NULL, bridge);
     reg_accessor(vm, doc_cls, "readyState", native_document_get_readyState, NULL, bridge);
@@ -3085,6 +3331,12 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     vm_reg_native(vm, el_cls, "setAttribute(name, value)", native_el_setAttribute, bridge);
     vm_reg_native(vm, el_cls, "hasAttribute(name)", native_el_hasAttribute, bridge);
     vm_reg_native(vm, el_cls, "removeAttribute(name)", native_el_removeAttribute, bridge);
+    /* Attr-node API: React's hydration/host-reset clear loop drives
+     * `.attributes` + removeAttributeNode; getAttributeNode/setAttributeNode
+     * complete the DOM contract scripts (and React's property diffing) expect. */
+    vm_reg_native(vm, el_cls, "getAttributeNode(name)", native_el_getAttributeNode, bridge);
+    vm_reg_native(vm, el_cls, "setAttributeNode(attr)", native_el_setAttributeNode, bridge);
+    vm_reg_native(vm, el_cls, "removeAttributeNode(attr)", native_el_removeAttributeNode, bridge);
 
     /* Attribute-backed and boolean properties: one accessor pair per table
      * row, with the row index as the native's `data`. */
@@ -3309,7 +3561,18 @@ var_t* js_dom_element_class(vm_t* vm) {
 int js_dom_add_timer(vm_t* vm, var_t* cb, uint32_t ms, bool repeat) {
     js_dom_state* st = state_from_vm(vm);
     if(st == NULL || cb == NULL || !cb->is_func) return 0;
-    return js_add_timer(vm, st, cb, ms, repeat);
+    return js_add_timer(vm, st, cb, ms, repeat, false);
+}
+
+/* Queue a microtask (promise reaction / queueMicrotask / process.nextTick). It
+ * rides the same table but is flagged so js_dom_poll_timers drains it ahead of
+ * every 0-ms macrotask, restoring the spec's microtask-before-macrotask order.
+ * Returns a positive id, or 0 when cb is not a function / the table is full -
+ * callers that must not lose the reaction (CLI, table-full) run it inline. */
+int js_dom_add_microtask(vm_t* vm, var_t* cb) {
+    js_dom_state* st = state_from_vm(vm);
+    if(st == NULL || cb == NULL || !cb->is_func) return 0;
+    return js_add_timer(vm, st, cb, 0, false, true);
 }
 
 void js_dom_clear_timer(vm_t* vm, int id) {
