@@ -38,9 +38,11 @@
 #include <tinyhttpsc/BearHttpsClientOne.h>
 #include <x/x.h>
 #include <clipboard/clipboard.h>
+#include <zlib.h>   /* gzip/deflate Content-Encoding decode (ek_inflate_body) */
 
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp */
 
 /* ------------------------------------------------------------------ */
 /* Handle <-> concrete type                                            */
@@ -223,7 +225,78 @@ static eweb_surface_t* ek_image_decode(void* ud, const uint8_t* data, int size) 
 typedef struct {
     TinyHttpsResponse* response;
     eweb_http_header_t* headers;
+    uint8_t* decoded;   /* inflate()d body copy; owns the buffer resp->body aliases */
 } ek_http_t;
+
+/* Inflate a gzip/zlib-wrapped HTTP body. CDNs (g.alicdn.com in particular)
+ * gzip script and JSON payloads even when the client sent no
+ * Accept-Encoding, and libtinyhttpsc hands the compressed bytes through
+ * verbatim, so the decode has to happen here in the port. windowBits 15+32
+ * makes zlib auto-detect the gzip vs zlib wrapper. Returns a malloc()d
+ * buffer (caller frees) or NULL when the body is not compressed or the
+ * stream is truncated/corrupt - the caller then keeps the raw bytes. */
+static uint8_t* ek_inflate_body(const uint8_t* src, int src_len, int* out_len) {
+    z_stream zs;
+    uint8_t* out;
+    size_t cap;
+    int ret;
+    if(!src || src_len <= 0 || !out_len) return NULL;
+    memset(&zs, 0, sizeof(zs));
+    if(inflateInit2(&zs, 15 + 32) != Z_OK) return NULL;
+    cap = (size_t)src_len * 4 + 4096;
+    out = (uint8_t*)malloc(cap);
+    if(!out) { inflateEnd(&zs); return NULL; }
+    zs.next_in  = (Bytef*)src;
+    zs.avail_in = (uInt)src_len;
+    for(;;) {
+        zs.next_out  = out + zs.total_out;
+        zs.avail_out = (uInt)(cap - zs.total_out);
+        ret = inflate(&zs, Z_NO_FLUSH);
+        if(ret == Z_STREAM_END) break;
+        if(ret != Z_OK) { free(out); inflateEnd(&zs); return NULL; }
+        if(zs.avail_out == 0) {
+            size_t ncap = cap * 2;
+            uint8_t* n = (uint8_t*)realloc(out, ncap);
+            if(!n) { free(out); inflateEnd(&zs); return NULL; }
+            out = n; cap = ncap;
+            continue;
+        }
+        if(zs.avail_in == 0) { free(out); inflateEnd(&zs); return NULL; }
+    }
+    *out_len = (int)zs.total_out;
+    inflateEnd(&zs);
+    return out;
+}
+
+/* Percent-encode characters that are illegal raw in a URL but that pages do
+ * emit unescaped in query strings (apple.com's webfont URL carries a literal
+ * '|': .../wss/fonts?families=SF+Pro,v3|SF+Pro+Icons,v3). libtinyhttpsc sends
+ * the request line verbatim, so the raw byte reached the server and the font
+ * 404'd, leaving the nav bag glyph as a missing-glyph blob. Already-escaped
+ * '%' sequences and the reserved set are left untouched to avoid double
+ * encoding. Falls back to the input when it would not fit. */
+static const char* ek_url_sanitize(const char* url, char* buf, size_t cap) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    const unsigned char* p = (const unsigned char*)url;
+    for(; *p; p++) {
+        unsigned char c = *p;
+        bool unsafe = (c == ' ' || c == '"' || c == '<' || c == '>' || c == '|' ||
+                       c == '{' || c == '}' || c == '\\' || c == '^' || c == '`' ||
+                       c >= 0x80);
+        if(unsafe) {
+            if(o + 3 >= cap) return url;
+            buf[o++] = '%';
+            buf[o++] = hex[c >> 4];
+            buf[o++] = hex[c & 0xF];
+        } else {
+            if(o + 1 >= cap) return url;
+            buf[o++] = (char)c;
+        }
+    }
+    buf[o] = '\0';
+    return buf;
+}
 
 static bool ek_net_request(void* ud, const char* url, const char* method,
                            const char* req_body, int req_body_size,
@@ -238,7 +311,10 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
     if(!url || !resp) return false;
     memset(resp, 0, sizeof(*resp));
 
-    request = NewHttpsRequest(url);
+    {
+        char safe[4096];
+        request = NewHttpsRequest(ek_url_sanitize(url, safe, sizeof(safe)));
+    }
     if(!request) return false;
 
     HttpsRequestSetTimeout(request, 10000);
@@ -290,6 +366,48 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
     resp->body      = (uint8_t*)body;   /* response-owned; freed with it */
     resp->body_size = (body && body_size > 0) ? body_size : 0;
     resp->native    = st;
+    /* Compressed payload? Inflate into a port-owned buffer and hand THAT to
+     * the core; the Content-Encoding header is rewritten to identity so the
+     * (key,value) index stays truthful about the bytes we now expose. */
+    if(resp->body_size > 2 && st->headers) {
+        int compressed = 0;
+        for(i = 0; i < n; i++) {
+            const char* k = st->headers[i].key;
+            const char* v = st->headers[i].value;
+            if(!k || !v) continue;
+            if(strcasecmp(k, "Content-Encoding") != 0) continue;
+            if(strstr(v, "gzip") || strstr(v, "deflate")) compressed = 1;
+        }
+        if(compressed) {
+            int dlen = 0;
+            uint8_t* dec = ek_inflate_body(resp->body, resp->body_size, &dlen);
+            if(dec) {
+                st->decoded = dec;
+                resp->body = dec;
+                resp->body_size = dlen;
+                for(i = 0; i < n; i++)
+                    if(st->headers[i].key &&
+                       strcasecmp(st->headers[i].key, "Content-Encoding") == 0)
+                        st->headers[i].value = "identity";
+            } else {
+                klog("[ewebview] net: Content-Encoding gzip but "
+                     "inflate failed: url=%s bytes=%d\n", url, resp->body_size);
+            }
+        }
+    }
+    /* The HAL response only carries `error`/`status`, so the core's loadURL
+     * failure branches cannot show WHY a transport failed. Surface tinyhttpsc's
+     * own error string/code through klog (the EwokOS log stream the rest of
+     * this port uses) on a transport error or a non-2xx status, so a failed
+     * fetch is diagnosable without a rebuild. */
+    if(resp->error || resp->status < 200 || resp->status > 299) {
+        klog("[ewebview] net.request diag: url=%s status=%d error=%d code=%d "
+             "msg=%s body=%d\n",
+             url, resp->status, resp->error ? 1 : 0,
+             HttpsResponseGetErrorCode(response),
+             HttpsResponseGetErrorMsg(response) ? HttpsResponseGetErrorMsg(response) : "(null)",
+             resp->body_size);
+    }
     return true;
 }
 
@@ -299,6 +417,7 @@ static void ek_net_free_response(void* ud, eweb_http_response_t* resp) {
     if(!resp) return;
     st = (ek_http_t*)resp->native;
     if(st) {
+        if(st->decoded) free(st->decoded);
         if(st->headers) free(st->headers);
         if(st->response) HttpsResponseFree(st->response);
         free(st);

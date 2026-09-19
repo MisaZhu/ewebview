@@ -105,9 +105,10 @@ static std::string html_decode_attr(const std::string& in)
         i = semi + 1;
     }
     /* A decoded value still wrapped in one quote pair (the &quot;-escaped form)
-     * is not a URL: drop the quotes so the asset resolves absolutely. */
+     * is not a URL: drop the quotes so the asset resolves absolutely.
+     * operator[] rather than front()/back(): ewokstl's std::string has neither. */
     if(out.size() >= 2 &&
-       ((out.front() == '"' && out.back() == '"') || (out.front() == '\'' && out.back() == '\'')))
+       ((out[0] == '"' && out[out.size() - 1] == '"') || (out[0] == '\'' && out[out.size() - 1] == '\'')))
         out = out.substr(1, out.size() - 2);
     return out;
 }
