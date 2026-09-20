@@ -13,18 +13,22 @@ LD = mkdir -p $(dir $@) && $(LD_BIN)
 OBJDUMP =  $(PREIX)objdump
 
 
-CFLAGS =  -march=armv8-a -Wno-incompatible-pointer-types -Wno-int-conversion \
+HOST_ARCH := $(shell uname -m)
+HOST_ARCH_FLAGS =
+ifeq ($(filter arm64 aarch64,$(HOST_ARCH)), $(HOST_ARCH))
+HOST_ARCH_FLAGS = -march=armv8-a -mstrict-align -mno-outline-atomics
+endif
+
+CFLAGS =  $(HOST_ARCH_FLAGS) -Wno-incompatible-pointer-types -Wno-int-conversion \
 		-Wno-implicit-function-declaration \
         -Wall -Wextra -fPIC \
 		-fno-builtin-memcpy \
 		-fno-builtin-memmove \
 		-fno-builtin-memset \
         -Wno-unused-parameter \
-		-mstrict-align \
-        -mno-outline-atomics \
-        -std=c99
+	        -std=c99
 
-CXXFLAGS = -march=armv8-a \
+CXXFLAGS = $(HOST_ARCH_FLAGS) \
         -Wall -Wextra -fPIC \
 		-fno-builtin-memcpy \
 		-fno-builtin-memmove \
@@ -32,9 +36,7 @@ CXXFLAGS = -march=armv8-a \
         -Wno-unused-parameter \
         -pedantic \
 		-fno-rtti \
-		-mstrict-align \
-        -mno-outline-atomics \
-        -fno-exceptions \
+	        -fno-exceptions \
         -fno-use-cxa-atexit \
         -std=c++14
 

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkg-config sdl2 sdl2_gfx sdl2_image sdl2_ttf
+
+      - name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential pkg-config \
+            libsdl2-dev libsdl2-gfx-dev libsdl2-image-dev libsdl2-ttf-dev
+
+      - name: Build all targets
+        run: make -j2
+
+      - name: Verify build artifacts
+        run: |
+          test -f build_aarch64/virt/lib/libewebview.a
+          test -x build_aarch64/virt/bin/sdlbrowser
