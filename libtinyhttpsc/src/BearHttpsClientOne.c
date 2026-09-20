@@ -94625,6 +94625,17 @@ static int private_BearHttpsRequest_connect_ipv4_no_error_raise( const char *ipv
              "connect to %s:%d not completed", ipv4_ip, port);
     int sockfd = Universal_socket(UNI_AF_INET, UNI_SOCK_STREAM, 0);
     if (sockfd < 0) {
+        /*
+         * [diag] socket() itself failed -- on EwokOS this is netd refusing a
+         * new socket because its TCP PCB table (or the fd table) is exhausted,
+         * which previously surfaced as the same generic "not completed" text as
+         * a connect() failure. Give it a distinct reason so the log tells the
+         * two apart.
+         */
+        int sock_errno = errno;
+        snprintf(private_BearHttps_last_connect_reason, sizeof(private_BearHttps_last_connect_reason),
+                 "socket() failed for %s:%d: %s (errno=%d) -- netd out of PCBs/fds?",
+                 ipv4_ip, port, strerror(sock_errno), sock_errno);
         return -1;
     }
 
@@ -94650,6 +94661,20 @@ static int private_BearHttpsRequest_connect_ipv4_no_error_raise( const char *ipv
     }
     int ret = Universal_connect(sockfd, (Universal_sockaddr *)&server_addr, sizeof(server_addr));
     if (private_BearHttps_socket_check_connect_in_progress(ret) < 0) {
+        /*
+         * [diag] On EwokOS the socket lib's connect() -> do_vfs_fcntl() ignores
+         * O_NONBLOCK and blocks on the VFS wait queue until the handshake
+         * resolves, so netd returns 0 (established) or -1 with a REAL errno
+         * (ETIMEDOUT / ECONNREFUSED / EBUSY / ENOBUFS / EIO ...) -- never
+         * EINPROGRESS. This branch therefore fires on a genuine connect failure,
+         * and the default "not completed" placeholder previously swallowed the
+         * cause. Capture errno so the log distinguishes a dropped SYN
+         * (ETIMEDOUT) from an RST (ECONNREFUSED) or resource exhaustion.
+         */
+        int connect_errno = errno;
+        snprintf(private_BearHttps_last_connect_reason, sizeof(private_BearHttps_last_connect_reason),
+                 "connect to %s:%d failed: %s (errno=%d)",
+                 ipv4_ip, port, strerror(connect_errno), connect_errno);
         Universal_close(sockfd); 
         return -1;
     }
