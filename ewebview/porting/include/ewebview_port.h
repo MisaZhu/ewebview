@@ -334,6 +334,19 @@ void eweb_port_init(eweb_port_t* port);
 
 void eweb_port_ewokos(eweb_port_t* port, void* ud);
 
+/* HiDPI (EwokOS port only): set the device-pixel ratio - device pixels per
+ * logical (CSS) pixel, e.g. 2.0 on a Retina-class panel. Call BEFORE the first
+ * ewebview_set_viewport() so the frame pool allocates device-sized buffers.
+ * The core keeps laying out in logical pixels; the port rasterises at native
+ * resolution. Default 1.0 (plain 1x, no scaling) - the EwokOS embedder passes
+ * 1.0 unless XBROWSER_DPR overrides it. */
+void eweb_port_ewokos_set_dpr(float dpr);
+
+/* HiDPI (EwokOS port only): recover the device-pixel graph_t* backing a
+ * surface handle so an embedder can graph_blt() an adopted frame straight into
+ * its window. Returns a graph_t* (as void*), or NULL for a NULL handle. */
+void* eweb_port_ewokos_surface_native(eweb_surface_t* s);
+
 #ifdef __cplusplus
 }
 #endif

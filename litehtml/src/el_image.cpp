@@ -2,6 +2,8 @@
 #include "el_image.h"
 #include "document.h"
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* Pick one URL from a srcset attribute: an exact 1x candidate wins, then the
  * narrowest w descriptor (this device is a low-density viewport), then the
@@ -76,44 +78,71 @@ static tstring pick_srcset_candidate(const tstring& srcset)
 
 void litehtml::el_image::resolve_effective_src()
 {
+	/* Re-read the element's own attributes first: a previous pass may have
+	 * overwritten m_src with a <source> candidate, and the winner can change
+	 * when the viewport (media) changes. */
+	m_src = get_attr(_t("src"), _t(""));
+	m_srcset = get_attr(_t("srcset"), _t(""));
+
+	/* HTML spec: inside <picture>, the first <source> whose media attribute
+	 * matches the current viewport overrides the <img>'s own srcset/src.
+	 * Skipping this evaluation picks an asset with the wrong intrinsic
+	 * ratio, and width:auto/height:100% boxes then come out too wide. */
+	element::ptr p = parent();
+	if(p && p->get_tagName() && !t_strcasecmp(p->get_tagName(), _t("picture")))
+	{
+		document* doc = get_document();
+		media_features mf;
+		if(doc && doc->container())
+		{
+			doc->container()->get_media_features(mf);
+		}
+		int cnt = (int) p->get_children_count();
+		for(int k = 0; k < cnt; k++)
+		{
+			element::ptr ch = p->get_child(k);
+			if(!ch || !ch->get_tagName() || t_strcasecmp(ch->get_tagName(), _t("source")))
+			{
+				continue;
+			}
+			const tchar_t* media = ch->get_attr(_t("media"));
+			if(media && media[0] && doc)
+			{
+				media_query_list::ptr mql = media_query_list::create_from_string(media, doc);
+				if(!mql)
+				{
+					continue;	// unparsable media: never matches
+				}
+				mql->apply_media_features(mf);
+				if(!mql->is_used())
+				{
+					continue;
+				}
+			}
+			const tchar_t* ss = ch->get_attr(_t("srcset"));
+			if(ss && ss[0])
+			{
+				tstring cand = pick_srcset_candidate(ss);
+				if(!cand.empty())
+				{
+					m_src = cand;
+					return;
+				}
+			}
+			const tchar_t* ssrc = ch->get_attr(_t("src"));
+			if(ssrc && ssrc[0])
+			{
+				m_src = ssrc;
+				return;
+			}
+		}
+	}
 	if(!m_srcset.empty())
 	{
 		tstring cand = pick_srcset_candidate(m_srcset);
 		if(!cand.empty())
 		{
 			m_src = cand;
-		}
-	}
-	if(m_src.empty())
-	{
-		element::ptr p = parent();
-		if(p && p->get_tagName() && !t_strcasecmp(p->get_tagName(), _t("picture")))
-		{
-			int cnt = (int) p->get_children_count();
-			for(int k = 0; k < cnt; k++)
-			{
-				element::ptr ch = p->get_child(k);
-				if(!ch || !ch->get_tagName() || t_strcasecmp(ch->get_tagName(), _t("source")))
-				{
-					continue;
-				}
-				const tchar_t* ss = ch->get_attr(_t("srcset"));
-				if(ss && ss[0])
-				{
-					tstring cand = pick_srcset_candidate(ss);
-					if(!cand.empty())
-					{
-						m_src = cand;
-						break;
-					}
-				}
-				const tchar_t* ssrc = ch->get_attr(_t("src"));
-				if(ssrc && ssrc[0])
-				{
-					m_src = ssrc;
-					break;
-				}
-			}
 		}
 	}
 }
@@ -123,6 +152,8 @@ litehtml::el_image::el_image(litehtml::document* doc) : html_tag(doc)
 	m_display = display_inline_block;
 	m_attr_width = 0;
 	m_attr_height = 0;
+	m_resolved_mw = -1;
+	m_resolved_mh = -1;
 }
 
 litehtml::el_image::~el_image( void )
@@ -176,6 +207,30 @@ bool litehtml::el_image::is_replaced() const
 
 int litehtml::el_image::render( int x, int y, int max_width, bool second_pass )
 {
+	/* <picture>/srcset selection is media-dependent; the first style pass can
+	 * run while the client viewport is still 0x0 (max-height:775px then
+	 * matches and the wrong asset ratio sizes the box). Re-resolve whenever
+	 * the live viewport differs from the snapshot taken at resolve time. */
+	{
+		document* rdoc = get_document();
+		if(rdoc && rdoc->container())
+		{
+			media_features mf;
+			rdoc->container()->get_media_features(mf);
+			if(mf.width != m_resolved_mw || mf.height != m_resolved_mh)
+			{
+				m_resolved_mw = mf.width;
+				m_resolved_mh = mf.height;
+				tstring old_src = m_src;
+				resolve_effective_src();
+				if(m_src != old_src && !m_src.empty())
+				{
+					rdoc->container()->load_image(m_src.c_str(), 0,
+						!m_css_height.is_predefined() && !m_css_width.is_predefined());
+				}
+			}
+		}
+	}
 	int parent_width = max_width;
 
 	calc_outlines(parent_width);

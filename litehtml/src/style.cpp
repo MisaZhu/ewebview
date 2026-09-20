@@ -827,6 +827,9 @@ void litehtml::style::parse_short_background( const tstring& val, const tchar_t*
 	add_parsed_property(_t("background-origin"),		_t("padding-box"),	important);
 	add_parsed_property(_t("background-clip"),			_t("border-box"),	important);
 	add_parsed_property(_t("background-attachment"),	_t("scroll"),		important);
+	/* The shorthand resets EVERY longhand; without a size reset a previous
+	 * rule's cover/contain leaked into declarations that omit it. */
+	add_parsed_property(_t("background-size"),			_t("auto"),			important);
 
 	if(val == _t("none"))
 	{
@@ -836,8 +839,31 @@ void litehtml::style::parse_short_background( const tstring& val, const tchar_t*
 	string_vector tokens;
 	split_string(val, tokens, _t(" "), _t(""), _t("("));
 	bool origin_found = false;
+	/* <bg-position> / <bg-size>: the slash form is how every modern hero
+	 * declares its scaling (apple.com paints the iPhone banner with
+	 * "background:url(...) center/cover"). Unhandled, the size token fell
+	 * through every branch below, the size stayed 'auto' and the bitmap
+	 * tiled at natural size - a 3008px banner across a 1280px box. */
+	bool size_open = false;
+	int size_n = 0;
+	tstring size_val;
 	for(string_vector::iterator tok = tokens.begin(); tok != tokens.end(); tok++)
 	{
+		/* <bg-size> token(s) right after the slash (or after a bare first
+		 * size token): lengths/percentages here must NOT reach the
+		 * position accumulator below. */
+		if(size_open && size_n < 2 &&
+		   (value_in_list(tok->c_str(), _t("auto;cover;contain")) ||
+			isdigit((unsigned char)(*tok)[0]) ||
+			(*tok)[0] == _t('-') || (*tok)[0] == _t('.') || (*tok)[0] == _t('+')))
+		{
+			if(size_n) size_val += _t(" ");
+			size_val += *tok;
+			size_n++;
+			continue;
+		}
+		size_open = false;
+
 		if(tok->substr(0, 3) == _t("url"))
 		{
 			add_parsed_property(_t("background-image"), *tok, important);
@@ -868,6 +894,34 @@ void litehtml::style::parse_short_background( const tstring& val, const tchar_t*
 			{
 				add_parsed_property(_t("background-clip"),*tok, important);
 			}
+		} else if( *tok == _t("/") )
+		{
+			/* bare slash separator: size tokens follow */
+			size_open = true;
+		} else if( value_in_list(tok->c_str(), _t("cover;contain")) )
+		{
+			/* keyword size, with or without a slash before it */
+			size_val = *tok;
+			size_n = 2;
+		} else if( tok->find(_t('/')) != tstring::npos &&
+				   tok->find(_t('/')) < tok->length() - 1 )
+		{
+			/* fused "<position>/<size>" token (the minified form) */
+			tstring left = tok->substr(0, tok->find(_t('/')));
+			tstring right = tok->substr(tok->find(_t('/')) + 1);
+			if(!left.empty())
+			{
+				if(m_properties.find(_t("background-position")) != m_properties.end())
+				{
+					m_properties[_t("background-position")].m_value = m_properties[_t("background-position")].m_value + _t(" ") + left;
+				} else
+				{
+					add_parsed_property(_t("background-position"), left, important);
+				}
+			}
+			size_val = right;
+			size_n = 1;
+			size_open = true;
 		} else if(	value_in_list(tok->c_str(), _t("left;right;top;bottom;center")) ||
 					isdigit((unsigned char)(*tok)[0]) ||
 					(*tok)[0] == _t('-')	||
@@ -885,6 +939,10 @@ void litehtml::style::parse_short_background( const tstring& val, const tchar_t*
 		{
 			add_parsed_property(_t("background-color"), *tok, important);
 		}
+	}
+	if(!size_val.empty())
+	{
+		add_parsed_property(_t("background-size"), size_val, important);
 	}
 }
 

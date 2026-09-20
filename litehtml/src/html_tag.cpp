@@ -1168,7 +1168,7 @@ void litehtml::html_tag::get_content_size( size& sz, int max_width )
 	}
 }
 
-bool litehtml::html_tag::push_css_clip(uint_ptr hdc, int x, int y)
+bool litehtml::html_tag::css_clip_rect(position& out, int x, int y) const
 {
 	if(!m_has_css_clip ||
 	   (m_el_position != element_position_absolute && m_el_position != element_position_fixed))
@@ -1183,9 +1183,33 @@ bool litehtml::html_tag::push_css_clip(uint_ptr hdc, int x, int y)
 	int right = m_css_clip.right.is_predefined() ? box.width : m_css_clip.right.calc_percent(box.width);
 	int bottom = m_css_clip.bottom.is_predefined() ? box.height : m_css_clip.bottom.calc_percent(box.height);
 	int left = m_css_clip.left.is_predefined() ? 0 : m_css_clip.left.calc_percent(box.width);
-	position r(box.x + left, box.y + top,
+	out = position(box.x + left, box.y + top,
 		(right > left) ? right - left : 0,
 		(bottom > top) ? bottom - top : 0);
+	return true;
+}
+
+/* An empty clip rectangle leaves no visible region at all, so the element
+ * and everything inside it paint nothing. This is what the standard
+ * "visually hidden" pattern relies on (clip:rect(1px,1px,1px,1px) on a 1px
+ * box - apple.com's .globalnav-link-text and its logo label). The check
+ * lives here, not in the backend clip primitive, because a zero-area clip
+ * is also the "no clip" sentinel of simple raster backends (the EwokOS
+ * graph lib treats clip.w==0/clip.h==0 as the whole canvas), which would
+ * paint the hidden text unclipped. */
+bool litehtml::html_tag::css_clip_hides_all(int x, int y) const
+{
+	position r;
+	if(!css_clip_rect(r, x, y))
+		return false;
+	return r.width <= 0 || r.height <= 0;
+}
+
+bool litehtml::html_tag::push_css_clip(uint_ptr hdc, int x, int y)
+{
+	position r;
+	if(!css_clip_rect(r, x, y))
+		return false;
 	border_radiuses radius;
 	get_document()->container()->set_clip(r, radius, true, true);
 	(void)hdc;
@@ -1200,6 +1224,12 @@ void litehtml::html_tag::draw( uint_ptr hdc, int x, int y, const position* clip 
 	/* opacity:0 (own or inherited from an ancestor) paints nothing. Layout is
 	 * untouched - this only suppresses drawing of the element's own box. */
 	if(opacity_hidden(m_opacity_cum))
+	{
+		return;
+	}
+	/* clip:rect() with an empty visible region (the visually-hidden
+	 * pattern) paints nothing of the element's own box. */
+	if(css_clip_hides_all(x, y))
 	{
 		return;
 	}
@@ -2194,6 +2224,18 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		 * routes to render_inline - a path that never lays a replaced box
 		 * out, so the images stayed zero-sized. */
 		m_display = is_replaced() ? display_inline_block : display_inline;
+	}
+	/* An absolutely-positioned element whose display computes to 'contents'
+	 * generates no box at all, so there is nothing to position and - unlike a
+	 * static contents wrapper - its descendants must not be promoted into the
+	 * ancestor flow. apple.com's globalnav hover flyout is exactly this
+	 * (position:absolute + display:inherit from a display:contents parent);
+	 * letting its menu copy flow painted a second set of nav labels over the
+	 * real bar. Collapsing the subtree to none matches the observed browser
+	 * result for this combination. */
+	if(m_display == display_contents && m_el_position == element_position_absolute)
+	{
+		m_display = display_none;
 	}
 	m_box_sizing	= (box_sizing)			value_index((own_box_sizing && t_strcasecmp(own_box_sizing, _t("inherit"))) ? own_box_sizing : _t("content-box"),	box_sizing_strings,			box_sizing_content_box);
 
@@ -6895,6 +6937,12 @@ void litehtml::html_tag::draw_children( uint_ptr hdc, int x, int y, const positi
 	{
 		return;
 	}
+	/* An empty CSS clip rect hides the whole subtree; skip the recursion
+	 * instead of pushing a zero-area clip the backend may ignore. */
+	if(css_clip_hides_all(x, y))
+	{
+		return;
+	}
 	bool css_clipped = push_css_clip(hdc, x, y);
 
 	/* The standard "visually hidden" accessibility pattern (skip links,
@@ -6948,13 +6996,6 @@ bool litehtml::html_tag::fetch_positioned()
 			ret = true;
 		}
 	}
-	if(getenv("EWEB_POSDBG")) {
-		int nfix = 0;
-		for(auto& e2 : m_positioned)
-			if(e2->get_element_position() == element_position_fixed) nfix++;
-		fprintf(stderr, "[posdbg] fetch_positioned this=%p children=%d positioned=%d fixed=%d ret=%d\n",
-			(void*)this, (int)m_children.size(), (int)m_positioned.size(), nfix, (int)ret);
-	}
 	return ret;
 }
 
@@ -6967,10 +7008,6 @@ void litehtml::html_tag::render_positioned(render_type rt)
 {
 	position wnd_position;
 	get_document()->container()->get_client_rect(wnd_position);
-	if(getenv("EWEB_POSDBG")) {
-		fprintf(stderr, "[posdbg] render_positioned this=%p rt=%d positioned=%d\n",
-			(void*)this, (int)rt, (int)m_positioned.size());
-	}
 
 	element_position el_position;
 	bool process;
@@ -7337,10 +7374,6 @@ void litehtml::html_tag::render_positioned(render_type rt)
 
 void litehtml::html_tag::draw_stacking_context( uint_ptr hdc, int x, int y, const position* clip, bool with_positioned )
 {
-	if(getenv("EWEB_POSDBG")) {
-		fprintf(stderr, "[posdbg] draw_stacking this=%p id=%s visible=%d with_pos=%d npos=%d\n",
-			(void*)this, get_attr(_t("id"), ""), (int)is_visible(), (int)with_positioned, (int)m_positioned.size());
-	}
 	if(!is_visible()) return;
 
 	std::map<int, bool> zindexes;
@@ -8870,12 +8903,6 @@ void litehtml::html_tag::draw_children_box(uint_ptr hdc, int x, int y, const pos
 				{
 					if (el->get_element_position() == element_position_fixed)
 					{
-						if(getenv("EWEB_POSDBG")) {
-							fprintf(stderr, "[posdbg] DRAW fixed el=%p id=%s cls=%s mpos=%d,%d %dx%d wnd=%d,%d z=%d\n",
-								(void*)el, el->get_attr(_t("id"), ""), el->get_attr(_t("class"), ""),
-								el->m_pos.x, el->m_pos.y, el->m_pos.width, el->m_pos.height,
-								browser_wnd.x, browser_wnd.y, el->get_zindex());
-						}
 						el->draw(hdc, browser_wnd.x, browser_wnd.y, clip);
 						el->draw_stacking_context(hdc, browser_wnd.x, browser_wnd.y, clip, true);
 						el = 0;
