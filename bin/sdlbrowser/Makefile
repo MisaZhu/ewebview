@@ -46,10 +46,11 @@ CFLAGS += $(SDL2_CFLAGS) -I $(TARGET_DIR)/include
 
 LDFLAGS += -L $(TARGET_DIR)/lib
 
-# Remove unreferenced functions/data after archive extraction. The archives
-# contain several large single-object implementations, so section-level dead
-# stripping is important for the standalone browser binary.
+# Remove unreferenced functions/data after archive extraction. This linker
+# option is specific to Apple's ld; ELF linkers use section GC variants.
+ifeq ($(shell uname -s),Darwin)
 LDFLAGS += -Wl,-dead_strip
+endif
 
 # Link order matters: ewebview references litehtml/mario/webp/tinyhttpsc
 # symbols, and the SDL2 port inside libewebview.a references SDL2 companions.
