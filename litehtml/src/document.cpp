@@ -485,8 +485,13 @@ litehtml::uint_ptr litehtml::document::add_font( const tchar_t* name, int size, 
 			case litehtml::fontWeightLighter:
 				fw = 300;
 				break;
-			default:
+			case litehtml::fontWeightNormal:
 				fw = 400;
+				break;
+			default:
+				/* Numeric keywords 100..900 sit after "lighter" in
+				 * font_weight_strings; map the enum back to its value. */
+				fw = (fw - litehtml::fontWeight100 + 1) * 100;
 				break;
 			}
 		} else
@@ -706,6 +711,41 @@ int litehtml::document::cvt_units( css_length& val, int fontSize, int size ) con
 		profile_cvt_units(start_ms);
 		return 0;
 	}
+	/* Fold a calc() addend held in font/viewport-relative units into the fixed
+	 * px offset now that the font and root sizes are known (e.g. the underline
+	 * bottom:calc(50% - 1.5rem)); px/unitless addends are already in calc_px.
+	 * Done once and cleared so relayout passes do not double-count. */
+	if(val.has_calc_add())
+	{
+		float av = val.calc_add_val();
+		float px = 0;
+		switch(val.calc_add_units())
+		{
+		case css_units_em:  px = av * fontSize; break;
+		case css_units_pt:  px = (float) m_container->pt_to_px((int)(av)); break;
+		case css_units_in:  px = (float) m_container->pt_to_px((int)(av * 72)); break;
+		case css_units_cm:  px = (float) m_container->pt_to_px((int)(av * 0.3937 * 72)); break;
+		case css_units_mm:  px = (float) m_container->pt_to_px((int)(av * 0.3937 * 72) / 10); break;
+		case css_units_vw: case css_units_dvw: case css_units_lvw: case css_units_svw:
+			px = (float)((double)m_media.width * (double)av / 100.0); break;
+		case css_units_vh: case css_units_dvh: case css_units_lvh: case css_units_svh:
+			px = (float)((double)m_media.height * (double)av / 100.0); break;
+		case css_units_rem:
+			{
+				double root_sz = m_root_font_size_px;
+				if(root_sz <= 0.0)
+				{
+					int irs = m_root ? m_root->get_font_size() : 0;
+					root_sz = (irs > 0) ? (double)irs : (double)m_container->get_default_font_size();
+				}
+				px = (float)(av * root_sz);
+			}
+			break;
+		case css_units_ch:  px = av * fontSize / 2.0f; break;
+		default: px = av; break;
+		}
+		val.fold_calc_px(px);
+	}
 	int ret = 0;
 	switch(val.units())
 	{
@@ -780,7 +820,7 @@ int litehtml::document::cvt_units( css_length& val, int fontSize, int size ) con
 		val.set_value((float) ret, css_units_px);
 		break;
 	default:
-		ret = (int) val.val();
+		ret = (int) (val.val() + val.calc_px());
 		break;
 	}
 	profile_cvt_units(start_ms);

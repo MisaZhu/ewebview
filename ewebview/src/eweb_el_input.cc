@@ -894,10 +894,24 @@ void eweb_el_input::get_content_size(litehtml::size& sz, int max_width)
         return;
     }
     switch (m_inputType) {
-    case EWEB_INPUT_TEXT:
-        sz.width = 100;
+    case EWEB_INPUT_TEXT: {
+        /* UA intrinsic width is `size` (default 20) average character widths
+         * of the control's font, like every browser. A flat 100 made a
+         * width:100% field measure at whatever its LAST layout filled, so
+         * github's "Go to file" box (font 14px -> ~154px in Chrome) claimed
+         * half the toolbar's max-content and shrank the ref/branch buttons
+         * into each other. Average width ~= the digit run / 10. */
+        int size = 20;
+        const litehtml::tchar_t* sa = get_attr(_t("size"));
+        if (sa && *sa) {
+            int v = atoi(sa);
+            if (v > 0) size = v;
+        }
+        int avg = label_width("0123456789");
+        sz.width = avg > 0 ? (size * avg + 5) / 10 : 100;
         sz.height = styled_vertical() ? content_line_height() : 24;
         break;
+    }
     case EWEB_INPUT_TEXTAREA:
         sz.width = 160;
         sz.height = 48;

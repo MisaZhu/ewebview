@@ -321,6 +321,10 @@ void EWebEngine::initJsVm()
     /* Let __await() pump the event loop for a not-yet-settled promise instead
      * of yielding undefined (see jsAwaitPendingTick). */
     m_jsVm->on_await_pending = jsAwaitPendingTick;
+    /* ES module loading: static/dynamic imports fetch their source over the
+     * network (see jsModuleResolve/jsModuleLoad). Process-wide in mario. */
+    _resolve_m_func = jsModuleResolve;
+    _load_m_func    = jsModuleLoad;
 
     js_dom_callbacks_t cb;
     memset(&cb, 0, sizeof(cb));
@@ -479,6 +483,7 @@ bool EWebEngine::runPageScripts()
         jsVmEnter();
         m_jsCurScriptSrc = &src;
         m_jsCurScriptUrl = (i < m_jsScriptSrcs.size()) ? m_jsScriptSrcs[i] : std::string();
+        jsSetModuleBase(true);
         {   /* Tag uncaught VM errors with the script index so a failing
              * minified bundle can be matched to its EWEB_DUMP_SCRIPTS file. */
             static char s_jsDbgTag[64];
@@ -506,6 +511,7 @@ bool EWebEngine::runPageScripts()
         m_jsVm->dbg_tag = nullptr;
         m_jsCurScriptSrc = nullptr;
         m_jsCurScriptUrl.clear();
+        jsSetModuleBase(false);
         bool terminated = jsVmExit();
         if(getenv("EWEB_SCRIPTDBG") != NULL)
             fprintf(stderr, "[ewebview] jsdbg: pc_range script %d = [%u,%u)\n", (int)i,
@@ -647,6 +653,7 @@ bool EWebEngine::runNextPageScript()
         jsVmEnter();
         m_jsCurScriptSrc = &src;
         m_jsCurScriptUrl = (i < m_jsScriptSrcs.size()) ? m_jsScriptSrcs[i] : std::string();
+        jsSetModuleBase(true);
         m_jsLastFlushAt = run_start;
         {
             static char s_jsDbgTag[64];
@@ -680,6 +687,7 @@ bool EWebEngine::runNextPageScript()
         m_jsVm->dbg_tag = nullptr;
         m_jsCurScriptSrc = nullptr;
         m_jsCurScriptUrl.clear();
+        jsSetModuleBase(false);
         bool terminated = jsVmExit();
         if(getenv("EWEB_SCRIPTDBG") != NULL)
             fprintf(stderr, "[ewebview] jsdbg: pc_range script %d = [%u,%u)\n", (int)i,
@@ -2450,6 +2458,93 @@ bool EWebEngine::jsWebRequest(void* ctx, const char* method, const char* url,
     return true;
 }
 
+/* ==================================================================
+ * ES module loader (mario _resolve_m_func / _load_m_func)
+ * ================================================================== */
+
+static EWebEngine* js_engine_of_vm(vm_t* vm)
+{
+    return (vm != nullptr) ? (EWebEngine*)vm->on_step_data : nullptr;
+}
+
+mstr_t* EWebEngine::jsModuleResolve(vm_t* vm, const char* spec, const char* base)
+{
+    EWebEngine* self = js_engine_of_vm(vm);
+    if(self == nullptr || spec == nullptr || spec[0] == 0) return nullptr;
+    /* Base for a relative specifier: the importing module's URL, else the
+     * <script src> being run, else the document. Bare specifiers ("react")
+     * have no browser resolution without an import map; leave them as-is so
+     * the registry key stays stable and the load simply fails. */
+    bool relative = (spec[0] == '.' || spec[0] == '/');
+    bool absolute = (strstr(spec, "://") != nullptr);
+    if(!relative && !absolute) return nullptr;
+    std::string b;
+    if(base != nullptr && base[0] != 0) b = base;
+    else if(!self->m_jsCurScriptUrl.empty())
+        b = EWebContainer::getFullURL(&self->m_port, self->m_jsCurScriptUrl.c_str(),
+                                      self->jsDocumentUrl());
+    if(b.empty()) b = self->jsDocumentUrl();
+    std::string full = EWebContainer::getFullURL(&self->m_port, spec, b);
+    if(full.empty()) return nullptr;
+    return mstr_new(full.c_str());
+}
+
+mstr_t* EWebEngine::jsModuleLoad(vm_t* vm, const char* spec)
+{
+    EWebEngine* self = js_engine_of_vm(vm);
+    if(self == nullptr || spec == nullptr || spec[0] == 0) return nullptr;
+    if(strstr(spec, "://") == nullptr) {
+        EWEB_LOG("[ewebview] js: module '%s' has no URL resolution (bare specifier)\n", spec);
+        return nullptr;
+    }
+    uint64_t t0 = self->ticMs();
+    int status = 0;
+    char* body = nullptr;
+    bool ok = jsWebRequest(self, "GET", spec, "Accept: */*", nullptr, &status, &body, nullptr);
+    if(!ok || body == nullptr || status < 200 || status >= 300) {
+        EWEB_LOG("[ewebview] js: module fetch failed (%d) %s\n", status, spec);
+        if(body != nullptr) mario_free(body);
+        return nullptr;
+    }
+    mstr_t* js = mstr_new(body);
+    mario_free(body);
+    EWEB_LOG("[ewebview] js: module %s -> %u bytes in %llu ms\n", spec,
+             (unsigned)js->len, (unsigned long long)(self->ticMs() - t0));
+    /* Debug aid: EWEB_MODULE_DUMP=<dir> writes every fetched module body to
+     * <dir>/<n>.js (with a .url sidecar) so an in-browser compile failure can be
+     * reproduced offline with `mario -c`. EWEB_MODULE_TRACE=1 logs each load. */
+    const char* dumpDir = getenv("EWEB_MODULE_DUMP");
+    if(dumpDir != nullptr && dumpDir[0] != 0) {
+        static int dumpSeq = 0;
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%d.js", dumpDir, dumpSeq);
+        FILE* f = fopen(path, "wb");
+        if(f != nullptr) { fwrite(js->cstr, 1, js->len, f); fclose(f); }
+        snprintf(path, sizeof(path), "%s/%d.url", dumpDir, dumpSeq);
+        f = fopen(path, "wb");
+        if(f != nullptr) { fprintf(f, "%s\n", spec); fclose(f); }
+        dumpSeq++;
+    }
+    if(getenv("EWEB_MODULE_TRACE") != nullptr)
+        fprintf(stderr, "[module] %s -> %u bytes (status %d) in %llu ms\n", spec,
+                (unsigned)js->len, status, (unsigned long long)(self->ticMs() - t0));
+    return js;
+}
+
+void EWebEngine::jsSetModuleBase(bool on)
+{
+    if(m_jsVm == nullptr) return;
+    if(!on) {
+        m_jsVm->cur_module_spec = nullptr;
+        return;
+    }
+    if(!m_jsCurScriptUrl.empty())
+        m_jsModuleBase = EWebContainer::getFullURL(&m_port, m_jsCurScriptUrl.c_str(), jsDocumentUrl());
+    else
+        m_jsModuleBase = jsDocumentUrl();
+    m_jsVm->cur_module_spec = m_jsModuleBase.empty() ? nullptr : m_jsModuleBase.c_str();
+}
+
 char* EWebEngine::jsWebGetCookie(void* ctx)
 {
     EWebEngine* self = (EWebEngine*)ctx;
@@ -2610,6 +2705,40 @@ void EWebEngine::jsFreeDetachedNodes()
     }
     m_jsDetached.clear();
     m_jsHoverElement = nullptr;
+}
+
+void EWebEngine::jsRestoreNoJsFallback()
+{
+    /* After all scripts have run, check whether the `no-js` progressive
+     * enhancement class should be restored on <html>. The original markup
+     * carries it (`<html class="no-js ...">`) and a tiny inline handler
+     * immediately strips it, assuming the full JS enhancement pipeline (React
+     * hydration, GSAP tweens, IntersectionObserver callbacks) will run and
+     * eventually toggle content from opacity:0 to 1. When the engine cannot
+     * complete the async hydration (e.g. Next.js initialize() stalls because
+     * the mario VM doesn't settle its internal Promises), the class never
+     * transitions to "enhanced" and the SSR content stays invisible behind
+     * the tween's initial opacity:0. Restoring `no-js` reactivates the
+     * fallback CSS that shows content at full opacity, matching what a
+     * no-JavaScript browser would display. */
+    if(!m_jsOrigHtmlHadNoJs) return;
+    litehtml::document* doc = jsActiveDoc();
+    if(doc == nullptr) return;
+    litehtml::element::ptr root = doc->root();
+    if(root == nullptr) return;
+    litehtml::element::ptr html_el = root->select_one("html");
+    if(html_el == nullptr) html_el = root; // root IS <html> in most trees
+    const char* cls = html_el->get_attr("class", "");
+    std::string clsStr = cls ? cls : "";
+    /* If the full enhancement pipeline ran (added "enhanced"), don't override. */
+    if(clsStr.find("enhanced") != std::string::npos) return;
+    /* Already has no-js (handler never ran): nothing to do. */
+    if(clsStr.find("no-js") != std::string::npos) return;
+    /* Re-add no-js. */
+    if(!clsStr.empty()) clsStr += " ";
+    clsStr += "no-js";
+    html_el->set_attr("class", clsStr.c_str());
+    EWEB_LOG("[ewebview] restored no-js fallback class on <html>\n");
 }
 
 void EWebEngine::jsFireLoadEvents()

@@ -101,6 +101,28 @@ void litehtml::style::parse_property( const tstring& txt, const tchar_t* baseurl
 
 void litehtml::style::combine( const litehtml::style& src )
 {
+	/* A rule that still holds a raw `font`/`flex` shorthand (deferred by
+	 * add_property because it contained a var()) supersedes every longhand
+	 * that earlier rules put here, exactly as parse_short_font would have if
+	 * the value had been tokenisable. Drop them first so that only longhands
+	 * from later rules survive to override the expanded shorthand. */
+	props_map::const_iterator sh = src.m_properties.find(_t("font"));
+	if(sh != src.m_properties.end())
+	{
+		remove_property(_t("font-style"),	sh->second.m_important);
+		remove_property(_t("font-variant"),	sh->second.m_important);
+		remove_property(_t("font-weight"),	sh->second.m_important);
+		remove_property(_t("font-size"),		sh->second.m_important);
+		remove_property(_t("line-height"),	sh->second.m_important);
+		remove_property(_t("font-family"),	sh->second.m_important);
+	}
+	sh = src.m_properties.find(_t("flex"));
+	if(sh != src.m_properties.end())
+	{
+		remove_property(_t("flex-grow"),   sh->second.m_important);
+		remove_property(_t("flex-shrink"), sh->second.m_important);
+		remove_property(_t("flex-basis"),  sh->second.m_important);
+	}
 	for(props_map::const_iterator i = src.m_properties.begin(); i != src.m_properties.end(); i++)
 	{
 		add_parsed_property(i->first.c_str(), i->second.m_value.c_str(), i->second.m_important);
@@ -573,6 +595,81 @@ void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, con
 			add_parsed_property(tstring(name) + _t("-left"),		tokens[0], important);
 		}
 	} else 
+
+	// flex shorthand: none | auto | initial | [<grow> <shrink>? || <basis>].
+	// Expanded here so the cascade orders it against the longhands and so a
+	// lone <length-percentage> (`flex:100%`, primer's PageLayout content) is
+	// the BASIS and not a flex-grow of 100 - that read kept a 100%-basis item
+	// on the header's line instead of wrapping it below (github.com body).
+	if(!t_strcmp(name, _t("flex")))
+	{
+		/* A var() may expand to several tokens (`flex: var(--f)` with
+		 * --f: 1 1 0%): keep the shorthand raw and let expand_css_functions
+		 * re-enter here with the substituted value. Earlier longhands are
+		 * dropped now so only later-cascade ones survive to override it. */
+		if(t_strstr(val, _t("var(")))
+		{
+			remove_property(_t("flex-grow"),   important);
+			remove_property(_t("flex-shrink"), important);
+			remove_property(_t("flex-basis"),  important);
+			add_parsed_property(name, val, important);
+			return;
+		}
+		tstring grow = _t("1"), shrink = _t("1"), basis = _t("0%");
+		if(!t_strcasecmp(val, _t("none")))			{ grow = _t("0"); shrink = _t("0"); basis = _t("auto"); }
+		else if(!t_strcasecmp(val, _t("auto")))	{ basis = _t("auto"); }
+		else if(!t_strcasecmp(val, _t("initial")))	{ grow = _t("0"); basis = _t("auto"); }
+		else
+		{
+			string_vector tokens;
+			split_string(val, tokens, _t(" "), _t(""), _t("("));
+			int nums = 0;
+			bool basis_seen = false;
+			for(size_t i = 0; i < tokens.size(); i++)
+			{
+				const tstring& tk = tokens[i];
+				if(tk.empty()) continue;
+				bool numeric = true;
+				for(size_t k = 0; k < tk.length(); k++)
+				{
+					tchar_t ch = tk[k];
+					if(!((ch >= _t('0') && ch <= _t('9')) || ch == _t('.') || ch == _t('-') || ch == _t('+')))
+					{ numeric = false; break; }
+				}
+				if(numeric && nums < 2)
+				{
+					if(nums == 0) grow = tk; else shrink = tk;
+					nums++;
+				} else if(!basis_seen)
+				{
+					basis = tk;
+					basis_seen = true;
+				}
+			}
+			if(nums == 0 && !basis_seen) return;   /* garbage: ignore the declaration */
+		}
+		add_parsed_property(_t("flex-grow"),   grow,   important);
+		add_parsed_property(_t("flex-shrink"), shrink, important);
+		add_parsed_property(_t("flex-basis"),  basis,  important);
+	} else 
+
+	// flex-flow shorthand: <flex-direction> || <flex-wrap>
+	if(!t_strcmp(name, _t("flex-flow")))
+	{
+		string_vector tokens;
+		split_string(val, tokens, _t(" "));
+		tstring dir = _t("row"), wrap = _t("nowrap");
+		for(size_t i = 0; i < tokens.size(); i++)
+		{
+			const tstring& tk = tokens[i];
+			if(tk == _t("row") || tk == _t("row-reverse") || tk == _t("column") || tk == _t("column-reverse"))
+				dir = tk;
+			else if(tk == _t("wrap") || tk == _t("nowrap") || tk == _t("wrap-reverse"))
+				wrap = tk;
+		}
+		add_parsed_property(_t("flex-direction"), dir,  important);
+		add_parsed_property(_t("flex-wrap"),      wrap, important);
+	} else 
 		
 		
 	// Parse border-* shorthand properties 
@@ -626,6 +723,23 @@ void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, con
 	// Parse font shorthand properties 
 	if(!t_strcmp(name, _t("font")))
 	{
+		/* `font: var(--title, 600 1rem/1.5 -apple-system, ...)` (primer's Heading)
+		 * cannot be tokenised until the var() is substituted, so keep it raw for
+		 * expand_css_functions to re-enter here. Cascade order is preserved by
+		 * dropping the longhands set BEFORE this declaration now: whatever
+		 * longhand is still present when the shorthand finally expands must
+		 * have come later in the cascade and correctly overrides it. */
+		if(t_strstr(val, _t("var(")))
+		{
+			remove_property(_t("font-style"),	important);
+			remove_property(_t("font-variant"),	important);
+			remove_property(_t("font-weight"),	important);
+			remove_property(_t("font-size"),		important);
+			remove_property(_t("line-height"),	important);
+			remove_property(_t("font-family"),	important);
+			add_parsed_property(name, val, important);
+			return;
+		}
 		parse_short_font(val, important);
 	} else 
 	{

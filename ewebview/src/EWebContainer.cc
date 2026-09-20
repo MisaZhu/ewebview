@@ -444,8 +444,16 @@ litehtml::uint_ptr EWebContainer::create_font(const litehtml::tchar_t* faceName,
      * concrete face (the reference port ships one CJK face and treats the
      * family as advisory). */
     std::string fontName = (faceName != NULL && faceName[0] != 0) ? faceName : "sans-serif";
+    /* Weight/style are part of the identity: a bold face measures wider than
+     * the regular one, so sharing a handle across weights would mis-lay-out
+     * every heading. Ports without create_styled still get one face per key
+     * (just a few more cache entries). */
+    bool isItalic = italic == fontStyleItalic;
+    if (weight <= 0) weight = 400;
     std::string key = fontName;
     key += "-" + std::to_string(size) + "px";
+    key += "-w" + std::to_string(weight);
+    if (isItalic) key += "-i";
 
     EWebFontInfo fontInfo;
     fontInfo.font = NULL;
@@ -454,7 +462,9 @@ litehtml::uint_ptr EWebContainer::create_font(const litehtml::tchar_t* faceName,
     if (m_fonts.find(key) != m_fonts.end()) {
         fontInfo = m_fonts[key];
     } else {
-        if(m_port->font.create)
+        if(m_port->font.create_styled)
+            fontInfo.font = m_port->font.create_styled(m_port->font.ud, fontName.c_str(), weight, isItalic ? 1 : 0);
+        else if(m_port->font.create)
             fontInfo.font = m_port->font.create(m_port->font.ud, fontName.c_str());
         fontInfo.size = size;
         m_fonts[key] = fontInfo;
@@ -519,6 +529,20 @@ int EWebContainer::text_width(const litehtml::tchar_t* text, litehtml::uint_ptr 
     const char* p = text;
     uint32_t w = 0;
     bool cache_hit_only = true;
+    /* Multi-glyph strings go to the port's shaped measurement when it has
+     * one: browsers lay words out with fractional advances plus kerning, and
+     * summing per-glyph advances that were each rounded to a logical px
+     * drifts an 8-letter word several px from Chrome (visible as gaps between
+     * adjacent inline spans). litehtml caches each text node's width, so this
+     * is one call per word per style pass, not per layout query. Single
+     * code points (spaces, punctuation) keep the per-glyph cache fast path. */
+    if(m_port->font.text_size && text[1]) {
+        int tw = 0;
+        m_port->font.text_size(m_port->font.ud, fontInfo->font, fontInfo->size, text, &tw, NULL);
+        m_text_width_misses++;
+        m_text_width_ms += (uint32_t)(m_port->clock.tic_ms(m_port->clock.ud) - start_ms);
+        return tw < 0 ? 0 : tw;
+    }
     while(*p) {
         uint32_t codepoint = 0;
         if(!next_utf8_codepoint(p, codepoint)) {

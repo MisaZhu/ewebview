@@ -122,11 +122,26 @@ typedef struct {
 #define SDL_FONT_MAX_FACES 24
 typedef struct {
     int       size;
-    TTF_Font* face;
+    TTF_Font* face;       /* primary (CSS family) face */
+    TTF_Font* fb;         /* CJK fallback face, NULL when primary == fallback */
 } sdl_face_slot_t;
 
+/* One concrete face: file + index (a plain .ttc face index, or a variable
+ * font's named instance in the high 16 bits, as FreeType expects) + the
+ * TTF_STYLE_* bits the file cannot supply and must be synthesised. */
 typedef struct {
-    char            family[64];
+    const char* path;
+    long        index;
+    int         synth;
+} sdl_face_spec_t;
+
+typedef struct {
+    char            family[192];  /* CSS font-family list, verbatim */
+    int             weight;       /* CSS font-weight 100..900 */
+    int             italic;
+    int             resolved;     /* prim/fb filled in on first face open */
+    sdl_face_spec_t prim;         /* face matching the CSS family */
+    sdl_face_spec_t fb;           /* CJK fallback for glyphs prim lacks */
     sdl_face_slot_t faces[SDL_FONT_MAX_FACES];
     int             face_count;
 } sdl_font_t;
@@ -916,38 +931,428 @@ static const char* sdl2_find_font_path(const char* family) {
     return NULL;
 }
 
-static TTF_Font* sdl_font_face(sdl_font_t* f, int size) {
-    const char* path;
+static bool sdl2_file_exists(const char* path) {
+    SDL_RWops* rw = path ? SDL_RWFromFile(path, "rb") : NULL;
+    if(!rw) return false;
+    SDL_RWclose(rw);
+    return true;
+}
+
+/* Case-insensitive substring test for face style names ("W6", "Bold", ...). */
+static bool sdl2_style_has(const char* style, const char* word) {
+    size_t n = strlen(word);
+    if(!style) return false;
+    for(; *style; style++) {
+        if(SDL_strncasecmp(style, word, n) == 0) return true;
+    }
+    return false;
+}
+
+static bool sdl2_style_is_bold(const char* style) {
+    /* Hiragino/PingFang name weights W3..W9; Latin faces say Bold/Semibold/
+     * Heavy/Black. Anything >= W6 / Semibold counts as a CSS >=600 face. */
+    return sdl2_style_has(style, "bold")  || sdl2_style_has(style, "heavy") ||
+           sdl2_style_has(style, "black") || sdl2_style_has(style, "W6") ||
+           sdl2_style_has(style, "W7")    || sdl2_style_has(style, "W8") ||
+           sdl2_style_has(style, "W9");
+}
+
+static bool sdl2_style_is_italic(const char* style) {
+    return sdl2_style_has(style, "italic") || sdl2_style_has(style, "oblique");
+}
+
+/* ---- CSS family -> Latin primary face ------------------------------------
+ *
+ * The CJK collection above is what every page USED to render with, which made
+ * Latin text look wrong on every site: Hiragino's Latin glyphs are wider and
+ * its space is ~1.5x a Western space, so word gaps, wrap points and button
+ * widths all drifted from what Chrome/Safari lay out. Browsers pick the first
+ * family in the CSS list that is installed, then fall back PER GLYPH for the
+ * characters that face lacks. We do the same: the family list resolves to one
+ * Latin "primary" face, and the CJK face becomes the per-glyph fallback.
+ *
+ * Generic-family and vendor mappings follow what Chrome does on macOS:
+ * -apple-system / system-ui -> SF Pro (SFNS.ttf, a variable font whose named
+ * instances give a real face for every CSS weight), sans-serif -> Helvetica,
+ * serif -> Times, monospace -> Menlo. Web-font names ("Mona Sans", "Inter")
+ * are simply skipped because we never load @font-face resources. */
+
+/* Strip quotes/whitespace from one comma-separated family token, lowercase
+ * it into out. Returns false when the token is empty. */
+static bool sdl2_family_token(const char** cursor, char* out, size_t cap) {
+    const char* p = *cursor;
+    size_t n = 0;
+    if(!p || !*p) return false;
+    while(*p == ' ' || *p == '\t' || *p == ',') p++;
+    while(*p && *p != ',') {
+        char c = *p++;
+        if(c == '"' || c == '\'') continue;
+        if(c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if(n + 1 < cap) out[n++] = c;
+    }
+    while(n > 0 && (out[n-1] == ' ' || out[n-1] == '\t')) n--;
+    out[n] = 0;
+    *cursor = p;
+    return n > 0;
+}
+
+/* Pick a face out of a .ttc by style name (Bold/Italic/Oblique/W6...), the
+ * way sdl2_resolve_face did for the CJK collection. Fills spec->index/synth. */
+static void sdl2_pick_ttc_face(sdl_face_spec_t* spec, bool want_bold, bool want_italic) {
+    long i, n = 1, best = 0;
+    bool best_bold = false, best_italic = false;
+    TTF_Font* probe;
+    spec->index = 0;
+    spec->synth = TTF_STYLE_NORMAL;
+    if(!want_bold && !want_italic) return;
+    probe = TTF_OpenFontIndex(spec->path, 16, 0);
+    if(!probe) return;
+    n = TTF_FontFaces(probe);
+    best_bold = sdl2_style_is_bold(TTF_FontFaceStyleName(probe));
+    best_italic = sdl2_style_is_italic(TTF_FontFaceStyleName(probe));
+    TTF_CloseFont(probe);
+    for(i = 1; i < n; i++) {
+        const char* fam;
+        bool b, it;
+        probe = TTF_OpenFontIndex(spec->path, 16, i);
+        if(!probe) continue;
+        fam = TTF_FontFaceFamilyName(probe);
+        b = sdl2_style_is_bold(TTF_FontFaceStyleName(probe));
+        it = sdl2_style_is_italic(TTF_FontFaceStyleName(probe));
+        TTF_CloseFont(probe);
+        /* Skip Apple's hidden ".Interface" twins; the visible face is the
+         * one whose metrics the rest of the page was measured with. */
+        if(fam && fam[0] == '.') continue;
+        /* Exact match wins outright; otherwise prefer getting bold right,
+         * since italic synthesises far better than weight does. */
+        if(b == want_bold && it == want_italic) { best = i; best_bold = b; best_italic = it; break; }
+        if(b == want_bold && best_bold != want_bold) { best = i; best_bold = b; best_italic = it; }
+    }
+    spec->index = best;
+    if(want_bold && !best_bold)     spec->synth |= TTF_STYLE_BOLD;
+    if(want_italic && !best_italic) spec->synth |= TTF_STYLE_ITALIC;
+}
+
+/* A family shipped as separate Regular/Bold/Italic/BoldItalic files (Arial,
+ * Times New Roman, Georgia, Verdana, Courier New under macOS Supplemental,
+ * DejaVu/Liberation on Linux). Any missing variant is synthesised. */
+typedef struct {
+    const char* regular;
+    const char* bold;
+    const char* italic;
+    const char* bold_italic;
+} sdl_font_files_t;
+
+static bool sdl2_spec_from_files(sdl_face_spec_t* spec, const sdl_font_files_t* ff,
+                                 bool want_bold, bool want_italic) {
+    const char* pick = NULL;
+    int synth = TTF_STYLE_NORMAL;
+    if(!sdl2_file_exists(ff->regular)) return false;
+    if(want_bold && want_italic && sdl2_file_exists(ff->bold_italic)) pick = ff->bold_italic;
+    else if(want_bold && sdl2_file_exists(ff->bold)) { pick = ff->bold; if(want_italic) synth |= TTF_STYLE_ITALIC; }
+    else if(want_italic && sdl2_file_exists(ff->italic)) { pick = ff->italic; if(want_bold) synth |= TTF_STYLE_BOLD; }
+    else {
+        pick = ff->regular;
+        if(want_bold)   synth |= TTF_STYLE_BOLD;
+        if(want_italic) synth |= TTF_STYLE_ITALIC;
+    }
+    spec->path = pick; spec->index = 0; spec->synth = synth;
+    return true;
+}
+
+/* SF Pro: named instances 1..9 are Ultralight..Black (100..900). Italic
+ * lives in a sibling file with the same instance layout. */
+static bool sdl2_spec_sf(sdl_face_spec_t* spec, int weight, bool want_italic) {
+    const char* path = want_italic ? "/System/Library/Fonts/SFNSItalic.ttf"
+                                   : "/System/Library/Fonts/SFNS.ttf";
+    long inst;
+    if(!sdl2_file_exists(path)) {
+        if(!want_italic) return false;
+        path = "/System/Library/Fonts/SFNS.ttf";
+        if(!sdl2_file_exists(path)) return false;
+    }
+    inst = (weight + 50) / 100;
+    if(inst < 1) inst = 1;
+    if(inst > 9) inst = 9;
+    spec->path = path;
+    spec->index = inst << 16;
+    spec->synth = TTF_STYLE_NORMAL;
+    /* Probe: an older macOS ships SFNS without the instance table. */
+    {
+        TTF_Font* probe = TTF_OpenFontIndex(path, 16, spec->index);
+        if(!probe) {
+            spec->index = 0;
+            if(weight >= 600) spec->synth |= TTF_STYLE_BOLD;
+        } else {
+            TTF_CloseFont(probe);
+        }
+    }
+    if(want_italic && !strstr(path, "Italic")) spec->synth |= TTF_STYLE_ITALIC;
+    return true;
+}
+
+static bool sdl2_spec_ttc(sdl_face_spec_t* spec, const char* path, bool want_bold, bool want_italic) {
+    if(!sdl2_file_exists(path)) return false;
+    spec->path = path;
+    sdl2_pick_ttc_face(spec, want_bold, want_italic);
+    return true;
+}
+
+enum { SDL_GEN_NONE = 0, SDL_GEN_SANS, SDL_GEN_SERIF, SDL_GEN_MONO, SDL_GEN_SYSTEM };
+
+static bool sdl2_has(const char* tok, const char* name) { return strcmp(tok, name) == 0; }
+
+/* Try to resolve one family token to an installed face. */
+static bool sdl2_spec_for_family(sdl_face_spec_t* spec, const char* tok, int weight, bool italic) {
+    static const sdl_font_files_t arial = {
+        "/System/Library/Fonts/Supplemental/Arial.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Italic.ttf", "/System/Library/Fonts/Supplemental/Arial Bold Italic.ttf" };
+    static const sdl_font_files_t times = {
+        "/System/Library/Fonts/Supplemental/Times New Roman.ttf", "/System/Library/Fonts/Supplemental/Times New Roman Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Times New Roman Italic.ttf", "/System/Library/Fonts/Supplemental/Times New Roman Bold Italic.ttf" };
+    static const sdl_font_files_t georgia = {
+        "/System/Library/Fonts/Supplemental/Georgia.ttf", "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Georgia Italic.ttf", "/System/Library/Fonts/Supplemental/Georgia Bold Italic.ttf" };
+    static const sdl_font_files_t verdana = {
+        "/System/Library/Fonts/Supplemental/Verdana.ttf", "/System/Library/Fonts/Supplemental/Verdana Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Verdana Italic.ttf", "/System/Library/Fonts/Supplemental/Verdana Bold Italic.ttf" };
+    static const sdl_font_files_t courier_new = {
+        "/System/Library/Fonts/Supplemental/Courier New.ttf", "/System/Library/Fonts/Supplemental/Courier New Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Courier New Italic.ttf", "/System/Library/Fonts/Supplemental/Courier New Bold Italic.ttf" };
+    static const sdl_font_files_t trebuchet = {
+        "/System/Library/Fonts/Supplemental/Trebuchet MS.ttf", "/System/Library/Fonts/Supplemental/Trebuchet MS Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Trebuchet MS Italic.ttf", "/System/Library/Fonts/Supplemental/Trebuchet MS Bold Italic.ttf" };
+    /* Linux equivalents, tried after the macOS files are found missing. */
+    static const sdl_font_files_t dejavu_sans = {
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf" };
+    static const sdl_font_files_t liberation_sans = {
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf" };
+    static const sdl_font_files_t liberation_serif = {
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf", "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf", "/usr/share/fonts/truetype/liberation/LiberationSerif-BoldItalic.ttf" };
+    static const sdl_font_files_t dejavu_mono = {
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf" };
+    bool bold = weight >= 600;
+    int gen = SDL_GEN_NONE;
+
+    /* Named families installed on macOS. */
+    if(sdl2_has(tok, "-apple-system") || sdl2_has(tok, "blinkmacsystemfont") ||
+       sdl2_has(tok, "system-ui") || sdl2_has(tok, "ui-sans-serif") || sdl2_has(tok, "sf pro") ||
+       sdl2_has(tok, "sf pro text") || sdl2_has(tok, "sf pro display"))
+        gen = SDL_GEN_SYSTEM;
+    else if(sdl2_has(tok, "helvetica") || sdl2_has(tok, "helvetica neue")) {
+        if(sdl2_spec_ttc(spec, sdl2_has(tok, "helvetica neue") ? "/System/Library/Fonts/HelveticaNeue.ttc"
+                                                                : "/System/Library/Fonts/Helvetica.ttc", bold, italic)) return true;
+        gen = SDL_GEN_SANS;
+    }
+    else if(sdl2_has(tok, "arial"))            { if(sdl2_spec_from_files(spec, &arial, bold, italic)) return true; gen = SDL_GEN_SANS; }
+    else if(sdl2_has(tok, "verdana"))          { if(sdl2_spec_from_files(spec, &verdana, bold, italic)) return true; gen = SDL_GEN_SANS; }
+    else if(sdl2_has(tok, "trebuchet ms"))     { if(sdl2_spec_from_files(spec, &trebuchet, bold, italic)) return true; gen = SDL_GEN_SANS; }
+    else if(sdl2_has(tok, "times new roman") || sdl2_has(tok, "times")) { if(sdl2_spec_from_files(spec, &times, bold, italic)) return true; gen = SDL_GEN_SERIF; }
+    else if(sdl2_has(tok, "georgia"))          { if(sdl2_spec_from_files(spec, &georgia, bold, italic)) return true; gen = SDL_GEN_SERIF; }
+    else if(sdl2_has(tok, "courier new"))      { if(sdl2_spec_from_files(spec, &courier_new, bold, italic)) return true; gen = SDL_GEN_MONO; }
+    else if(sdl2_has(tok, "courier"))          { if(sdl2_spec_ttc(spec, "/System/Library/Fonts/Courier.ttc", bold, italic)) return true; gen = SDL_GEN_MONO; }
+    else if(sdl2_has(tok, "menlo") || sdl2_has(tok, "sfmono-regular") || sdl2_has(tok, "sf mono") ||
+            sdl2_has(tok, "ui-monospace") || sdl2_has(tok, "monaco") || sdl2_has(tok, "consolas"))
+        gen = SDL_GEN_MONO;
+    else if(sdl2_has(tok, "sans-serif") || sdl2_has(tok, "segoe ui") || sdl2_has(tok, "roboto") ||
+            sdl2_has(tok, "noto sans") || sdl2_has(tok, "ubuntu") || sdl2_has(tok, "cantarell") ||
+            sdl2_has(tok, "liberation sans") || sdl2_has(tok, "dejavu sans"))
+        gen = SDL_GEN_SANS;
+    else if(sdl2_has(tok, "serif") || sdl2_has(tok, "ui-serif"))
+        gen = SDL_GEN_SERIF;
+    else if(sdl2_has(tok, "monospace") || sdl2_has(tok, "liberation mono") || sdl2_has(tok, "dejavu sans mono"))
+        gen = SDL_GEN_MONO;
+    else
+        return false;   /* web font or unknown family: browsers skip it too */
+
+    switch(gen) {
+    case SDL_GEN_SYSTEM:
+        if(sdl2_spec_sf(spec, weight, italic)) return true;
+        /* fallthrough: no SF on this box, use the sans mapping */
+    case SDL_GEN_SANS:
+        if(sdl2_spec_ttc(spec, "/System/Library/Fonts/Helvetica.ttc", bold, italic)) return true;
+        if(sdl2_spec_from_files(spec, &arial, bold, italic)) return true;
+        if(sdl2_spec_from_files(spec, &liberation_sans, bold, italic)) return true;
+        if(sdl2_spec_from_files(spec, &dejavu_sans, bold, italic)) return true;
+        return false;
+    case SDL_GEN_SERIF:
+        if(sdl2_spec_from_files(spec, &times, bold, italic)) return true;
+        if(sdl2_spec_from_files(spec, &liberation_serif, bold, italic)) return true;
+        return false;
+    case SDL_GEN_MONO:
+        if(sdl2_spec_ttc(spec, "/System/Library/Fonts/Menlo.ttc", bold, italic)) return true;
+        if(sdl2_spec_from_files(spec, &courier_new, bold, italic)) return true;
+        if(sdl2_spec_from_files(spec, &dejavu_mono, bold, italic)) return true;
+        return false;
+    default:
+        return false;
+    }
+}
+
+/* Resolve the CSS family list + weight/style into prim (first installed
+ * family, else the sans default) and fb (the CJK collection). Done once per
+ * handle; it opens a handful of faces at a nominal size, which is cheap. */
+static void sdl2_resolve_font(sdl_font_t* f) {
+    const char* cjk = sdl2_find_font_path(f->family);
+    const char* cur = f->family;
+    char tok[96];
+    bool italic = f->italic != 0;
+    bool have_prim = false;
+    f->resolved = 1;
+    f->prim.path = f->fb.path = NULL;
+    /* EWEBVIEW_SDL2_FONT pins everything to one face, as before. */
+    if(!SDL_getenv("EWEBVIEW_SDL2_FONT")) {
+        while(sdl2_family_token(&cur, tok, sizeof(tok))) {
+            if(sdl2_spec_for_family(&f->prim, tok, f->weight, italic)) { have_prim = true; break; }
+        }
+        if(!have_prim && sdl2_spec_for_family(&f->prim, "sans-serif", f->weight, italic)) have_prim = true;
+    }
+    if(cjk) {
+        f->fb.path = cjk;
+        sdl2_pick_ttc_face(&f->fb, f->weight >= 600, italic);
+    }
+    if(!have_prim) {
+        /* No Latin face installed: the CJK collection is the only face. */
+        f->prim = f->fb;
+        f->fb.path = NULL;
+    } else if(f->fb.path && strcmp(f->fb.path, f->prim.path) == 0 && f->fb.index == f->prim.index) {
+        f->fb.path = NULL;
+    }
+}
+
+/* Decode one UTF-8 sequence; returns bytes consumed (>=1). Malformed input
+ * yields U+FFFD one byte at a time so runs still terminate. */
+static int sdl2_decode_utf8(const char* s, uint32_t* cp) {
+    const unsigned char* p = (const unsigned char*)s;
+    if(p[0] < 0x80) { *cp = p[0]; return 1; }
+    if((p[0] & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+        *cp = ((uint32_t)(p[0] & 0x1F) << 6) | (p[1] & 0x3F); return 2;
+    }
+    if((p[0] & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+        *cp = ((uint32_t)(p[0] & 0x0F) << 12) | ((uint32_t)(p[1] & 0x3F) << 6) | (p[2] & 0x3F); return 3;
+    }
+    if((p[0] & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
+        *cp = ((uint32_t)(p[0] & 0x07) << 18) | ((uint32_t)(p[1] & 0x3F) << 12) |
+              ((uint32_t)(p[2] & 0x3F) << 6) | (p[3] & 0x3F); return 4;
+    }
+    *cp = 0xFFFD;
+    return 1;
+}
+
+/* Which face draws this code point: the primary whenever it has the glyph,
+ * else the fallback if THAT has it, else the primary (renders its notdef).
+ * Control/format characters never trigger a fallback switch. */
+static TTF_Font* sdl2_face_for(TTF_Font* prim, TTF_Font* fb, uint32_t cp) {
+    if(!fb || cp < 0x80) return prim;
+    if(TTF_GlyphIsProvided32(prim, cp)) return prim;
+    if(TTF_GlyphIsProvided32(fb, cp)) return fb;
+    return prim;
+}
+
+/* Split text into maximal same-face runs and call fn(face, run, len, ud).
+ * Returns false when the whole string is a single primary run (the caller
+ * can then use the plain single-face API with no copying). */
+typedef void (*sdl2_run_fn)(TTF_Font* face, const char* run, int len, void* ud);
+static bool sdl2_for_each_run(TTF_Font* prim, TTF_Font* fb, const char* text, sdl2_run_fn fn, void* ud) {
+    const char* p = text;
+    const char* run_start = text;
+    TTF_Font* run_face = NULL;
+    bool mixed = false;
+    if(!fb) return false;
+    while(*p) {
+        uint32_t cp;
+        int n = sdl2_decode_utf8(p, &cp);
+        TTF_Font* face = sdl2_face_for(prim, fb, cp);
+        if(!run_face) run_face = face;
+        else if(face != run_face) {
+            mixed = true;
+            break;
+        }
+        p += n;
+    }
+    if(!mixed) return false;
+    /* Second pass, now known to be mixed: emit the runs. */
+    p = text; run_face = NULL; run_start = text;
+    while(*p) {
+        uint32_t cp;
+        int n = sdl2_decode_utf8(p, &cp);
+        TTF_Font* face = sdl2_face_for(prim, fb, cp);
+        if(run_face && face != run_face) {
+            fn(run_face, run_start, (int)(p - run_start), ud);
+            run_start = p;
+        }
+        run_face = face;
+        p += n;
+    }
+    if(run_face && p > run_start) fn(run_face, run_start, (int)(p - run_start), ud);
+    return true;
+}
+
+/* Open (or fetch from the per-size cache) the primary + fallback faces for
+ * one pixel size. *fb is NULL when there is no separate fallback face. */
+static TTF_Font* sdl_font_faces(sdl_font_t* f, int size, TTF_Font** fb) {
     TTF_Font* face;
     int i;
+    if(fb) *fb = NULL;
     if(!f) return NULL;
     if(size <= 0) size = 12;
     /* Linear scan: cache is tiny (<=24) and hits are overwhelmingly repeat
      * sizes, so this is faster than any hash we'd write. */
     for(i = 0; i < f->face_count; i++) {
-        if(f->faces[i].size == size) return f->faces[i].face;
+        if(f->faces[i].size == size) {
+            if(fb) *fb = f->faces[i].fb;
+            return f->faces[i].face;
+        }
     }
     if(f->face_count >= SDL_FONT_MAX_FACES) {
         /* Cache full: close slot 0 and reuse it. Safe because the HAL never
          * holds a TTF_Font* across calls - it only sees eweb_font_t. */
         TTF_CloseFont(f->faces[0].face);
+        if(f->faces[0].fb) TTF_CloseFont(f->faces[0].fb);
         f->faces[0].face = NULL;
+        f->faces[0].fb = NULL;
         f->faces[0].size = 0;
         /* Compact: shift the rest down so the next miss fills slot 0 cleanly. */
         for(i = 1; i < f->face_count; i++) f->faces[i-1] = f->faces[i];
         f->face_count--;
     }
-    path = sdl2_find_font_path(f->family);
-    if(!path) return NULL;
-    face = TTF_OpenFont(path, size);
+    if(!f->resolved) sdl2_resolve_font(f);
+    if(!f->prim.path) return NULL;
+    face = TTF_OpenFontIndex(f->prim.path, size, f->prim.index);
     if(!face) return NULL;
+    /* No hinting: browsers on macOS position glyphs by their unhinted
+     * fractional advances (with kerning), and with hinting off SDL_ttf's
+     * TTF_SizeUTF8 equals the rendered width AND that browser measurement,
+     * so words measure and paint at the same width Chrome gives them.
+     * Hinted advances snap every glyph to a whole device pixel, which made
+     * words up to 5% wider than the reference. */
+    TTF_SetFontHinting(face, TTF_HINTING_NONE);
+    if(f->prim.synth != TTF_STYLE_NORMAL) TTF_SetFontStyle(face, f->prim.synth);
     f->faces[f->face_count].size = size;
     f->faces[f->face_count].face = face;
+    f->faces[f->face_count].fb = NULL;
+    if(f->fb.path) {
+        TTF_Font* fbf = TTF_OpenFontIndex(f->fb.path, size, f->fb.index);
+        if(fbf) {
+            TTF_SetFontHinting(fbf, TTF_HINTING_NONE);
+            if(f->fb.synth != TTF_STYLE_NORMAL) TTF_SetFontStyle(fbf, f->fb.synth);
+            f->faces[f->face_count].fb = fbf;
+        }
+    }
+    if(fb) *fb = f->faces[f->face_count].fb;
     f->face_count++;
     return face;
 }
 
-static eweb_font_t* ek_font_create(void* ud, const char* family) {
+static TTF_Font* sdl_font_face(sdl_font_t* f, int size) {
+    return sdl_font_faces(f, size, NULL);
+}
+
+static eweb_font_t* ek_font_create_styled(void* ud, const char* family, int weight, int italic) {
     sdl_font_t* f;
     (void)ud;
     if(!sdl2_ensure_libs()) return NULL;
@@ -957,7 +1362,14 @@ static eweb_font_t* ek_font_create(void* ud, const char* family) {
         strncpy(f->family, family, sizeof(f->family) - 1);
         f->family[sizeof(f->family) - 1] = 0;
     }
+    f->weight = weight > 0 ? weight : 400;
+    f->italic = italic ? 1 : 0;
+    f->resolved = 0;   /* resolved lazily on the first face open */
     return FH(f);
+}
+
+static eweb_font_t* ek_font_create(void* ud, const char* family) {
+    return ek_font_create_styled(ud, family, 400, 0);
 }
 
 static void ek_font_destroy(void* ud, eweb_font_t* h) {
@@ -968,6 +1380,7 @@ static void ek_font_destroy(void* ud, eweb_font_t* h) {
     f = F(h);
     for(i = 0; i < f->face_count; i++) {
         if(f->faces[i].face) TTF_CloseFont(f->faces[i].face);
+        if(f->faces[i].fb)   TTF_CloseFont(f->faces[i].fb);
     }
     free(f);
 }
@@ -1003,37 +1416,68 @@ static void ek_font_metrics(void* ud, eweb_font_t* h, int size, eweb_font_metric
 static int ek_font_char_width(void* ud, eweb_font_t* h, int size, uint32_t codepoint) {
     sdl_font_t* f;
     TTF_Font* face;
+    TTF_Font* fb = NULL;
     int minx = 0, maxx = 0, miny = 0, maxy = 0, adv = 0;
     (void)ud;
     if(!h) return 0;
     if(size <= 0) return 0;   /* font-size:0 glyphs advance nothing */
     f = F(h);
-    face = sdl_font_face(f, sdl2_font_px(size));   /* device-px face, logical result */
+    face = sdl_font_faces(f, sdl2_font_px(size), &fb);   /* device-px face, logical result */
     if(!face) return 0;
-    /* BMP fast path: TTF_GlyphMetrics is O(1) (FreeType charmap lookup),
-     * which matters because char_width is the hottest layout callback. */
-    if(codepoint <= 0xFFFF) {
-        if(TTF_GlyphMetrics(face, (Uint16)codepoint, &minx, &maxx, &miny, &maxy, &adv) < 0)
-            return 0;
-        return sdl2_logical_px(adv);
+    face = sdl2_face_for(face, fb, codepoint);
+    /* TTF_GlyphMetrics32 is O(1) (FreeType charmap lookup), which matters
+     * because char_width is the hottest layout callback. */
+    if(TTF_GlyphMetrics32(face, codepoint, &minx, &maxx, &miny, &maxy, &adv) < 0)
+        return 0;
+    return sdl2_logical_px(adv);
+}
+
+/* Run callbacks for the mixed-face paths: measure sums run widths, draw
+ * blits each run at the running x. */
+typedef struct { int w; int h; } sdl_measure_ud_t;
+static void sdl2_measure_run(TTF_Font* face, const char* run, int len, void* ud) {
+    sdl_measure_ud_t* m = (sdl_measure_ud_t*)ud;
+    char buf[512];
+    char* tmp = buf;
+    int w = 0, h = 0;
+    if(len >= (int)sizeof(buf)) { tmp = (char*)malloc((size_t)len + 1); if(!tmp) return; }
+    memcpy(tmp, run, (size_t)len); tmp[len] = 0;
+    if(TTF_SizeUTF8(face, tmp, &w, &h) == 0) { m->w += w; if(h > m->h) m->h = h; }
+    if(tmp != buf) free(tmp);
+}
+
+typedef struct { sdl_surf_t* s; int x; int y; int ascent; SDL_Color c; } sdl_draw_ud_t;
+static void sdl2_draw_run(TTF_Font* face, const char* run, int len, void* ud) {
+    sdl_draw_ud_t* d = (sdl_draw_ud_t*)ud;
+    char buf[512];
+    char* tmp = buf;
+    SDL_Surface* txt;
+    SDL_Rect dst;
+    if(len >= (int)sizeof(buf)) { tmp = (char*)malloc((size_t)len + 1); if(!tmp) return; }
+    memcpy(tmp, run, (size_t)len); tmp[len] = 0;
+    txt = TTF_RenderUTF8_Blended(face, tmp, d->c);
+    if(txt) {
+        int adv = 0, hh = 0;
+        SDL_SetSurfaceBlendMode(txt, SDL_BLENDMODE_BLEND);
+        /* Layout placed the line by the PRIMARY face's ascent; shift a
+         * fallback run so its baseline lands on the same row. */
+        dst.x = d->x; dst.y = d->y + (d->ascent - TTF_FontAscent(face)); dst.w = txt->w; dst.h = txt->h;
+        SDL_BlitSurface(txt, NULL, d->s->surf, &dst);
+        SDL_FreeSurface(txt);
+        /* Advance by the run's advance width, not the bitmap width, so the
+         * next run starts where layout measured it. */
+        if(TTF_SizeUTF8(face, tmp, &adv, &hh) == 0) d->x += adv;
+        else d->x += dst.w;
     }
-    /* Supplementary planes: encode as UTF-8 and let TTF_SizeUTF8 walk the
-     * (surrogate-paired) glyph. Rare enough that the extra cost is fine. */
-    {
-        char buf[8];
-        int n = sdl2_encode_utf8(codepoint, buf);
-        int w = 0, hh = 0;
-        if(n <= 0) return 0;
-        buf[n] = 0;
-        if(TTF_SizeUTF8(face, buf, &w, &hh) < 0) return 0;
-        return sdl2_logical_px(w);
-    }
+    if(tmp != buf) free(tmp);
 }
 
 static void ek_font_text_size(void* ud, eweb_font_t* h, int size, const char* text,
                                int* w, int* hh) {
     sdl_font_t* f;
     TTF_Font* face;
+    TTF_Font* fb = NULL;
+    sdl_measure_ud_t m = { 0, 0 };
     int ww = 0, hgt = 0;
     (void)ud;
     if(w)  *w  = 0;
@@ -1041,9 +1485,13 @@ static void ek_font_text_size(void* ud, eweb_font_t* h, int size, const char* te
     if(!h || !text) return;
     if(size <= 0) return;   /* font-size:0 measures empty */
     f = F(h);
-    face = sdl_font_face(f, sdl2_font_px(size));
+    face = sdl_font_faces(f, sdl2_font_px(size), &fb);
     if(!face) return;
-    if(TTF_SizeUTF8(face, text, &ww, &hgt) < 0) return;
+    if(sdl2_for_each_run(face, fb, text, sdl2_measure_run, &m)) {
+        ww = m.w; hgt = m.h;
+    } else if(TTF_SizeUTF8(face, text, &ww, &hgt) < 0) {
+        return;
+    }
     if(w)  *w  = sdl2_logical_px(ww);
     if(hh) *hh = sdl2_logical_px(hgt);
 }
@@ -1053,9 +1501,11 @@ static void ek_font_draw_text(void* ud, eweb_surface_t* sh, int x, int y, const 
     sdl_surf_t* s;
     sdl_font_t* f;
     TTF_Font* face;
+    TTF_Font* fb = NULL;
     SDL_Color c;
     SDL_Surface* txt;
     SDL_Rect dst;
+    sdl_draw_ud_t d;
     (void)ud;
     if(!sh || !fh || !text || !text[0]) return;
     if(size <= 0) return;   /* font-size:0 draws nothing */
@@ -1065,12 +1515,15 @@ static void ek_font_draw_text(void* ud, eweb_surface_t* sh, int x, int y, const 
     /* Rasterise at the TARGET surface's device resolution and place the glyph
      * bitmap at the surface's device coordinates (s->dpr, not g_dpr: a surface
      * created before a ratio change keeps rendering consistently). */
-    face = sdl_font_face(f, sdl2_font_px_dpr(size, s->dpr));
+    face = sdl_font_faces(f, sdl2_font_px_dpr(size, s->dpr), &fb);
     if(!face) return;
     c.r = (Uint8)((color >> 16) & 0xFF);
     c.g = (Uint8)((color >> 8)  & 0xFF);
     c.b = (Uint8)( color        & 0xFF);
     c.a = (Uint8)((color >> 24) & 0xFF);
+    /* Mixed Latin/CJK text: one blit per same-face run. */
+    d.s = s; d.x = sdl2_sp(s, x); d.y = sdl2_sp(s, y); d.ascent = TTF_FontAscent(face); d.c = c;
+    if(sdl2_for_each_run(face, fb, text, sdl2_draw_run, &d)) return;
     /* TTF_RenderUTF8_Blended produces an ARGB8888 surface with per-pixel
      * alpha; blitting it with BLEND composites correctly onto our target.
      * The HAL anchors text at its TOP-LEFT (matching litehtml's baseline
@@ -1078,7 +1531,7 @@ static void ek_font_draw_text(void* ud, eweb_surface_t* sh, int x, int y, const 
     txt = TTF_RenderUTF8_Blended(face, text, c);
     if(!txt) return;
     SDL_SetSurfaceBlendMode(txt, SDL_BLENDMODE_BLEND);
-    dst.x = sdl2_sp(s, x); dst.y = sdl2_sp(s, y); dst.w = txt->w; dst.h = txt->h;
+    dst.x = d.x; dst.y = d.y; dst.w = txt->w; dst.h = txt->h;
     SDL_BlitSurface(txt, NULL, s->surf, &dst);
     SDL_FreeSurface(txt);
 }
@@ -1686,6 +2139,7 @@ void eweb_port_sdl2(eweb_port_t* port, void* ud) {
     port->font.char_width  = ek_font_char_width;
     port->font.text_size   = ek_font_text_size;
     port->font.draw_text   = ek_font_draw_text;
+    port->font.create_styled = ek_font_create_styled;
 
     port->image.ud     = ud;
     port->image.decode = ek_image_decode;

@@ -1902,6 +1902,18 @@ static const attr_prop_t kAttrProps[] = {
     {"action",      "action"},
     {"method",      "method"},
     {"lang",        "lang"},
+    /* <meta>: vscode.dev reads querySelector('meta[name=...]').content.split(). */
+    {"content",     "content"},
+    {"charset",     "charset"},
+    {"httpEquiv",   "http-equiv"},
+    {"media",       "media"},
+    {"target",      "target"},
+    {"nonce",       "nonce"},
+    {"crossOrigin", "crossorigin"},
+    {"referrerPolicy", "referrerpolicy"},
+    {"srcset",      "srcset"},
+    {"sizes",       "sizes"},
+    {"role",        "role"},
 };
 #define ATTR_PROP_COUNT ((int)(sizeof(kAttrProps) / sizeof(kAttrProps[0])))
 
@@ -2629,9 +2641,9 @@ static var_t* native_cancelAnimationFrame(vm_t* vm, var_t* env, void* data) {
 /* thus every React Server-Component flight reaction, is stranded and  */
 /* the RSC stream stalls after its first chunk. Delivery rides the DOM */
 /* timer table at 0 ms like MessageChannel/queueMicrotask, coalesced   */
-/* to one callback per observer per turn. Intersection/Resize have no  */
-/* layout events to deliver, so their observe() still only accepts the */
-/* target and never fires.                                            */
+/* to one callback per observer per turn. IntersectionObserver delivers */
+/* a one-shot intersecting entry per observed target (see native_io_*); */
+/* ResizeObserver has no layout feed, so its observe() only registers.  */
 /* ------------------------------------------------------------------ */
 #define OB_REG    "@@obreg"    /* root hidden array of live MutationObservers */
 #define OB_CB     "@@obcb"     /* observer -> callback function */
@@ -2827,6 +2839,92 @@ static var_t* native_observer_observe(vm_t* vm, var_t* env, void* data) {
         fprintf(stderr, "[modbg] observe self=%p target=%p opts=%p\n",
             (void*)self, (void*)target, (void*)options);
     return NULL;   /* undefined */
+}
+
+/* IntersectionObserver delivery (ewebview): the engine has no scroll/viewport
+ * event feed, yet many sites gate visibility on an IO callback firing with an
+ * intersecting entry - apple.com's "StaggeredFadeInTween" keeps a section at
+ * opacity:0 (class enhanced--initial) until the callback reads
+ * entry.isIntersecting truthy and swaps in the visible class. With no delivery
+ * the reveal never runs and whole sections (the Mac product lineup gallery)
+ * stay invisible. A static full-page render is best approximated by reporting
+ * every observed target as fully intersecting once, shortly after observe(),
+ * so the reveal/enhance JS runs. Delivered on the DOM timer table as a small
+ * macrotask so the observing script turn finishes first. MutationObserver and
+ * ResizeObserver keep the plain observe() that only registers the target. */
+typedef struct io_disp { var_t* observer; var_t* target; } io_disp_t;
+
+static var_t* native_io_dispatch(vm_t* vm, var_t* env, void* data) {
+    (void)env;
+    io_disp_t* d = (io_disp_t*)data;
+    if(d == NULL) return NULL;
+    var_t* observer = d->observer;
+    var_t* target   = d->target;
+    mario_free(d);
+    if(observer == NULL || observer->status <= V_ST_GC_FREE) return NULL;
+    var_t* dead = var_find_own_member_var(observer, OB_DEAD);
+    if(dead != NULL && var_get_int(dead) != 0) return NULL;
+    var_t* cb = var_find_own_member_var(observer, OB_CB);
+    if(cb == NULL || !cb->is_func) return NULL;
+    if(target == NULL || target->status <= V_ST_GC_FREE) return NULL;
+    /* one fully-intersecting entry; rects are zero-filled (reveal callbacks read
+     * only isIntersecting, but destructuring must not trip on missing fields) */
+    var_t* rect = var_new_obj_no_proto(vm, NULL, NULL);
+    var_add(rect, "x", var_new_int(vm, 0));
+    var_add(rect, "y", var_new_int(vm, 0));
+    var_add(rect, "width", var_new_int(vm, 0));
+    var_add(rect, "height", var_new_int(vm, 0));
+    var_add(rect, "top", var_new_int(vm, 0));
+    var_add(rect, "right", var_new_int(vm, 0));
+    var_add(rect, "bottom", var_new_int(vm, 0));
+    var_add(rect, "left", var_new_int(vm, 0));
+    var_t* entry = var_new_obj_no_proto(vm, NULL, NULL);
+    var_add(entry, "isIntersecting", var_new_bool(vm, true));
+    var_add(entry, "intersectionRatio", var_new_float64(vm, 1.0));
+    var_add(entry, "target", target);
+    var_add(entry, "boundingClientRect", rect);
+    var_add(entry, "intersectionRect", rect);
+    var_add(entry, "rootBounds", var_new_null(vm));
+    var_add(entry, "time", var_new_float64(vm, 0.0));
+    var_t* entries = var_new_array(vm);
+    var_array_add(entries, entry);
+    var_t* args = var_new_array(vm);
+    var_array_add(args, entries);
+    var_array_add(args, observer);
+    var_array_reverse(args);   /* call_m_func wants the last arg at index 0 */
+    var_t* r = call_m_func(vm, observer, cb, args);
+    if(r != NULL) var_unref(r);
+    var_unref(args);
+    return NULL;
+}
+
+static void io_schedule(vm_t* vm, void* bridge, var_t* observer, var_t* target) {
+    js_dom_state* st = state_any(vm, bridge);
+    if(st == NULL || observer == NULL || target == NULL) return;
+    io_disp_t* d = (io_disp_t*)mario_malloc(sizeof(io_disp_t));
+    if(d == NULL) return;
+    d->observer = observer;
+    d->target   = target;
+    var_t* tr = var_new_native_func(vm, native_io_dispatch, d);
+    int id = js_add_timer(vm, st, tr, 48, false, false);
+    if(id == 0) { mario_free(d); var_unref(tr); return; }
+    /* tr is owned by the timer table anchor (starts at refs==0): do NOT unref
+     * here or it is freed before it fires. observer stays rooted in @@obreg and
+     * target in the observer's OB_TG array, so both survive the delay. */
+}
+
+/* IntersectionObserver.observe(): register the target like the base observer,
+ * then queue a one-shot intersecting delivery for it (see native_io_dispatch). */
+static var_t* native_io_observe(vm_t* vm, var_t* env, void* data) {
+    var_t* r = native_observer_observe(vm, env, data);
+    if(r != NULL) var_unref(r);
+    var_t* self = get_obj(env, THIS);
+    if(self == NULL) return NULL;
+    var_t* args = get_func_args(env);
+    node_t* tn = var_array_get(args, 0);
+    var_t* target = (tn != NULL) ? tn->var : NULL;
+    if(target != NULL) io_schedule(vm, data, self, target);
+    return NULL;
 }
 
 static var_t* native_observer_unobserve(vm_t* vm, var_t* env, void* data) {
@@ -3306,7 +3404,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     vm_reg_native(vm, mo_cls, "takeRecords()", native_observer_takeRecords, bridge);
     var_t* io_cls = vm_new_class(vm, "IntersectionObserver");
     vm_reg_native(vm, io_cls, "constructor(cb, options)", native_observer_ctor, bridge);
-    vm_reg_native(vm, io_cls, "observe(target, options)", native_observer_observe, bridge);
+    vm_reg_native(vm, io_cls, "observe(target, options)", native_io_observe, bridge);
     vm_reg_native(vm, io_cls, "unobserve(target)", native_observer_unobserve, bridge);
     vm_reg_native(vm, io_cls, "disconnect()", native_observer_disconnect, bridge);
     vm_reg_native(vm, io_cls, "takeRecords()", native_observer_takeRecords, bridge);

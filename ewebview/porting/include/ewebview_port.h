@@ -183,6 +183,13 @@ typedef struct eweb_font_api {
     /* Draw a UTF-8 string with its top-left at (x,y) onto surface `s`. REQUIRED. */
     void (*draw_text)(void* ud, eweb_surface_t* s, int x, int y, const char* text,
                       eweb_font_t* f, int size, uint32_t color);
+
+    /* Like create(), but also receives the CSS font-weight (100..900, 400 =
+     * normal, 700 = bold) and italic flag so the port can pick a bold/oblique
+     * face (or synthesise one). OPTIONAL: when NULL the core calls create() and
+     * every weight/style renders with the same face. Appended last so ports
+     * that memset the table keep working unchanged. */
+    eweb_font_t* (*create_styled)(void* ud, const char* family, int weight, int italic);
 } eweb_font_api_t;
 
 /* ------------------------------------------------------------------ */

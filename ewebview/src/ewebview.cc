@@ -140,6 +140,424 @@ static std::string script_attr_value(const std::string& lower_tag,
     return std::string();
 }
 
+/* ------------------------------------------------------------------ */
+/* <noscript> unwrap  +  <picture>/<source srcSet> → <img src> lowering */
+/* ------------------------------------------------------------------ */
+
+/* Extract the first URL from a srcSet value string.
+ * srcSet format: "url1.jpg, url2.jpg 2x, url3.jpg 3x"
+ * Returns the first URL (before any whitespace descriptor). If the URL is
+ * just "#" (Next.js placeholder), returns empty. */
+static std::string first_srcset_url(const std::string& srcset)
+{
+    size_t start = 0;
+    while(start < srcset.size() && ::isspace((unsigned char)srcset[start])) start++;
+    size_t end = start;
+    while(end < srcset.size() && srcset[end] != ',' && !::isspace((unsigned char)srcset[end])) end++;
+    std::string url = srcset.substr(start, end - start);
+    if(url == "#" || url.empty()) return std::string();
+    return url;
+}
+
+/* Read an attribute value from an open tag (original case). The tag string
+ * starts at '<' and ends at or past '>'. `lower_tag` must be the same span,
+ * lower-cased. This is similar to script_attr_value but operates on any tag. */
+static std::string tag_attr_value(const std::string& lower_tag,
+                                  const std::string& orig_tag, const char* name)
+{
+    size_t nlen = strlen(name);
+    size_t pos = 0;
+    while(pos < lower_tag.size()) {
+        size_t f = lower_tag.find(name, pos);
+        if(f == std::string::npos) break;
+        bool left_ok = (f == 0) || ::isspace((unsigned char)lower_tag[f - 1]) || lower_tag[f - 1] == '<';
+        size_t after = f + nlen;
+        while(after < lower_tag.size() && ::isspace((unsigned char)lower_tag[after])) after++;
+        if(left_ok && after < lower_tag.size() && lower_tag[after] == '=') {
+            size_t v = after + 1;
+            while(v < orig_tag.size() && ::isspace((unsigned char)orig_tag[v])) v++;
+            std::string val;
+            if(v < orig_tag.size() && (orig_tag[v] == '"' || orig_tag[v] == '\'')) {
+                char q = orig_tag[v++];
+                while(v < orig_tag.size() && orig_tag[v] != q) val += orig_tag[v++];
+            } else {
+                while(v < orig_tag.size() && !::isspace((unsigned char)orig_tag[v]) && orig_tag[v] != '>') val += orig_tag[v++];
+            }
+            return val;
+        }
+        pos = f + 1;
+    }
+    return std::string();
+}
+
+/* Preprocess the raw HTML before script extraction:
+ *
+ * 1. **<noscript> unwrap**: modern SSR pages (Next.js, Apple) ship real image
+ *    URLs inside <noscript> for the no-JS fallback while the JS-side <picture>
+ *    uses placeholder srcSet="#, # 2x". Since the VM cannot always complete
+ *    async hydration, unwrapping <noscript> into the main DOM exposes those
+ *    images.
+ *
+ * 2. **<picture>/<source srcSet> lowering**: litehtml has no <picture> or srcSet
+ *    support. For every <picture> element this pass finds the best <source>
+ *    (prefer the one without a media attribute, else the last), extracts the
+ *    first URL from its srcSet, and emits a plain <img> with src/width/height.
+ *    Pictures whose sources are all placeholder ("#") are dropped entirely so
+ *    only the no-JS fallback pictures (with real URLs) remain. The <picture>
+ *    wrapper is dropped (no CSS display:none pitfall).
+ *
+ * 3. **Image-hiding CSS class strip**: the SSR HTML marks figures with classes
+ *    like `responsive-picture--removed` / `responsive-picture--no-load` to hide
+ *    them until JavaScript activates them. Since hydration may not complete, we
+ *    strip those class tokens from the class attribute so the images are visible
+ *    immediately. */
+static std::string preprocess_noscript_picture(const std::string& html)
+{
+    if(html.empty()) return html;
+
+    /* --- Pass 1: unwrap <noscript> ------------------------------------ */
+    std::string stage1;
+    stage1.reserve(html.size());
+    {
+        std::string lower = html;
+        for(char& ch : lower) ch = (char)::tolower((unsigned char)ch);
+        size_t pos = 0;
+        while(pos < html.size()) {
+            size_t open = lower.find("<noscript", pos);
+            if(open == std::string::npos) {
+                stage1.append(html, pos, html.size() - pos);
+                break;
+            }
+            stage1.append(html, pos, open - pos);
+            size_t tag_end = lower.find('>', open);
+            if(tag_end == std::string::npos) { stage1.append(html, open, html.size() - open); break; }
+            size_t close = lower.find("</noscript>", tag_end);
+            if(close == std::string::npos) {
+                stage1.append(html, tag_end + 1, html.size() - (tag_end + 1));
+                break;
+            }
+            stage1.append(html, tag_end + 1, close - (tag_end + 1));
+            pos = close + 11;
+        }
+    }
+
+    /* --- Pass 2: lower <picture>/<source srcSet> to plain <img> ------- */
+    /* For each <picture>...</picture>:
+     * - collect best srcSet URL from <source> tags
+     * - if a valid URL exists, emit a standalone <img src=url width height>
+     * - if no valid URL (all placeholders), drop the entire <picture> block
+     * The <picture>/<source> wrapper is removed entirely (litehtml doesn't
+     * understand it, and its CSS class may carry display:none). */
+    std::string stage2;
+    stage2.reserve(stage1.size());
+    {
+        std::string lower = stage1;
+        for(char& ch : lower) ch = (char)::tolower((unsigned char)ch);
+        size_t pos = 0;
+        while(pos < stage1.size()) {
+            size_t pic_open = lower.find("<picture", pos);
+            if(pic_open == std::string::npos) {
+                stage2.append(stage1, pos, stage1.size() - pos);
+                break;
+            }
+            stage2.append(stage1, pos, pic_open - pos);
+            size_t pic_close = lower.find("</picture>", pic_open);
+            if(pic_close == std::string::npos) {
+                stage2.append(stage1, pic_open, stage1.size() - pic_open);
+                break;
+            }
+            size_t pic_end = pic_close + 10;
+            std::string pic_orig = stage1.substr(pic_open, pic_end - pic_open);
+            std::string pic_low  = lower.substr(pic_open, pic_end - pic_open);
+
+            /* Collect best srcSet URL from <source> tags. */
+            std::string best_url, best_width, best_height;
+            std::string fallback_url, fallback_width, fallback_height;
+            size_t sp = 0;
+            while(sp < pic_low.size()) {
+                size_t src_open = pic_low.find("<source", sp);
+                if(src_open == std::string::npos) break;
+                size_t src_end = pic_low.find('>', src_open);
+                if(src_end == std::string::npos) break;
+                std::string stag_low = pic_low.substr(src_open, src_end - src_open + 1);
+                std::string stag_orig = pic_orig.substr(src_open, src_end - src_open + 1);
+                std::string srcset = tag_attr_value(stag_low, stag_orig, "srcset");
+                std::string url = first_srcset_url(srcset);
+                std::string w = tag_attr_value(stag_low, stag_orig, "width");
+                std::string h = tag_attr_value(stag_low, stag_orig, "height");
+                if(!url.empty()) {
+                    fallback_url = url;
+                    fallback_width = w;
+                    fallback_height = h;
+                    std::string media = tag_attr_value(stag_low, stag_orig, "media");
+                    if(media.empty()) {
+                        best_url = url;
+                        best_width = w;
+                        best_height = h;
+                    }
+                }
+                sp = src_end + 1;
+            }
+            if(best_url.empty()) {
+                best_url = fallback_url;
+                best_width = fallback_width;
+                best_height = fallback_height;
+            }
+
+            if(best_url.empty()) {
+                /* No usable source (all placeholders) — drop the entire
+                 * <picture> block so only no-JS fallbacks remain. */
+                pos = pic_end;
+                continue;
+            }
+
+            /* Emit a plain <img> with the resolved URL + dimensions.
+             * Preserve the original <img>'s remaining attributes (alt, class,
+             * aria-hidden, etc.) but inject src/width/height. */
+            size_t img_pos = pic_low.find("<img");
+            std::string extra_attrs;
+            if(img_pos != std::string::npos) {
+                size_t img_gt = pic_low.find('>', img_pos);
+                if(img_gt != std::string::npos) {
+                    /* Original img tag attributes (skip "<img" prefix). */
+                    std::string img_orig = pic_orig.substr(img_pos, img_gt - img_pos + 1);
+                    std::string img_low  = pic_low.substr(img_pos, img_gt - img_pos + 1);
+                    /* Collect attrs excluding src/width/height (we inject those). */
+                    /* Just take everything after "<img" up to "/>" or ">" */
+                    size_t a = 4; /* past "<img" */
+                    /* Strip trailing "/>" or ">" */
+                    std::string attr_text = img_orig.substr(a);
+                    if(!attr_text.empty() && attr_text.back() == '>') attr_text.pop_back();
+                    if(!attr_text.empty() && attr_text.back() == '/') attr_text.pop_back();
+                    extra_attrs = attr_text;
+                }
+            }
+            stage2 += "<img src=\"";
+            stage2 += best_url;
+            stage2 += "\"";
+            if(!best_width.empty()) {
+                stage2 += " width=\"";
+                stage2 += best_width;
+                stage2 += "\"";
+            }
+            if(!best_height.empty()) {
+                stage2 += " height=\"";
+                stage2 += best_height;
+                stage2 += "\"";
+            }
+            if(!extra_attrs.empty()) stage2 += extra_attrs;
+            stage2 += "/>";
+            pos = pic_end;
+        }
+    }
+
+    /* --- Pass 3: strip element-hiding CSS class tokens --------------- */
+    /* SSR frameworks (Next.js, Apple Artisan) add class tokens that hide
+     * elements via display:none or opacity:0 until JavaScript activates
+     * them.  Since hydration may not complete, strip those tokens so the
+     * SSR content is visible immediately.  Each pattern is a prefix; the
+     * token extends through any non-whitespace suffix (__HASH). */
+    static const char* const strip_patterns[] = {
+        "responsive-picture--removed",   /* display:none on <figure>   */
+        "responsive-picture--no-load",   /* display:none on <img>      */
+        "enhanced--initial",             /* opacity:0 (StaggeredFadeInTween / MarcomSection) */
+        "enhanced--active",              /* opacity:0 (same family)    */
+    };
+    static const size_t strip_count = sizeof(strip_patterns) / sizeof(strip_patterns[0]);
+
+    std::string out;
+    {
+        /* Quick check: if none of the patterns appear, skip this pass. */
+        bool need_strip = false;
+        for(size_t k = 0; k < strip_count && !need_strip; ++k)
+            need_strip = (stage2.find(strip_patterns[k]) != std::string::npos);
+
+        if(need_strip) {
+            out.reserve(stage2.size());
+            size_t pos = 0;
+            while(pos < stage2.size()) {
+                /* Find the earliest occurrence of any pattern. */
+                size_t best = std::string::npos;
+                size_t best_plen = 0;
+                for(size_t k = 0; k < strip_count; ++k) {
+                    size_t f = stage2.find(strip_patterns[k], pos);
+                    if(f != std::string::npos && f < best) {
+                        best = f;
+                        best_plen = strlen(strip_patterns[k]);
+                    }
+                }
+                if(best == std::string::npos) {
+                    out.append(stage2, pos, stage2.size() - pos);
+                    break;
+                }
+                out.append(stage2, pos, best - pos);
+                /* Back up to the start of the class token (preceding space
+                 * or quote delimiter).  Then skip forward through the token's
+                 * non-whitespace suffix (__HASH). This erases the *entire*
+                 * CSS class token that contains the pattern. */
+                size_t tok_start = best;
+                while(tok_start > pos && !::isspace((unsigned char)stage2[tok_start - 1]) &&
+                      stage2[tok_start - 1] != '"' && stage2[tok_start - 1] != '\'') --tok_start;
+                /* Trim the output back to remove the already-appended prefix
+                 * portion of this token (e.g. "StaggeredFadeInTween_"). */
+                out.resize(out.size() - (best - tok_start));
+                size_t end = best + best_plen;
+                while(end < stage2.size() && !::isspace((unsigned char)stage2[end]) &&
+                      stage2[end] != '"' && stage2[end] != '\'') ++end;
+                if(end < stage2.size() && stage2[end] == ' ') ++end;
+                pos = end;
+            }
+        } else {
+            out = std::move(stage2);
+        }
+    }
+
+    /* --- Pass 4: inject inline-style overrides for layout-challenged patterns.
+     * Apple's product-tile gallery uses CSS features litehtml does not yet
+     * handle (all:unset, width:fit-content, overflow-x:scroll on a grid with
+     * no template).  Inject explicit inline styles so the gallery items
+     * render as a horizontal flex row at their designed width. Also fix
+     * section-content padding so headings don't stick to the left edge. */
+    {
+        std::string lower = out;
+        for(char& ch : lower) ch = (char)::tolower((unsigned char)ch);
+
+        /* Helper: inject " style=\"...\"" right before the closing '>' of a
+         * tag that starts at `tag_pos` in `out`.  If the tag already has a
+         * style attribute, append to it instead.  Returns the number of
+         * characters inserted so callers can adjust their search positions. */
+        auto inject_style = [&](size_t tag_pos, const char* css) -> size_t {
+            size_t gt = out.find('>', tag_pos);
+            if(gt == std::string::npos) return 0;
+            /* Check for existing style= attribute */
+            size_t style_attr = lower.find("style=", tag_pos);
+            if(style_attr != std::string::npos && style_attr < gt) {
+                char q = out[style_attr + 6];
+                size_t end_q = out.find(q, style_attr + 7);
+                if(end_q != std::string::npos && end_q <= gt) {
+                    std::string inject = std::string(";") + css;
+                    out.insert(end_q, inject);
+                    lower.insert(end_q, inject);
+                    return inject.size();
+                }
+            } else {
+                std::string inject = std::string(" style=\"") + css + "\"";
+                out.insert(gt, inject);
+                std::string linject = inject;
+                for(char& ch : linject) ch = (char)::tolower((unsigned char)ch);
+                lower.insert(gt, linject);
+                return inject.size();
+            }
+            return 0;
+        };
+
+        /* (a) section-content: add left/right padding so headings don't
+         *     stick to the viewport edge (apple.com uses calc()+min()+vw). */
+        {
+            size_t pos = 0;
+            while(pos < lower.size()) {
+                size_t f = lower.find("class=\"", pos);
+                if(f == std::string::npos) break;
+                size_t v = f + 7;
+                if(lower.substr(v, 15) == "section-content") {
+                    size_t tag_start = out.rfind('<', f);
+                    size_t added = 0;
+                    if(tag_start != std::string::npos)
+                        added = inject_style(tag_start, "max-width:87.5%;margin-left:auto;margin-right:auto");
+                    pos = v + 30 + added;
+                } else {
+                    pos = v + 1;
+                }
+            }
+        }
+
+        /* (a2) globalnav-content: the Apple globalnav uses max-width:1024px +
+         *      margin:0 auto + padding-inline with max().  Inject explicit
+         *      centering so the nav bar sits centered in wide viewports. */
+        {
+            size_t pos = 0;
+            while(pos < lower.size()) {
+                size_t f = lower.find("globalnav-content", pos);
+                if(f == std::string::npos) break;
+                size_t tag_start = out.rfind('<', f);
+                size_t added = 0;
+                if(tag_start != std::string::npos)
+                    added = inject_style(tag_start,
+                        "max-width:1024px;margin-left:auto;margin-right:auto;"
+                        "padding-left:22px;padding-right:22px;box-sizing:border-box");
+                pos = f + 18 + added;
+            }
+        }
+
+        /* (a3) globalnav-list: ensure flex row with space-between layout. */
+        {
+            size_t pos = 0;
+            while(pos < lower.size()) {
+                size_t f = lower.find("globalnav-list", pos);
+                if(f == std::string::npos) break;
+                /* Avoid matching globalnav-list- prefixed classes */
+                if(f + 14 < lower.size() && lower[f + 14] != '"' && lower[f + 14] != ' ')
+                    { pos = f + 15; continue; }
+                size_t tag_start = out.rfind('<', f);
+                size_t added = 0;
+                if(tag_start != std::string::npos)
+                    added = inject_style(tag_start,
+                        "display:flex;justify-content:space-between;"
+                        "height:44px;list-style:none;margin:0 -8px;padding:0");
+                pos = f + 15 + added;
+            }
+        }
+
+        /* (b) StickyFooterGallery_itemContainer (the <ul>): force flex row */
+        {
+            size_t pos = 0;
+            while(pos < lower.size()) {
+                size_t f = lower.find("stickyfootergallery_itemcontainer", pos);
+                if(f == std::string::npos) break;
+                size_t tag_start = out.rfind('<', f);
+                size_t added = 0;
+                if(tag_start != std::string::npos)
+                    added = inject_style(tag_start,
+                        "display:flex;flex-wrap:nowrap;list-style:none;"
+                        "padding:0 72px;margin:0;gap:20px;overflow:hidden");
+                pos = f + 35 + added;
+            }
+        }
+
+        /* (c) StickyFooterGallery_galleryItem (each <li>): fixed width */
+        {
+            size_t pos = 0;
+            while(pos < lower.size()) {
+                size_t f = lower.find("stickyfootergallery_galleryitem", pos);
+                if(f == std::string::npos) break;
+                size_t tag_start = out.rfind('<', f);
+                size_t added = 0;
+                if(tag_start != std::string::npos)
+                    added = inject_style(tag_start,
+                        "display:block;width:372px;flex-shrink:0;list-style:none");
+                pos = f + 33 + added;
+            }
+        }
+
+        /* (d) StickyFooterGallery_scrollContainer: drop grid in favour of
+         *     plain block so the flex <ul> can drive the horizontal row. */
+        {
+            size_t pos = 0;
+            while(pos < lower.size()) {
+                size_t f = lower.find("stickyfootergallery_scrollcontainer", pos);
+                if(f == std::string::npos) break;
+                size_t tag_start = out.rfind('<', f);
+                size_t added = 0;
+                if(tag_start != std::string::npos)
+                    added = inject_style(tag_start, "display:block;overflow:hidden");
+                pos = f + 37 + added;
+            }
+        }
+    }
+
+    return out;
+}
+
 static std::string extract_scripts(const std::string& html, std::vector<std::string>* scripts,
                                    std::vector<std::string>* script_srcs,
                                    bool* has_inline_handlers,
@@ -265,6 +683,17 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
                     if(script_srcs != nullptr) script_srcs->push_back(std::string());
                 }
             }
+        }
+        /* Non-JS script tags (type="application/json", "application/ld+json",
+         * etc.) are data islands: they carry structured data that page scripts
+         * read via getElementById + textContent. Next.js stores its SSR
+         * props in <script id="__NEXT_DATA__" type="application/json"> and
+         * calls JSON.parse(document.getElementById('__NEXT_DATA__').textContent)
+         * during hydration. Keep such tags in the output HTML so litehtml
+         * parses them into the DOM tree; only executable script bodies (the
+         * !non_js path above) are extracted into the run queue. */
+        if(non_js) {
+            out.append(html, script_open, (script_close + 9) - script_open);
         }
 
         pos = script_close + 9;
@@ -2911,13 +3340,42 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     m_jsScriptDone.clear();
     m_jsScriptEls.clear();
     m_jsHasInlineHandlers = false;
+    m_jsOrigHtmlHadNoJs = false;
     m_jsCurScriptEl = nullptr;
     m_jsCurScriptElUrl.clear();
     m_jsBuildHasModules = false;
-    m_buildHtmlContent = extract_scripts(content, m_jsEnabled ? &m_jsScripts : nullptr,
+    /* Detect the `no-js` progressive-enhancement class on <html> before any
+     * script runs. Pages like apple.com ship `<html class="no-js">` plus an
+     * inline handler that strips it once JS is confirmed; their CSS exposes
+     * hidden content under `.no-js`. If the engine's VM cannot complete async
+     * hydration, we re-add the class after all scripts finish (see
+     * jsRestoreNoJsFallback). */
+    {
+        std::string lower = content;
+        for(char& ch : lower) ch = (char)::tolower((unsigned char)ch);
+        size_t html_tag = lower.find("<html");
+        if(html_tag != std::string::npos) {
+            size_t html_end = lower.find('>', html_tag);
+            if(html_end != std::string::npos) {
+                std::string tag = lower.substr(html_tag, html_end - html_tag + 1);
+                m_jsOrigHtmlHadNoJs = (tag.find("no-js") != std::string::npos);
+            }
+        }
+    }
+    /* Pre-process: unwrap <noscript> (expose no-JS fallback images with real
+     * URLs) and lower <picture>/<source srcSet> to plain <img src> for litehtml
+     * (which has no <picture> or srcSet support). */
+    std::string preprocessed = preprocess_noscript_picture(content);
+    /* TEMP: dump preprocessed HTML to /tmp for debugging */
+    { FILE* _dbg = fopen("/tmp/eweb_preprocessed.html", "w");
+      if(_dbg) { fwrite(preprocessed.data(), 1, preprocessed.size(), _dbg); fclose(_dbg); } }
+    m_buildHtmlContent = extract_scripts(preprocessed, m_jsEnabled ? &m_jsScripts : nullptr,
                                          m_jsEnabled ? &m_jsScriptSrcs : nullptr,
                                          m_jsEnabled ? &m_jsHasInlineHandlers : nullptr,
                                          &m_jsBuildHasModules);
+    /* TEMP: dump final HTML to /tmp for debugging */
+    { FILE* _dbg2 = fopen("/tmp/eweb_final.html", "w");
+      if(_dbg2) { fwrite(m_buildHtmlContent.data(), 1, m_buildHtmlContent.size(), _dbg2); fclose(_dbg2); } }
     /* Mark each slot ready/pending: an external <script src> starts pending and
      * is filled when its EWEB_TASK_SCRIPT fetch lands; inline bodies are ready
      * now. extract_scripts keeps m_jsScriptSrcs the same length as m_jsScripts. */
@@ -3540,6 +3998,7 @@ void EWebEngine::advanceBuildStep()
         postScrollClamp();
         /* DOMContentLoaded / load fire only now, after the page's inline
          * scripts have finished - the order every page assumes. */
+        jsRestoreNoJsFallback();
         jsFireLoadEvents();
         markContentDirty();
         return;
@@ -3707,6 +4166,7 @@ void EWebEngine::advanceBuildStep()
              * on-screen document - the same element pointers they will keep
              * using afterwards, since the swap above hands over the very same
              * document object. */
+            jsRestoreNoJsFallback();
             jsFireLoadEvents();
         }
         markContentDirty();
@@ -3718,6 +4178,7 @@ void EWebEngine::advanceBuildStep()
     }
 }
 
+static void ewebDumpLayoutFile(FILE* f, litehtml::element* el, int depth);
 void EWebEngine::drawPageToCacheLocked(int stripY, int stripH)
 {
     /* ENGINE-THREAD ONLY: m_doc and m_pageCache (the pooled buffer the engine
@@ -3757,6 +4218,11 @@ void EWebEngine::drawPageToCacheLocked(int stripY, int stripH)
         drawModuleNotice(cache, cacheW, cacheH);
     if(m_port.gfx.surface_unset_clip != nullptr)
         m_port.gfx.surface_unset_clip(m_port.gfx.ud, cache);
+    static const char* layoutDump = getenv("EWEB_LAYOUTDUMP");
+    if(layoutDump != nullptr) {
+        FILE* lf = fopen(layoutDump, "w");
+        if(lf != nullptr) { ewebDumpLayoutFile(lf, m_doc->root(), 0); fclose(lf); }
+    }
     uint32_t draw_ms = (uint32_t)(ticMs() - draw_start);
     if(m_container != NULL && draw_ms >= 20) {
         uint32_t text_width_calls = 0, text_width_ms = 0, draw_text_calls = 0, draw_text_ms = 0;
@@ -3957,6 +4423,45 @@ static void ewebDumpTreeFile(FILE* f, litehtml::element* el, int depth)
     size_t c = el->get_children_count();
     for(size_t i = 0; i < c; ++i)
         ewebDumpTreeFile(f, el->get_child((int)i), depth + 1);
+}
+/* Layout dump (EWEB_LAYOUTDUMP=<path>): one line per element with its tag,
+ * id, class, computed display/position and the ABSOLUTE laid-out box, written
+ * after every paint (last paint wins). Text nodes print their first words.
+ * Pure diagnostic: lets a rendering defect be localised to the element whose
+ * box is wrong without instrumenting litehtml itself. */
+static void ewebDumpLayoutFile(FILE* f, litehtml::element* el, int depth)
+{
+    if(el == nullptr || depth > 40) return;
+    if(el->is_white_space()) return;
+    for(int d = 0; d < depth; ++d) fputc(' ', f);
+    const litehtml::tchar_t* tag = el->get_tagName();
+    litehtml::position p = el->get_placement();
+    if(tag == nullptr || *tag == 0) {
+        litehtml::tstring txt;
+        el->get_text(txt);
+        for(char& ch : txt) if(ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+        fprintf(f, "#text [%d,%d %dx%d] \"%.40s\"\n", p.x, p.y, p.width, p.height, txt.c_str());
+        return;
+    }
+    static const char* DISP[] = { "none","block","inline","inline-block","inline-table","list-item",
+        "table","table-caption","table-cell","table-column","table-column-group","table-footer-group",
+        "table-header-group","table-row","table-row-group","flex","inline-flex","grid","inline-grid","contents","inline-text" };
+    static const char* POS[] = { "static","relative","absolute","fixed" };
+    int disp = (int)el->get_display();
+    int epos = (int)el->get_element_position();
+    fprintf(f, "<%s", tag);
+    const litehtml::tchar_t* id = el->get_attr(_t("id"), nullptr);
+    if(id != nullptr) fprintf(f, " id=%s", id);
+    const litehtml::tchar_t* cls = el->get_attr(_t("class"), nullptr);
+    if(cls != nullptr) fprintf(f, " class=\"%.80s\"", cls);
+    fprintf(f, "> %s", (disp >= 0 && disp < (int)(sizeof(DISP)/sizeof(DISP[0]))) ? DISP[disp] : "?");
+    if(epos > 0 && epos < 4) fprintf(f, " pos=%s", POS[epos]);
+    if(el->get_float() != litehtml::float_none) fprintf(f, " float");
+    fprintf(f, " [%d,%d %dx%d]\n", p.x, p.y, p.width, p.height);
+    if(disp == (int)litehtml::display_none) return;
+    size_t c = el->get_children_count();
+    for(size_t i = 0; i < c; ++i)
+        ewebDumpLayoutFile(f, el->get_child((int)i), depth + 1);
 }
 void EWebEngine::jsDomMountDiag()
 {

@@ -1803,10 +1803,16 @@ void litehtml::html_tag::expand_css_functions()
 	document* doc = get_document();
 	props_map old = m_style.properties();
 	m_style.clear();
+	/* Two passes: deferred shorthands (`font`/`flex` kept raw by
+	 * style::add_property because they held a var()) expand first, so the
+	 * longhands that survived the cascade re-apply on top of them in pass 1. */
+	for(int pass = 0; pass < 2; pass++)
 	for(props_map::const_iterator it = old.begin(); it != old.end(); ++it)
 	{
 		const tstring& name = it->first;
 		const tstring& raw = it->second.m_value;
+		bool shorthand = (name == _t("font") || name == _t("flex"));
+		if(shorthand != (pass == 0)) continue;
 		if(name.length() > 2 && name[0] == _t('-') && name[1] == _t('-'))
 		{
 			/* keep the raw definition: it is re-resolved per element */
@@ -5820,7 +5826,14 @@ int litehtml::html_tag::place_element(const element::ptr &el, int max_width)
 
 			m_boxes.back()->add_element(el);
 
-			if(el->is_inline_box() && !el->skip())
+			/* A collapsible space must not extend the shrink-to-fit width: if it
+			 * ends the line it is stripped by line_box::finish (CSS Text 3 §4.1.3),
+			 * and if a word follows, that word's right() covers it. Counting it
+			 * here made every float/inline-block whose markup has a newline
+			 * before the closing tag one space wider than its max-content, so
+			 * the flex base size measured for github's floated action <li>s
+			 * came up 4px short each and the Star button wrapped to a new row. */
+			if(el->is_inline_box() && !el->skip() && !el->is_white_space())
 			{
 				ret_width = el->right() + (max_width - line_ctx.right);
 			}
@@ -6153,6 +6166,9 @@ bool litehtml::html_tag::is_floats_holder() const
 {
 	if(	m_display == display_inline_block || 
 		m_display == display_inline_flex || 
+		m_display == display_flex || 
+		m_display == display_grid || 
+		m_display == display_inline_grid || 
 		m_display == display_table_cell || 
 		!have_parent() ||
 		is_body() || 
@@ -6162,6 +6178,20 @@ bool litehtml::html_tag::is_floats_holder() const
 		m_overflow > overflow_visible)
 	{
 		return true;
+	}
+	/* A flex/grid item establishes an independent formatting context: floats
+	 * inside it never escape into the container. github's repo header keeps
+	 * its action buttons as floated <li> under an inline <ul> inside a flex
+	 * item; without this the floats registered with an ancestor holder and
+	 * the Star button landed under the repo title. */
+	element::ptr p = parent();
+	if(p)
+	{
+		style_display pd = p->get_display();
+		if(pd == display_flex || pd == display_inline_flex || pd == display_grid || pd == display_inline_grid)
+		{
+			return true;
+		}
 	}
 	return false;
 }

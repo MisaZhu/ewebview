@@ -14,8 +14,12 @@ TARGET_DIR = $(BUILD_DIR)
 # <litehtml.h> and <mario/*.h> come from $(TARGET_DIR)/include, installed by
 # the sibling litehtml/mario Makefiles, so ewebview must build after them
 # (see DIRS in ../Makefile). -I include comes from make.inc.
-CXXFLAGS += -I porting/include -MMD -MP
-CFLAGS   += -I porting/include -MMD -MP
+#
+# porting/include must come BEFORE make.inc's -I $(TARGET_DIR)/include: the
+# installed ewebview_port.h is a copy made at link time, so an edit to the
+# HAL header would otherwise compile against the previous build's copy.
+CXXFLAGS := -I porting/include -MMD -MP $(CXXFLAGS)
+CFLAGS   := -I porting/include -MMD -MP $(CFLAGS)
 
 # port_sdl2.c (the sdl2 PORT_OBJS below) includes <SDL.h> plus the companion
 # SDL2_image/_ttf/_gfx headers, which Homebrew installs under include/SDL2.

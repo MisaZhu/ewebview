@@ -119,7 +119,24 @@ static void flex_parse_gap(html_tag* el, int avail, int& row_gap, int& col_gap)
  * template (the generic block loop's max-of-children is correct then). */
 static int grid_max_content_width(litehtml::html_tag* el, int avail);
 
+static int preferred_content_width_impl(const litehtml::element::ptr& el);
+static int pcw_depth = 0;
 static int preferred_content_width(const litehtml::element::ptr& el)
+{
+	static const char* dbg = getenv("EWEB_PCWDBG");
+	if(!dbg || !el) return preferred_content_width_impl(el);
+	pcw_depth++;
+	int r = preferred_content_width_impl(el);
+	pcw_depth--;
+	const litehtml::tchar_t* cls = el->get_attr(_t("class"), _t(""));
+	const litehtml::tchar_t* tag = el->get_tagName();
+	if(pcw_depth < 12)
+		fprintf(stderr, "PCW %*s<%s class=\"%.40s\"> disp=%d ws=%d ml=%d mr=%d -> %d\n", pcw_depth*2, "",
+			tag ? tag : "", cls ? cls : "", (int)el->get_display(), (int)el->is_white_space(),
+			el->margin_left(), el->margin_right(), r);
+	return r;
+}
+static int preferred_content_width_impl(const litehtml::element::ptr& el)
 {
 	if(!el) return 0;
 	litehtml::style_display d = el->get_display();
@@ -143,6 +160,31 @@ static int preferred_content_width(const litehtml::element::ptr& el)
 			sz.width = 0; sz.height = 0;
 			el->get_content_size(sz, 0);
 			return sz.width;
+		}
+		/* A percentage width is indefinite while the container's own size is
+		 * being derived from its contents (CSS Sizing 3 §5.2.1: treat as auto),
+		 * so the contribution is the intrinsic size + box. width() is the fill
+		 * of the LAST pass: github's "Go to file" <input style=width:100%>
+		 * reported 418px and the toolbar's max-content ballooned. Same for the
+		 * very first pass (width() still 0) of an auto-width control. Media
+		 * (img/video/canvas) stay on width(): their intrinsic size is the raw
+		 * source and a 100% width on them means "fill", never "natural". */
+		{
+			litehtml::css_length cw = el->get_css_width();
+			const litehtml::tchar_t* tn = el->get_tagName();
+			bool media = tn && (!t_strcmp(tn, _t("img")) || !t_strcmp(tn, _t("video")) ||
+								!t_strcmp(tn, _t("canvas")) || !t_strcmp(tn, _t("svg")));
+			bool pct = !media && !cw.is_predefined() && cw.units() == litehtml::css_units_percentage;
+			bool unset = !media && (cw.is_predefined() || cw.units() == litehtml::css_units_none) && el->width() == 0;
+			if(pct || unset)
+			{
+				litehtml::size sz;
+				sz.width = 0; sz.height = 0;
+				el->get_content_size(sz, 0x3fffffff);
+				if(sz.width > 0)
+					return sz.width + el->padding_left() + el->padding_right() +
+						   el->border_left() + el->border_right();
+			}
 		}
 		return el->width();
 	}
@@ -199,8 +241,19 @@ static int preferred_content_width(const litehtml::element::ptr& el)
 	}
 	if(d == litehtml::display_flex || d == litehtml::display_inline_flex)
 	{
-		/* row flex: the items sit side by side, so their widths add up */
+		/* row flex: the items sit side by side, so their widths add up; column
+		 * flex stacks them, so the widest one wins */
+		const litehtml::tchar_t* dir_s = el->get_style_property(_t("flex-direction"), false, _t("row"));
+		bool column = flex_flag(dir_s, "column", "column-reverse");
+		int gap = 0;
+		if(!column)
+		{
+			int rg = 0, cg = 0;
+			flex_parse_gap(static_cast<litehtml::html_tag*>(el), 0, rg, cg);
+			gap = cg;
+		}
 		int w = 0;
+		int cnt = 0;
 		size_t n = el->get_children_count();
 		for(size_t i = 0; i < n; i++)
 		{
@@ -208,8 +261,12 @@ static int preferred_content_width(const litehtml::element::ptr& el)
 			if(!c || !c->is_visible()) continue;
 			if(c->get_element_position() == litehtml::element_position_absolute ||
 			   c->get_element_position() == litehtml::element_position_fixed) continue;
-			w += c->margin_left() + c->margin_right() + preferred_content_width(c);
+			if(c->is_white_space()) continue;
+			int cw = c->margin_left() + c->margin_right() + preferred_content_width(c);
+			if(column) { if(cw > w) w = cw; }
+			else       { w += cw; cnt++; }
 		}
+		if(!column && cnt > 1) w += gap * (cnt - 1);
 		return w + el->padding_left() + el->padding_right() +
 			   el->border_left() + el->border_right();
 	}
@@ -232,9 +289,11 @@ static int preferred_content_width(const litehtml::element::ptr& el)
 		litehtml::style_display cd = c->get_display();
 		if(cd == litehtml::display_inline || cd == litehtml::display_inline_text ||
 		   cd == litehtml::display_inline_block || cd == litehtml::display_inline_flex ||
-		   cd == litehtml::display_inline_grid || cd == litehtml::display_inline_table)
+		   cd == litehtml::display_inline_grid || cd == litehtml::display_inline_table ||
+		   c->get_float() != litehtml::float_none)
 		{
-			/* inline-level siblings flow into the same line */
+			/* inline-level siblings flow into the same line; floats sit side
+			 * by side at max-content too (github's floated action <li>s) */
 			line += mw + preferred_content_width(c);
 		}
 		else
@@ -314,10 +373,59 @@ static int flex_run_wrap(const std::vector<litehtml::element::ptr>& run, int inn
 	return ly + lh;
 }
 
+/* Explicit min-width of a box as an OUTER (border-box) width, or -1 when it
+ * is auto / a percentage / a keyword that leaves the automatic minimum in
+ * force. `max-content` resolves to the preferred width, which is how
+ * github's Primer buttons (min-width:max-content) refuse to shrink into
+ * their label; an explicit 0 means "no floor" and is returned as 0. */
+static int flex_explicit_min_width(const litehtml::element::ptr& el)
+{
+	if(!el) return -1;
+	const litehtml::tchar_t* mw = el->get_style_property(_t("min-width"), false, nullptr);
+	if(!mw || !*mw) return -1;
+	if(!t_strcmp(mw, _t("max-content"))) return preferred_content_width(el);
+	litehtml::css_length l;
+	l.fromString(mw);
+	if(l.is_predefined() || l.units() == litehtml::css_units_none ||
+	   l.units() == litehtml::css_units_percentage)
+	{
+		/* a bare "0" parses as css_units_none */
+		if(!l.is_predefined() && l.units() == litehtml::css_units_none && l.val() == 0) return 0;
+		return -1;
+	}
+	int v = el->get_document()->cvt_units(l, el->get_font_size(), 0);
+	if(v < 0) return -1;
+	if(v > 0 && static_cast<litehtml::html_tag*>(el)->get_box_sizing() == litehtml::box_sizing_content_box)
+		v += el->padding_left() + el->padding_right() + el->border_left() + el->border_right();
+	return v;
+}
+
 /* Automatic minimum size of a flex item (min-content): shrinking below the
  * widest unsplittable word makes glyphs overflow into the neighbour item,
  * which is exactly the nav-row overlap real flexbox never shows. */
+static int flex_min_content_inner_impl(const litehtml::element::ptr& el);
 static int flex_min_content_inner(const litehtml::element::ptr& el)
+{
+	if(!el) return 0;
+	int w = flex_min_content_inner_impl(el);
+	/* the min-content CONTRIBUTION is clamped by the box's own min-width */
+	int emw = flex_explicit_min_width(el);
+	if(emw > 0)
+	{
+		int inner = emw - el->padding_left() - el->padding_right() -
+					el->border_left() - el->border_right();
+		if(inner > w) w = inner;
+	}
+	if(getenv("EWEB_PCWDBG") && pcw_depth < 8)
+	{
+		pcw_depth++;
+		fprintf(stderr, "MINC %*s<%s class=\"%.40s\"> disp=%d -> %d (emw=%d)\n", pcw_depth*2, "",
+			el->get_tagName() ? el->get_tagName() : "", el->get_attr(_t("class"), _t("")), (int)el->get_display(), w, emw);
+		pcw_depth--;
+	}
+	return w;
+}
+static int flex_min_content_inner_impl(const litehtml::element::ptr& el)
 {
 	if(!el) return 0;
 	/* A specified definite width IS the box's min-content size. Falling back
@@ -331,7 +439,16 @@ static int flex_min_content_inner(const litehtml::element::ptr& el)
 	   cw.units() != litehtml::css_units_percentage)
 	{
 		int wv = el->get_document()->cvt_units(cw, el->get_font_size(), 0);
-		if(wv > 0) return wv;
+		if(wv > 0)
+		{
+			/* callers add padding/border back; a border-box width has them inside */
+			if(static_cast<litehtml::html_tag*>(el)->get_box_sizing() == litehtml::box_sizing_border_box)
+			{
+				wv -= el->padding_left() + el->padding_right() + el->border_left() + el->border_right();
+				if(wv < 0) wv = 0;
+			}
+			return wv;
+		}
 	}
 	litehtml::style_display d = el->get_display();
 	bool flexd = (d == litehtml::display_flex || d == litehtml::display_inline_flex);
@@ -413,7 +530,12 @@ static int flex_min_content_inner(const litehtml::element::ptr& el)
 		if(!c || !c->is_visible()) continue;
 		if(c->get_element_position() == litehtml::element_position_absolute ||
 		   c->get_element_position() == litehtml::element_position_fixed) continue;
-		int cw = flex_min_content_inner(c);
+		/* a child's contribution is its OUTER width: inner floor plus its own
+		 * padding and borders. Summing bare inner widths dropped 16px of button
+		 * padding per github nav item (583 vs 693), so the nav shrank below
+		 * its nowrap labels and "Open Source" broke across two lines. */
+		int cw = flex_min_content_inner(c) + c->padding_left() + c->padding_right() +
+				 c->border_left() + c->border_right();
 		if(one_line)
 		{
 			/* row flex: the items sit side by side even at min-content, so
@@ -869,10 +991,16 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				mht->m_css_margins.right = smr;
 				/* block-level containers fill the available width (block
 				 * semantics); recover the content preferred width so the flex
-				 * base size is max-content, as the spec requires */
+				 * base size is max-content, as the spec requires. A nested flex
+				 * container is the same case: render_flex reports its PACKED
+				 * width, which a flex:1 child stretches to the whole line, so
+				 * github's header topRow (toggle slot flex:1 + 32px logo) and
+				 * the nav menu next to it both claimed the full bar and were
+				 * shrunk 50/50, centring the logo. */
 				litehtml::style_display d = it.el->get_display();
 				if(!it.el->is_replaced() &&
-				   (d == litehtml::display_block || d == litehtml::display_list_item))
+				   (d == litehtml::display_block || d == litehtml::display_list_item ||
+				    d == litehtml::display_flex || d == litehtml::display_grid))
 				{
 					litehtml::css_length iw = it.el->get_css_width();
 					if(iw.is_predefined() || iw.units() == litehtml::css_units_none)
@@ -1024,29 +1152,64 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		}
 		else if(free < 0 && total_shrink > 0)
 		{
+			/* Resolve flexible lengths (CSS Flexbox §9.7): shrink, clamp every
+			 * item that fell below its minimum, FREEZE those and redistribute the
+			 * shortfall over the rest until nothing else violates. A single pass
+			 * left github's header 171px over budget: the nav was clamped at
+			 * its nowrap content but the width:100% CTA box kept the share it
+			 * had been dealt before the clamp and pushed Sign in/up off screen. */
+			std::vector<int>  minc(line.size(), 0);
+			std::vector<bool> frozen(line.size(), false);
 			for(size_t i = 0; i < line.size(); i++)
 			{
 				flex_item& it = items[line[i]];
-				int sh = (int)((float)(-free) * it.shrink * (float)it.base / total_shrink);
-				it.main = it.base - sh;
 				/* automatic minimum size: never below min-content */
-				int minc = 0;
+				int mc = 0;
 				if(!it.run.empty())
 				{
 					for(size_t k = 0; k < it.run.size(); k++)
 					{
 						litehtml::size sz;
 						it.run[k]->get_content_size(sz, avail);
-						if(sz.width > minc) minc = sz.width;
+						if(sz.width > mc) mc = sz.width;
 					}
 				}
 				else
 				{
-					minc = flex_min_content(it.el);
+					/* a specified min-width replaces the automatic minimum
+					 * (CSS Flexbox §4.5): 0 lets the item shrink freely,
+					 * max-content pins it at its preferred width */
+					int emw = flex_explicit_min_width(it.el);
+					mc = emw >= 0 ? emw : flex_min_content(it.el);
 				}
-				minc += it.ml + it.mr;
-				if(it.main < minc) it.main = minc;
-				if(it.main < it.ml + it.mr) it.main = it.ml + it.mr;
+				mc += it.ml + it.mr;
+				if(mc < it.ml + it.mr) mc = it.ml + it.mr;
+				minc[i] = mc;
+				it.main = it.base;
+				if(it.shrink <= 0) frozen[i] = true;
+			}
+			for(size_t iter = 0; iter <= line.size(); iter++)
+			{
+				int   used = col_gaps;
+				float scaled = 0;
+				for(size_t i = 0; i < line.size(); i++)
+				{
+					flex_item& it = items[line[i]];
+					if(frozen[i]) used += it.main;
+					else { used += it.base; scaled += it.shrink * (float)it.base; }
+				}
+				int over = used - avail;
+				if(over <= 0 || scaled <= 0) break;
+				bool violated = false;
+				for(size_t i = 0; i < line.size(); i++)
+				{
+					if(frozen[i]) continue;
+					flex_item& it = items[line[i]];
+					int sh = (int)((float)over * it.shrink * (float)it.base / scaled);
+					it.main = it.base - sh;
+					if(it.main < minc[i]) { it.main = minc[i]; frozen[i] = true; violated = true; }
+				}
+				if(!violated) break;
 			}
 			free = 0;
 		}

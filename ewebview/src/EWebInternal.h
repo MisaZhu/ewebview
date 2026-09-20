@@ -41,6 +41,7 @@
 /* mario JavaScript VM handle; the full definition lives in <mario/mario.h>
  * (a C header) and is only pulled in by the .cc files that touch the VM. */
 struct st_vm;
+struct st_mstr;
 struct st_var;   /* mario var_t; full definition lives in <mario/mario.h> */
 
 namespace eweb {
@@ -413,6 +414,7 @@ public:
     void jsMarkLayoutDirty() { markLayoutDirty(jsActiveIsBuild()); jsProgressiveFlush(false); }
 
     void jsFireLoadEvents();
+    void jsRestoreNoJsFallback();
     void jsFireResizeEvent();
     void jsFireScrollEvent();
     /* Poll setInterval/setTimeout callbacks (engine loop step 7). Brackets the
@@ -574,6 +576,17 @@ public:
     static bool  jsWebRequest(void* ctx, const char* method, const char* url,
                               const char* headers, const char* body,
                               int* status, char** out_body, char** out_headers);
+    /* ES module loader hooks (mario `_resolve_m_func` / `_load_m_func`): a
+     * static `import` / dynamic `import()` in a running script canonicalises
+     * its specifier to an absolute URL against the importing module (falling
+     * back to the <script src> in flight, then the document) and fetches the
+     * source synchronously through jsWebRequest. Both are process-wide in
+     * mario, so the engine is recovered from vm->on_step_data. */
+    static struct st_mstr* jsModuleResolve(struct st_vm* vm, const char* spec, const char* base);
+    static struct st_mstr* jsModuleLoad(struct st_vm* vm, const char* spec);
+    /* Point vm->cur_module_spec at the absolute URL of the top-level script
+     * about to run (import.meta.url / relative-import base); NULL clears it. */
+    void jsSetModuleBase(bool on);
 
     /* ---- Canvas 2D (EWebCanvasGlue.cc) ---- */
     void registerCanvasNatives(struct st_vm* vm);
@@ -740,6 +753,13 @@ public:
      * with jsElIsLive before use: the node may have been removed. */
     std::vector<void*>          m_jsScriptEls;
     bool                        m_jsHasInlineHandlers;
+    /* True when the original <html> tag carried the `no-js` CSS class. Pages
+     * (e.g. Next.js) that ship with this class assume their client JS will
+     * remove it once the full enhancement pipeline runs; if the engine cannot
+     * complete async hydration, the class is re-added after all scripts finish
+     * so the no-js fallback CSS remains in effect and the SSR content stays
+     * visible instead of being masked by opacity:0 stagger-in tweens. */
+    bool                        m_jsOrigHtmlHadNoJs;
     bool                        m_jsEnabled;
     int                         m_jsReparseCount;
     bool                        m_jsRunBeforePaint;
@@ -784,6 +804,9 @@ public:
      * document.currentScript, which security SDKs use to insert their loader
      * next to themselves. */
     std::string                 m_jsCurScriptUrl;
+    /* Absolute URL backing vm->cur_module_spec while a top-level script runs
+     * (see jsSetModuleBase); stable storage the VM points into. */
+    std::string                 m_jsModuleBase;
     /* Stand-in element handed out as document.currentScript for a stripped
      * static <script src> (see jsCurrentScriptEl): the URL it was built for
      * and the cached node, so repeated reads see one stable element. */

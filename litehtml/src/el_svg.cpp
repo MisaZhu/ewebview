@@ -649,6 +649,31 @@ void litehtml::el_svg::draw(uint_ptr hdc, int x, int y, const position* clip)
 	float dx = (pos.width - vbw * s) / 2.0f - m_vb_x * s;
 	float dy = (pos.height - vbh * s) / 2.0f - m_vb_y * s;
 
+	/* CSS transform on the <svg> itself (GitHub's nav chevrons are a
+	 * chevron-right icon with transform:rotate(90deg)). The container's paint
+	 * transform only bends border quads, so the matrix is applied here to every
+	 * emitted point instead; it is computed about the border box, like
+	 * html_tag::draw_background does. */
+	position border_box = pos;
+	border_box += m_padding;
+	border_box += m_borders;
+	float xf[6];
+	bool have_xf = compute_transform_matrix(border_box, xf);
+	auto emit = [&](std::vector<float>& out, float px, float py)
+	{
+		float X = px * s + dx + pos.x;
+		float Y = py * s + dy + pos.y;
+		if(have_xf)
+		{
+			float tx = xf[0] * X + xf[2] * Y + xf[4];
+			float ty = xf[1] * X + xf[3] * Y + xf[5];
+			X = tx;
+			Y = ty;
+		}
+		out.push_back(X);
+		out.push_back(Y);
+	};
+
 	/* Paint consecutive same-colour subpaths together (one draw_svg call each)
 	 * so nonzero-winding counters inside a shape survive, while differently
 	 * filled shapes (accent rect + bg-coloured dot) layer in document order.
@@ -675,8 +700,7 @@ void litehtml::el_svg::draw(uint_ptr hdc, int x, int y, const position* clip)
 			counts.push_back(n);
 			for(int i = 0; i < n; i++)
 			{
-				pts.push_back(sp.pts[i * 2] * s + dx + pos.x);
-				pts.push_back(sp.pts[i * 2 + 1] * s + dy + pos.y);
+				emit(pts, sp.pts[i * 2], sp.pts[i * 2 + 1]);
 			}
 		}
 		if(counts.empty()) return;
@@ -763,17 +787,11 @@ void litehtml::el_svg::draw(uint_ptr hdc, int x, int y, const position* clip)
 				continue;
 			}
 			float nx = -dys / len * hw, ny = dxs / len * hw;
-			float q[8] = {
-				(x0 + nx) * s + dx + pos.x, (y0 + ny) * s + dy + pos.y,
-				(x1 + nx) * s + dx + pos.x, (y1 + ny) * s + dy + pos.y,
-				(x1 - nx) * s + dx + pos.x, (y1 - ny) * s + dy + pos.y,
-				(x0 - nx) * s + dx + pos.x, (y0 - ny) * s + dy + pos.y,
-			};
 			scounts.push_back(4);
-			for(int q_i = 0; q_i < 8; q_i++)
-			{
-				spts.push_back(q[q_i]);
-			}
+			emit(spts, x0 + nx, y0 + ny);
+			emit(spts, x1 + nx, y1 + ny);
+			emit(spts, x1 - nx, y1 - ny);
+			emit(spts, x0 - nx, y0 - ny);
 		}
 	}
 	flush_strokes();

@@ -158,10 +158,12 @@ static void browser_detect_color_scheme(void) {
 #if defined(__APPLE__)
     CFStringRef v;
     if(getenv("EWEB_COLOR_SCHEME")) return;
-    /* The global preferences domain's identifier is literally the string
-     * "kCFPreferencesGlobalDomain"; CoreFoundation ships no constant for it. */
+    /* The global ("Apple Global Domain") preferences are addressed with the
+     * kCFPreferencesAnyApplication constant - NOT a literal domain string; the
+     * AppleInterfaceStyle key lives there and is "Dark" only in dark mode
+     * (absent in light mode, which is why NULL means light). */
     v = (CFStringRef)CFPreferencesCopyValue(CFSTR("AppleInterfaceStyle"),
-            CFSTR("kCFPreferencesGlobalDomain"),
+            kCFPreferencesAnyApplication,
             kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
     if(v) {
         int dark = (CFGetTypeID(v) == CFStringGetTypeID() &&

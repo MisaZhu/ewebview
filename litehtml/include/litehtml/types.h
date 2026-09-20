@@ -250,7 +250,7 @@ namespace litehtml
 		font_variant_italic
 	};
 
-#define  font_weight_strings	_t("normal;bold;bolder;lighter100;200;300;400;500;600;700")
+#define  font_weight_strings	_t("normal;bold;bolder;lighter;100;200;300;400;500;600;700;800;900")
 
 	enum font_weight
 	{
@@ -264,7 +264,9 @@ namespace litehtml
 		fontWeight400,
 		fontWeight500,
 		fontWeight600,
-		fontWeight700
+		fontWeight700,
+		fontWeight800,
+		fontWeight900
 	};
 
 #define  list_style_type_strings	_t("none;circle;disc;square;armenian;cjk-ideographic;decimal;decimal-leading-zero;georgian;hebrew;hiragana;hiragana-iroha;katakana;katakana-iroha;lower-alpha;lower-greek;lower-latin;lower-roman;upper-alpha;upper-latin;upper-roman")
