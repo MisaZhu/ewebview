@@ -40,3 +40,42 @@ jobs:
         run: |
           test -f build_aarch64/virt/lib/libewebview.a
           test -x build_aarch64/virt/bin/sdlbrowser
+
+  ewokos-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out ewebview
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          path: ewebview
+
+      - name: Check out EwokOS
+        uses: actions/checkout@v4
+        with:
+          repository: MisaZhu/ewokos
+          submodules: recursive
+          path: ewokos
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential
+
+      - name: Build EwokOS port
+        working-directory: ewebview
+        run: |
+          make clean
+          make -j2 \
+            OS_TYPE=ewokos \
+            PORTING=ewokos \
+            ewokos="$GITHUB_WORKSPACE/ewokos"
+
+      - name: Verify EwokOS artifacts
+        run: |
+          test -f ewokos/system/build_aarch64/virt/lib/libewebview.a
+          test -f ewokos/system/build_aarch64/virt/lib/liblitehtml.a
+          test -f ewokos/system/build_aarch64/virt/lib/libmario_jsn.a
+          test -f ewokos/system/build_aarch64/virt/lib/libwebp.a
+          test -f ewokos/system/build_aarch64/virt/lib/libtinyhttpsc.a
