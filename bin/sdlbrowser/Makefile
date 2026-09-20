@@ -46,6 +46,11 @@ CFLAGS += $(SDL2_CFLAGS) -I $(TARGET_DIR)/include
 
 LDFLAGS += -L $(TARGET_DIR)/lib
 
+# Remove unreferenced functions/data after archive extraction. The archives
+# contain several large single-object implementations, so section-level dead
+# stripping is important for the standalone browser binary.
+LDFLAGS += -Wl,-dead_strip
+
 # Link order matters: ewebview references litehtml/mario/webp/tinyhttpsc
 # symbols, and the SDL2 port inside libewebview.a references SDL2 companions.
 # libewebview.a is C++14 internally, so link with $(CXX) to pull in libstdc++.
@@ -83,6 +88,7 @@ all: $(TARGET)
 $(TARGET): $(OBJS) $(PROJ_LIBS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(OBJS) -o $@ $(LDFLAGS) $(LIBS)
+	strip -x $@
 	cp -r res $(dir $@)
 
 $(ARCH)/%.o: %.c
