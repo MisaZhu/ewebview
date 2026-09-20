@@ -546,8 +546,23 @@ static std::string preprocess_noscript_picture(const std::string& html)
                 if(tag_start != std::string::npos)
                     added = inject_style(tag_start,
                         "display:flex;flex-wrap:nowrap;list-style:none;"
-                        "padding:0 72px;margin:0;gap:20px;overflow:hidden");
+                        "padding:0 6.25%;margin:0;gap:20px;overflow:hidden");
                 pos = f + 35 + added;
+            }
+        }
+
+        /* (b2) TabbedGallery's SSR panels are intentionally hidden until React
+         *      hydration adds the active class. If hydration is unavailable,
+         *      reveal only the first panel and put it back in normal flow so it
+         *      contributes the gallery height instead of leaving a blank section. */
+        {
+            size_t f = lower.find("tabbedgallery_tabpanel");
+            if(f != std::string::npos) {
+                size_t tag_start = out.rfind('<', f);
+                if(tag_start != std::string::npos)
+                    inject_style(tag_start,
+                        "position:relative;left:-7.142857%;width:114.285714%;"
+                        "visibility:visible;opacity:1");
             }
         }
 
@@ -561,7 +576,7 @@ static std::string preprocess_noscript_picture(const std::string& html)
                 size_t added = 0;
                 if(tag_start != std::string::npos)
                     added = inject_style(tag_start,
-                        "display:block;width:372px;flex-shrink:0;list-style:none");
+                        "display:block;width:344px;flex-shrink:0;list-style:none");
                 pos = f + 33 + added;
             }
         }
