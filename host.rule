@@ -19,7 +19,7 @@ ifeq ($(filter arm64 aarch64,$(HOST_ARCH)), $(HOST_ARCH))
 HOST_ARCH_FLAGS = -march=armv8-a -mstrict-align -mno-outline-atomics
 endif
 
-CFLAGS =  $(HOST_ARCH_FLAGS) -Wno-incompatible-pointer-types -Wno-int-conversion \
+CFLAGS =  $(HOST_ARCH_FLAGS) -D_DEFAULT_SOURCE -Wno-incompatible-pointer-types -Wno-int-conversion \
 		-Wno-implicit-function-declaration \
         -Wall -Wextra -fPIC \
 		-fno-builtin-memcpy \
