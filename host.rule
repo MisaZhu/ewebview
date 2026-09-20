@@ -18,8 +18,12 @@ HOST_ARCH_FLAGS =
 ifeq ($(filter arm64 aarch64,$(HOST_ARCH)), $(HOST_ARCH))
 HOST_ARCH_FLAGS = -march=armv8-a -mstrict-align -mno-outline-atomics
 endif
+HOST_POSIX_FLAGS =
+ifneq ($(shell uname -s),Darwin)
+HOST_POSIX_FLAGS = -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L
+endif
 
-CFLAGS =  $(HOST_ARCH_FLAGS) -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L -Wno-incompatible-pointer-types -Wno-int-conversion \
+CFLAGS =  $(HOST_ARCH_FLAGS) $(HOST_POSIX_FLAGS) -Wno-incompatible-pointer-types -Wno-int-conversion \
 		-Wno-implicit-function-declaration \
         -Wall -Wextra -fPIC \
 		-fno-builtin-memcpy \
@@ -28,7 +32,7 @@ CFLAGS =  $(HOST_ARCH_FLAGS) -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L -Wno-in
         -Wno-unused-parameter \
 	        -std=c99
 
-CXXFLAGS = $(HOST_ARCH_FLAGS) -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L \
+CXXFLAGS = $(HOST_ARCH_FLAGS) $(HOST_POSIX_FLAGS) \
         -Wall -Wextra -fPIC \
 		-fno-builtin-memcpy \
 		-fno-builtin-memmove \
