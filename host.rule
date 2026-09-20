@@ -28,7 +28,7 @@ CFLAGS =  $(HOST_ARCH_FLAGS) -D_DEFAULT_SOURCE -Wno-incompatible-pointer-types -
         -Wno-unused-parameter \
 	        -std=c99
 
-CXXFLAGS = $(HOST_ARCH_FLAGS) \
+CXXFLAGS = $(HOST_ARCH_FLAGS) -D_DEFAULT_SOURCE \
         -Wall -Wextra -fPIC \
 		-fno-builtin-memcpy \
 		-fno-builtin-memmove \
