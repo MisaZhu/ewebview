@@ -62,17 +62,16 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes build-essential \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu
+          sudo apt-get install --yes build-essential
 
-      - name: Provide EwokOS toolchain names
+      - name: Install EwokOS toolchain
         run: |
-          for tool in gcc g++ c++ ar as ld objdump; do
-            source_tool="$tool"
-            if [ "$tool" = c++ ]; then source_tool=g++; fi
-            sudo ln -sf "$(command -v aarch64-linux-gnu-$source_tool)" "/usr/local/bin/aarch64-none-elf-$tool"
-          done
+          version=14.3.rel1
+          archive="arm-gnu-toolchain-${version}-x86_64-aarch64-none-elf.tar.xz"
+          url="https://developer.arm.com/-/media/Files/downloads/gnu/${version}/binrel/${archive}"
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/$archive" "$url"
+          tar -xJf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/arm-gnu-toolchain-${version}-x86_64-aarch64-none-elf/bin" >> "$GITHUB_PATH"
 
       - name: Build EwokOS port
         working-directory: ewebview
