@@ -117,7 +117,17 @@ static uint32_t ek_get_pixel(void* ud, eweb_surface_t* s, int x, int y) { (void)
 static void ek_blit(void* ud, eweb_surface_t* src, int sx, int sy, int sw, int sh,
                     eweb_surface_t* dst, int dx, int dy, int dw, int dh) {
     (void)ud;
-    if(src && dst) graph_blt(G(src), sx, sy, sw, sh, G(dst), dx, dy, dw, dh);
+    if(!src || !dst) return;
+    /* graph_blt() intersects the source and destination rectangles as a 1:1
+     * copy before entering its resampler. When a HiDPI image is drawn from a
+     * larger source rectangle into a smaller CSS-sized destination, that step
+     * truncates the source to dw x dh and only the first part of the image is
+     * visible. Use the graph library's scaling primitive whenever the two
+     * rectangles differ; retain graph_blt() for the fast exact-copy path. */
+    if(sw == dw && sh == dh)
+        graph_blt(G(src), sx, sy, sw, sh, G(dst), dx, dy, dw, dh);
+    else
+        graph_blt_fit(G(src), sx, sy, sw, sh, G(dst), dx, dy, dw, dh);
 }
 static void ek_blit_fit_alpha(void* ud, eweb_surface_t* src, int sx, int sy, int sw, int sh,
                               eweb_surface_t* dst, int dx, int dy, int dw, int dh, uint8_t alpha) {

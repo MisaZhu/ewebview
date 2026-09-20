@@ -399,8 +399,8 @@ void eweb_el_input::setCaretFromPoint(int localX, int localY)
 int eweb_el_input::optionCount()
 {
     int n = 0;
-    for(int i = 0; i < get_children_count(); i++) {
-        litehtml::element::ptr ch = get_child(i);
+    for(size_t i = 0; i < get_children_count(); i++) {
+        litehtml::element::ptr ch = get_child((int)i);
         if(ch && ch->get_tagName() && !t_strcasecmp(ch->get_tagName(), _t("option"))) n++;
     }
     return n;
@@ -409,8 +409,8 @@ int eweb_el_input::optionCount()
 litehtml::element::ptr eweb_el_input::optionAt(int i)
 {
     int n = 0;
-    for(int k = 0; k < get_children_count(); k++) {
-        litehtml::element::ptr ch = get_child(k);
+    for(size_t k = 0; k < get_children_count(); k++) {
+        litehtml::element::ptr ch = get_child((int)k);
         if(ch && ch->get_tagName() && !t_strcasecmp(ch->get_tagName(), _t("option"))) {
             if(n == i) return ch;
             n++;
@@ -422,8 +422,8 @@ litehtml::element::ptr eweb_el_input::optionAt(int i)
 int eweb_el_input::selectedOptionIndex()
 {
     int n = 0;
-    for(int i = 0; i < get_children_count(); i++) {
-        litehtml::element::ptr ch = get_child(i);
+    for(size_t i = 0; i < get_children_count(); i++) {
+        litehtml::element::ptr ch = get_child((int)i);
         if(!ch || !ch->get_tagName() || t_strcasecmp(ch->get_tagName(), _t("option"))) continue;
         if(ch->get_attr(_t("selected"))) return n;
         n++;
@@ -434,8 +434,8 @@ int eweb_el_input::selectedOptionIndex()
 void eweb_el_input::selectOptionIndex(int i)
 {
     int n = 0;
-    for(int k = 0; k < get_children_count(); k++) {
-        litehtml::element::ptr ch = get_child(k);
+    for(size_t k = 0; k < get_children_count(); k++) {
+        litehtml::element::ptr ch = get_child((int)k);
         if(!ch || !ch->get_tagName() || t_strcasecmp(ch->get_tagName(), _t("option"))) continue;
         if(n == i) ch->set_attr(_t("selected"), _t(""));
         else       ch->remove_attr(_t("selected"));
@@ -757,8 +757,8 @@ std::string eweb_el_input::label(bool* is_placeholder)
          * caller's register garbage and the `if(!first)`/`if(first)` guards
          * then deref a bogus address, crashing every <select> on layout. */
         litehtml::element::ptr first = nullptr;
-        for (int i = 0; i < get_children_count(); i++) {
-            litehtml::element::ptr ch = get_child(i);
+        for (size_t i = 0; i < get_children_count(); i++) {
+            litehtml::element::ptr ch = get_child((int)i);
             if (!ch || !ch->get_tagName() || t_strcasecmp(ch->get_tagName(), _t("option"))) {
                 continue;
             }

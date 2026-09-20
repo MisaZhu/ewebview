@@ -20,7 +20,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#ifdef __ewokos__
+#include <openlibm_math.h>
+#else
 #include <math.h>
+#endif
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -1454,7 +1458,7 @@ static bool parse_shadow_length(const std::string& token, float& value)
 {
     if (token.empty()) return false;
     char* end = NULL;
-    value = strtof(token.c_str(), &end);
+    value = (float)strtod(token.c_str(), &end);
     if (end == token.c_str()) return false;
     if (*end == '\0' || !strcmp(end, "px")) return true;
     return false;
