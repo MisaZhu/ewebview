@@ -69,7 +69,9 @@ jobs:
       - name: Provide EwokOS toolchain names
         run: |
           for tool in gcc g++ c++ ar as ld objdump; do
-            sudo ln -sf "$(command -v aarch64-linux-gnu-$tool)" "/usr/local/bin/aarch64-none-elf-$tool"
+            source_tool="$tool"
+            if [ "$tool" = c++ ]; then source_tool=g++; fi
+            sudo ln -sf "$(command -v aarch64-linux-gnu-$source_tool)" "/usr/local/bin/aarch64-none-elf-$tool"
           done
 
       - name: Build EwokOS port
