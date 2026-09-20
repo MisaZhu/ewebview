@@ -73,6 +73,10 @@ jobs:
           tar -xJf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/arm-gnu-toolchain-${version}-x86_64-aarch64-none-elf/bin" >> "$GITHUB_PATH"
 
+      - name: Build EwokOS SDK
+        run: |
+          make -C "$GITHUB_WORKSPACE/ewokos/machine.virt/system" -j2 x
+
       - name: Build EwokOS port
         working-directory: ewebview
         run: |
