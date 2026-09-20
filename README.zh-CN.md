@@ -2,11 +2,12 @@
   <h1>ewebview</h1>
   <p>面向资源受限系统和裸机环境的自包含嵌入式 Web 引擎。</p>
   <p><a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a></p>
-  <p>
-    <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="许可证：Apache-2.0"></a>
-    <a href="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml"><img src="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml/badge.svg?branch=main&job=build%20%28macos-14%29" alt="macOS CI"></a>
-    <a href="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml"><img src="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml/badge.svg?branch=main&job=build%20%28ubuntu-latest%29" alt="Linux CI"></a>
-  </p>
+  <p><a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="许可证：Apache-2.0"></a></p>
+  <table>
+    <tr><th>平台</th><th>Runner</th><th>CI 状态</th></tr>
+    <tr><td>macOS</td><td><code>macos-14</code></td><td><a href="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml"><img src="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml/badge.svg?branch=main&job=build%20%28macos-14%29" alt="macOS CI"></a></td></tr>
+    <tr><td>Linux</td><td><code>ubuntu-latest</code></td><td><a href="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml"><img src="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml/badge.svg?branch=main&job=build%20%28ubuntu-latest%29" alt="Linux CI"></a></td></tr>
+  </table>
 </div>
 
 **ewebview** 是一个自包含的嵌入式 Web 引擎，支持 HTML、CSS 和 JavaScript，面向资源受限操作系统及裸机环境。它将页面渲染到抽象的 ARGB8888 内存画布（`eweb_surface_t`），图形、字体、图片解码、网络和时钟等平台能力通过 `eweb_port_t` 回调表注入，核心代码不依赖特定操作系统或窗口系统。
