@@ -59,6 +59,30 @@ static int flex_len(const tchar_t* v, int avail, int font_size, document* doc)
 	return px > 0 ? px : 0;
 }
 
+/* Recursively flatten display:contents for the layout box tree while leaving
+ * the DOM parent/child relationships untouched. */
+static void collect_box_children(element::ptr parent, std::vector<element::ptr>& out)
+{
+	if(!parent) return;
+	for(size_t i = 0; i < parent->get_children_count(); i++)
+	{
+		element::ptr child = parent->get_child((int)i);
+		if(!child) continue;
+		if(child->get_display() == display_contents)
+			collect_box_children(child, out);
+		else
+			out.push_back(child);
+	}
+}
+
+/* visibility:hidden suppresses painting and hit testing, not layout. Using
+ * is_visible() here removed hidden flex/grid descendants from sizing entirely;
+ * tab panels could then never be measured by ResizeObserver and activated. */
+static bool participates_in_layout(const element::ptr& el)
+{
+	return el && el->get_display() != display_none;
+}
+
 /* gap / row-gap / column-gap: "gap: <row> [<column>]" */
 static void flex_parse_gap(html_tag* el, int avail, int& row_gap, int& col_gap)
 {
@@ -123,17 +147,43 @@ static int preferred_content_width_impl(const litehtml::element::ptr& el);
 static int pcw_depth = 0;
 static int preferred_content_width(const litehtml::element::ptr& el)
 {
-	static const char* dbg = getenv("EWEB_PCWDBG");
-	if(!dbg || !el) return preferred_content_width_impl(el);
+	if(!el) return 0;
 	pcw_depth++;
 	int r = preferred_content_width_impl(el);
 	pcw_depth--;
-	const litehtml::tchar_t* cls = el->get_attr(_t("class"), _t(""));
-	const litehtml::tchar_t* tag = el->get_tagName();
-	if(pcw_depth < 12)
-		fprintf(stderr, "PCW %*s<%s class=\"%.40s\"> disp=%d ws=%d ml=%d mr=%d -> %d\n", pcw_depth*2, "",
-			tag ? tag : "", cls ? cls : "", (int)el->get_display(), (int)el->is_white_space(),
-			el->margin_left(), el->margin_right(), r);
+
+	/* A box's intrinsic contribution is clamped by definite min/max widths.
+	 * Without this, a width:100% wrapper around a max-width:344px card reported
+	 * the entire 896px gallery viewport as its flex base, so one card consumed
+	 * each row instead of forming the horizontal strip. */
+	auto width_limit = [&](const tchar_t* name) -> int {
+		const tchar_t* raw = el->get_style_property(name, false, nullptr);
+		if(!raw || !*raw) return -1;
+		css_length l;
+		l.fromString(raw);
+		if(l.is_predefined() || l.units() == css_units_none || l.units() == css_units_percentage)
+			return -1;
+		int v = el->get_document()->cvt_units(l, el->get_font_size(), 0);
+		if(v < 0) return -1;
+		if(static_cast<html_tag*>(el)->get_box_sizing() == box_sizing_content_box)
+			v += el->padding_left() + el->padding_right() + el->border_left() + el->border_right();
+		return v;
+	};
+	int max_w = width_limit(_t("max-width"));
+	if(max_w >= 0 && r > max_w) r = max_w;
+	int min_w = width_limit(_t("min-width"));
+	if(min_w >= 0 && r < min_w) r = min_w;
+
+	static const char* dbg = getenv("EWEB_PCWDBG");
+	if(dbg)
+	{
+		const litehtml::tchar_t* cls = el->get_attr(_t("class"), _t(""));
+		const litehtml::tchar_t* tag = el->get_tagName();
+		if(pcw_depth < 12)
+			fprintf(stderr, "PCW %*s<%s class=\"%.40s\"> disp=%d ws=%d ml=%d mr=%d -> %d\n", pcw_depth*2, "",
+				tag ? tag : "", cls ? cls : "", (int)el->get_display(), (int)el->is_white_space(),
+				el->margin_left(), el->margin_right(), r);
+	}
 	return r;
 }
 static int preferred_content_width_impl(const litehtml::element::ptr& el)
@@ -258,7 +308,7 @@ static int preferred_content_width_impl(const litehtml::element::ptr& el)
 		for(size_t i = 0; i < n; i++)
 		{
 			litehtml::element::ptr c = el->get_child((int)i);
-			if(!c || !c->is_visible()) continue;
+			if(!participates_in_layout(c)) continue;
 			if(c->get_element_position() == litehtml::element_position_absolute ||
 			   c->get_element_position() == litehtml::element_position_fixed) continue;
 			if(c->is_white_space()) continue;
@@ -276,7 +326,7 @@ static int preferred_content_width_impl(const litehtml::element::ptr& el)
 	for(size_t i = 0; i < n; i++)
 	{
 		litehtml::element::ptr c = el->get_child((int)i);
-		if(!c || !c->is_visible()) continue;
+		if(!participates_in_layout(c)) continue;
 		if(c->get_element_position() == litehtml::element_position_absolute ||
 		   c->get_element_position() == litehtml::element_position_fixed) continue;
 		int mw = c->margin_left() + c->margin_right();
@@ -527,7 +577,7 @@ static int flex_min_content_inner_impl(const litehtml::element::ptr& el)
 	for(size_t i = 0; i < n; i++)
 	{
 		litehtml::element::ptr c = el->get_child((int)i);
-		if(!c || !c->is_visible()) continue;
+		if(!participates_in_layout(c)) continue;
 		if(c->get_element_position() == litehtml::element_position_absolute ||
 		   c->get_element_position() == litehtml::element_position_fixed) continue;
 		/* a child's contribution is its OUTER width: inner floor plus its own
@@ -630,14 +680,15 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		const tchar_t* col_ai = get_style_property(_t("align-items"), false, _t("stretch"));
 
 		std::vector<element::ptr> kids;
+		std::vector<element::ptr> layout_children;
 		std::vector<int> ord;
-		for(auto& el : m_children)
+		collect_box_children(this, layout_children);
+		for(auto& el : layout_children)
 		{
-			if(!el || !el->is_visible()) continue;
+			if(!participates_in_layout(el)) continue;
 			element_position ep = el->get_element_position();
 			if(ep == element_position_absolute || ep == element_position_fixed) continue;
 			if(el->is_white_space()) continue;
-			if(el->get_display() == display_contents) continue;
 			const tchar_t* o = el->get_style_property(_t("order"), false, _t("0"));
 			ord.push_back(o ? atoi(o) : 0);
 			kids.push_back(el);
@@ -772,9 +823,11 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 	flex_parse_gap(this, avail, row_gap, col_gap);
 
 	std::vector<flex_item> items;
-	for(auto& el : m_children)
+	std::vector<element::ptr> layout_children;
+	collect_box_children(this, layout_children);
+	for(auto& el : layout_children)
 	{
-		if(!el || !el->is_visible()) continue;
+		if(!participates_in_layout(el)) continue;
 		element_position ep = el->get_element_position();
 		if(ep == element_position_absolute || ep == element_position_fixed) continue;
 		if(el->is_white_space())
@@ -787,7 +840,6 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			}
 			continue;
 		}
-		if(el->get_display() == display_contents) continue; /* box-less wrapper */
 		if(el->get_display() == display_inline_text)
 		{
 			/* contiguous text boxifies into ONE anonymous flex item */
@@ -1089,9 +1141,18 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			 * the li, so the card can fill the row and its last text rows
 			 * stop hanging under the row's overflow clip). Auto-height
 			 * parents keep the CSS fallback: percentage behaves as auto,
-			 * never against a stale pass value. */
+			 * never against a stale pass value.
+			 * Resolve through the parent's SPECIFIED height first: while the
+			 * parent is still laying out its children its m_pos.height is 0,
+			 * which zeroed workspace.google.com's nav{height:100%} inside the
+			 * 64px header row and dropped every menu label 16px too low. */
 			element::ptr p = parent();
-			if(p && !p->get_css_height().is_predefined())
+			int spec_h = 0;
+			if(get_predefined_height(spec_h))
+			{
+				fixed_h = spec_h;
+			}
+			else if(p && !p->get_css_height().is_predefined())
 			{
 				fixed_h = m_css_height.calc_percent(p->m_pos.height);
 			}
@@ -1466,6 +1527,8 @@ namespace litehtml
 		int		min_w = 0;			// minmax() lower bound, used by repeat(auto-fill)
 		bool	is_content = false;	// min-content / max-content track
 		bool	content_min = false;	// true = min-content, false = max-content
+		bool	is_auto = true;		// 'auto' (or implicit) - content-sized; columns treat it as 1fr,
+									// rows must NOT: 'auto 1fr' gives the fr row all the leftover
 	};
 }
 
@@ -1559,12 +1622,22 @@ static void grid_parse_tracks(const tchar_t* spec, int avail, int font_size, doc
 			continue;
 		}
 
+		/* Line names ('[full-start]') are not tracks, and 'none' declares no
+		 * explicit tracks at all: both used to fall through as an fr track. */
+		if(t.empty() || t == _t("none")) continue;
+		if(t[0] == _t('['))
+		{
+			while(t.find(_t(']')) == tstring::npos && i + 1 < toks.size()) t = toks[++i];
+			continue;
+		}
+
 		grid_track tr;
 		tr.is_fixed = false;
 		tr.fixed_w = 0;
 		tr.fr = 1;
 		tr.min_w = 0;
-		size_t fl = str_rfind(t, 'r');
+		tr.is_auto = false;
+		size_t fl = str_rfind(t, 'f');
 		if(fl != tstring::npos && fl == t.length() - 2 && t.substr(fl) == _t("fr"))
 		{
 			tr.fr = (float)atof(t.c_str());
@@ -1573,6 +1646,7 @@ static void grid_parse_tracks(const tchar_t* spec, int avail, int font_size, doc
 		else if(t == _t("auto"))
 		{
 			tr.fr = 1;
+			tr.is_auto = true;
 		}
 		else if(t.substr(0, 7) == _t("minmax("))
 		{
@@ -1635,6 +1709,11 @@ static void grid_parse_tracks(const tchar_t* spec, int avail, int font_size, doc
 				tr.is_fixed = true;
 				tr.fixed_w = doc->cvt_units(l, font_size, avail);
 				tr.min_w = tr.fixed_w;
+			}
+			else
+			{
+				/* fit-content(), masonry, subgrid, ...: content-size it */
+				tr.is_auto = true;
 			}
 		}
 		tracks.push_back(tr);
@@ -1826,7 +1905,7 @@ std::vector<element::ptr> items;
 for(size_t i = 0; i < el->get_children_count(); i++)
 {
 element::ptr c = el->get_child((int)i);
-if(!c || !c->is_visible()) continue;
+if(!participates_in_layout(c)) continue;
 element_position ep = c->get_element_position();
 if(ep == element_position_absolute || ep == element_position_fixed) continue;
 if(c->is_white_space()) continue;
@@ -1937,7 +2016,18 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 	{
 		avail -= content_margins_left() + content_margins_right();
 	}
+	/* Grid boxes obey max-width just like block and flex boxes. The omission
+	 * made Apple's max-width:344px cards expand to the full gallery viewport. */
+	if(!m_css_max_width.is_predefined() && !second_pass)
+	{
+		int mw = get_document()->cvt_units(m_css_max_width, m_font_size, parent_width);
+		if(m_box_sizing == box_sizing_border_box)
+			mw -= m_padding.left + m_borders.left + m_padding.right + m_borders.right;
+		if(avail > mw) avail = mw;
+	}
 	if(avail < 0) avail = 0;
+	std::vector<element::ptr> layout_children;
+	collect_box_children(this, layout_children);
 
 	std::vector<grid_track> tracks;
 	int row_gap = 0, col_gap = 0;
@@ -1957,10 +2047,9 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 		if(af && t_strstr(af, _t("column")))
 		{
 			int count = 0;
-			for(auto& el : m_children)
+			for(auto& el : layout_children)
 			{
-				if(!el || !el->is_visible() || el->is_white_space()) continue;
-				if(el->get_display() == display_contents) continue;
+				if(!participates_in_layout(el) || el->is_white_space()) continue;
 				element_position ep = el->get_element_position();
 				if(ep == element_position_absolute || ep == element_position_fixed) continue;
 				count++;
@@ -1989,9 +2078,9 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 		 * ":has(:nth-child(2))", which the selector engine cannot match, and
 		 * strict single-column auto-flow would stack the pills vertically. */
 		bool placed = false;
-		for(auto& el : m_children)
+		for(auto& el : layout_children)
 		{
-			if(!el || !el->is_visible() || el->get_display() == display_inline_text) continue;
+			if(!participates_in_layout(el) || el->get_display() == display_inline_text) continue;
 			if(el->get_style_property(_t("grid-area"), false, 0) ||
 			   el->get_style_property(_t("grid-row"), false, 0) ||
 			   el->get_style_property(_t("grid-row-start"), false, 0) ||
@@ -2020,13 +2109,12 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 		if(tracks[i].is_content) have_content_track = true;
 
 	std::vector<element::ptr> items;
-	for(auto& el : m_children)
+	for(auto& el : layout_children)
 	{
-		if(!el || !el->is_visible()) continue;
+		if(!participates_in_layout(el)) continue;
 		element_position ep = el->get_element_position();
 		if(ep == element_position_absolute || ep == element_position_fixed) continue;
 		if(el->is_white_space()) continue;
-		if(el->get_display() == display_contents) continue; /* box-less wrapper */
 		switch(el->get_display())
 		{
 		case display_inline:		el->set_display(display_block);		break;
@@ -2039,20 +2127,56 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 
 	int bottom = 0;
 
-	/* grid-auto-rows: minmax(L, ...) floors every row height; items then
-	 * stretch to the row height (align-self:stretch default), which is what
-	 * centers captions vertically inside the square member tiles. */
-	int row_min = 0;
-	const tchar_t* ar = get_style_property(_t("grid-auto-rows"), false, 0);
-	if(ar)
+	/* Row tracks. The container's block size decides how they resolve: with
+	 * a definite height (or a min-height, per css-grid 12.7.1/12.8 the min is
+	 * used as the free space when the height itself is indefinite) fr rows
+	 * share the leftover and auto rows stretch into it; otherwise every row
+	 * is content-sized. apple.com's "Why Apple" cards are
+	 * 'grid-template-rows:auto 1fr; height:100%; min-height:387px' with a
+	 * figure{height:100%} in the fr row: content-sizing that row against
+	 * the CARD height made the artwork row as tall as the whole card, and
+	 * the cards grew to text + card height. */
+	int cont_h = -1;
 	{
-		std::vector<grid_track> rt;
-		grid_parse_tracks(ar, avail, m_font_size, get_document(), rt, col_gap);
-		if(!rt.empty())
-		{
-			row_min = rt[0].min_w > 0 ? rt[0].min_w : (rt[0].is_fixed ? rt[0].fixed_w : 0);
-		}
+		int bh = 0;
+		if(get_predefined_height(bh)) cont_h = border_box_content_height(bh);
 	}
+	int cont_min_h = 0;
+	if(!m_css_min_height.is_predefined() && m_css_min_height.units() != css_units_none)
+	{
+		if(m_css_min_height.units() == css_units_percentage)
+		{
+			element::ptr p = parent();
+			int ph = 0;
+			if(p && p->get_predefined_height(ph))
+				cont_min_h = m_css_min_height.calc_percent(p->border_box_content_height(ph));
+		}
+		else
+		{
+			cont_min_h = get_document()->cvt_units(m_css_min_height, m_font_size, 0);
+		}
+		if(m_box_sizing == box_sizing_border_box)
+			cont_min_h -= m_padding.top + m_padding.bottom + m_borders.top + m_borders.bottom;
+		if(cont_min_h < 0) cont_min_h = 0;
+	}
+	std::vector<grid_track> tmpl_rows, auto_rows;
+	int track_avail_h = cont_h > 0 ? cont_h : cont_min_h;
+	if(const tchar_t* trs = get_style_property(_t("grid-template-rows"), false, 0))
+		grid_parse_tracks(trs, track_avail_h, m_font_size, get_document(), tmpl_rows, row_gap);
+	/* grid-auto-rows sizes every implicit row (cycled); minmax(L, ...) floors
+	 * it, which is what centers captions inside square member tiles. */
+	if(const tchar_t* ar = get_style_property(_t("grid-auto-rows"), false, 0))
+		grid_parse_tracks(ar, track_avail_h, m_font_size, get_document(), auto_rows, row_gap);
+	auto row_track = [&](int r) -> grid_track {
+		if(r < (int)tmpl_rows.size()) return tmpl_rows[r];
+		if(!auto_rows.empty()) return auto_rows[(r - (int)tmpl_rows.size()) % (int)auto_rows.size()];
+		grid_track t;
+		t.is_auto = true;
+		return t;
+	};
+	auto row_is_fr = [](const grid_track& t) -> bool {
+		return !t.is_fixed && !t.is_auto && !t.is_content && t.fr > 0;
+	};
 
 	/* Author-specified heights, saved so the stretch pass below can force a
 	 * row height and a later relayout measures from the clean state again. */
@@ -2294,80 +2418,195 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 		t->m_css_width = cw;
 	};
 
+	/* Phase 1 - measure. Every item is laid out once at its cell width to get
+	 * its natural outer height. A percentage height is measured as 'auto':
+	 * it resolves against the grid AREA, whose size is not known until the
+	 * row is sized (resolving it against the container here is exactly the
+	 * bug described above). Fixed rows skip the measurement - the track is
+	 * definite regardless of content. */
+	std::vector<grid_track> rtr(row_count);
+	std::vector<int> row_nat(row_count, 0);
+	for(int r = 0; r < row_count; r++) rtr[r] = row_track(r);
+
+	auto item_is_pct_h = [&](size_t k) -> bool {
+		return !orig_h[k].is_predefined() && orig_h[k].units() == css_units_percentage;
+	};
+	for(size_t k = 0; k < items.size(); k++)
+	{
+		int r = place[k].row;
+		element::ptr el = items[k];
+		if(rtr[r].is_fixed && el->get_display() != display_inline_text) continue;
+		int ix = col_x(place[k].col);
+		int outer = col_span_w(place[k].col, place[k].span);
+		int cross = 0;
+		if(el->get_display() == display_inline_text)
+		{
+			litehtml::size sz;
+			el->get_content_size(sz, outer);
+			el->m_pos = sz;
+			el->m_pos.x = ix;
+			el->m_pos.y = 0;
+			cross = sz.height;
+		}
+		else
+		{
+			html_tag* git = static_cast<html_tag*>(el);
+			git->m_css_height = orig_h[k];
+			if(item_is_pct_h(k)) git->m_css_height.predef(0);
+			git->m_css_width = orig_w[k];
+			stretch_item_width(el, outer);
+			el->render(ix, 0, outer, second_pass);
+			/* A row track is sized by the item's OUTER box. Measuring the
+			 * content height alone dropped each tile's vertical padding -
+			 * apple.com's .section grids (gap:12px, one tile per row,
+			 * .tile-wrapper padding up to 69px) then stacked every row inside
+			 * the previous tile, overlapping the whole page top to bottom. */
+			cross = el->get_position().height + el->padding_top() + el->padding_bottom()
+				+ el->border_top() + el->border_bottom()
+				+ el->margin_top() + el->margin_bottom();
+		}
+		crossv[k] = cross;
+		if(cross > row_nat[r]) row_nat[r] = cross;
+	}
+
+	/* Phase 2 - size the row tracks. */
+	std::vector<int> row_h(row_count, 0);
+	int rows_used = row_gap * (row_count - 1);
+	bool have_fr_row = false, have_auto_row = false;
 	for(int r = 0; r < row_count; r++)
 	{
-		int cur_row_h = 0;
+		if(rtr[r].is_fixed)
+			row_h[r] = rtr[r].fixed_w;
+		else
+			row_h[r] = row_nat[r] > rtr[r].min_w ? row_nat[r] : rtr[r].min_w;
+		if(row_is_fr(rtr[r])) have_fr_row = true;
+		else if(rtr[r].is_auto) have_auto_row = true;
+		rows_used += row_h[r];
+	}
+	int target_h = cont_h > cont_min_h ? cont_h : cont_min_h;
+	if(target_h > rows_used)
+	{
+		if(have_fr_row)
+		{
+			/* css-grid 12.7.1: hypothetical fr = free / sum(fr); a flexible
+			 * track whose base (content) size already exceeds its share is
+			 * frozen at that size and the rest re-shared. */
+			std::vector<char> flex(row_count, 0);
+			int inflex = row_gap * (row_count - 1);
+			for(int r = 0; r < row_count; r++)
+			{
+				if(row_is_fr(rtr[r])) flex[r] = 1;
+				else inflex += row_h[r];
+			}
+			for(;;)
+			{
+				float fsum = 0;
+				for(int r = 0; r < row_count; r++) if(flex[r]) fsum += rtr[r].fr;
+				if(fsum <= 0) break;
+				int space = target_h - inflex;
+				if(space < 0) space = 0;
+				bool frozen = false;
+				for(int r = 0; r < row_count; r++)
+				{
+					if(!flex[r]) continue;
+					int share = (int)((float)space * rtr[r].fr / fsum);
+					if(row_h[r] > share)
+					{
+						flex[r] = 0;
+						inflex += row_h[r];
+						frozen = true;
+					}
+				}
+				if(frozen) continue;
+				for(int r = 0; r < row_count; r++)
+					if(flex[r]) row_h[r] = (int)((float)space * rtr[r].fr / fsum);
+				break;
+			}
+		}
+		else if(have_auto_row)
+		{
+			/* 12.8 stretch auto tracks (align-content:normal): the leftover is
+			 * split equally between the auto rows. */
+			const tchar_t* ac = get_style_property(_t("align-content"), false, 0);
+			bool stretch = true;
+			if(ac)
+			{
+				tstring a = ac; trim(a);
+				stretch = (a == _t("stretch") || a == _t("normal"));
+			}
+			if(stretch)
+			{
+				int cnt = 0;
+				for(int r = 0; r < row_count; r++) if(rtr[r].is_auto && !rtr[r].is_fixed) cnt++;
+				int extra = (target_h - rows_used) / cnt;
+				for(int r = 0; r < row_count; r++) if(rtr[r].is_auto && !rtr[r].is_fixed) row_h[r] += extra;
+			}
+		}
+	}
+
+	/* Phase 3 - place. Items are re-laid out only when the row changed their
+	 * size (stretch, percentage height, fixed track); otherwise the measured
+	 * box is just moved into the row - a grid item is a floats holder and its
+	 * children are positioned relative to it, so the subtree follows. */
+	for(int r = 0; r < row_count; r++)
+	{
 		for(size_t k = 0; k < items.size(); k++)
 		{
 			if(place[k].row != r) continue;
-
-			/* Item coordinates are relative to this grid container's content-box
-			 * origin (m_pos already holds that origin). Seeding ix with m_pos.x and
-			 * y with m_pos.y double-counted the container offset during the draw
-			 * pass, shifting every tile of a non-left-aligned grid to the right. */
-			int ix = col_x(place[k].col);
-			int outer = col_span_w(place[k].col, place[k].span);
-
 			element::ptr el = items[k];
-			int cross = 0;
 			if(el->get_display() == display_inline_text)
 			{
-				litehtml::size sz;
-				el->get_content_size(sz, outer);
-				el->m_pos = sz;
-				el->m_pos.x = ix;
 				el->m_pos.y = bottom;
-				cross = sz.height;
+				continue;
 			}
-			else
-			{
-				html_tag* git = static_cast<html_tag*>(el);
-				git->m_css_height = orig_h[k];
-				git->m_css_width = orig_w[k];
-				stretch_item_width(el, outer);
-				el->render(ix, bottom, outer, second_pass);
-				/* A row track is sized by the item's OUTER box. Measuring the
-				 * content height alone dropped each tile's vertical padding -
-				 * apple.com's .section grids (gap:12px, one tile per row,
-				 * .tile-wrapper padding up to 69px) then stacked every row inside
-				 * the previous tile, overlapping the whole page top to bottom. */
-				cross = el->get_position().height + el->padding_top() + el->padding_bottom()
-					+ el->border_top() + el->border_bottom()
-					+ el->margin_top() + el->margin_bottom();
-			}
-			crossv[k] = cross;
-			if(cross > cur_row_h) cur_row_h = cross;
-		}
-
-		int row_h = cur_row_h > row_min ? cur_row_h : row_min;
-		/* stretch: the default align-self fills the row height */
-		for(size_t k = 0; k < items.size(); k++)
-		{
-			if(place[k].row != r) continue;
-			element::ptr el = items[k];
-			if(el->get_display() == display_inline_text) continue;
-			if(crossv[k] >= row_h) continue;
 			int ix = col_x(place[k].col);
 			int outer = col_span_w(place[k].col, place[k].span);
 			html_tag* gst = static_cast<html_tag*>(el);
-			int inner = row_h - el->margin_top() - el->margin_bottom();
-			css_length h;
-			/* The forced height is interpreted per the item's box-sizing: a
-			 * border-box item keeps its padding inside the row, a content-box
-			 * item outside it - one raw value made stretched tiles either fall
-			 * short of the row or overflow it by their padding. */
-			if(gst->m_box_sizing != box_sizing_border_box)
+			bool pct = item_is_pct_h(k);
+			if(!pct && !rtr[r].is_fixed && crossv[k] >= row_h[r])
 			{
-				inner -= el->padding_top() + el->padding_bottom() + el->border_top() + el->border_bottom();
+				el->m_pos.x = ix + el->content_margins_left();
+				el->m_pos.y = bottom + el->content_margins_top();
+				continue;
 			}
+			/* Fixed-height items keep their height and sit at the row start
+			 * (align-self:stretch only applies to auto heights). */
+			if(!pct && !orig_h[k].is_predefined())
+			{
+				if(rtr[r].is_fixed)
+				{
+					gst->m_css_height = orig_h[k];
+					gst->m_css_width = orig_w[k];
+					stretch_item_width(el, outer);
+					el->render(ix, bottom, outer, second_pass);
+				}
+				else
+				{
+					el->m_pos.x = ix + el->content_margins_left();
+					el->m_pos.y = bottom + el->content_margins_top();
+				}
+				continue;
+			}
+			/* Percentage heights resolve against the grid area (= the row);
+			 * auto heights stretch to it. The forced height is interpreted per
+			 * the item's box-sizing: a border-box item keeps its padding inside
+			 * the row, a content-box item outside it - one raw value made
+			 * stretched tiles either fall short of the row or overflow it by
+			 * their padding. */
+			int inner = pct ? orig_h[k].calc_percent(row_h[r])
+							: row_h[r] - el->margin_top() - el->margin_bottom();
+			if(gst->m_box_sizing == box_sizing_border_box || !pct)
+				inner -= el->padding_top() + el->padding_bottom() + el->border_top() + el->border_bottom();
 			if(inner < 0) inner = 0;
+			css_length h;
 			h = (float)inner;
 			gst->m_css_height = h;
+			gst->m_css_width = orig_w[k];
 			stretch_item_width(el, outer);
 			el->render(ix, bottom, outer, second_pass);
 		}
 
-		bottom += row_h;
+		bottom += row_h[r];
 		if(r + 1 < row_count) bottom += row_gap;
 	}
 
@@ -2383,7 +2622,10 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 	}
 
 	m_pos.width = width_auto ? avail : avail;
-	m_pos.height = bottom;
+	/* A definite height is the box height (content overflows, it does not
+	 * grow the box); min-height floors an auto one. */
+	m_pos.height = cont_h >= 0 ? cont_h : bottom;
+	if(cont_h < 0 && cont_min_h > m_pos.height) m_pos.height = cont_min_h;
 	calc_auto_margins(parent_width);
 
 	m_pos.move_to(x, y);

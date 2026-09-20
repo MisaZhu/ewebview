@@ -90,6 +90,9 @@ public:
      * (0 when rectangular / mixed corners) and the clip rectangle itself. */
     int                                top_clip_radius() const;
     litehtml::position                 top_clip_rect() const;
+    /* Solid fill masked to the active rounded clip; false = use fill_rect. */
+    bool                               fill_rect_round_clipped(eweb_surface_t* s, const eweb_gfx_t* gfx,
+                                                               const litehtml::position& r, uint32_t argb);
 
     void                               get_client_rect(litehtml::position& client) const override;
     void                               set_client_size(int width, int height);

@@ -280,6 +280,8 @@ litehtml::html_tag::html_tag(litehtml::document* doc) : litehtml::element(doc)
 	m_box_sizing			= box_sizing_content_box;
 	m_z_index				= 0;
 	m_z_index_auto			= true;
+	m_isolate				= false;
+	m_has_css_clip			= false;
 	m_overflow				= overflow_visible;
 	m_box					= 0;
 	m_text_align			= text_align_left;
@@ -294,7 +296,10 @@ litehtml::html_tag::html_tag(litehtml::document* doc) : litehtml::element(doc)
 	m_font					= 0;
 	m_font_size				= 0;
 	m_white_space			= white_space_normal;
+	m_text_wrap_balance		= false;
+	m_balanced_line_width	= 0;
 	m_lh_predefined			= false;
+	m_lh_factor				= 0.0f;
 	m_line_height			= 0;
 	m_visibility			= visibility_visible;
 	m_opacity				= 1.0f;
@@ -386,10 +391,34 @@ static void parent_and_style_text(litehtml::element* parent, litehtml::element::
 	}
 }
 
+/* display:contents keeps its DOM node and relationships, but contributes no
+ * layout box. Recursively expose its children to the surrounding formatting
+ * context without mutating the DOM tree (hydrators depend on childNodes). */
+static void collect_box_children(litehtml::element::ptr parent, litehtml::elements_vector& out)
+{
+	if(!parent) return;
+	for(size_t i = 0; i < parent->get_children_count(); i++)
+	{
+		litehtml::element::ptr child = parent->get_child((int)i);
+		if(!child) continue;
+		if(child->get_display() == litehtml::display_contents)
+			collect_box_children(child, out);
+		else
+			out.push_back(child);
+	}
+}
+
 bool litehtml::html_tag::appendChild(const element::ptr &el)
 {
 	if(el)
 	{
+		/* DOM appendChild moves an attached node to the new final position. Keep
+		 * the object alive while unlinking it; removeChild never deletes. */
+		element::ptr old_parent = el->parent();
+		if(old_parent)
+		{
+			old_parent->removeChild(el);
+		}
 		std::vector<element::ptr> nodes;
 		cjk_split_insert(m_doc, el, nodes);
 		for(size_t i = 0; i < nodes.size(); i++)
@@ -821,10 +850,6 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 		return;
 	}
 	uint64_t apply_start = sys_tic_ms(0);
-	if(stylesheet.has_before_after())
-	{
-		remove_before_after();
-	}
 
 	const tstring k_class_attr = _t("class");
 	const tstring k_id_attr = _t("id");
@@ -1068,7 +1093,7 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 					element::ptr el = get_element_after();
 					if(el)
 					{
-						el->add_style(*sel->m_style);
+						el->add_style(*sel->m_style, sel->m_specificity);
 					}
 				} else if(apply & select_match_with_before)
 				{
@@ -1076,7 +1101,7 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 					element::ptr el = get_element_before();
 					if(el)
 					{
-						el->add_style(*sel->m_style);
+						el->add_style(*sel->m_style, sel->m_specificity);
 					}
 				} else if(apply & select_match_with_widget)
 				{
@@ -1090,7 +1115,7 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 					}
 				} else
 				{
-					add_style(*sel->m_style);
+					add_style(*sel->m_style, sel->m_specificity);
 					ensure_used_style().m_used = true;
 				}
 			}
@@ -1113,6 +1138,10 @@ void litehtml::html_tag::reapply_style_cascade( const litehtml::css& master, con
 	}
 #endif
 	clear_style_property_cache();
+	/* A full cascade rebuild must discard generated boxes once, before the
+	 * master and author sheets are accumulated. Removing them inside each
+	 * stylesheet pass loses ::before/::after rules from every earlier sheet. */
+	remove_before_after();
 	/* Clean slate: the old cascade was computed with a different (or no)
 	 * ancestor chain, so both the merged property bag and the matched-selector
 	 * list are stale. apply_stylesheet_own rebuilds both; the inline style=
@@ -1139,8 +1168,35 @@ void litehtml::html_tag::get_content_size( size& sz, int max_width )
 	}
 }
 
+bool litehtml::html_tag::push_css_clip(uint_ptr hdc, int x, int y)
+{
+	if(!m_has_css_clip ||
+	   (m_el_position != element_position_absolute && m_el_position != element_position_fixed))
+		return false;
+
+	position box = m_pos;
+	box.x += x;
+	box.y += y;
+	box += m_padding;
+	box += m_borders;
+	int top = m_css_clip.top.is_predefined() ? 0 : m_css_clip.top.calc_percent(box.height);
+	int right = m_css_clip.right.is_predefined() ? box.width : m_css_clip.right.calc_percent(box.width);
+	int bottom = m_css_clip.bottom.is_predefined() ? box.height : m_css_clip.bottom.calc_percent(box.height);
+	int left = m_css_clip.left.is_predefined() ? 0 : m_css_clip.left.calc_percent(box.width);
+	position r(box.x + left, box.y + top,
+		(right > left) ? right - left : 0,
+		(bottom > top) ? bottom - top : 0);
+	border_radiuses radius;
+	get_document()->container()->set_clip(r, radius, true, true);
+	(void)hdc;
+	return true;
+}
+
 void litehtml::html_tag::draw( uint_ptr hdc, int x, int y, const position* clip )
 {
+	/* display:contents has no principal box; descendants are painted by the
+	 * normal recursive child walk. */
+	if(m_display == display_contents) return;
 	/* opacity:0 (own or inherited from an ancestor) paints nothing. Layout is
 	 * untouched - this only suppresses drawing of the element's own box. */
 	if(opacity_hidden(m_opacity_cum))
@@ -1151,6 +1207,7 @@ void litehtml::html_tag::draw( uint_ptr hdc, int x, int y, const position* clip 
 	position pos = m_pos;
 	pos.x	+= x;
 	pos.y	+= y;
+	bool css_clipped = push_css_clip(hdc, x, y);
 
 	draw_background(hdc, x, y, clip);
 
@@ -1177,6 +1234,8 @@ void litehtml::html_tag::draw( uint_ptr hdc, int x, int y, const position* clip 
 			get_document()->container()->del_clip();
 		}
 	}
+	if(css_clipped)
+		get_document()->container()->del_clip();
 }
 
 litehtml::uint_ptr litehtml::html_tag::get_font(font_metrics* fm)
@@ -1392,6 +1451,32 @@ static bool eval_one_length(const tstring& tok, document* doc, int font_size, in
 	return true;
 }
 
+/* CSS2 clip applies a rectangular paint clip to positioned elements. Modern
+ * sites still pair it with clip-path for screen-reader-only text. Keep `auto`
+ * as a predefined edge so paint can resolve it against the final border box. */
+static bool parse_css_clip_rect(const tchar_t* raw, css_offsets& out)
+{
+	if(!raw) return false;
+	tstring val = raw;
+	trim(val);
+	if(val.length() < 6 || t_strncasecmp(val.c_str(), _t("rect("), 5) || val[val.length() - 1] != _t(')'))
+		return false;
+	tstring args = val.substr(5, val.length() - 6);
+	string_vector toks;
+	split_string(args, toks, _t(", \t\r\n"));
+	if(toks.size() != 4) return false;
+	css_length* edges[4] = { &out.top, &out.right, &out.bottom, &out.left };
+	for(size_t i = 0; i < 4; i++)
+	{
+		trim(toks[i]);
+		if(!t_strcasecmp(toks[i].c_str(), _t("auto")))
+			edges[i]->predef(0);
+		else
+			edges[i]->fromString(toks[i].c_str());
+	}
+	return true;
+}
+
 /* Evaluate an additive length expression: terms separated by top-level '+'/'-'
  * (e.g. "2.51rem + 6.198vw", the standard fluid-type preferred value inside
  * clamp()). Every term must be a resolvable length; a percent or nested
@@ -1511,6 +1596,88 @@ static bool eval_term_px(const tstring& in, document* doc, int font_size, int& o
 	return true;
 }
 
+/* A calc() body with no unit anywhere is a <number> expression (grid-column
+ * spans, z-index, opacity, flex-grow...), not a length: "calc(6 - 2 + 1)".
+ * Evaluates + - * / with the usual precedence; parens are never present here
+ * because nested calc() has already been folded innermost-first. */
+static bool eval_number_expr(const tstring& body, double& out)
+{
+	for(size_t k = 0; k < body.length(); k++)
+	{
+		tchar_t c = body[k];
+		if(c == _t('%') || c == _t('(') || (c >= _t('a') && c <= _t('z')) || (c >= _t('A') && c <= _t('Z')))
+		{
+			return false;
+		}
+	}
+	double total = 0;
+	int sign = 1;
+	bool any = false;
+	tstring term;
+	for(size_t k = 0; k <= body.length(); k++)
+	{
+		tchar_t c = (k < body.length()) ? body[k] : 0;
+		bool is_op = (c == _t('+') || c == _t('-'));
+		if(is_op)
+		{
+			/* a sign directly after another operator or at the start belongs to
+			 * the number ("2 * -1"); a sign after an operand is an operator */
+			tstring t = term; trim(t);
+			if(t.empty() || t[t.length() - 1] == _t('*') || t[t.length() - 1] == _t('/'))
+			{
+				is_op = false;
+			}
+		}
+		if(is_op || c == 0)
+		{
+			tstring t = term; trim(t);
+			if(t.empty())
+			{
+				if(c == 0) break;
+				return false;
+			}
+			/* multiplicative term */
+			double acc = 0;
+			bool have = false;
+			tchar_t op = _t('*');
+			tstring fac;
+			for(size_t m = 0; m <= t.length(); m++)
+			{
+				tchar_t d = (m < t.length()) ? t[m] : 0;
+				if(d == _t('*') || d == _t('/') || d == 0)
+				{
+					tstring f = fac; trim(f);
+					if(f.empty()) return false;
+					tchar_t* end = 0;
+					double n = strtod((const char*) f.c_str(), (char**) &end);
+					if(!end || *end != 0) return false;
+					if(!have) { acc = n; have = true; }
+					else if(op == _t('*')) acc *= n;
+					else { if(n == 0) return false; acc /= n; }
+					fac.clear();
+					op = d;
+					if(d == 0) break;
+					continue;
+				}
+				fac += d;
+			}
+			if(!have) return false;
+			total += sign * acc;
+			any = true;
+			term.clear();
+			if(c == 0) break;
+			sign = (c == _t('-')) ? -1 : 1;
+		}
+		else
+		{
+			term += c;
+		}
+	}
+	if(!any) return false;
+	out = total;
+	return true;
+}
+
 /* Rewrite every resolvable bare calc() in 'val' to a px literal. apple.com
  * sizes its buttons with "padding-inline:calc(var(--pad) - var(--border))";
  * after var() expansion that is a plain additive calc() which nothing else
@@ -1566,6 +1733,29 @@ static void eval_calc_funcs(tstring& val, document* doc, int font_size)
 		tstring body = val.substr(args_start, j - args_start);
 		int px = 0;
 		bool ok = false;
+		double num = 0;
+		if(body.find(_t(',')) == tstring::npos && eval_number_expr(body, num))
+		{
+			/* workspace.google.com: grid-column-end:span calc(var(--end) -
+			 * var(--start) + 1). Folding that to "span 5px" made the placement
+			 * parser reject the span, so the hero copy collapsed into one track. */
+			char buf[64];
+			if(num == (double)(long long) num)
+			{
+				snprintf(buf, sizeof(buf), "%lld", (long long) num);
+			}
+			else
+			{
+				snprintf(buf, sizeof(buf), "%.4f", num);
+				size_t L = strlen(buf);
+				while(L > 0 && buf[L - 1] == '0') buf[--L] = 0;
+				if(L > 0 && buf[L - 1] == '.') buf[--L] = 0;
+			}
+			tstring repl = buf;
+			val.replace(f, (j - f) + 1, repl);
+			from = f + repl.length();
+			continue;
+		}
 		if(body.find(_t(',')) == tstring::npos)
 		{
 			/* additive over top-level '+'/'-' of multiplicative terms */
@@ -1816,7 +2006,8 @@ void litehtml::html_tag::expand_css_functions()
 		if(name.length() > 2 && name[0] == _t('-') && name[1] == _t('-'))
 		{
 			/* keep the raw definition: it is re-resolved per element */
-			m_style.add_property(name.c_str(), raw.c_str(), NULL, it->second.m_important);
+			m_style.add_property(name.c_str(), raw.c_str(), NULL, it->second.m_important,
+				it->second.m_specificity);
 			continue;
 		}
 		tstring v = raw;
@@ -1850,7 +2041,8 @@ void litehtml::html_tag::expand_css_functions()
 				}
 			}
 		}
-		m_style.add_property(name.c_str(), v.c_str(), NULL, it->second.m_important);
+		m_style.add_property(name.c_str(), v.c_str(), NULL, it->second.m_important,
+			it->second.m_specificity);
 	}
 }
 
@@ -1941,6 +2133,14 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	}
 	document* doc = get_document();
 	element::ptr el_parent = parent();
+	m_has_css_clip = parse_css_clip_rect(get_style_property_own(_t("clip")), m_css_clip);
+	if(m_has_css_clip)
+	{
+		doc->cvt_units(m_css_clip.top, m_font_size);
+		doc->cvt_units(m_css_clip.right, m_font_size);
+		doc->cvt_units(m_css_clip.bottom, m_font_size);
+		doc->cvt_units(m_css_clip.left, m_font_size);
+	}
 	const tchar_t* own_position = own_style_ref_ptr(own_refs.position);
 	const tchar_t* own_overflow = own_style_ref_ptr(own_refs.overflow);
 	const tchar_t* own_display = own_style_ref_ptr(own_refs.display);
@@ -1957,6 +2157,22 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		own_overflow = _t("hidden");
 	}
 	m_overflow		= (overflow)			value_index((own_overflow && t_strcasecmp(own_overflow, _t("inherit"))) ? own_overflow : _t("visible"),		overflow_strings,			overflow_visible);
+	/* css-overflow-3 §3.3: the root's overflow - or <body>'s when the root is
+	 * visible - propagates to the viewport and the element's own used value
+	 * becomes visible. The shell scrolls the viewport itself, so the propagated
+	 * value is simply dropped here; keeping it on <body> would clip positioned
+	 * children to the body box (workspace.google.com: body{overflow-y:scroll}). */
+	if(m_overflow > overflow_visible)
+	{
+		if(!el_parent)
+		{
+			m_overflow = overflow_visible;
+		}
+		else if(is_body() && el_parent->get_overflow() == overflow_visible)
+		{
+			m_overflow = overflow_visible;
+		}
+	}
 	if(own_display && t_strcasecmp(own_display, _t("inherit")))
 	{
 		m_display = (style_display) value_index(own_display, style_display_strings, display_block);
@@ -2056,6 +2272,13 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		m_white_space = white_space_normal;
 	}
 
+	/* text-wrap is inherited. `balance` keeps the normal number of lines but
+	 * chooses a narrower wrapping threshold so their lengths are more even. */
+	{
+		const tchar_t* text_wrap = get_style_property(_t("text-wrap"), true, _t("wrap"));
+		m_text_wrap_balance = text_wrap && !t_strcasecmp(text_wrap, _t("balance"));
+	}
+
 	/* text-overflow:ellipsis is defined for single-line boxes only. Without
 	 * this, a clipped list row (fixed height + overflow:hidden) wraps to a
 	 * second line that the clip then slices mid-glyph - the "torn row"
@@ -2138,6 +2361,10 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 			m_z_index = 0;
 			m_z_index_auto = true;
 		}
+	}
+	{
+		const tchar_t* iso = get_style_property_own(_t("isolation"));
+		m_isolate = iso && !t_strcasecmp(iso, _t("isolate"));
 	}
 
 	const tchar_t* own_vertical_align = own_style_ref_ptr(own_refs.vertical_align);
@@ -2226,16 +2453,24 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 			{
 				m_line_height = m_font_metrics.height;
 				m_lh_predefined = true;
+				m_lh_factor = 0.0f;
+			} else if(el_parent->line_height_factor() > 0.0f)
+			{
+				m_lh_factor = el_parent->line_height_factor();
+				m_line_height = (int) (m_lh_factor * m_font_size);
+				m_lh_predefined = false;
 			} else
 			{
 				m_line_height = el_parent->line_height();
 				m_lh_predefined = false;
+				m_lh_factor = 0.0f;
 			}
 		}
 		else
 		{
 			m_line_height = m_font_metrics.height;
 			m_lh_predefined = true;
+			m_lh_factor = 0.0f;
 		}
 		m_list_style_type = list_style_type_none;
 		m_list_style_position = list_style_position_outside;
@@ -2322,6 +2557,7 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		m_bg.m_position.height.predef(background_size_auto);
 		m_line_height = m_font_metrics.height;
 		m_lh_predefined = true;
+		m_lh_factor = 0.0f;
 		m_list_style_type = list_style_type_none;
 		m_list_style_position = list_style_position_outside;
 
@@ -2405,13 +2641,11 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		}
 	}
 
-	/* display:contents generates no box of its own: queue the child lift for
-	 * the next document::render (the single safe point - no child-list
-	 * iteration is in flight there). */
-	if(m_display == display_contents && !m_contents_spliced)
+	if(m_display == display_contents)
 	{
-		m_contents_spliced = true;
-		if(doc) doc->queue_contents_splice(this);
+		/* The wrapper has no principal box. Its descendants are laid out by the
+		 * surrounding formatting context via collect_box_children(). */
+		m_pos.clear();
 	}
 
 	if(profile_enabled)
@@ -2427,7 +2661,11 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		own_width = get_style_property_own(_t("inline-size"));
 	}
 	if(own_width) {
-		m_css_width.fromString(own_width, _t("auto"));
+		/* The intrinsic-size keywords stay "predefined" (every auto-width
+		 * check keeps working) but with a non-zero predef so render_box can
+		 * shrink-to-fit the block like a float: apple.com's tab pill is a
+		 * plain <div> with width:fit-content and stretched to 1260px. */
+		m_css_width.fromString(own_width, _t("auto;fit-content;max-content;min-content"));
 	} else {
 		css_length_set_predef0(m_css_width);
 	}
@@ -2723,6 +2961,7 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	}
 
 	const tchar_t* own_line_height = get_style_property_own(_t("line-height"));
+	m_lh_factor = 0.0f;
 	if(own_line_height)
 	{
 		css_length line_height;
@@ -2734,6 +2973,12 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		}
 		else if(line_height.units() == css_units_none)
 		{
+			/* Unitless number: the computed value IS the number, so it inherits
+			 * as a factor and every descendant re-multiplies by its own font
+			 * size. Inheriting the pixel product instead gave a 3rem heading
+			 * under html{line-height:1.5} a 24px line box and overlapping lines
+			 * (workspace.google.com). */
+			m_lh_factor = line_height.val();
 			m_line_height = (int) (line_height.val() * m_font_size);
 			m_lh_predefined = false;
 		}
@@ -2753,6 +2998,11 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		{
 			m_line_height = m_font_metrics.height;
 			m_lh_predefined = true;
+		} else if(el_parent->line_height_factor() > 0.0f)
+		{
+			m_lh_factor = el_parent->line_height_factor();
+			m_line_height = (int) (m_lh_factor * m_font_size);
+			m_lh_predefined = false;
 		} else
 		{
 			m_line_height = el_parent->line_height();
@@ -4405,8 +4655,36 @@ void litehtml::html_tag::parse_background()
 	const tchar_t* bg_origin = get_style_property_own(_t("background-origin"));
 	const tchar_t* bg_image = get_style_property_own(_t("background-image"));
 	const tchar_t* bg_baseurl = get_style_property_own(_t("background-image-baseurl"));
+	const tchar_t* box_shadow = get_style_property_own(_t("box-shadow"));
+	const tchar_t* mask = get_style_property_own(_t("mask"));
+	if(!mask) mask = get_style_property_own(_t("-webkit-mask"));
+	const tchar_t* mask_image = get_style_property_own(_t("mask-image"));
+	if(!mask_image) mask_image = get_style_property_own(_t("-webkit-mask-image"));
+	const tchar_t* mask_clip = get_style_property_own(_t("mask-clip"));
+	if(!mask_clip) mask_clip = get_style_property_own(_t("-webkit-mask-clip"));
+	const tchar_t* mask_composite = get_style_property_own(_t("mask-composite"));
+	if(!mask_composite) mask_composite = get_style_property_own(_t("-webkit-mask-composite"));
 
 	m_bg.m_color = bg_color ? web_color::from_string(bg_color, get_document()->container()) : web_color(0, 0, 0, 0);
+	m_bg.m_box_shadow = (box_shadow && t_strcasecmp(box_shadow, _t("none"))) ? box_shadow : _t("");
+	m_bg.m_mask = (mask && t_strcasecmp(mask, _t("none"))) ? mask : _t("");
+	/* Modern sites commonly express the two-layer ring mask entirely through
+	 * longhands. Keep the relevant computed values together for the software
+	 * painter, which currently implements the content-box exclude/xor subset. */
+	if(m_bg.m_mask.empty() && mask_image && t_strcasecmp(mask_image, _t("none")))
+	{
+		m_bg.m_mask = mask_image;
+		if(mask_clip)
+		{
+			m_bg.m_mask += _t(" ");
+			m_bg.m_mask += mask_clip;
+		}
+	}
+	if(!m_bg.m_mask.empty() && mask_composite)
+	{
+		m_bg.m_mask += _t(" ");
+		m_bg.m_mask += mask_composite;
+	}
 	m_bg.m_position.x.set_value(0, css_units_percentage);
 	m_bg.m_position.y.set_value(0, css_units_percentage);
 	m_bg.m_position.width.predef(background_size_auto);
@@ -4577,7 +4855,8 @@ void litehtml::html_tag::parse_background()
 	// parse background-image
 	if(bg_image && bg_image[0])
 	{
-		if(!t_strncasecmp(bg_image, _t("linear-gradient("), 16))
+		if(!t_strncasecmp(bg_image, _t("linear-gradient("), 16) ||
+		   !t_strncasecmp(bg_image, _t("conic-gradient("), 15))
 		{
 			/* Paint syntax, not a URL: keep the whole function string so the
 			 * container can rasterise it; parse_css_url would drop it. */
@@ -4592,7 +4871,9 @@ void litehtml::html_tag::parse_background()
 		}
 	}
 
-	if(!m_bg.m_image.empty() && t_strncasecmp(m_bg.m_image.c_str(), _t("linear-gradient("), 16))
+	if(!m_bg.m_image.empty() &&
+	   t_strncasecmp(m_bg.m_image.c_str(), _t("linear-gradient("), 16) &&
+	   t_strncasecmp(m_bg.m_image.c_str(), _t("conic-gradient("), 15))
 	{
 		doc->container()->load_image(m_bg.m_image.c_str(), m_bg.m_baseurl.empty() ? 0 : m_bg.m_baseurl.c_str(), true);
 	}
@@ -4639,6 +4920,16 @@ bool litehtml::html_tag::is_stacking_participant() const
 			return true;
 		}
 	}
+	/* A static box that is nevertheless a stacking context (opacity<1,
+	 * isolation:isolate) paints atomically "as if positioned with z-index:0"
+	 * (CSS 2.1 App. E step 8). Routing it through the positioned phase is
+	 * also the only way its own positioned descendants ever get painted:
+	 * fetch_positioned parks them in ITS m_positioned, and the draw_block
+	 * walk never calls draw_stacking_context on a plain block. */
+	if (have_parent() && (m_isolate || m_opacity < 1.0f))
+	{
+		return true;
+	}
 	return false;
 }
 
@@ -4656,6 +4947,10 @@ bool litehtml::html_tag::is_stacking_context() const
 		return true;
 	}
 	if (m_opacity < 1.0f)
+	{
+		return true;
+	}
+	if (m_isolate)
 	{
 		return true;
 	}
@@ -5124,6 +5419,15 @@ void litehtml::html_tag::init_font(const tchar_t* own_font_size, const tchar_t* 
 				 * unitless value is invalid here and inherits. Treating 0 as
 				 * inherit kept the hidden headers' glyphs at full size. */
 				m_font_size = (sz.val() == 0) ? 0 : parent_sz;
+			} else if(sz.units() >= css_units_cqw && sz.units() <= css_units_cqmax)
+			{
+				/* Container-query units on font-size: cvt_units maps them to a
+				 * percentage of the containing block, which for font-size would
+				 * mean "% of the parent font size" - nonsense. Use the spec's
+				 * no-container fallback (small viewport) instead. */
+				css_length vp;
+				vp.set_value(sz.val(), (sz.units() == css_units_cqh || sz.units() == css_units_cqb) ? css_units_vh : css_units_vw);
+				m_font_size = doc ? doc->cvt_units(vp, parent_sz) : parent_sz;
 			} else
 			{
 				if (doc)
@@ -5534,14 +5838,13 @@ int litehtml::html_tag::render_inline(const element::ptr &container, int max_wid
 		skip_spaces = true;
 	}
 	bool was_space = false;
+	std::vector<element::ptr> layout_children;
+	collect_box_children(this, layout_children);
 
-	for (auto& el : m_children)
+	for (auto& el : layout_children)
 	{
 		// Check if element is valid
 		if (!el) continue;
-
-		// display:contents elements generate no box of their own
-		if (el->get_display() == display_contents) continue;
 
 		// skip spaces to make rendering a bit faster
 		if (skip_spaces)
@@ -5766,36 +6069,32 @@ int litehtml::html_tag::place_element(const element::ptr &el, int max_width)
 				get_line_left_right(line_ctx.top, max_width, line_ctx.left, line_ctx.right);
 			}
 
-			if(!el->is_inline_box())
+			/* Parent/child margin collapsing (CSS 2.1 8.3.1): 'shift' is how far the
+			 * child's box is pulled up so its top margin is carried by THIS box
+			 * instead (render_box then absorbs it into m_margins.top). A box that
+			 * establishes a new block formatting context never collapses with its
+			 * children, so its first child keeps the margin inside. */
+			int  margin_shift = 0;
+			int  pre_margin   = 0;
+			bool block_child  = !el->is_inline_box();
+			if(block_child)
 			{
+				pre_margin = el->margin_top();
 				if(m_boxes.size() == 1)
 				{
-					if(collapse_top_margin())
+					if(collapse_top_margin() && m_overflow == overflow_visible)
 					{
-						int shift = el->margin_top();
-						if(shift >= 0)
-						{
-							line_ctx.top -= shift;
-							m_boxes.back()->y_shift(-shift);
-						}
+						margin_shift = pre_margin;
 					}
 				} else
 				{
-					int shift = 0;
 					int prev_margin = m_boxes[m_boxes.size() - 2]->bottom_margin();
-
-					if(prev_margin > el->margin_top())
-					{
-						shift = el->margin_top();
-					} else
-					{
-						shift = prev_margin;
-					}
-					if(shift >= 0)
-					{
-						line_ctx.top -= shift;
-						m_boxes.back()->y_shift(-shift);
-					}
+					margin_shift = std::min(prev_margin, pre_margin);
+				}
+				if(margin_shift > 0)
+				{
+					line_ctx.top -= margin_shift;
+					m_boxes.back()->y_shift(-margin_shift);
 				}
 			}
 
@@ -5822,6 +6121,40 @@ int litehtml::html_tag::place_element(const element::ptr &el, int max_width)
 			default:
 				ret_width = 0;
 				break;
+			}
+
+			/* The child's top margin can GROW while it renders: render_box absorbs
+			 * the collapsed-through margins of its own first descendants, and its
+			 * final m_pos.y already sits that far below line_ctx.top. The shift
+			 * above only knew the child's own CSS margin, so pull the box up by the
+			 * growth as well - otherwise the margin is counted inside this box AND
+			 * re-absorbed as our own, once per ancestor level. workspace.google.com's
+			 * .base_main{margin-top:64px} under five plain wrappers opened a 320px
+			 * hole below the header this way. */
+			if(block_child && el->margin_top() > pre_margin)
+			{
+				int post_margin = el->margin_top();
+				int new_shift = 0;
+				if(m_boxes.size() == 1)
+				{
+					if(collapse_top_margin() && m_overflow == overflow_visible)
+					{
+						new_shift = post_margin;
+					}
+				} else
+				{
+					int prev_margin = m_boxes[m_boxes.size() - 2]->bottom_margin();
+					new_shift = std::min(prev_margin, post_margin);
+				}
+				if(new_shift > margin_shift)
+				{
+					/* the box does not hold el yet (add_element below), so its
+					 * y_shift moves only the box top - move the element too */
+					int extra = new_shift - margin_shift;
+					line_ctx.top -= extra;
+					m_boxes.back()->y_shift(-extra);
+					el->m_pos.y -= extra;
+				}
 			}
 
 			m_boxes.back()->add_element(el);
@@ -6021,6 +6354,11 @@ bool litehtml::html_tag::is_line_height_normal() const
 	return m_lh_predefined;
 }
 
+float litehtml::html_tag::line_height_factor() const
+{
+	return m_lh_factor;
+}
+
 bool litehtml::html_tag::is_replaced() const
 {
 	return false;
@@ -6098,7 +6436,8 @@ int litehtml::html_tag::new_box(const element::ptr &el, int max_width, line_cont
 
 		font_metrics fm;
 		get_font(&fm);
-		m_boxes.emplace_back(std::unique_ptr<line_box>(new line_box(line_ctx.top, line_ctx.left + first_line_margin + text_indent, line_ctx.right, line_height(), fm, m_text_align)));
+		m_boxes.emplace_back(std::unique_ptr<line_box>(new line_box(line_ctx.top, line_ctx.left + first_line_margin + text_indent,
+			line_ctx.right, line_height(), fm, m_text_align, m_balanced_line_width)));
 	} else
 	{
 		m_boxes.emplace_back(std::unique_ptr<block_box>(new block_box(line_ctx.top, line_ctx.left, line_ctx.right)));
@@ -6377,6 +6716,7 @@ void litehtml::html_tag::init_background_paint(position pos, background_paint &b
 	bg_paint = *bg;
 	position content_box	= pos;
 	position padding_box	= pos;
+	bg_paint.content_box = content_box;
 	padding_box += m_padding;
 	position border_box		= padding_box;
 	border_box += m_borders;
@@ -6555,6 +6895,7 @@ void litehtml::html_tag::draw_children( uint_ptr hdc, int x, int y, const positi
 	{
 		return;
 	}
+	bool css_clipped = push_css_clip(hdc, x, y);
 
 	/* The standard "visually hidden" accessibility pattern (skip links,
 	 * screen-reader-only spans such as the w3.org logo label) sizes the box to
@@ -6567,6 +6908,8 @@ void litehtml::html_tag::draw_children( uint_ptr hdc, int x, int y, const positi
 	if(m_overflow > overflow_visible &&
 	   m_pos.width + m_padding.width() <= 1 && m_pos.height + m_padding.height() <= 1)
 	{
+		if(css_clipped)
+			get_document()->container()->del_clip();
 		return;
 	}
 	if (m_display == display_table || m_display == display_inline_table)
@@ -6577,6 +6920,8 @@ void litehtml::html_tag::draw_children( uint_ptr hdc, int x, int y, const positi
 	{
 		draw_children_box(hdc, x, y, clip, flag, zindex);
 	}
+	if(css_clipped)
+		get_document()->container()->del_clip();
 }
 
 bool litehtml::html_tag::fetch_positioned()
@@ -6939,7 +7284,26 @@ void litehtml::html_tag::render_positioned(render_type rt)
 			if(need_render)
 			{
 				position pos = el->m_pos;
+				/* render() clears m_pos before laying out descendants. When this
+				 * positioned box just acquired a definite used height from a
+				 * percentage or opposing insets, temporarily expose that height as
+				 * a px CSS height so children with height:100% resolve against it.
+				 * Otherwise an absolute 628px image layer re-rendered its figure at
+				 * the intrinsic 104px, then merely restored the outer 628px box. */
+				html_tag* positioned_tag = static_cast<html_tag*>(el);
+				css_length saved_css_height = positioned_tag->m_css_height;
+				bool force_used_height = pos.height >= 0 &&
+					(new_height != -1 || (!css_top.is_predefined() && !css_bottom.is_predefined()));
+				if(force_used_height)
+				{
+					int css_h = pos.height;
+					if(positioned_tag->m_box_sizing == box_sizing_border_box)
+						css_h += el->padding_top() + el->padding_bottom() + el->border_top() + el->border_bottom();
+					css_length forced; forced = (float)css_h;
+					positioned_tag->m_css_height = forced;
+				}
 				el->render(el->left(), el->top(), el->width(), true);
+				if(force_used_height) positioned_tag->m_css_height = saved_css_height;
 				if(replaced_autosize)
 				{
 					/* Preserve the CSS-driven position and any definite dimension,
@@ -7388,10 +7752,10 @@ litehtml::element::ptr litehtml::html_tag::get_element_after()
 	return el;
 }
 
-void litehtml::html_tag::add_style( const litehtml::style& st )
+void litehtml::html_tag::add_style( const litehtml::style& st, const litehtml::selector_specificity& spec )
 {
 	clear_style_property_cache();
-	m_style.combine(st);
+	m_style.combine(st, spec);
 }
 
 void litehtml::html_tag::clear_style_property_cache() const
@@ -7458,19 +7822,19 @@ void litehtml::html_tag::refresh_styles()
 							element::ptr el = get_element_after();
 							if(el)
 							{
-								el->add_style(*usel.m_selector->m_style);
+								el->add_style(*usel.m_selector->m_style, usel.m_selector->m_specificity);
 							}
 						} else if(apply & select_match_with_before)
 						{
 							element::ptr el = get_element_before();
 							if(el)
 							{
-								el->add_style(*usel.m_selector->m_style);
+								el->add_style(*usel.m_selector->m_style, usel.m_selector->m_specificity);
 							}
 						}
 						else
 						{
-							add_style(*usel.m_selector->m_style);
+							add_style(*usel.m_selector->m_style, usel.m_selector->m_specificity);
 							usel.m_used = true;
 						}
 					}
@@ -7479,14 +7843,14 @@ void litehtml::html_tag::refresh_styles()
 					element::ptr el = get_element_after();
 					if(el)
 					{
-						el->add_style(*usel.m_selector->m_style);
+						el->add_style(*usel.m_selector->m_style, usel.m_selector->m_specificity);
 					}
 				} else if(apply & select_match_with_before)
 				{
 					element::ptr el = get_element_before();
 					if(el)
 					{
-						el->add_style(*usel.m_selector->m_style);
+						el->add_style(*usel.m_selector->m_style, usel.m_selector->m_specificity);
 					}
 				} else if(apply & select_match_with_widget)
 				{
@@ -7500,7 +7864,7 @@ void litehtml::html_tag::refresh_styles()
 					}
 				} else
 				{
-					add_style(*usel.m_selector->m_style);
+					add_style(*usel.m_selector->m_style, usel.m_selector->m_specificity);
 					usel.m_used = true;
 				}
 			}
@@ -7704,14 +8068,14 @@ const litehtml::background* litehtml::html_tag::get_background(bool own_only)
 	if(own_only)
 	{
 		// return own background with check for empty one
-		if(m_bg.m_image.empty() && !m_bg.m_color.alpha)
+		if(m_bg.m_image.empty() && !m_bg.m_color.alpha && m_bg.m_box_shadow.empty())
 		{
 			return 0;
 		}
 		return &m_bg;
 	}
 
-	if(m_bg.m_image.empty() && !m_bg.m_color.alpha)
+	if(m_bg.m_image.empty() && !m_bg.m_color.alpha && m_bg.m_box_shadow.empty())
 	{
 		// if this is root element (<html>) try to get background from body
 		if (!have_parent())
@@ -7812,7 +8176,93 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 
 	if (get_predefined_height(block_height))
 	{
-		m_pos.height = block_height;
+		m_pos.height = border_box_content_height(block_height);
+	}
+
+	/* CSS Text 4 `text-wrap:balance`: first determine how many lines normal
+	 * wrapping needs, then choose a narrower threshold that keeps that line
+	 * count while minimizing line-width variance. Alignment still uses the full
+	 * content width; only line_box::can_hold uses this threshold. */
+	m_balanced_line_width = 0;
+	std::vector<element::ptr> layout_children;
+	collect_box_children(this, layout_children);
+	if(m_text_wrap_balance && max_width > 0 && layout_children.size() <= 100)
+	{
+		struct balance_item { int width; bool space; };
+		std::vector<balance_item> items;
+		bool eligible = true;
+		int widest = 0;
+		for(const auto& child : layout_children)
+		{
+			if(child->get_display() == display_none)
+				continue;
+			if(child->get_display() != display_inline_text || child->is_break())
+			{
+				eligible = false;
+				break;
+			}
+			size child_size;
+			child->get_content_size(child_size, max_width);
+			int child_width = child_size.width + child->get_inline_shift_left() + child->get_inline_shift_right();
+			items.push_back(balance_item{child_width, child->is_white_space()});
+			if(!child->is_white_space()) widest = std::max(widest, child_width);
+		}
+		auto measure_lines = [&](int limit, std::vector<int>& lines)
+		{
+			lines.clear();
+			int occupied = 0;
+			int content = 0;
+			for(const auto& item : items)
+			{
+				if(item.space)
+				{
+					if(occupied > 0) occupied += item.width;
+					continue;
+				}
+				if(content > 0 && occupied + item.width > limit)
+				{
+					lines.push_back(content);
+					occupied = item.width;
+					content = occupied;
+				}
+				else
+				{
+					occupied += item.width;
+					content = occupied;
+				}
+			}
+			if(content > 0) lines.push_back(content);
+		};
+		if(eligible && !items.empty())
+		{
+			std::vector<int> natural;
+			measure_lines(max_width, natural);
+			if(natural.size() >= 2 && natural.size() <= 6)
+			{
+				long long best_score = -1;
+				int best_width = max_width;
+				for(int candidate = std::max(1, widest); candidate <= max_width; candidate++)
+				{
+					std::vector<int> lines;
+					measure_lines(candidate, lines);
+					if(lines.size() != natural.size()) continue;
+					long long total = 0;
+					for(int line_width : lines) total += line_width;
+					long long score = 0;
+					for(int line_width : lines)
+					{
+						long long delta = (long long)line_width * (long long)lines.size() - total;
+						score += delta * delta;
+					}
+					if(best_score < 0 || score < best_score)
+					{
+						best_score = score;
+						best_width = candidate;
+					}
+				}
+				if(best_width < max_width) m_balanced_line_width = best_width;
+			}
+		}
 	}
 
 	white_space ws = get_white_space();
@@ -7826,11 +8276,8 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 
 	bool was_space = false;
 
-	for (auto el : m_children)
+	for (auto el : layout_children)
 	{
-		// display:contents elements generate no box of their own
-		if (el->get_display() == display_contents) continue;
-
 		// we don't need process absolute and fixed positioned element on the second pass
 		if (second_pass)
 		{
@@ -7881,7 +8328,10 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 
 	if (!m_boxes.empty())
 	{
-		if (collapse_top_margin())
+		/* A BFC root (overflow other than visible) keeps its children's margins
+		 * inside; see the matching check in place_element. */
+		bool bfc_root = m_overflow != overflow_visible;
+		if (collapse_top_margin() && !bfc_root)
 		{
 			int old_top = m_margins.top;
 			m_margins.top = std::max(m_boxes.front()->top_margin(), m_margins.top);
@@ -7890,7 +8340,7 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 				update_floats(m_margins.top - old_top, this);
 			}
 		}
-		if (collapse_bottom_margin())
+		if (collapse_bottom_margin() && !bfc_root)
 		{
 			m_margins.bottom = std::max(m_boxes.back()->bottom_margin(), m_margins.bottom);
 			m_pos.height = m_boxes.back()->bottom() - m_boxes.back()->bottom_margin();
@@ -7919,7 +8369,7 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 
 	if (get_predefined_height(block_height))
 	{
-		m_pos.height = block_height;
+		m_pos.height = border_box_content_height(block_height);
 	}
 
 	int min_height = 0;
@@ -7993,7 +8443,12 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 	// re-render with new width
 	if (ret_width < max_width && !second_pass && have_parent())
 	{
+		/* width:fit-content / max-content / min-content on an in-flow block:
+		 * shrink-to-fit exactly like a float, then let margin:auto centre the
+		 * narrowed box (the first-pass calc_auto_margins saw the full width). */
+		bool intrinsic_width = m_css_width.is_predefined() && m_css_width.predef() > 0;
 		if (m_display == display_inline_block ||
+			intrinsic_width ||
 			m_css_width.is_predefined() &&
 			(m_float != float_none ||
 			m_display == display_table ||
@@ -8004,6 +8459,11 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 		{
 			render(x, y, ret_width, true);
 			m_pos.width = ret_width - (content_margins_left() + content_margins_right());
+			if (intrinsic_width && m_display == display_block)
+			{
+				calc_auto_margins(parent_width);
+				m_pos.x = x + content_margins_left();
+			}
 		}
 	}
 

@@ -520,12 +520,12 @@ void litehtml::el_svg::parse_attributes()
 	if(attr_w && *attr_w)
 	{
 		m_intrinsic_w = atoi(attr_w);
-		m_style.add_property(_t("width"), attr_w, 0, false);
+		m_style.add_property(_t("width"), attr_w, 0, false, presentation_attribute_specificity);
 	}
 	if(attr_h && *attr_h)
 	{
 		m_intrinsic_h = atoi(attr_h);
-		m_style.add_property(_t("height"), attr_h, 0, false);
+		m_style.add_property(_t("height"), attr_h, 0, false, presentation_attribute_specificity);
 	}
 
 	/* get_attr folds the key to lower case (attributes are stored folded). */

@@ -21,66 +21,78 @@ litehtml::el_before_after_base::~el_before_after_base()
 
 }
 
-void litehtml::el_before_after_base::add_style(const litehtml::style& st)
+void litehtml::el_before_after_base::add_style(const litehtml::style& st, const litehtml::selector_specificity& spec)
 {
-	html_tag::add_style(st);
+	html_tag::add_style(st, spec);
 
 	tstring content = get_style_property(_t("content"), false, _t(""));
-	if(!content.empty())
+	if(content == m_content)
 	{
-		int idx = value_index(content.c_str(), content_property_string);
-		/* content keywords: none(0) / normal(1) suppress the box; anything
-		 * else (quotes, strings, attr(), counters) generates one */
-		if(idx < 0 || idx > 1)
+		return;
+	}
+
+	/* A pseudo-element accumulates declarations from many rules and sheets.
+	 * Rebuild generated children only when the winning content value changes;
+	 * reparsing it after every unrelated rule duplicates attr()/string text. */
+	m_content = content;
+	m_children.clear();
+	m_box_content = false;
+	if(content.empty())
+	{
+		return;
+	}
+
+	int idx = value_index(content.c_str(), content_property_string);
+	/* content keywords none/normal suppress the box. Empty quoted strings are
+	 * valid generated content: they create a box without a text child. */
+	m_box_content = idx < 0 || idx > 1;
+	if(idx >= 0)
+	{
+		return;
+	}
+
+	tstring fnc;
+	tstring::size_type i = 0;
+	while(i < content.length() && i != tstring::npos)
+	{
+		if(content.at(i) == _t('"'))
 		{
-			m_box_content = true;
-		}
-		if(idx < 0)
-		{
-			tstring fnc;
-			tstring::size_type i = 0;
-			while(i < content.length() && i != tstring::npos)
+			fnc.clear();
+			i++;
+			tstring::size_type pos = content.find(_t('"'), i);
+			tstring txt;
+			if(pos == tstring::npos)
 			{
-				if(content.at(i) == _t('"'))
-				{
-					fnc.clear();
-					i++;
-					tstring::size_type pos = content.find(_t('"'), i);
-					tstring txt;
-					if(pos == tstring::npos)
-					{
-						txt = content.substr(i);
-						i = tstring::npos;
-					} else
-					{
-						txt = content.substr(i, pos - i);
-						i = pos + 1;
-					}
-					add_text(txt);
-				} else if(content.at(i) == _t('('))
-				{
-					i++;
-					litehtml::trim(fnc);
-					litehtml::lcase(fnc);
-					tstring::size_type pos = content.find(_t(')'), i);
-					tstring params;
-					if(pos == tstring::npos)
-					{
-						params = content.substr(i);
-						i = tstring::npos;
-					} else
-					{
-						params = content.substr(i, pos - i);
-						i = pos + 1;
-					}
-					add_function(fnc, params);
-					fnc.clear();
-				} else
-				{
-					fnc += content.at(i);
-					i++;
-				}
+				txt = content.substr(i);
+				i = tstring::npos;
+			} else
+			{
+				txt = content.substr(i, pos - i);
+				i = pos + 1;
 			}
+			add_text(txt);
+		} else if(content.at(i) == _t('('))
+		{
+			i++;
+			litehtml::trim(fnc);
+			litehtml::lcase(fnc);
+			tstring::size_type pos = content.find(_t(')'), i);
+			tstring params;
+			if(pos == tstring::npos)
+			{
+				params = content.substr(i);
+				i = tstring::npos;
+			} else
+			{
+				params = content.substr(i, pos - i);
+				i = pos + 1;
+			}
+			add_function(fnc, params);
+			fnc.clear();
+		} else
+		{
+			fnc += content.at(i);
+			i++;
 		}
 	}
 }

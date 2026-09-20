@@ -1848,6 +1848,15 @@ static bool mq_eval(vm_t* vm, const char* q) {
     return false;
 }
 
+/* CSS.supports() is primarily an optional-feature probe. Without the global
+ * object, a probe throws before the caller can choose its fallback path. The
+ * renderer has no public declaration parser here, so report unsupported
+ * conservatively instead of claiming features that may render incorrectly. */
+static var_t* native_css_supports(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    return var_new_bool(vm, false);
+}
+
 static var_t* native_matchMedia(vm_t* vm, var_t* env, void* data) {
     (void)data;
     mstr_t* s = mstr_new("");
@@ -3538,7 +3547,7 @@ static void web_mirror_globals(vm_t* vm, var_t* window) {
         "Event", "CustomEvent", "MouseEvent", "KeyboardEvent",
         "Element", "Document", "Storage", "Location", "History",
         "Navigator", "Screen", "Performance", "XMLHttpRequest",
-        "Response", "Headers", "URL", "URLSearchParams"
+        "Response", "Headers", "URL", "URLSearchParams", "CSS"
     };
     /* A/B knob (MARIO_NOQMT): withhold the native queueMicrotask so polyfills
      * (core-js) install their own - on rokid.com the engine-backed microtask
@@ -3637,6 +3646,12 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
     vm_reg_static(vm, NULL, "fetch(i, init)",           native_fetch,              bridge);
     vm_reg_static(vm, NULL, "confirm(v)",               native_win_confirm,        bridge);
     vm_reg_static(vm, NULL, "prompt(v, d)",             native_win_prompt,         bridge);
+
+    /* CSS namespace. CSS.supports() must be callable even when the queried
+     * feature is unavailable; throwing here aborts framework initialization. */
+    cls = vm_new_class(vm, "CSS");
+    if(cls != NULL)
+        vm_reg_static(vm, cls, "supports(a, b)", native_css_supports, bridge);
 
     /* ---- window methods ---- */
     vm_reg_static(vm, NULL, "scrollTo(a, b)",    native_win_scrollTo, bridge);

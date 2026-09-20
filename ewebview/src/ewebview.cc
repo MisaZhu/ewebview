@@ -204,7 +204,9 @@ static std::string tag_attr_value(const std::string& lower_tag,
  *    first URL from its srcSet, and emits a plain <img> with src/width/height.
  *    Pictures whose sources are all placeholder ("#") are dropped entirely so
  *    only the no-JS fallback pictures (with real URLs) remain. The <picture>
- *    wrapper is dropped (no CSS display:none pitfall).
+ *    open/close tags themselves are KEPT (as a generic inline container) so the
+ *    page's own "picture img{...}" / ".picture-class>img{object-fit..}" rules
+ *    still reach the lowered <img>; apple.com bottom-anchors card art that way.
  *
  * 3. **Image-hiding CSS class strip**: the SSR HTML marks figures with classes
  *    like `responsive-picture--removed` / `responsive-picture--no-load` to hide
@@ -244,10 +246,10 @@ static std::string preprocess_noscript_picture(const std::string& html)
     /* --- Pass 2: lower <picture>/<source srcSet> to plain <img> ------- */
     /* For each <picture>...</picture>:
      * - collect best srcSet URL from <source> tags
-     * - if a valid URL exists, emit a standalone <img src=url width height>
+     * - if a valid URL exists, emit <picture ...><img src=url width height></picture>
      * - if no valid URL (all placeholders), drop the entire <picture> block
-     * The <picture>/<source> wrapper is removed entirely (litehtml doesn't
-     * understand it, and its CSS class may carry display:none). */
+     * The <source> tags are removed (litehtml doesn't understand them); the
+     * <picture> tag stays so descendant/child selectors keep matching. */
     std::string stage2;
     stage2.reserve(stage1.size());
     {
@@ -269,6 +271,13 @@ static std::string preprocess_noscript_picture(const std::string& html)
             size_t pic_end = pic_close + 10;
             std::string pic_orig = stage1.substr(pic_open, pic_end - pic_open);
             std::string pic_low  = lower.substr(pic_open, pic_end - pic_open);
+            /* the <picture ...> start tag, kept verbatim around the lowered img */
+            std::string pic_start_tag;
+            {
+                size_t gt = pic_low.find('>');
+                if(gt != std::string::npos) pic_start_tag = pic_orig.substr(0, gt + 1);
+                else pic_start_tag = "<picture>";
+            }
 
             /* Collect best srcSet URL from <source> tags. */
             std::string best_url, best_width, best_height;
@@ -305,8 +314,25 @@ static std::string preprocess_noscript_picture(const std::string& html)
             }
 
             if(best_url.empty()) {
-                /* No usable source (all placeholders) — drop the entire
-                 * <picture> block so only no-JS fallbacks remain. */
+                /* No <source> carried a URL. A <picture> wrapping just an <img src>
+                 * is valid HTML - keep that <img> verbatim (the wrapper alone is
+                 * dropped). Only a picture whose sources are ALL placeholders and
+                 * whose <img> has no src is discarded so the no-JS fallback
+                 * picture next to it remains the sole image. */
+                size_t img_pos = pic_low.find("<img");
+                if(img_pos != std::string::npos) {
+                    size_t img_gt = pic_low.find('>', img_pos);
+                    if(img_gt != std::string::npos) {
+                        std::string img_low  = pic_low.substr(img_pos, img_gt - img_pos + 1);
+                        std::string img_orig = pic_orig.substr(img_pos, img_gt - img_pos + 1);
+                        std::string src = tag_attr_value(img_low, img_orig, "src");
+                        if(!src.empty() && src != "#") {
+                            stage2 += pic_start_tag;
+                            stage2 += img_orig;
+                            stage2 += "</picture>";
+                        }
+                    }
+                }
                 pos = pic_end;
                 continue;
             }
@@ -332,6 +358,7 @@ static std::string preprocess_noscript_picture(const std::string& html)
                     extra_attrs = attr_text;
                 }
             }
+            stage2 += pic_start_tag;
             stage2 += "<img src=\"";
             stage2 += best_url;
             stage2 += "\"";
@@ -346,7 +373,7 @@ static std::string preprocess_noscript_picture(const std::string& html)
                 stage2 += "\"";
             }
             if(!extra_attrs.empty()) stage2 += extra_attrs;
-            stage2 += "/>";
+            stage2 += "/></picture>";
             pos = pic_end;
         }
     }
@@ -560,6 +587,7 @@ static std::string preprocess_noscript_picture(const std::string& html)
 
 static std::string extract_scripts(const std::string& html, std::vector<std::string>* scripts,
                                    std::vector<std::string>* script_srcs,
+                                   std::vector<std::string>* script_ids,
                                    bool* has_inline_handlers,
                                    bool* has_module_scripts)
 {
@@ -672,6 +700,8 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
                  * script_srcs stay the same length. */
                 scripts->push_back(std::string());
                 if(script_srcs != nullptr) script_srcs->push_back(src_val);
+                if(script_ids != nullptr)
+                    script_ids->push_back(script_attr_value(open_tag, open_tag_orig, "id"));
             } else {
                 /* Skip blank/whitespace-only bodies to avoid empty vm_load calls. */
                 bool blank = true;
@@ -681,6 +711,8 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
                 if(!blank) {
                     scripts->push_back(body);
                     if(script_srcs != nullptr) script_srcs->push_back(std::string());
+                    if(script_ids != nullptr)
+                        script_ids->push_back(script_attr_value(open_tag, open_tag_orig, "id"));
                 }
             }
         }
@@ -2583,6 +2615,7 @@ void EWebEngine::cleanupBuildResources()
     resetJsVm();
     m_jsScripts.clear();
     m_jsScriptSrcs.clear();
+    m_jsScriptIds.clear();
     m_jsScriptDone.clear();
     m_jsScriptEls.clear();
     m_jsHasInlineHandlers = false;
@@ -3337,6 +3370,7 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     /* extract_scripts and the m_js* fields are engine-owned; no locking. */
     m_jsScripts.clear();
     m_jsScriptSrcs.clear();
+    m_jsScriptIds.clear();
     m_jsScriptDone.clear();
     m_jsScriptEls.clear();
     m_jsHasInlineHandlers = false;
@@ -3371,6 +3405,7 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
       if(_dbg) { fwrite(preprocessed.data(), 1, preprocessed.size(), _dbg); fclose(_dbg); } }
     m_buildHtmlContent = extract_scripts(preprocessed, m_jsEnabled ? &m_jsScripts : nullptr,
                                          m_jsEnabled ? &m_jsScriptSrcs : nullptr,
+                                         m_jsEnabled ? &m_jsScriptIds : nullptr,
                                          m_jsEnabled ? &m_jsHasInlineHandlers : nullptr,
                                          &m_jsBuildHasModules);
     /* TEMP: dump final HTML to /tmp for debugging */
@@ -3469,6 +3504,7 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
         for(size_t k = 1; k < parts.size(); ++k) {
             m_jsScriptSrcs.insert(m_jsScriptSrcs.begin() + (long)(i + k), parts[k]);
             m_jsScripts.insert(m_jsScripts.begin() + (long)(i + k), std::string());
+            m_jsScriptIds.insert(m_jsScriptIds.begin() + (long)(i + k), std::string());
             m_jsScriptDone.insert(m_jsScriptDone.begin() + (long)(i + k), 0);
         }
         i += parts.size() - 1;
@@ -3480,6 +3516,10 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
             addTask(task);
         }
     }
+    /* Parser-extracted slots have no live source element; keep this vector
+     * index-aligned so later dynamically inserted scripts receive load/error
+     * on the element that actually owns their queue slot. */
+    m_jsScriptEls.assign(m_jsScripts.size(), nullptr);
 
     setBuildStatus("preparing document", 5);
     EWEB_LOG("[ewebview] build queued: content_size=%d client=%dx%d\n",
@@ -4360,70 +4400,6 @@ bool EWebEngine::jsSkeletonProbeCached()
     return m_jsSkeletonProbeVal;
 }
 
-/* TEMP DIAGNOSTIC (taobao): count elements in a subtree and locate the app's
- * mount point (#ice-container) so we can tell whether the React entry actually
- * wrote DOM or bailed before rendering. Gated by EWEB_DOMDBG. Remove with the
- * other temp probes. */
-static int ewebCountElements(litehtml::element* el)
-{
-    if(el == nullptr) return 0;
-    int n = 1;
-    size_t c = el->get_children_count();
-    for(size_t i = 0; i < c; ++i)
-        n += ewebCountElements(el->get_child((int)i));
-    return n;
-}
-static void ewebDumpMountDiag(litehtml::element* el, const char* wantId,
-                              int* foundCount, int* total)
-{
-    if(el == nullptr) return;
-    (*total)++;
-    const litehtml::tchar_t* id = el->get_attr(_t("id"), nullptr);
-    if(id != nullptr && t_strcasecmp(id, _t(wantId)) == 0)
-        *foundCount = ewebCountElements(el);
-    size_t c = el->get_children_count();
-    for(size_t i = 0; i < c; ++i)
-        ewebDumpMountDiag(el->get_child((int)i), wantId, foundCount, total);
-}
-
-/* TEMP DIAGNOSTIC (taobao): find an element by id and dump its text. The page's
- * production bundles stub console.log, so an EWEB_INJECT_JS probe cannot report
- * through the console; it writes its findings into #__inject_diag__ instead and
- * we read them back here (engine-side, console-independent). */
-static litehtml::element* ewebFindById(litehtml::element* el, const char* wantId)
-{
-    if(el == nullptr) return nullptr;
-    const litehtml::tchar_t* id = el->get_attr(_t("id"), nullptr);
-    if(id != nullptr && t_strcasecmp(id, _t(wantId)) == 0)
-        return el;
-    size_t c = el->get_children_count();
-    for(size_t i = 0; i < c; ++i) {
-        litehtml::element* hit = ewebFindById(el->get_child((int)i), wantId);
-        if(hit != nullptr) return hit;
-    }
-    return nullptr;
-}
-
-/* Per-script mount diagnostic (EWEB_DOMDBG): report whether the React entry
- * has populated #ice-container yet, so a silent CSR bail is distinguishable
- * from a render that is merely hidden behind the skeleton overlay. */
-static void ewebDumpTreeFile(FILE* f, litehtml::element* el, int depth)
-{
-    if(el == nullptr || depth > 14) return;
-    for(int d = 0; d < depth; ++d) fputc(' ', f);
-    const litehtml::tchar_t* tag = el->get_tagName();
-    fprintf(f, "<%s", tag ? tag : _t("?"));
-    const litehtml::tchar_t* id = el->get_attr(_t("id"), nullptr);
-    if(id != nullptr) fprintf(f, " id=%s", id);
-    const litehtml::tchar_t* src = el->get_attr(_t("src"), nullptr);
-    if(src != nullptr) fprintf(f, " src=%.90s", src);
-    const litehtml::tchar_t* cls = el->get_attr(_t("class"), nullptr);
-    if(cls != nullptr) fprintf(f, " class=%.40s", cls);
-    fprintf(f, ">\n");
-    size_t c = el->get_children_count();
-    for(size_t i = 0; i < c; ++i)
-        ewebDumpTreeFile(f, el->get_child((int)i), depth + 1);
-}
 /* Layout dump (EWEB_LAYOUTDUMP=<path>): one line per element with its tag,
  * id, class, computed display/position and the ABSOLUTE laid-out box, written
  * after every paint (last paint wins). Text nodes print their first words.
@@ -4454,34 +4430,38 @@ static void ewebDumpLayoutFile(FILE* f, litehtml::element* el, int depth)
     if(id != nullptr) fprintf(f, " id=%s", id);
     const litehtml::tchar_t* cls = el->get_attr(_t("class"), nullptr);
     if(cls != nullptr) fprintf(f, " class=\"%.80s\"", cls);
-    fprintf(f, "> %s", (disp >= 0 && disp < (int)(sizeof(DISP)/sizeof(DISP[0]))) ? DISP[disp] : "?");
+    const litehtml::tchar_t* inline_style = el->get_attr(_t("style"), nullptr);
+    if(inline_style != nullptr) fprintf(f, " style=\"%.160s\"", inline_style);
+    fprintf(f, "> %s visible=%d", (disp >= 0 && disp < (int)(sizeof(DISP)/sizeof(DISP[0]))) ? DISP[disp] : "?", el->is_visible() ? 1 : 0);
     if(epos > 0 && epos < 4) fprintf(f, " pos=%s", POS[epos]);
     if(el->get_float() != litehtml::float_none) fprintf(f, " float");
-    fprintf(f, " [%d,%d %dx%d]\n", p.x, p.y, p.width, p.height);
+    fprintf(f, " [%d,%d %dx%d]", p.x, p.y, p.width, p.height);
+    /* Include the sizing declarations that explain flex/grid/percentage-height
+     * failures. This remains behind EWEB_LAYOUTDUMP and has no runtime effect
+     * unless that diagnostic output is explicitly requested. */
+    static const char* SIZE_PROPS[] = {
+        "width", "height", "min-width", "min-height", "max-width", "max-height",
+        "flex", "flex-basis", "flex-grow", "flex-shrink", "align-items", "align-self",
+        "grid-template-columns", "grid-template-rows"
+    };
+    for(const char* prop : SIZE_PROPS) {
+        const litehtml::tchar_t* value = el->get_style_property(_t(prop), false, nullptr);
+        if(value != nullptr) fprintf(f, " %s=%s", prop, value);
+    }
+    /* Own (non-inherited) color/background/border declarations, so a cascade
+     * miss can be traced without rebuilding a repro around the element. */
+    const litehtml::tchar_t* own_color = el->get_style_property_own(_t("color"));
+    if(own_color != nullptr) fprintf(f, " color=%s", own_color);
+    const litehtml::tchar_t* own_bg = el->get_style_property_own(_t("background-color"));
+    if(own_bg != nullptr) fprintf(f, " bg=%s", own_bg);
+    const litehtml::tchar_t* own_bw = el->get_style_property_own(_t("border-top-width"));
+    if(own_bw != nullptr) fprintf(f, " bw=%s", own_bw);
+    fputc('\n', f);
     if(disp == (int)litehtml::display_none) return;
     size_t c = el->get_children_count();
     for(size_t i = 0; i < c; ++i)
         ewebDumpLayoutFile(f, el->get_child((int)i), depth + 1);
 }
-void EWebEngine::jsDomMountDiag()
-{
-    if(m_doc == nullptr) return;
-    int iceCount = 0, total = 0;
-    ewebDumpMountDiag(m_doc->root(), "ice-container", &iceCount, &total);
-    fprintf(stderr, "[domdbg] total_elements=%d ice-container_subtree=%d\n", total, iceCount);
-    litehtml::element* diag = ewebFindById(m_doc->root(), "__inject_diag__");
-    if(diag != nullptr) {
-        litehtml::tstring txt;
-        diag->get_text(txt);
-        fprintf(stderr, "[injectdiag] %s\n", txt.empty() ? "(empty)" : txt.c_str());
-    }
-    if(getenv("EWEB_DOMDUMP") != nullptr) {
-        FILE* df = fopen(".tmp_repro/rokid/domdump.txt", "w");
-        if(df != nullptr) { ewebDumpTreeFile(df, m_doc->root(), 0); fclose(df); }
-    }
-    fflush(stderr);
-}
-
 void EWebEngine::decideCsrNotice()
 {
     /* ENGINE-THREAD ONLY. Classic-script client-rendered shell (taobao.com):
@@ -4491,15 +4471,6 @@ void EWebEngine::decideCsrNotice()
      * never loads) and the data APIs are unreachable by design. Arm the notice
      * instead of leaving grey blocks standing in for content forever. */
     m_moduleNoticeDecided = true;
-    if(getenv("EWEB_DOMDBG") != nullptr && m_doc != nullptr) {
-        litehtml::element::ptr root = m_doc->root();
-        int iceCount = 0, total = 0;
-        ewebDumpMountDiag(root, "ice-container", &iceCount, &total);
-        int bodyCount = 0, bodyTotal = 0;
-        /* body child element count: walk root, find body */
-        fprintf(stderr, "[domdbg] total_elements=%d ice-container_subtree=%d\n", total, iceCount);
-        (void)bodyCount; (void)bodyTotal;
-    }
     if(!pageShowsSkeletonPlaceholder())
         return;
     m_showModuleNotice = true;

@@ -69,7 +69,6 @@ namespace litehtml
 		litehtml::size						m_size;
 		position::vector					m_fixed_boxes;
 		media_query_list::vector			m_media_lists;
-		std::vector<element*>				m_contents_splice;
 		/* Set when a post-creation style update re-resolves computed styles:
 		 * table grids (html_tag::m_grid) were built in init() against the old
 		 * display values, so they must be rebuilt before the next layout or
@@ -158,11 +157,6 @@ namespace litehtml
 		 * detached, where ancestor-dependent selectors could not match. A work
 		 * budget bounds each call. */
 		void style_detached_subtree(element* el);
-		/* display:contents: elements whose children must be lifted into
-		 * the parent's child list before the next layout. Filled by
-		 * parse_styles, drained by render() - a single point where no
-		 * child-list iteration is in flight. */
-		void queue_contents_splice(element* el);
 		element::ptr					root();
 		void							get_fixed_boxes(position::vector& fixed_boxes);
 		void							add_fixed_box(const position& pos);
@@ -276,7 +270,23 @@ namespace litehtml
 	}
 	inline bool document::match_lang(const tstring & lang)
 	{
-		return lang == m_lang || lang == m_culture;
+		/* Initialise lazily: :lang() selectors are evaluated during the first
+		 * style pass, before embedders normally have a reason to call
+		 * lang_changed().  CSS language ranges match both an exact tag and a
+		 * hyphen-separated subtag ("en" matches "en-US"). */
+		if(m_lang.empty() && m_container)
+		{
+			tstring culture;
+			m_container->get_language(m_lang, culture);
+			m_culture = culture.empty() ? tstring() : m_lang + _t('-') + culture;
+		}
+		auto matches = [&lang](const tstring& value)
+		{
+			return value.length() >= lang.length() &&
+				!t_strncasecmp(value.c_str(), lang.c_str(), lang.length()) &&
+				(value.length() == lang.length() || value[lang.length()] == _t('-'));
+		};
+		return !lang.empty() && (matches(m_lang) || matches(m_culture));
 	}
 
 	/* Split a character-data run into line-breakable chunks: browsers may

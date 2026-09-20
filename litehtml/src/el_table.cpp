@@ -63,7 +63,7 @@ void litehtml::el_table::parse_attributes()
 	const tchar_t* str = get_attr(_t("width"));
 	if(str)
 	{
-		m_style.add_property(_t("width"), str, 0, false);
+		m_style.add_property(_t("width"), str, 0, false, presentation_attribute_specificity);
 	}
 
 	str = get_attr(_t("align"));
@@ -73,12 +73,12 @@ void litehtml::el_table::parse_attributes()
 		switch(align)
 		{
 		case 1:
-			m_style.add_property(_t("margin-left"), _t("auto"), 0, false);
-			m_style.add_property(_t("margin-right"), _t("auto"), 0, false);
+			m_style.add_property(_t("margin-left"), _t("auto"), 0, false, presentation_attribute_specificity);
+			m_style.add_property(_t("margin-right"), _t("auto"), 0, false, presentation_attribute_specificity);
 			break;
 		case 2:
-			m_style.add_property(_t("margin-left"), _t("auto"), 0, false);
-			m_style.add_property(_t("margin-right"), _t("0"), 0, false);
+			m_style.add_property(_t("margin-left"), _t("auto"), 0, false, presentation_attribute_specificity);
+			m_style.add_property(_t("margin-right"), _t("0"), 0, false, presentation_attribute_specificity);
 			break;
 		}
 	}
@@ -89,19 +89,19 @@ void litehtml::el_table::parse_attributes()
 		tstring val = str;
 		val += _t(" ");
 		val += str;
-		m_style.add_property(_t("border-spacing"), val.c_str(), 0, false);
+		m_style.add_property(_t("border-spacing"), val.c_str(), 0, false, presentation_attribute_specificity);
 	}
 	
 	str = get_attr(_t("border"));
 	if(str)
 	{
-		m_style.add_property(_t("border-width"), str, 0, false);
+		m_style.add_property(_t("border-width"), str, 0, false, presentation_attribute_specificity);
 	}
 
 	str = get_attr(_t("bgcolor"));
 	if (str)
 	{
-		m_style.add_property(_t("background-color"), str, 0, false);
+		m_style.add_property(_t("background-color"), str, 0, false, presentation_attribute_specificity);
 	}
 
 	html_tag::parse_attributes();

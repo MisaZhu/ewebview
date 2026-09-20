@@ -95420,7 +95420,10 @@ int BearHttpsResponse_read_body_chunck_raw(BearHttpsResponse *self,unsigned char
 
     long readded = private_BearHttpsResponse_recv(self,buffer+total_prev_sended,size-total_prev_sended);
     if(readded < 0){
-        return readded;
+        /* A TLS peer may signal close as a negative read after the complete body
+         * was already buffered with the headers. Do not discard those bytes: the
+         * caller must receive them before the following read observes EOF. */
+        return total_prev_sended > 0 ? total_prev_sended : readded;
     }
     if(readded> 0){
         self->body_readded_size+=readded;
@@ -95436,7 +95439,13 @@ int BearHttpsResponse_read_body_chunck(BearHttpsResponse *self,unsigned char *bu
         return -1;
     }
 
-    if(self->body_readded_size == self->respnse_content_lenght && self->body_read_mode == PRIVATE_BEARSSL_BY_CONTENT_LENGTH ){
+    /* Header parsing may already have buffered the entire (usually tiny) body.
+     * Drain those bytes through read_body_chunck_raw before declaring EOF. Without
+     * this guard a response whose body fits in the final header recv reports
+     * Content-Length bytes received but returns an empty body to the caller. */
+    if(self->extra_body_remaning_to_send == 0 &&
+       self->body_readded_size == self->respnse_content_lenght &&
+       self->body_read_mode == PRIVATE_BEARSSL_BY_CONTENT_LENGTH ){
         return 0;
     }
 

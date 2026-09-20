@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <vector>
+#include <string>
 #include <algorithm>
 
 #include <plutovg.h>
@@ -137,6 +138,99 @@ static std::string trim_request_url(const std::string& url)
     }
 
     return url.substr(begin, end - begin);
+}
+
+static bool url_has_scheme(const std::string& url)
+{
+    if(url.empty() || !((url[0] >= 'A' && url[0] <= 'Z') ||
+                        (url[0] >= 'a' && url[0] <= 'z')))
+        return false;
+    for(size_t i = 1; i < url.size(); i++) {
+        char ch = url[i];
+        if(ch == ':')
+            return true;
+        if(!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+             (ch >= '0' && ch <= '9') || ch == '+' || ch == '-' || ch == '.'))
+            return false;
+    }
+    return false;
+}
+
+static int hex_digit(char ch)
+{
+    if(ch >= '0' && ch <= '9') return ch - '0';
+    if(ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if(ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+static int base64_digit(char ch)
+{
+    if(ch >= 'A' && ch <= 'Z') return ch - 'A';
+    if(ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+    if(ch >= '0' && ch <= '9') return ch - '0' + 52;
+    if(ch == '+') return 62;
+    if(ch == '/') return 63;
+    return -1;
+}
+
+/* Decode a data: URL into the same malloc-owned byte buffer loadURL returns for
+ * file/http resources. Both percent-encoded text (common for inline SVG) and
+ * RFC 4648 base64 payloads are supported; '+' remains a literal plus because a
+ * data URL is not application/x-www-form-urlencoded. */
+static uint8_t* decode_data_url(const std::string& url, int* out_size)
+{
+    if(out_size != NULL) *out_size = 0;
+    if(url.compare(0, 5, "data:") != 0)
+        return NULL;
+    size_t comma = url.find(',');
+    if(comma == std::string::npos)
+        return NULL;
+
+    std::string meta = url.substr(5, comma - 5);
+    std::transform(meta.begin(), meta.end(), meta.begin(), [](unsigned char ch) {
+        return (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : (char)ch;
+    });
+    bool is_base64 = meta.size() >= 7 &&
+        meta.compare(meta.size() - 7, 7, ";base64") == 0;
+    const std::string payload = url.substr(comma + 1);
+    uint8_t* out = (uint8_t*)malloc(payload.size() + 1);
+    if(out == NULL)
+        return NULL;
+
+    size_t used = 0;
+    if(is_base64) {
+        unsigned value = 0;
+        int bits = 0;
+        for(char ch : payload) {
+            if(ch == '=') break;
+            if(ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
+            int digit = base64_digit(ch);
+            if(digit < 0) { free(out); return NULL; }
+            value = (value << 6) | (unsigned)digit;
+            bits += 6;
+            if(bits >= 8) {
+                bits -= 8;
+                out[used++] = (uint8_t)((value >> bits) & 0xffu);
+            }
+        }
+    } else {
+        for(size_t i = 0; i < payload.size(); i++) {
+            if(payload[i] == '%' && i + 2 < payload.size()) {
+                int hi = hex_digit(payload[i + 1]);
+                int lo = hex_digit(payload[i + 2]);
+                if(hi >= 0 && lo >= 0) {
+                    out[used++] = (uint8_t)((hi << 4) | lo);
+                    i += 2;
+                    continue;
+                }
+            }
+            out[used++] = (uint8_t)payload[i];
+        }
+    }
+    out[used] = 0;
+    if(out_size != NULL) *out_size = (int)used;
+    return out;
 }
 
 /* Case-insensitive header-name compare, local so this file needs no libc
@@ -723,6 +817,11 @@ const std::string EWebContainer::getFullURL(const eweb_port_t* port, const std::
         }
         return clean_src;
     }
+    else if(url_has_scheme(clean_src)) {
+        /* Opaque absolute URLs such as data:image/svg+xml,... must never be
+         * joined to the document directory. loadURL handles data: locally. */
+        return clean_src;
+    }
     else if(clean_src.compare(0, 2, "//") == 0) {
         // Protocol-relative URL: //example.com/path
         // Use https by default, or http if baseurl uses http
@@ -771,6 +870,12 @@ uint8_t* EWebContainer::loadURL(const eweb_port_t* port, const std::string& url,
 
     std::string full_url = getFullURL(port, url, "");
     EWEB_LOG("[ewebview] loadURL: %s -> %s\n", url.c_str(), full_url.c_str());
+    if(full_url.compare(0, 5, "data:") == 0) {
+        ret = decode_data_url(full_url, sz);
+        if(ret != NULL && finalUrl != NULL)
+            *finalUrl = full_url;
+        return ret;
+    }
     if(full_url.compare(0, 7, "file://") == 0) {
         std::string path = full_url.substr(6);
         if(!path.empty() && port->net.read_file) { //local file
@@ -1218,6 +1323,86 @@ static bool parse_linear_gradient(const std::string& val, LinearGradient& out)
     return true;
 }
 
+static bool parse_conic_gradient(const std::string& val, LinearGradient& out)
+{
+    size_t open = val.find('(');
+    size_t close = val.rfind(')');
+    if (open == std::string::npos || close == std::string::npos || close < open)
+        return false;
+    std::vector<std::string> parts;
+    split_top_level_commas(val.substr(open + 1, close - open - 1), parts);
+    out.angle_deg = 0.0f;
+    out.stops.clear();
+    size_t first_stop = 0;
+    if (!parts.empty()) {
+        std::string head = eweb_trim(parts[0]);
+        if (eweb_starts_with_ci(head, "from ")) {
+            std::string angle = eweb_trim(head.substr(5));
+            size_t at = angle.find(" at ");
+            if (at != std::string::npos)
+                angle = eweb_trim(angle.substr(0, at));
+            float deg = 0.0f;
+            if (parse_gradient_angle(angle, deg)) {
+                out.angle_deg = deg;
+                first_stop = 1;
+            }
+        } else if (eweb_starts_with_ci(head, "at ")) {
+            first_stop = 1; /* centre positions are not needed for the common case yet */
+        }
+    }
+    for (size_t i = first_stop; i < parts.size(); i++) {
+        std::string tok = eweb_trim(parts[i]);
+        if (tok.empty())
+            continue;
+        std::string color_str;
+        std::string rest;
+        size_t paren = tok.find('(');
+        if (paren != std::string::npos) {
+            size_t cp = tok.rfind(')');
+            if (cp == std::string::npos)
+                continue;
+            color_str = tok.substr(0, cp + 1);
+            rest = eweb_trim(tok.substr(cp + 1));
+        } else {
+            size_t sp = tok.find(' ');
+            if (sp == std::string::npos) color_str = tok;
+            else {
+                color_str = tok.substr(0, sp);
+                rest = eweb_trim(tok.substr(sp + 1));
+            }
+        }
+        GradientStop st;
+        st.off = -1.0f;
+        litehtml::web_color clr = litehtml::web_color::from_string(color_str.c_str(), 0);
+        st.r = clr.red; st.g = clr.green; st.b = clr.blue; st.a = clr.alpha;
+        if (!rest.empty()) {
+            if (rest.size() > 3 && rest.compare(rest.size() - 3, 3, "deg") == 0)
+                st.off = (float)atof(rest.c_str()) / 360.0f;
+            else
+                st.off = (float)atof(rest.c_str()) / 100.0f;
+        }
+        out.stops.push_back(st);
+    }
+    if (out.stops.size() < 2)
+        return false;
+    if (out.stops.front().off < 0.0f) out.stops.front().off = 0.0f;
+    if (out.stops.back().off < 0.0f) out.stops.back().off = 1.0f;
+    for (size_t i = 0; i < out.stops.size();) {
+        if (out.stops[i].off >= 0.0f) { i++; continue; }
+        size_t j = i;
+        while (j < out.stops.size() && out.stops[j].off < 0.0f) j++;
+        float lo = out.stops[i - 1].off;
+        float hi = (j < out.stops.size()) ? out.stops[j].off : 1.0f;
+        for (size_t k = i; k < j; k++)
+            out.stops[k].off = lo + (hi - lo) * (float)(k - i + 1) / (float)(j - i + 1);
+        i = j;
+    }
+    for (size_t i = 1; i < out.stops.size(); i++)
+        if (out.stops[i].off < out.stops[i - 1].off)
+            out.stops[i].off = out.stops[i - 1].off;
+    return true;
+}
+
 static uint32_t sample_linear_gradient(const LinearGradient& grad, float t)
 {
     if (t <= 0.0f) t = 0.0f;
@@ -1238,6 +1423,126 @@ static uint32_t sample_linear_gradient(const LinearGradient& grad, float t)
     return (al << 24) | (r << 16) | (g << 8) | bl;
 }
 
+struct BoxShadowSpec {
+    float x, y, blur, spread;
+    std::string color;
+    bool inset;
+    BoxShadowSpec() : x(0), y(0), blur(0), spread(0), color("black"), inset(false) {}
+};
+
+static void split_shadow_tokens(const std::string& text, std::vector<std::string>& out)
+{
+    int depth = 0;
+    size_t start = std::string::npos;
+    for (size_t i = 0; i <= text.size(); i++) {
+        char c = i < text.size() ? text[i] : ' ';
+        if (c == '(') depth++;
+        else if (c == ')' && depth > 0) depth--;
+        bool sep = i == text.size() || (depth == 0 && (c == ' ' || c == '\t' || c == '\r' || c == '\n'));
+        if (sep) {
+            if (start != std::string::npos) {
+                out.push_back(text.substr(start, i - start));
+                start = std::string::npos;
+            }
+        } else if (start == std::string::npos) {
+            start = i;
+        }
+    }
+}
+
+static bool parse_shadow_length(const std::string& token, float& value)
+{
+    if (token.empty()) return false;
+    char* end = NULL;
+    value = strtof(token.c_str(), &end);
+    if (end == token.c_str()) return false;
+    if (*end == '\0' || !strcmp(end, "px")) return true;
+    return false;
+}
+
+static bool parse_box_shadow(const std::string& text, BoxShadowSpec& out)
+{
+    std::vector<std::string> tokens;
+    split_shadow_tokens(eweb_trim(text), tokens);
+    std::vector<float> lengths;
+    for (size_t i = 0; i < tokens.size(); i++) {
+        std::string token = eweb_trim(tokens[i]);
+        if (token == "inset") {
+            out.inset = true;
+            continue;
+        }
+        float v = 0;
+        if (parse_shadow_length(token, v)) {
+            lengths.push_back(v);
+        } else {
+            out.color = token;
+        }
+    }
+    if (lengths.size() < 2) return false;
+    out.x = lengths[0];
+    out.y = lengths[1];
+    if (lengths.size() > 2) out.blur = std::max(0.0f, lengths[2]);
+    if (lengths.size() > 3) out.spread = lengths[3];
+    return true;
+}
+
+static void paint_box_shadow(eweb_surface_t* dst, const eweb_gfx_t* gfx,
+                             const litehtml::background_paint& bg,
+                             const BoxShadowSpec& sh,
+                             litehtml::document_container* container)
+{
+    if (sh.inset || !gfx->surface_new || !gfx->surface_pixels ||
+        !gfx->surface_free || !gfx->blit_fit_alpha)
+        return;
+
+    litehtml::web_color wc = litehtml::web_color::from_string(sh.color.c_str(), container);
+    if (!wc.alpha) return;
+
+    float bx = bg.border_box.x + sh.x - sh.spread;
+    float by = bg.border_box.y + sh.y - sh.spread;
+    float bw = bg.border_box.width + sh.spread * 2.0f;
+    float bh = bg.border_box.height + sh.spread * 2.0f;
+    if (bw <= 0 || bh <= 0) return;
+
+    int pad = sh.blur > 0 ? (int)ceilf(sh.blur * 1.5f) + 2 : 1;
+    int ox = (int)floorf(bx) - pad;
+    int oy = (int)floorf(by) - pad;
+    int ow = (int)ceilf(bx + bw) - ox + pad;
+    int oh = (int)ceilf(by + bh) - oy + pad;
+    if (ow <= 0 || oh <= 0 || ow > 8192 || oh > 8192) return;
+
+    eweb_surface_t* tmp = gfx->surface_new(gfx->ud, ow, oh);
+    if (!tmp) return;
+    if (gfx->surface_clear) gfx->surface_clear(gfx->ud, tmp, 0);
+    int tw = 0, th = 0;
+    uint32_t* px = gfx->surface_pixels(gfx->ud, tmp, &tw, &th);
+    if (px && tw > 0 && th > 0) {
+        float radius = (float)std::max(bg.border_radius.top_left_x, bg.border_radius.top_left_y) + sh.spread;
+        radius = std::max(0.0f, std::min(radius, std::min(bw, bh) * 0.5f));
+        float cx = bx + bw * 0.5f, cy = by + bh * 0.5f;
+        float hx = bw * 0.5f, hy = bh * 0.5f;
+        float sigma = std::max(0.5f, sh.blur * 0.5f);
+        const float inv = 1.0f / (1.41421356237f * sigma);
+        float kx = (float)ow / (float)tw, ky = (float)oh / (float)th;
+        for (int yy = 0; yy < th; yy++) {
+            float Y = oy + (yy + 0.5f) * ky;
+            float qy = fabsf(Y - cy) - (hy - radius);
+            for (int xx = 0; xx < tw; xx++) {
+                float X = ox + (xx + 0.5f) * kx;
+                float qx = fabsf(X - cx) - (hx - radius);
+                float ax = std::max(qx, 0.0f), ay = std::max(qy, 0.0f);
+                float dist = sqrtf(ax * ax + ay * ay) + std::min(std::max(qx, qy), 0.0f) - radius;
+                float coverage = sh.blur > 0 ? 0.5f * erfcf(dist * inv) : (dist <= 0 ? 1.0f : 0.0f);
+                int alpha = (int)floorf((float)wc.alpha * coverage + 0.5f);
+                px[yy * tw + xx] = ((uint32_t)alpha << 24) | ((uint32_t)wc.red << 16) |
+                                     ((uint32_t)wc.green << 8) | (uint32_t)wc.blue;
+            }
+        }
+        gfx->blit_fit_alpha(gfx->ud, tmp, 0, 0, ow, oh, dst, ox, oy, ow, oh, 0xFF);
+    }
+    gfx->surface_free(gfx->ud, tmp);
+}
+
 void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::background_paint& bg)
 {
     eweb_surface_t* s = (eweb_surface_t*)hdc;
@@ -1246,10 +1551,26 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
         return;
     const eweb_gfx_t* gfx = &m_port->gfx;
 
-    if (eweb_starts_with_ci(bg.image, "linear-gradient(")) {
+    /* Outer shadows paint behind the element's background. CSS lists the
+     * front-most shadow first, therefore render in reverse declaration order. */
+    if (!bg.box_shadow.empty()) {
+        std::vector<std::string> layers;
+        split_top_level_commas(bg.box_shadow, layers);
+        for (size_t i = layers.size(); i > 0; i--) {
+            BoxShadowSpec sh;
+            if (parse_box_shadow(layers[i - 1], sh))
+                paint_box_shadow(s, gfx, bg, sh, this);
+        }
+    }
+
+    bool is_linear_gradient = eweb_starts_with_ci(bg.image, "linear-gradient(");
+    bool is_conic_gradient = eweb_starts_with_ci(bg.image, "conic-gradient(");
+    if (is_linear_gradient || is_conic_gradient) {
         const litehtml::position& cb = bg.clip_box;
         LinearGradient grad;
-        if (cb.width <= 0 || cb.height <= 0 || !parse_linear_gradient(bg.image, grad))
+        bool parsed = is_conic_gradient ? parse_conic_gradient(bg.image, grad)
+                                        : parse_linear_gradient(bg.image, grad);
+        if (cb.width <= 0 || cb.height <= 0 || !parsed)
             return;
         if (!gfx->surface_new || !gfx->surface_pixels || !gfx->surface_free || !gfx->blit_fit_alpha)
             return;
@@ -1268,6 +1589,13 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
             float sx = W * 0.5f - dx * L * 0.5f;
             float sy = H * 0.5f - dy * L * 0.5f;
             float kx = W / (float)tw, ky = H / (float)th;
+            bool exclude_content = !bg.mask.empty() &&
+                bg.mask.find("content-box") != std::string::npos &&
+                (bg.mask.find("exclude") != std::string::npos || bg.mask.find("xor") != std::string::npos);
+            float inner_x = (float)(bg.content_box.x - cb.x);
+            float inner_y = (float)(bg.content_box.y - cb.y);
+            float inner_w = (float)bg.content_box.width;
+            float inner_h = (float)bg.content_box.height;
             /* CSS border-radius clamping: overlapping corner radii shrink
              * proportionally so a 30rem radius on a 55rem-tall pill becomes
              * the stadium shape the button shows in a real browser. */
@@ -1285,11 +1613,19 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
                 rbl_x *= f; rbl_y *= f; rbr_x *= f; rbr_y *= f;
             }
             bool rounded = (rtl_x > 0 || rtl_y > 0 || rtr_x > 0 || rbr_x > 0 || rbl_x > 0);
+            bool round_hole = rounded && inner_w > 0 && inner_h > 0;
             for (int yy = 0; yy < th; yy++) {
                 float Y = (yy + 0.5f) * ky;
                 for (int xx = 0; xx < tw; xx++) {
                     float X = (xx + 0.5f) * kx;
-                    uint32_t c = sample_linear_gradient(grad, ((X - sx) * dx + (Y - sy) * dy) / L);
+                    float t;
+                    if (is_conic_gradient) {
+                        float sample_angle = atan2f(X - W * 0.5f, -(Y - H * 0.5f)) * 180.0f / kPi;
+                        t = fmodf(sample_angle - grad.angle_deg + 360.0f, 360.0f) / 360.0f;
+                    } else {
+                        t = ((X - sx) * dx + (Y - sy) * dy) / L;
+                    }
+                    uint32_t c = sample_linear_gradient(grad, t);
                     if (rounded) {
                         float ex = 0, ey = 0, rx = 0, ry = 0;
                         bool in_corner = false;
@@ -1303,15 +1639,23 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
                                 c = 0;
                         }
                     }
+                    if (exclude_content && inner_w > 0 && inner_h > 0 &&
+                        X >= inner_x && Y >= inner_y && X <= inner_x + inner_w && Y <= inner_y + inner_h) {
+                        bool in_hole = true;
+                        if (round_hole) {
+                            float nx = (X - inner_x - inner_w * 0.5f) / (inner_w * 0.5f);
+                            float ny = (Y - inner_y - inner_h * 0.5f) / (inner_h * 0.5f);
+                            in_hole = nx * nx + ny * ny <= 1.0f;
+                        }
+                        if (in_hole) c = 0;
+                    }
                     px[yy * tw + xx] = c;
                 }
             }
             /* src rect lives in the SOURCE surface's logical space (the HAL
              * scales it by tmp's own dpr); tmp was created at cb.width x
              * cb.height logical, so passing the device-pixel tw/th here
-             * double-scaled the src rect on HiDPI (dpr=2) and SDL's clip of
-             * the oversized src shrank the dst to half the clip box - the
-             * half-size hero gradient and clipped pill buttons on Retina. */
+             * double-scaled the src rect on HiDPI (dpr=2). */
             gfx->blit_fit_alpha(gfx->ud, tmp, 0, 0, cb.width, cb.height, s, cb.x, cb.y, cb.width, cb.height, 0xFF);
         }
         gfx->surface_free(gfx->ud, tmp);
@@ -1559,6 +1903,8 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
         if(rounded && gfx->fill_round)
             gfx->fill_round(gfx->ud, s, bg.clip_box.x, bg.clip_box.y, bg.clip_box.width, bg.clip_box.height,
                 rad_x > rad_y ? rad_x : rad_y, color);
+        else if(fill_rect_round_clipped(s, gfx, bg.clip_box, color))
+            ;
         else if(gfx->fill_rect)
             gfx->fill_rect(gfx->ud, s, bg.clip_box.x, bg.clip_box.y, bg.clip_box.width, bg.clip_box.height, color);
     } else {
@@ -1769,6 +2115,54 @@ int EWebContainer::top_clip_radius() const
     if(e.radius <= 0) return 0;
     int half = (e.r.width < e.r.height ? e.r.width : e.r.height) / 2;
     return e.radius < half ? e.radius : half;
+}
+
+/* Solid fill under an overflow:hidden + border-radius ancestor. The HAL clip
+ * is rectangular, so a child's square background painted straight over the
+ * ancestor's rounded corners (apple.com's cards: white rounded card, child
+ * copy block with its own background reaching the top corners). When the
+ * rect actually reaches a corner square, fill the rounded clip box as an
+ * anti-aliased polygon limited to the rect instead. Returns false when the
+ * plain fill_rect is fine. */
+bool EWebContainer::fill_rect_round_clipped(eweb_surface_t* s, const eweb_gfx_t* gfx,
+                                            const litehtml::position& r, uint32_t argb)
+{
+    int crad = top_clip_radius();
+    if(crad <= 0 || !s) return false;
+    const litehtml::position& c = m_clips.back().r;
+    bool near_x = r.x < c.x + crad || r.right() > c.right() - crad;
+    bool near_y = r.y < c.y + crad || r.bottom() > c.bottom() - crad;
+    if(!near_x || !near_y) return false;
+
+    litehtml::position ib;
+    ib.x = r.x > c.x ? r.x : c.x;
+    ib.y = r.y > c.y ? r.y : c.y;
+    int x2 = r.right() < c.right() ? r.right() : c.right();
+    int y2 = r.bottom() < c.bottom() ? r.bottom() : c.bottom();
+    ib.width = x2 - ib.x;
+    ib.height = y2 - ib.y;
+    if(ib.width <= 0 || ib.height <= 0) return true;
+
+    const int SEG = 8;
+    const float kPi = 3.14159265358979f;
+    std::vector<float> pts;
+    pts.reserve((SEG + 1) * 8);
+    float X = (float)c.x, Y = (float)c.y, W = (float)c.width, H = (float)c.height, R = (float)crad;
+    auto arc = [&](float cx, float cy, float a0, float a1) {
+        for(int i = 0; i <= SEG; i++) {
+            float a = a0 + (a1 - a0) * (float)i / (float)SEG;
+            pts.push_back(cx + R * cosf(a));
+            pts.push_back(cy + R * sinf(a));
+        }
+    };
+    arc(X + W - R, Y + R,     -kPi * 0.5f, 0.0f);
+    arc(X + W - R, Y + H - R,  0.0f,       kPi * 0.5f);
+    arc(X + R,     Y + H - R,  kPi * 0.5f, kPi);
+    arc(X + R,     Y + R,      kPi,        kPi * 1.5f);
+    int count = (int)(pts.size() / 2);
+    if(!fill_polys_aa(s, gfx, ib, pts.data(), &count, 1, argb))
+        fill_polys_nz(s, gfx, ib, pts.data(), &count, 1, argb);
+    return true;
 }
 
 litehtml::position EWebContainer::top_clip_rect() const

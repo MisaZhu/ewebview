@@ -620,15 +620,6 @@ litehtml::uint_ptr litehtml::document::get_font( const tchar_t* name, int size, 
 int litehtml::document::render( int max_width, render_type rt )
 {
 	int ret = 0;
-	/* Lift display:contents children into their grandparents before any layout
-	 * walk starts (parse_styles queued them; no child iteration is in flight
-	 * here, so the vector moves are safe). */
-	if(!m_contents_splice.empty())
-	{
-		for(auto* el : m_contents_splice)
-			el->splice_contents_children();
-		m_contents_splice.clear();
-	}
 	/* Viewport units (vw/vh/vmin/vmax) resolve against m_media, snapshotted
 	 * from the container at create time - often before the widget had a client
 	 * size - and media_changed() only refreshes it when the page carries @media
@@ -812,6 +803,28 @@ int litehtml::document::cvt_units( css_length& val, int fontSize, int size ) con
 			ret = round_f((float)(val.val() * root_sz));
 			val.set_value((float) ret, css_units_px);
 		}
+		break;
+	case css_units_cqw:
+	case css_units_cqi:
+	case css_units_cqmin:
+	case css_units_cqmax:
+		/* Container-query inline units. We do not track query containers, but
+		 * on the sites that use them (apple.com: 'width:100cqw' on an accordion
+		 * tray, 'padding:0 6.25cqw' on the accordion itself) the nearest
+		 * container IS the containing block, so 1cqw == 1% of it. Rewriting to a
+		 * percentage lets the normal layout-time resolution do the rest. Before
+		 * this the unit was unknown, "100cqw" read as 100px and the accordion
+		 * copy wrapped one word per line. (font-size resolves these itself.) */
+		val.set_value(val.val(), css_units_percentage);
+		ret = val.calc_percent(size);
+		break;
+	case css_units_cqh:
+	case css_units_cqb:
+		/* Block-axis container units: percent heights need a definite
+		 * containing block we rarely have, so use the spec's no-container
+		 * fallback (the small viewport) instead. */
+		ret = (int)((double)m_media.height * (double)val.val() / 100.0);
+		val.set_value((float) ret, css_units_px);
 		break;
 	case css_units_ch:
 		/* advance of "0"; approximated as half an em, which is what most
@@ -1098,11 +1111,6 @@ void style_detached_subtree_walk(litehtml::element* el,
 	}
 }
 } // namespace
-
-void litehtml::document::queue_contents_splice(element* el)
-{
-	if(el) m_contents_splice.push_back(el);
-}
 
 void litehtml::document::style_detached_subtree(element* el)
 {

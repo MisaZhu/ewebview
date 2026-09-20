@@ -17,17 +17,17 @@ void litehtml::el_tr::parse_attributes()
 	const tchar_t* str = get_attr(_t("align"));
 	if(str)
 	{
-		m_style.add_property(_t("text-align"), str, 0, false);
+		m_style.add_property(_t("text-align"), str, 0, false, presentation_attribute_specificity);
 	}
 	str = get_attr(_t("valign"));
 	if(str)
 	{
-		m_style.add_property(_t("vertical-align"), str, 0, false);
+		m_style.add_property(_t("vertical-align"), str, 0, false, presentation_attribute_specificity);
 	}
 	str = get_attr(_t("bgcolor"));
 	if (str)
 	{
-		m_style.add_property(_t("background-color"), str, 0, false);
+		m_style.add_property(_t("background-color"), str, 0, false, presentation_attribute_specificity);
 	}
 	html_tag::parse_attributes();
 }

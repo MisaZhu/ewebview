@@ -421,8 +421,6 @@ public:
      * poll with jsVmEnter/jsVmExit and returns how many timers fired (0 when
      * the VM is off/disabled/page-disabled). */
     int  jsPollTimers();
-    /* TEMP DIAGNOSTIC (EWEB_DOMDBG): print #ice-container subtree size. */
-    void jsDomMountDiag();
     /* Fire "load"/"error" on the dynamic <script> element of slot i so
      * webpack's d.l chunk loader settles (see m_jsScriptEls). */
     void jsFireScriptElEvent(size_t i, const char* type);
@@ -537,13 +535,16 @@ public:
     void*        jsCurrentScriptEl();
     /* Stand-in <script src> element for a stripped static script tag: searches
      * the live tree for a <script> carrying this src, else materialises one in
-     * <head> and returns it (nullptr if the doc/host is gone). Pre-materialising
+     * <head> and returns it (nullptr if the doc/host is gone). The parser also
+     * retains the original id so self-locating bundles can find their own tag
+     * through getElementById (Google Workspace's `base-js`). Pre-materialising
      * every queued external script makes document.getElementsByTagName("script")
      * and document.scripts see real attached nodes - SDKs that locate themselves
      * via the script list otherwise get an empty list and dereference undefined
      * (taobao baxia: `ref.parentNode.insertBefore(...)` -> "can not find
      * function 'insertBefore'"). */
-    void*        jsScriptStandInEl(const std::string& url);
+    void*        jsScriptStandInEl(const std::string& url,
+                                   const std::string& id = std::string());
     void         jsMaterializeScriptStandIns();
     /* selectionStart/End + setSelectionRange()/select() backends: codepoint
      * offsets into the focused text control's live value. */
@@ -743,6 +744,11 @@ public:
      * (1) or still awaiting its EWEB_TASK_SCRIPT fetch (0). runNextPageScript
      * blocks on a pending slot so classic scripts run in document order. */
     std::vector<std::string>    m_jsScriptSrcs;
+    /* Parallel to m_jsScripts: id from each parser-extracted executable script
+     * tag (empty when absent or dynamically inserted). Executable tags are
+     * stripped before litehtml parses the document, so stand-ins must restore
+     * the id for getElementById/self-locating bundle bootstrap code. */
+    std::vector<std::string>    m_jsScriptIds;
     std::vector<char>           m_jsScriptDone;
     /* Parallel to m_jsScripts (kept the same length at every mutation):
      * the litehtml element of a dynamically inserted <script>, nullptr for

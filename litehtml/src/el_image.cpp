@@ -456,6 +456,51 @@ void litehtml::el_image::draw( uint_ptr hdc, int x, int y, const position* clip 
 					fw = (int)(iw * s); fh = (int)(ih * s);
 					fx = pos.x + (pos.width - fw) / 2;
 					fy = pos.y + (pos.height - fh) / 2;
+					/* object-position: where the (possibly larger) fitted bitmap sits
+					 * inside the box. apple.com anchors card art with "bottom" so a
+					 * 284px image in a shorter object-fit:none box shows its bottom. */
+					const tchar_t* op = get_style_property(_t("object-position"), false, 0);
+					if (op && *op)
+					{
+						string_vector toks;
+						split_string(op, toks, _t(" \t"));
+						float px = 50.f, py = 50.f;		/* percentages */
+						bool px_abs = false, py_abs = false;
+						int  ax = 0, ay = 0;				/* absolute px offsets */
+						int  idx = 0;
+						bool horiz_set = false, vert_set = false;
+						for (size_t k = 0; k < toks.size() && idx < 2; k++)
+						{
+							const tstring& tk = toks[k];
+							if (tk.empty()) continue;
+							if (!t_strcasecmp(tk.c_str(), _t("left")))   { px = 0;   horiz_set = true; idx++; continue; }
+							if (!t_strcasecmp(tk.c_str(), _t("right")))  { px = 100; horiz_set = true; idx++; continue; }
+							if (!t_strcasecmp(tk.c_str(), _t("top")))    { py = 0;   vert_set = true;  idx++; continue; }
+							if (!t_strcasecmp(tk.c_str(), _t("bottom"))) { py = 100; vert_set = true;  idx++; continue; }
+							if (!t_strcasecmp(tk.c_str(), _t("center"))) { idx++; continue; }
+							css_length L;
+							L.fromString(tk, _t(""), -1);
+							/* first numeric token is horizontal unless a keyword already
+							 * fixed that axis ("bottom 10px" is invalid, but "10px bottom"
+							 * and "left 20%" are common). */
+							bool to_vert = horiz_set || (idx == 1 && !vert_set);
+							if (!to_vert)
+							{
+								if (L.units() == css_units_percentage) px = L.val();
+								else { px_abs = true; ax = doc->cvt_units(L, get_font_size()); }
+								horiz_set = true;
+							}
+							else
+							{
+								if (L.units() == css_units_percentage) py = L.val();
+								else { py_abs = true; ay = doc->cvt_units(L, get_font_size()); }
+								vert_set = true;
+							}
+							idx++;
+						}
+						fx = pos.x + (px_abs ? ax : (int)((pos.width  - fw) * px / 100.f));
+						fy = pos.y + (py_abs ? ay : (int)((pos.height - fh) * py / 100.f));
+					}
 				}
 			}
 			bg.image_size.width		= fw;

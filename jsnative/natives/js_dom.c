@@ -484,6 +484,20 @@ static var_t* native_el_get_tagName(vm_t* vm, var_t* env, void* data) {
     return adopt_cstr(vm, tag);
 }
 
+/* Element.localName is the lower-case tag name for HTML elements. Virtual DOM
+ * hydrators (including the one used by Apple's global header) use localName to
+ * match server-rendered nodes. Returning undefined makes every element look
+ * mismatched, so a second client tree is inserted beside the SSR tree. */
+static var_t* native_el_get_localName(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = handle_from_this(this_from_env(env));
+    if(st == NULL || el == NULL || st->cb.el_get_tag == NULL)
+        return var_new_null(vm);
+    if(st->cb.el_is_tag != NULL && !st->cb.el_is_tag(st->ctx, el))
+        return var_new_null(vm);
+    return adopt_cstr(vm, st->cb.el_get_tag(st->ctx, el));
+}
+
 /* Node.nodeType. React's createRoot/hydrateRoot validate the container with
  * `node.nodeType` (1 element / 3 text / 9 document); without it every wrapper
  * reads undefined and hydration aborts with "Target container is not a DOM
@@ -2643,7 +2657,7 @@ static var_t* native_cancelAnimationFrame(vm_t* vm, var_t* env, void* data) {
 /* timer table at 0 ms like MessageChannel/queueMicrotask, coalesced   */
 /* to one callback per observer per turn. IntersectionObserver delivers */
 /* a one-shot intersecting entry per observed target (see native_io_*); */
-/* ResizeObserver has no layout feed, so its observe() only registers.  */
+/* ResizeObserver delivers an initial laid-out size after observe().      */
 /* ------------------------------------------------------------------ */
 #define OB_REG    "@@obreg"    /* root hidden array of live MutationObservers */
 #define OB_CB     "@@obcb"     /* observer -> callback function */
@@ -2851,7 +2865,7 @@ static var_t* native_observer_observe(vm_t* vm, var_t* env, void* data) {
  * every observed target as fully intersecting once, shortly after observe(),
  * so the reveal/enhance JS runs. Delivered on the DOM timer table as a small
  * macrotask so the observing script turn finishes first. MutationObserver and
- * ResizeObserver keep the plain observe() that only registers the target. */
+ * ResizeObserver independently queues a delayed initial size delivery. */
 typedef struct io_disp { var_t* observer; var_t* target; } io_disp_t;
 
 static var_t* native_io_dispatch(vm_t* vm, var_t* env, void* data) {
@@ -2924,6 +2938,116 @@ static var_t* native_io_observe(vm_t* vm, var_t* env, void* data) {
     node_t* tn = var_array_get(args, 0);
     var_t* target = (tn != NULL) ? tn->var : NULL;
     if(target != NULL) io_schedule(vm, data, self, target);
+    return NULL;
+}
+
+/* ResizeObserver delivery. The embedder can report the current laid-out border
+ * box, which is sufficient for the common responsive-component contract:
+ * observe an element, read contentRect/borderBoxSize, then store a pixel CSS
+ * variable. A delayed first delivery lets the initial document layout finish;
+ * subsequent DOM writes still trigger normal relayout before paint. */
+typedef struct ro_disp { var_t* observer; var_t* target; } ro_disp_t;
+
+static var_t* ro_size(vm_t* vm, int w, int h) {
+    var_t* size = var_new_obj_no_proto(vm, NULL, NULL);
+    var_add(size, "inlineSize", var_new_int(vm, w));
+    var_add(size, "blockSize", var_new_int(vm, h));
+    return size;
+}
+
+static var_t* ro_size_array(vm_t* vm, int w, int h) {
+    var_t* arr = var_new_array(vm);
+    var_array_add(arr, ro_size(vm, w, h));
+    return arr;
+}
+
+static var_t* native_ro_dispatch(vm_t* vm, var_t* env, void* data) {
+    (void)env;
+    ro_disp_t* d = (ro_disp_t*)data;
+    if(d == NULL) return NULL;
+    var_t* observer = d->observer;
+    var_t* target = d->target;
+    mario_free(d);
+    if(observer == NULL || observer->status <= V_ST_GC_FREE ||
+       target == NULL || target->status <= V_ST_GC_FREE) {
+        if(getenv("MARIO_RODBG") != NULL)
+            fprintf(stderr, "[rodbg] dispatch dropped observer=%p target=%p\n",
+                (void*)observer, (void*)target);
+        return NULL;
+    }
+    var_t* dead = var_find_own_member_var(observer, OB_DEAD);
+    if(dead != NULL && var_get_int(dead) != 0) {
+        if(getenv("MARIO_RODBG") != NULL)
+            fprintf(stderr, "[rodbg] dispatch disconnected observer=%p\n", (void*)observer);
+        return NULL;
+    }
+    var_t* cb = var_find_own_member_var(observer, OB_CB);
+    if(cb == NULL || !cb->is_func) {
+        if(getenv("MARIO_RODBG") != NULL)
+            fprintf(stderr, "[rodbg] dispatch missing callback observer=%p\n", (void*)observer);
+        return NULL;
+    }
+
+    int x = 0, y = 0, w = 0, h = 0;
+    el_rect(state_from_vm(vm), handle_from_this(target), &x, &y, &w, &h);
+    if(getenv("MARIO_RODBG") != NULL)
+        fprintf(stderr, "[rodbg] dispatch observer=%p target=%p rect=%d,%d %dx%d\n",
+            (void*)observer, (void*)target, x, y, w, h);
+    var_t* rect = var_new_obj_no_proto(vm, NULL, NULL);
+    var_add(rect, "x", var_new_int(vm, x));
+    var_add(rect, "y", var_new_int(vm, y));
+    var_add(rect, "width", var_new_int(vm, w));
+    var_add(rect, "height", var_new_int(vm, h));
+    var_add(rect, "top", var_new_int(vm, y));
+    var_add(rect, "right", var_new_int(vm, x + w));
+    var_add(rect, "bottom", var_new_int(vm, y + h));
+    var_add(rect, "left", var_new_int(vm, x));
+
+    var_t* entry = var_new_obj_no_proto(vm, NULL, NULL);
+    var_add(entry, "target", target);
+    var_add(entry, "contentRect", rect);
+    var_add(entry, "borderBoxSize", ro_size_array(vm, w, h));
+    var_add(entry, "contentBoxSize", ro_size_array(vm, w, h));
+    var_add(entry, "devicePixelContentBoxSize", ro_size_array(vm, w, h));
+    var_t* entries = var_new_array(vm);
+    var_array_add(entries, entry);
+    var_t* args = var_new_array(vm);
+    var_array_add(args, entries);
+    var_array_add(args, observer);
+    var_array_reverse(args);
+    var_t* r = call_m_func(vm, observer, cb, args);
+    if(getenv("MARIO_RODBG") != NULL)
+        fprintf(stderr, "[rodbg] callback complete observer=%p result=%p\n",
+            (void*)observer, (void*)r);
+    if(r != NULL) var_unref(r);
+    var_unref(args);
+    return NULL;
+}
+
+static void ro_schedule(vm_t* vm, void* bridge, var_t* observer, var_t* target) {
+    js_dom_state* st = state_any(vm, bridge);
+    if(st == NULL || observer == NULL || target == NULL) return;
+    ro_disp_t* d = (ro_disp_t*)mario_malloc(sizeof(ro_disp_t));
+    if(d == NULL) return;
+    d->observer = observer;
+    d->target = target;
+    var_t* tr = var_new_native_func(vm, native_ro_dispatch, d);
+    int id = js_add_timer(vm, st, tr, 64, false, false);
+    if(getenv("MARIO_RODBG") != NULL)
+        fprintf(stderr, "[rodbg] schedule observer=%p target=%p timer=%d\n",
+            (void*)observer, (void*)target, id);
+    if(id == 0) { mario_free(d); var_unref(tr); }
+}
+
+static var_t* native_ro_observe(vm_t* vm, var_t* env, void* data) {
+    var_t* r = native_observer_observe(vm, env, data);
+    if(r != NULL) var_unref(r);
+    var_t* self = get_obj(env, THIS);
+    if(self == NULL) return NULL;
+    var_t* args = get_func_args(env);
+    node_t* tn = var_array_get(args, 0);
+    var_t* target = (tn != NULL) ? tn->var : NULL;
+    if(target != NULL) ro_schedule(vm, data, self, target);
     return NULL;
 }
 
@@ -3410,7 +3534,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     vm_reg_native(vm, io_cls, "takeRecords()", native_observer_takeRecords, bridge);
     var_t* ro_cls = vm_new_class(vm, "ResizeObserver");
     vm_reg_native(vm, ro_cls, "constructor(cb)", native_observer_ctor, bridge);
-    vm_reg_native(vm, ro_cls, "observe(target, options)", native_observer_observe, bridge);
+    vm_reg_native(vm, ro_cls, "observe(target, options)", native_ro_observe, bridge);
     vm_reg_native(vm, ro_cls, "unobserve(target)", native_observer_unobserve, bridge);
     vm_reg_native(vm, ro_cls, "disconnect()", native_observer_disconnect, bridge);
     vm_reg_native(vm, ro_cls, "takeRecords()", native_observer_takeRecords, bridge);
@@ -3421,6 +3545,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     reg_accessor(vm, el_cls, "innerHTML", native_el_get_innerHTML, native_el_set_innerHTML, bridge);
     reg_accessor(vm, el_cls, "tagName", native_el_get_tagName, NULL, bridge);
     reg_accessor(vm, el_cls, "nodeName", native_el_get_tagName, NULL, bridge);
+    reg_accessor(vm, el_cls, "localName", native_el_get_localName, NULL, bridge);
     reg_accessor(vm, el_cls, "nodeType", native_el_get_nodeType, NULL, bridge);
     reg_accessor(vm, el_cls, "className", native_el_get_className, native_el_set_className, bridge);
     reg_accessor(vm, el_cls, "classList", native_el_get_classList, NULL, bridge);

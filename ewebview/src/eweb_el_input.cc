@@ -1029,7 +1029,16 @@ bool eweb_el_input::page_styled_box() const
 
 litehtml::element_position eweb_el_input::get_element_position(litehtml::css_offsets* offsets) const
 {
-    return litehtml::element_position_relative;
+    /* A control is its own containing block by default (relative), but a page
+     * that positions it must win: apple.com's card overlay is a <button> with
+     * "position:absolute; inset:0" - forcing relative laid it out in flow as a
+     * full-height grid row, doubling the card height and pushing the "+"
+     * control off the card. */
+    litehtml::element_position p = litehtml::html_tag::get_element_position(offsets);
+    if (p == litehtml::element_position_static) {
+        return litehtml::element_position_relative;
+    }
+    return p;
 }
 
 void eweb_el_input::add_widget_part_style(const litehtml::tstring& part, const litehtml::style& st)

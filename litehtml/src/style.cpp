@@ -18,12 +18,14 @@ void litehtml::style::init_valid_values()
 
 litehtml::style::style()
 {
+	m_cur_specificity = inline_style_specificity;
 	init_valid_values();
 }
 
 litehtml::style::style( const style& val )
 {
 	m_properties = val.m_properties;
+	m_cur_specificity = val.m_cur_specificity;
 }
 
 litehtml::style::~style()
@@ -99,8 +101,12 @@ void litehtml::style::parse_property( const tstring& txt, const tchar_t* baseurl
 	}
 }
 
-void litehtml::style::combine( const litehtml::style& src )
+void litehtml::style::combine( const litehtml::style& src, const selector_specificity& spec )
 {
+	/* Every property copied from src belongs to the same rule, so they all
+	 * cascade at that rule's specificity; add_parsed_property reads it from
+	 * m_cur_specificity. */
+	m_cur_specificity = spec;
 	/* A rule that still holds a raw `font`/`flex` shorthand (deferred by
 	 * add_property because it contained a var()) supersedes every longhand
 	 * that earlier rules put here, exactly as parse_short_font would have if
@@ -127,6 +133,14 @@ void litehtml::style::combine( const litehtml::style& src )
 	{
 		add_parsed_property(i->first.c_str(), i->second.m_value.c_str(), i->second.m_important);
 	}
+}
+
+void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, const tchar_t* baseurl, bool important, const selector_specificity& spec )
+{
+	/* Start a new declaration context. The four-argument worker deliberately
+	 * preserves this value while recursively expanding shorthands. */
+	m_cur_specificity = spec;
+	add_property(name, val, baseurl, important);
 }
 
 void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, const tchar_t* baseurl, bool important )
@@ -218,6 +232,21 @@ void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, con
 	if(!t_strcmp(name, _t("inset-block-end")))
 	{
 		name = _t("bottom");
+	} else
+	/* The engine has a single overflow; per css-overflow-3 when one axis is
+	 * non-visible the other computes to auto anyway, so a non-visible axis
+	 * value stands for the whole box. A bare 'overflow-x/y:visible' is left
+	 * alone so it cannot undo an earlier 'overflow:hidden'. Unmapped, the
+	 * longhand was dropped and workspace.google.com's page wrapper
+	 * (overflow-y:hidden) never became a BFC, letting the hero's 64px
+	 * header margin collapse all the way out through <body>. */
+	if(!t_strcmp(name, _t("overflow-x")) || !t_strcmp(name, _t("overflow-y")))
+	{
+		if(!t_strcasecmp(val, _t("visible")))
+		{
+			return;
+		}
+		name = _t("overflow");
 	} else
 	if(!t_strcmp(name, _t("margin-inline")) || !t_strcmp(name, _t("padding-inline")) ||
 	   !t_strcmp(name, _t("margin-block")) || !t_strcmp(name, _t("padding-block")) ||
@@ -817,11 +846,11 @@ void litehtml::style::parse_short_background( const tstring& val, const tchar_t*
 				add_parsed_property(_t("background-image-baseurl"), baseurl, important);
 			}
 
-		} else if( !t_strncasecmp(tok->c_str(), _t("linear-gradient("), 16) )
+		} else if( !t_strncasecmp(tok->c_str(), _t("linear-gradient("), 16) ||
+				   !t_strncasecmp(tok->c_str(), _t("conic-gradient("), 15) )
 		{
 			/* Gradient paint syntax must reach background-image; the colour
-			 * branch below would swallow it as an unresolvable colour and the
-			 * hero fields of Tailwind pages would paint transparent. */
+			 * branch below would swallow it as an unresolvable colour. */
 			add_parsed_property(_t("background-image"), *tok, important);
 		} else if( value_in_list(tok->c_str(), background_repeat_strings) )
 		{
@@ -861,6 +890,21 @@ void litehtml::style::parse_short_background( const tstring& val, const tchar_t*
 
 void litehtml::style::parse_short_font( const tstring& val, bool important )
 {
+	/* CSS-wide keyword: every longhand takes it. apple.com's reset does
+	 * '@layer sasskit{button{font:inherit}}' so its accordion/tab <button>s
+	 * pick up the 28px semibold headline of the <h3> around them; tokenising
+	 * "inherit" as a family name left them at the UA 'medium' size. */
+	if(val == _t("inherit") || val == _t("unset"))
+	{
+		const tchar_t* kw = _t("inherit");
+		add_parsed_property(_t("font-style"),   kw, important);
+		add_parsed_property(_t("font-variant"), kw, important);
+		add_parsed_property(_t("font-weight"),  kw, important);
+		add_parsed_property(_t("font-size"),    kw, important);
+		add_parsed_property(_t("line-height"),  kw, important);
+		add_parsed_property(_t("font-family"),  kw, important);
+		return;
+	}
 	add_parsed_property(_t("font-style"),	_t("normal"),	important);
 	add_parsed_property(_t("font-variant"),	_t("normal"),	important);
 	add_parsed_property(_t("font-weight"),	_t("normal"),	important);
@@ -945,15 +989,30 @@ void litehtml::style::add_parsed_property( const tstring& name, const tstring& v
 		props_map::iterator prop = m_properties.find(name);
 		if (prop != m_properties.end())
 		{
-			if (!prop->second.m_important || (important && prop->second.m_important))
+			/* CSS cascade among declarations for the same property: an
+			 * !important declaration always beats a non-important one; within
+			 * the same importance tier the higher (or, on a tie, the later,
+			 * hence >=) specificity wins. This is what lets an external
+			 * <link> rule of higher specificity survive a later, lower-
+			 * specificity inline <style> rule even though the two sheets are
+			 * applied in separate passes (master then document). */
+			bool overwrite;
+			if (important && !prop->second.m_important)
+				overwrite = true;
+			else if (!important && prop->second.m_important)
+				overwrite = false;
+			else
+				overwrite = (m_cur_specificity >= prop->second.m_specificity);
+			if (overwrite)
 			{
 				prop->second.m_value = val;
 				prop->second.m_important = important;
+				prop->second.m_specificity = m_cur_specificity;
 			}
 		}
 		else
 		{
-			m_properties[name] = property_value(val.c_str(), important);
+			m_properties[name] = property_value(val.c_str(), important, m_cur_specificity);
 		}
 	}
 }

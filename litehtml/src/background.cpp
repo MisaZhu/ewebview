@@ -17,6 +17,8 @@ litehtml::background::background( const background& val )
 {
 	m_image			= val.m_image;
 	m_baseurl		= val.m_baseurl;
+	m_box_shadow	= val.m_box_shadow;
+	m_mask			= val.m_mask;
 	m_color			= val.m_color;
 	m_attachment	= val.m_attachment;
 	m_position		= val.m_position;
@@ -33,6 +35,8 @@ litehtml::background& litehtml::background::operator=( const background& val )
 {
 	m_image			= val.m_image;
 	m_baseurl		= val.m_baseurl;
+	m_box_shadow	= val.m_box_shadow;
+	m_mask			= val.m_mask;
 	m_color			= val.m_color;
 	m_attachment	= val.m_attachment;
 	m_position		= val.m_position;
@@ -56,11 +60,14 @@ litehtml::background_paint::background_paint( const background_paint& val )
 {
 	image			= val.image;
 	baseurl			= val.baseurl;
+	box_shadow		= val.box_shadow;
+	mask			= val.mask;
 	attachment		= val.attachment;
 	repeat			= val.repeat;
 	color			= val.color;
 	clip_box		= val.clip_box;
 	origin_box		= val.origin_box;
+	content_box		= val.content_box;
 	border_box		= val.border_box;
 	border_radius	= val.border_radius;
 	image_size		= val.image_size;
@@ -73,6 +80,8 @@ void litehtml::background_paint::operator=( const background& val )
 {
 	attachment	= val.m_attachment;
 	baseurl		= val.m_baseurl;
+	box_shadow	= val.m_box_shadow;
+	mask		= val.m_mask;
 	image		= val.m_image;
 	repeat		= val.m_repeat;
 	color		= val.m_color;

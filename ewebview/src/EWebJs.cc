@@ -409,6 +409,10 @@ bool EWebEngine::runPageScripts()
     if(m_jsVm == nullptr && m_jsScripts.empty() && !m_jsHasInlineHandlers) return true;
     initJsVm();
     if(m_jsVm == nullptr) return true;
+    /* Parser-extracted script elements must exist before the first script runs,
+     * including the pre-paint/document.write path. Self-locating bundles read
+     * their own id/src synchronously during top-level evaluation. */
+    if(m_jsNextScript == 0) jsMaterializeScriptStandIns();
 
     while(m_jsNextScript < m_jsScripts.size()) {
         size_t i = m_jsNextScript;
@@ -713,6 +717,10 @@ bool EWebEngine::runNextPageScript()
                m_jsRequeuedSrcs.end()) {
             m_jsRequeuedSrcs.push_back(src);
             m_jsScripts.push_back(src);
+            m_jsScriptSrcs.push_back(i < m_jsScriptSrcs.size()
+                                        ? m_jsScriptSrcs[i] : std::string());
+            m_jsScriptIds.push_back(i < m_jsScriptIds.size()
+                                       ? m_jsScriptIds[i] : std::string());
             m_jsScriptDone.push_back(1);
             m_jsScriptEls.push_back(nullptr);   /* keep the vectors aligned */
             for(auto it = m_jsRunawaySrcs.begin(); it != m_jsRunawaySrcs.end(); ++it) {
@@ -730,7 +738,6 @@ bool EWebEngine::runNextPageScript()
             fprintf(stderr, "[promledger] --- after script %d (post-swap) ---\n", (int)i);
             mario_promise_ledger_dump(m_jsVm);
         }
-        if(getenv("EWEB_DOMDBG") != NULL) jsDomMountDiag();
         /* The body ran (or was cut after running): fire the element's load
          * event so webpack's d.l chunk loader resolves its promise. A cut or
          * faulted body reports error instead - the loader must settle either
@@ -774,7 +781,6 @@ bool EWebEngine::runNextPageScript()
                     if(!vm_load_run(m_jsVm, body.c_str()))
                         EWEB_LOG("[ewebview] js: inject body failed to compile\n");
                     jsVmExit();
-                    if(getenv("EWEB_DOMDBG") != NULL) jsDomMountDiag();
                     jsProgressiveFlush(true);
                 }
             }
@@ -866,6 +872,7 @@ void EWebEngine::jsDynamicScriptInserted(void* script_el)
         bool external = !parts[k].empty();
         m_jsScripts.push_back(external ? std::string() : body);
         m_jsScriptSrcs.push_back(parts[k]);
+        m_jsScriptIds.push_back(std::string());
         m_jsScriptDone.push_back(external ? 0 : 1);
         /* Remember the element so the ordered run can fire load/error on it
          * (see m_jsScriptEls). Only part 0 of a split combo owns the element;
@@ -1230,14 +1237,6 @@ int EWebEngine::jsPollTimers()
     int fired = js_dom_poll_timers(m_jsVm, ticMs());
     eweb_segv_disarm();
     jsVmExit();
-    /* TEMP DIAGNOSTIC (EWEB_DOMDBG): React mounts from these timer/message
-     * callbacks, i.e. AFTER the last page script, so sample the mount point
-     * here (throttled) rather than only per-script. */
-    if(getenv("EWEB_DOMDBG") != nullptr && fired > 0) {
-        static uint64_t s_domdbg_last = 0;
-        uint64_t t = ticMs();
-        if(t - s_domdbg_last >= 2000) { s_domdbg_last = t; jsDomMountDiag(); }
-    }
     /* TEMP DIAGNOSTIC (MARIO_PROMLEDGER): periodic dump so a stall that begins
      * after the last script (React scheduler suspended on a never-settling
      * promise) is visible during the idle timer phase. */
@@ -1365,7 +1364,8 @@ void EWebEngine::jsElSetText(void* ctx, void* el, const char* text)
 {
     EWebEngine* self = (EWebEngine*)ctx;
     if(el == nullptr) return;
-    js_set_element_text((litehtml::element*)el, text != nullptr ? text : "",
+    litehtml::element* e = (litehtml::element*)el;
+    js_set_element_text(e, text != nullptr ? text : "",
                         self != nullptr ? &self->m_jsDetached : nullptr);
     if(self != nullptr) {
         const char* idv = ((litehtml::element*)el)->get_attr("id", nullptr);
@@ -1470,10 +1470,11 @@ void EWebEngine::jsElSetAttr(void* ctx, void* el, const char* name, const char* 
         e->set_attr(name, value != nullptr ? value : "");
         /* class/id decide selector matching; style= feeds the inline cascade.
          * Neither is visible to a layout-only invalidation, so restyle. */
-        if(strcmp(name, "class") == 0 || strcmp(name, "id") == 0)
+        if(strcmp(name, "class") == 0 || strcmp(name, "id") == 0 ||
+           strcmp(name, "style") == 0)
+            /* Rebuild from raw declarations: parse_styles() expands var()/calc()
+             * in-place, so reusing the old computed bag preserves stale values. */
             jsRestyleSubtree(e, true);
-        else if(strcmp(name, "style") == 0)
-            jsRestyleSubtree(e, false);
     }
     if(self != nullptr) {
         const char* idv = e->get_attr("id", nullptr);
@@ -1567,13 +1568,20 @@ void* EWebEngine::jsCurrentScriptEl()
  * that locate themselves through that list then dereference undefined and abort
  * (taobao baxia: `ref.parentNode.insertBefore(...)`). Search first so a real or
  * previously materialised node is reused; otherwise create one in <head>. */
-void* EWebEngine::jsScriptStandInEl(const std::string& url)
+void* EWebEngine::jsScriptStandInEl(const std::string& url, const std::string& id)
 {
     if(url.empty()) return nullptr;
     litehtml::document* doc = jsActiveDoc();
     if(doc == nullptr) return nullptr;
     litehtml::element::ptr root = doc->root();
     if(root == nullptr) return nullptr;
+    /* An id uniquely identifies the original parser-inserted element. Prefer it
+     * over src because valid markup may contain the same bundle URL more than
+     * once under different ids. */
+    if(!id.empty()) {
+        litehtml::element::ptr byId = root->select_one((std::string("#") + id).c_str());
+        if(byId != nullptr) return (void*)byId;
+    }
     /* Compare scheme-less: markup often carries "//g.alicdn.com/..." while the
      * run queue stores the resolved absolute URL. */
     auto norm = [](const std::string& u) -> std::string {
@@ -1590,19 +1598,26 @@ void* EWebEngine::jsScriptStandInEl(const std::string& url)
         for(size_t j = 0; j < part.size(); ++j) {
             if(part[j] == nullptr) continue;
             const char* sa = part[j]->get_attr("src", nullptr);
-            if(sa == nullptr || sa[0] == 0) continue;
-            if(norm(std::string(sa)) == want) return (void*)part[j];
+            if(sa == nullptr || sa[0] == 0 || norm(std::string(sa)) != want) continue;
+            const char* ownId = part[j]->get_attr("id", nullptr);
+            if(id.empty() || ownId == nullptr || ownId[0] == 0) {
+                if(!id.empty()) part[j]->set_attr("id", id.c_str());
+                return (void*)part[j];
+            }
+            if(id == ownId) return (void*)part[j];
         }
     }
     litehtml::string_map attrs;
     litehtml::element::ptr el = doc->create_element("script", attrs);
     if(el == nullptr) return nullptr;
     el->set_attr("src", url.c_str());
+    if(!id.empty()) el->set_attr("id", id.c_str());
     litehtml::element::ptr host = root->select_one("head");
     if(host == nullptr) host = root->select_one("body");
     if(host == nullptr) return nullptr;
     host->appendChild(el);
-    EWEB_LOG("[ewebview] script stand-in created el=%p src=%s\n", (void*)el, url.c_str());
+    EWEB_LOG("[ewebview] script stand-in created el=%p id=%s src=%s\n",
+             (void*)el, id.empty() ? "(none)" : id.c_str(), url.c_str());
     return (void*)el;
 }
 
@@ -1610,7 +1625,9 @@ void EWebEngine::jsMaterializeScriptStandIns()
 {
     for(size_t i = 0; i < m_jsScriptSrcs.size(); ++i) {
         if(m_jsScriptSrcs[i].empty()) continue;
-        jsScriptStandInEl(m_jsScriptSrcs[i]);
+        std::string id = (i < m_jsScriptIds.size())
+                             ? m_jsScriptIds[i] : std::string();
+        jsScriptStandInEl(m_jsScriptSrcs[i], id);
     }
 }
 
@@ -1863,8 +1880,9 @@ bool EWebEngine::jsElAppendChild(void* ctx, void* parent, void* child)
         EWEB_LOG("[ewebview] appendChild rejected stale handle: parent=%p child=%p\n", parent, child);
         return false;
     }
+    litehtml::element* p = (litehtml::element*)parent;
     litehtml::element* c = (litehtml::element*)child;
-    if(!((litehtml::element*)parent)->appendChild(c)) return false;
+    if(!p->appendChild(c)) return false;
     /* A node built by createElement never went through the document-creation
      * stylesheet walks, so match master/attribute/document styles against the
      * inserted subtree first - without it a scripted <div> keeps html_tag's
@@ -1906,10 +1924,11 @@ bool EWebEngine::jsElInsertBefore(void* ctx, void* parent, void* child, void* re
         EWEB_LOG("[ewebview] insertBefore dropped stale ref=%p (append instead)\n", ref);
         ref = nullptr;
     }
+    litehtml::element* p = (litehtml::element*)parent;
     litehtml::element* c = (litehtml::element*)child;
     /* html_tag::insertBefore appends when ref is null or is not a child of
      * parent, which is exactly the DOM contract. */
-    if(!((litehtml::element*)parent)->insertBefore(c, (litehtml::element*)ref))
+    if(!p->insertBefore(c, (litehtml::element*)ref))
         return false;
     if(litehtml::document* d = c->get_document()) {
         d->style_detached_subtree(c);
@@ -1937,8 +1956,9 @@ bool EWebEngine::jsElRemoveChild(void* ctx, void* parent, void* child)
         EWEB_LOG("[ewebview] removeChild rejected stale handle: parent=%p child=%p\n", parent, child);
         return false;
     }
+    litehtml::element* p = (litehtml::element*)parent;
     litehtml::element* c = (litehtml::element*)child;
-    if(!((litehtml::element*)parent)->removeChild(c)) return false;
+    if(!p->removeChild(c)) return false;
     if(self != nullptr) {
         /* removeChild only unlinks; the node is not deleted. See the comment on
          * m_jsDetached: freeing it here would dangle every cached wrapper and
@@ -1964,10 +1984,11 @@ void EWebEngine::jsElRemoveAttr(void* ctx, void* el, const char* name)
         e->remove_attr(name);
         /* Same restyle contract as jsElSetAttr: dropping class/id/style can
          * change which rules match or what the inline cascade contributes. */
-        if(strcmp(name, "class") == 0 || strcmp(name, "id") == 0)
+        if(strcmp(name, "class") == 0 || strcmp(name, "id") == 0 ||
+           strcmp(name, "style") == 0)
+            /* Rebuild from raw declarations: parse_styles() expands var()/calc()
+             * in-place, so reusing the old computed bag preserves stale values. */
             jsRestyleSubtree(e, true);
-        else if(strcmp(name, "style") == 0)
-            jsRestyleSubtree(e, false);
     }
     if(self != nullptr) self->jsMarkLayoutDirty();
 }

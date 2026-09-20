@@ -326,7 +326,7 @@ bool litehtml::line_box::can_hold(const element::ptr &el, white_space ws)
 		return true;
 	}
 
-	if(m_box_left + m_width + el->width() + el->get_inline_shift_left() + el->get_inline_shift_right() > m_box_right)
+	if(m_box_left + m_width + el->width() + el->get_inline_shift_left() + el->get_inline_shift_right() > m_wrap_right)
 	{
 		return false;
 	}
@@ -415,8 +415,10 @@ void litehtml::line_box::new_width( int left, int right, elements_vector& els )
 	int add = left - m_box_left;
 	if(add)
 	{
+		int wrap_width = m_wrap_right - m_box_left;
 		m_box_left	= left;
 		m_box_right	= right;
+		m_wrap_right = std::min(right, left + wrap_width);
 		m_width = 0;
 		auto remove_begin = m_items.end();
 		for (auto i = m_items.begin() + 1; i != m_items.end(); i++)
@@ -425,7 +427,7 @@ void litehtml::line_box::new_width( int left, int right, elements_vector& els )
 
 			if(!el->m_skip)
 			{
-				if(m_box_left + m_width + el->width() + el->get_inline_shift_right() + el->get_inline_shift_left() > m_box_right)
+				if(m_box_left + m_width + el->width() + el->get_inline_shift_right() + el->get_inline_shift_left() > m_wrap_right)
 				{
 					remove_begin = i;
 					break;

@@ -12,7 +12,6 @@ litehtml::element::element(litehtml::document* doc) : m_doc(doc), m_parent(nullp
 	m_step_stamp	= 0;
 	m_step_done		= false;
 	m_sheets_applied = false;
-	m_contents_spliced = false;
 	m_el_magic		= (unsigned int)ELEMENT_LIVE_MAGIC;
 }
 
@@ -23,31 +22,6 @@ litehtml::element::~element()
 	m_el_magic		= 0;
 }
 
-
-void litehtml::element::splice_contents_children()
-{
-	/* display:contents: this element generates no box, so its children join
-	 * the parent's child list (immediately after it, keeping document order)
-	 * and the parent's layout - block, inline, flex or grid - treats them as
-	 * its own. The element itself stays in the tree as a box-less placeholder
-	 * so DOM relationships and selectors through it keep working. Nested
-	 * contents elements are queued in parse order (parent first), so splicing
-	 * them one by one lifts whole chains (e.g. apple.com's globalnav menu). */
-	element* p = m_parent;
-	if(!p || m_children.empty()) return;
-	elements_vector& pc = p->m_children;
-	size_t idx = 0;
-	bool found = false;
-	for(size_t i = 0; i < pc.size(); i++)
-	{
-		if(pc[i] == this) { idx = i; found = true; break; }
-	}
-	if(!found) return;
-	pc.insert(pc.begin() + idx + 1, m_children.begin(), m_children.end());
-	for(auto& c : m_children)
-		c->m_parent = p;
-	m_children.clear();
-}
 
 bool litehtml::element::is_point_inside( int x, int y )
 {
@@ -155,7 +129,8 @@ bool litehtml::element::get_predefined_height(int& p_height) const
 			int ph = 0;
 			if (el_parent->get_predefined_height(ph))
 			{
-				p_height = h.calc_percent(ph);
+				/* percentages resolve against the parent's CONTENT box */
+				p_height = h.calc_percent(el_parent->border_box_content_height(ph));
 				if (is_body())
 				{
 					p_height -= content_margins_height();
@@ -349,7 +324,7 @@ const litehtml::background* litehtml::element::get_background(bool own_only)		LI
 litehtml::element::ptr litehtml::element::get_element_by_point(int x, int y, int client_x, int client_y)	LITEHTML_RETURN_FUNC(0)
 litehtml::element::ptr litehtml::element::get_child_by_point(int x, int y, int client_x, int client_y, draw_flag flag, int zindex) LITEHTML_RETURN_FUNC(0)
 void litehtml::element::get_line_left_right( int y, int def_right, int& ln_left, int& ln_right ) LITEHTML_EMPTY_FUNC
-void litehtml::element::add_style( const litehtml::style& st )						LITEHTML_EMPTY_FUNC
+void litehtml::element::add_style( const litehtml::style& st, const litehtml::selector_specificity& spec )						LITEHTML_EMPTY_FUNC
 void litehtml::element::select_all(const css_selector& selector, litehtml::elements_vector& res)	LITEHTML_EMPTY_FUNC
 litehtml::elements_vector litehtml::element::select_all(const litehtml::css_selector& selector)	 LITEHTML_RETURN_FUNC(litehtml::elements_vector())
 litehtml::elements_vector litehtml::element::select_all(const litehtml::tstring& selector)			 LITEHTML_RETURN_FUNC(litehtml::elements_vector())
@@ -450,6 +425,7 @@ litehtml::element_position litehtml::element::get_element_position(css_offsets* 
 bool litehtml::element::is_replaced() const											LITEHTML_RETURN_FUNC(false)
 int litehtml::element::line_height() const											LITEHTML_RETURN_FUNC(0)
 bool litehtml::element::is_line_height_normal() const							LITEHTML_RETURN_FUNC(false)
+float litehtml::element::line_height_factor() const								LITEHTML_RETURN_FUNC(0.0f)
 litehtml::text_align litehtml::element::get_text_align() const						LITEHTML_RETURN_FUNC(text_align_left)
 litehtml::text_transform litehtml::element::get_text_transform() const				LITEHTML_RETURN_FUNC(text_transform_none)
 void litehtml::element::draw( uint_ptr hdc, int x, int y, const position* clip )	LITEHTML_EMPTY_FUNC

@@ -85,8 +85,9 @@ namespace litehtml
 		font_metrics			m_font_metrics;
 		int						m_baseline;
 		text_align				m_text_align;
+		int						m_wrap_right;
 	public:
-		line_box(int top, int left, int right, int line_height, font_metrics& fm, text_align align) : box(top, left, right)
+		line_box(int top, int left, int right, int line_height, font_metrics& fm, text_align align, int wrap_width = 0) : box(top, left, right)
 		{
 			m_height		= 0;
 			m_width			= 0;
@@ -94,6 +95,7 @@ namespace litehtml
 			m_line_height	= line_height;
 			m_baseline		= 0;
 			m_text_align	= align;
+			m_wrap_right	= wrap_width > 0 && left + wrap_width < right ? left + wrap_width : right;
 		}
 
 		virtual litehtml::box_type	get_type();

@@ -372,7 +372,7 @@ namespace litehtml
  * chrome that collapses on scroll), so all three alias to the corresponding
  * vh/vw/vmin/vmax in document::computeLength. They are enumerated separately
  * so parser-side code can recognise them without string-munging. */
-#define  css_units_strings	_t("none;%;in;cm;mm;em;ex;pt;pc;px;dpi;dpcm;vw;vh;vmin;vmax;rem;ch;dvw;dvh;dvmin;dvmax;lvw;lvh;lvmin;lvmax;svw;svh;svmin;svmax")
+#define  css_units_strings	_t("none;%;in;cm;mm;em;ex;pt;pc;px;dpi;dpcm;vw;vh;vmin;vmax;rem;ch;dvw;dvh;dvmin;dvmax;lvw;lvh;lvmin;lvmax;svw;svh;svmin;svmax;cqw;cqh;cqi;cqb;cqmin;cqmax")
 
 	enum css_units
 	{
@@ -406,6 +406,15 @@ namespace litehtml
 		css_units_svh,
 		css_units_svmin,
 		css_units_svmax,
+		/* container-query units (cqw/cqi = 1% of the query container's inline
+		 * size, cqh/cqb its block size). We have no container tracking, so
+		 * document::cvt_units approximates them: see the comment there. */
+		css_units_cqw,
+		css_units_cqh,
+		css_units_cqi,
+		css_units_cqb,
+		css_units_cqmin,
+		css_units_cqmax,
 	};
 
 #define  background_attachment_strings	_t("scroll;fixed")

@@ -268,14 +268,23 @@ void litehtml::css_element_selector::parse( const tstring& txt )
 						iii++;
 					}
 				}
-				if(pos != tstring::npos)
+				tstring raw = (pos != tstring::npos) ? txt.substr(el_end + 1, pos - el_end - 1) : txt.substr(el_end + 1);
+				tstring::size_type par = raw.find(_t('('));
+				tstring fname = css_unescape(par == tstring::npos ? raw : raw.substr(0, par));
+				litehtml::lcase(fname);
+				if(par != tstring::npos && (fname == _t("not") || fname == _t("is") || fname == _t("where") || fname == _t("has")))
 				{
-					attribute.val		= css_unescape(txt.substr(el_end + 1, pos - el_end - 1));
+					/* The argument is a selector list that gets parsed again at match
+					 * time, so it must keep its escapes and its case: workspace.google.com
+					 * sizes every heading through ':where(.Heading_size\:h1)', which
+					 * unescaping+lowercasing turned into '.heading_size:h1' - a class
+					 * that never matches plus an unknown pseudo. */
+					attribute.val = fname + raw.substr(par);
 				} else
 				{
-					attribute.val		= css_unescape(txt.substr(el_end + 1));
+					attribute.val = css_unescape(raw);
+					litehtml::lcase(attribute.val);
 				}
-				litehtml::lcase(attribute.val);
 				if(attribute.val == _t("after") || attribute.val == _t("before"))
 				{
 					attribute.condition	= select_pseudo_element;

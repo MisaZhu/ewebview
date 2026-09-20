@@ -74,6 +74,10 @@ namespace litehtml
 		list_style_type			m_list_style_type;
 		list_style_position		m_list_style_position;
 		white_space				m_white_space;
+		bool					m_text_wrap_balance;
+		/* Width used only as the line-breaking threshold for text-wrap:balance;
+		 * alignment and the element's content box still use the full width. */
+		int						m_balanced_line_width;
 		element_float			m_float;
 		element_clear			m_clear;
 		floated_box::vector		m_floats_left;
@@ -83,6 +87,7 @@ namespace litehtml
 		element_position		m_el_position;
 		int						m_line_height;
 		bool					m_lh_predefined;
+		float					m_lh_factor;
 		string_vector			m_pseudo_classes;
 		used_selector::vector	m_used_styles;		
 		
@@ -121,6 +126,11 @@ namespace litehtml
 		css_length				m_css_max_height;
 		css_offsets				m_css_offsets;
 		css_length				m_css_text_indent;
+		/* CSS2 clip:rect(top,right,bottom,left), applied to positioned boxes at
+		 * paint time. Apple uses it to hide the accessible text copy beside each
+		 * SVG global-nav wordmark. */
+		bool					m_has_css_clip;
+		css_offsets				m_css_clip;
 
 		overflow				m_overflow;
 		visibility				m_visibility;
@@ -136,6 +146,10 @@ namespace litehtml
 		 * stacking context; z-index:auto leaves it transparent so its z-indexed
 		 * descendants bubble to the nearest real stacking context. */
 		bool						m_z_index_auto;
+		/* 'isolation:isolate' - an unconditional stacking context with no other
+		 * visual effect (apple.com's cards use it so a z-index:-1 image paints
+		 * above the card's own background instead of vanishing behind it). */
+		bool						m_isolate;
 		box_sizing				m_box_sizing;
 
 		int_int_cache			m_cahe_line_left;
@@ -198,6 +212,17 @@ namespace litehtml
 		virtual element_position	get_element_position(css_offsets* offsets = 0) const override;
 		virtual overflow			get_overflow() const override;
 		box_sizing				get_box_sizing() const { return m_box_sizing; }
+		/* A specified height is the border-box height under box-sizing:border-box;
+		 * m_pos.height is always the content box, so strip padding+border first. */
+		int						border_box_content_height(int h) const override
+		{
+			if(m_box_sizing == box_sizing_border_box)
+			{
+				h -= m_padding.top + m_padding.bottom + m_borders.top + m_borders.bottom;
+				if(h < 0) h = 0;
+			}
+			return h;
+		}
 		/* Automatic margins resolve against free space at pack time; they must
 		 * contribute 0 to intrinsic (min/max-content) sizes, so callers computing
 		 * those need to tell an auto margin apart from a resolved length. */
@@ -242,6 +267,7 @@ namespace litehtml
 		virtual bool				is_replaced() const override;
 		virtual int					line_height() const override;
 		virtual bool				is_line_height_normal() const override;
+		virtual float				line_height_factor() const override;
 		virtual text_align			get_text_align() const override;
 		virtual text_transform		get_text_transform() const override;
 		virtual white_space			get_white_space() const override;
@@ -335,7 +361,7 @@ namespace litehtml
 		virtual void				draw_stacking_context(uint_ptr hdc, int x, int y, const position* clip, bool with_positioned) override;
 		virtual void				calc_document_size(litehtml::size& sz, int x = 0, int y = 0) override;
 		virtual void				get_redraw_box(litehtml::position& pos, int x = 0, int y = 0) override;
-		virtual void				add_style(const litehtml::style& st) override;
+		virtual void				add_style(const litehtml::style& st, const litehtml::selector_specificity& spec = litehtml::inline_style_specificity) override;
 		virtual element::ptr		get_element_by_point(int x, int y, int client_x, int client_y) override;
 		virtual element::ptr		get_child_by_point(int x, int y, int client_x, int client_y, draw_flag flag, int zindex) override;
 
@@ -350,6 +376,7 @@ namespace litehtml
 		/* Recompute m_opacity_cum from the parent's cum and own m_opacity,
 		 * then recurse into children. Called by set_animated_opacity. */
 		void						propagate_opacity_cum();
+		bool						push_css_clip(uint_ptr hdc, int x, int y);
 		int							render_box(int x, int y, int max_width, bool second_pass = false);
 		int											render_flex(int x, int y, int max_width, bool second_pass = false);
 		int											render_grid(int x, int y, int max_width, bool second_pass = false);

@@ -13,6 +13,8 @@ namespace litehtml
 	public:
 		tstring					m_image;
 		tstring					m_baseurl;
+		tstring					m_box_shadow;
+		tstring					m_mask;
 		web_color				m_color;
 		background_attachment	m_attachment;
 		css_position			m_position;
@@ -34,11 +36,14 @@ namespace litehtml
 	public:
 		tstring					image;
 		tstring					baseurl;
+		tstring					box_shadow;
+		tstring					mask;
 		background_attachment	attachment;
 		background_repeat		repeat;
 		web_color				color;
 		position				clip_box;
 		position				origin_box;
+		position				content_box;
 		position				border_box;
 		border_radiuses			border_radius;
 		size					image_size;

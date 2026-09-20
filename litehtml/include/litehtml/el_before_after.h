@@ -9,7 +9,7 @@ namespace litehtml
 		el_before_after_base(litehtml::document* doc, bool before);
 		virtual ~el_before_after_base();
 	
-		virtual void add_style(const litehtml::style& st) override;
+		virtual void add_style(const litehtml::style& st, const litehtml::selector_specificity& spec = litehtml::inline_style_specificity) override;
 		virtual void apply_stylesheet(const litehtml::css& stylesheet) override;
 		virtual style_display get_display() const override;
 	private:
@@ -21,6 +21,7 @@ namespace litehtml
 		 * universal `*, *::before, *::after` reset inserts phantom
 		 * grid/flex items */
 		bool	m_box_content;
+		tstring	m_content;
 	};
 
 	class el_before : public el_before_after_base

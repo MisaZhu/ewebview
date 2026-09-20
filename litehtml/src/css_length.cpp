@@ -52,8 +52,54 @@ void litehtml::css_length::fromString( const tchar_t* str, const tchar_t* predef
 				if(*p == _t('%')) p++;
 				else while((*p >= _t('a') && *p <= _t('z')) || (*p >= _t('A') && *p <= _t('Z'))) p++;
 				size_t ul = (size_t)(p - us);
+				/* Multiplicative factors: `<n> * <len>`, `<len> * <n>`, `<len> / <n>`.
+				 * var()-substituted expressions lean on these - apple.com sizes its
+				 * card wrappers with calc(100% - var(--scale-offset)*1px) - and
+				 * bailing out made the whole length 'auto'. Exactly one factor may
+				 * carry a unit; it becomes the term's unit. */
+				for(;;)
+				{
+					const tchar_t* q = p;
+					while(*q == _t(' ')) q++;
+					if(*q != _t('*') && *q != _t('/')) break;
+					bool div = (*q == _t('/'));
+					q++;
+					while(*q == _t(' ')) q++;
+					const tchar_t* num2 = q;
+					if(*q == _t('+') || *q == _t('-')) q++;
+					bool digits2 = false;
+					while(t_isdigit(*q) || *q == _t('.')) { if(t_isdigit(*q)) digits2 = true; q++; }
+					if(!digits2) { ok = false; break; }
+					double v2 = (double) t_strtod(num2, 0);
+					const tchar_t* us2 = q;
+					if(*q == _t('%')) q++;
+					else while((*q >= _t('a') && *q <= _t('z')) || (*q >= _t('A') && *q <= _t('Z'))) q++;
+					size_t ul2 = (size_t)(q - us2);
+					if(div)
+					{
+						if(ul2 != 0 || v2 == 0) { ok = false; break; }
+						v /= v2;
+					}
+					else
+					{
+						if(ul2 != 0)
+						{
+							if(ul != 0) { ok = false; break; }
+							us = us2; ul = ul2;
+						}
+						v *= v2;
+					}
+					p = q;
+				}
+				if(!ok) break;
 				if(ul == 1 && us[0] == _t('%'))
 				{
+					pct += v; have_pct = true;
+				}
+				else if(ul == 3 && us[0] == _t('c') && us[1] == _t('q') && (us[2] == _t('w') || us[2] == _t('i')))
+				{
+					/* cqw/cqi inside calc(): same containing-block approximation
+					 * as document::cvt_units, folded straight into the % part. */
 					pct += v; have_pct = true;
 				}
 				else if(ul == 0 || (ul == 2 && us[0] == _t('p') && us[1] == _t('x')))

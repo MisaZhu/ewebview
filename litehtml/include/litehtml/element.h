@@ -19,8 +19,6 @@ namespace litehtml
 protected:
 	litehtml::element*			m_parent;
 	litehtml::document*			m_doc;
-		/* display:contents children already lifted into the parent. */
-		bool						m_contents_spliced;
 		litehtml::box*				m_box;
 		elements_vector				m_children;
 		position					m_pos;
@@ -144,9 +142,6 @@ protected:
 		 * protected m_children. Returns false when `el` is null. */
 		virtual bool				insertBefore(const ptr &el, const ptr &ref);
 		virtual void				clearRecursive();
-		/* display:contents support: lift this element's children into the
-		 * parent's child list (see element.cpp). */
-		void						splice_contents_children();
 
 		virtual const tchar_t*		get_tagName() const;
 		/* True only for html_tag and subclasses. Several element subclasses
@@ -173,6 +168,10 @@ protected:
 		 * function-local static would drag in libcxx's conflicting copy. */
 		virtual const string_map*	get_custom_props() const { return 0; }
 		virtual overflow			get_overflow() const;
+		/* Content-box height a child's percentage height resolves against:
+		 * the specified height minus padding+border under box-sizing:border-box.
+		 * html_tag overrides; the base has no box-sizing and returns h as is. */
+		virtual int					border_box_content_height(int h) const { return h; }
 
 		virtual css_length			get_css_left() const;
 		virtual css_length			get_css_right() const;
@@ -213,6 +212,10 @@ protected:
 		 * is resolved from the element's OWN font metrics and must NOT be
 		 * inherited as a pixel value by descendants (CSS 2.1 10.8.1). */
 		virtual bool				is_line_height_normal() const;
+		/* The unitless <number> a line-height was declared with (0 when it was
+		 * 'normal' or a length/percentage). Unitless line-height inherits as the
+		 * NUMBER and is re-multiplied by each descendant's own font size. */
+		virtual float				line_height_factor() const;
 		virtual text_align			get_text_align() const;
 		virtual text_transform		get_text_transform() const;
 		virtual white_space			get_white_space() const;
@@ -280,7 +283,7 @@ protected:
 		virtual bool				get_predefined_height(int& p_height) const;
 		virtual void				calc_document_size(litehtml::size& sz, int x = 0, int y = 0);
 		virtual void				get_redraw_box(litehtml::position& pos, int x = 0, int y = 0);
-		virtual void				add_style(const litehtml::style& st);
+		virtual void				add_style(const litehtml::style& st, const litehtml::selector_specificity& spec = litehtml::inline_style_specificity);
 		/* Form-widget part pseudo-elements (::-webkit-slider-thumb,
 		 * ::-moz-range-track, ...) hand their declaration block here instead of
 		 * being dropped as unknown pseudo-elements. The base ignores them;
