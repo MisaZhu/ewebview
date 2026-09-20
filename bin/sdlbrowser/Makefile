@@ -46,6 +46,12 @@ CFLAGS += $(SDL2_CFLAGS) -I $(TARGET_DIR)/include
 
 LDFLAGS += -L $(TARGET_DIR)/lib
 
+# Remove unreferenced functions/data after archive extraction. This linker
+# option is specific to Apple's ld; ELF linkers use section GC variants.
+ifeq ($(shell uname -s),Darwin)
+LDFLAGS += -Wl,-dead_strip
+endif
+
 # Link order matters: ewebview references litehtml/mario/webp/tinyhttpsc
 # symbols, and the SDL2 port inside libewebview.a references SDL2 companions.
 # libewebview.a is C++14 internally, so link with $(CXX) to pull in libstdc++.
@@ -83,6 +89,7 @@ all: $(TARGET)
 $(TARGET): $(OBJS) $(PROJ_LIBS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(OBJS) -o $@ $(LDFLAGS) $(LIBS)
+	strip -x $@
 	cp -r res $(dir $@)
 
 $(ARCH)/%.o: %.c

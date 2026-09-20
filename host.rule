@@ -48,8 +48,23 @@ ifeq ($(DEBUG),yes)
 CFLAGS +=  -g
 CXXFLAGS +=  -g
 else
-CFLAGS +=  -O2
-CXXFLAGS +=  -O2
+# Clang supports the more aggressive -Oz; GCC's size-optimized equivalent is
+# -Os. Keep the release flags portable across the macOS and Ubuntu CI jobs.
+ifeq ($(shell $(CC) --version 2>/dev/null | grep -qi clang && echo yes),yes)
+SIZE_OPT := -Oz
+else
+SIZE_OPT := -Os
+endif
+CFLAGS +=  $(SIZE_OPT) -ffunction-sections -fdata-sections
+CXXFLAGS +=  $(SIZE_OPT) -ffunction-sections -fdata-sections
+endif
+
+# Optional link-time optimization. Enable with `make LTO=yes`; keeping it
+# opt-in avoids changing the default build time and toolchain requirements.
+ifeq ($(LTO),yes)
+CFLAGS += -flto
+CXXFLAGS += -flto
+LDFLAGS += -flto
 endif
 
 # LITEHTML_LIFETIME_DEBUG is NOT a verbose-logging switch (that is XBROWSER_DEBUG):

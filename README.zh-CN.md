@@ -5,6 +5,7 @@
   <p><a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="许可证：Apache-2.0"></a></p>
   <table>
     <tr><th>平台</th><th>Runner</th><th>CI 状态</th></tr>
+    <tr><td>EwokOS</td><td><code>ubuntu-latest</code></td><td><a href="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml"><img src="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml/badge.svg?branch=main&job=build%20%28ewokos%29" alt="EwokOS CI"></a></td></tr>
     <tr><td>macOS</td><td><code>macos-14</code></td><td><a href="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml"><img src="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml/badge.svg?branch=main&job=build%20%28macos-14%29" alt="macOS CI"></a></td></tr>
     <tr><td>Linux</td><td><code>ubuntu-latest</code></td><td><a href="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml"><img src="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml/badge.svg?branch=main&job=build%20%28ubuntu-latest%29" alt="Linux CI"></a></td></tr>
   </table>
