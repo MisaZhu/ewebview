@@ -42,6 +42,7 @@ jobs:
           test -x build_aarch64/virt/bin/sdlbrowser
 
   ewokos-build:
+    name: build (ewokos)
     runs-on: ubuntu-latest
 
     steps:
@@ -61,7 +62,15 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes build-essential
+          sudo apt-get install --yes build-essential \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu
+
+      - name: Provide EwokOS toolchain names
+        run: |
+          for tool in gcc g++ c++ ar as ld objdump; do
+            sudo ln -sf "$(command -v aarch64-linux-gnu-$tool)" "/usr/local/bin/aarch64-none-elf-$tool"
+          done
 
       - name: Build EwokOS port
         working-directory: ewebview
