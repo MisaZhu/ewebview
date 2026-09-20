@@ -594,7 +594,26 @@ void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, con
 			add_parsed_property(tstring(name) + _t("-right"),		tokens[0], important);
 			add_parsed_property(tstring(name) + _t("-left"),		tokens[0], important);
 		}
-	} else 
+	} else
+
+	/* inset shorthand: top/right/bottom/left with margin's 1-4 value rules.
+	 * apple.com paints its card backgrounds with "::after{position:absolute;
+	 * inset:0}" - unmapped, the pseudo kept all four offsets auto and sat as
+	 * a 0x0 box under the card, so the tile had no fill at all. */
+	if(!t_strcmp(name, _t("inset")))
+	{
+		string_vector tokens;
+		split_string(val, tokens, _t(" "), _t(""), _t("("));
+		if(tokens.empty()) return;
+		const tstring& t = tokens[0];
+		const tstring& r = tokens.size() >= 2 ? tokens[1] : tokens[0];
+		const tstring& b = tokens.size() >= 3 ? tokens[2] : tokens[0];
+		const tstring& l = tokens.size() >= 4 ? tokens[3] : r;
+		add_parsed_property(_t("top"),    t, important);
+		add_parsed_property(_t("right"),  r, important);
+		add_parsed_property(_t("bottom"), b, important);
+		add_parsed_property(_t("left"),   l, important);
+	} else
 
 	// flex shorthand: none | auto | initial | [<grow> <shrink>? || <basis>].
 	// Expanded here so the cascade orders it against the longhands and so a

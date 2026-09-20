@@ -1060,34 +1060,85 @@ static bool sdl2_spec_from_files(sdl_face_spec_t* spec, const sdl_font_files_t* 
     return true;
 }
 
-/* SF Pro: named instances 1..9 are Ultralight..Black (100..900). Italic
- * lives in a sibling file with the same instance layout. */
-static bool sdl2_spec_sf(sdl_face_spec_t* spec, int weight, bool want_italic) {
-    const char* path = want_italic ? "/System/Library/Fonts/SFNSItalic.ttf"
-                                   : "/System/Library/Fonts/SFNS.ttf";
-    long inst;
-    if(!sdl2_file_exists(path)) {
-        if(!want_italic) return false;
-        path = "/System/Library/Fonts/SFNS.ttf";
-        if(!sdl2_file_exists(path)) return false;
-    }
-    inst = (weight + 50) / 100;
-    if(inst < 1) inst = 1;
-    if(inst > 9) inst = 9;
-    spec->path = path;
-    spec->index = inst << 16;
-    spec->synth = TTF_STYLE_NORMAL;
-    /* Probe: an older macOS ships SFNS without the instance table. */
-    {
-        TTF_Font* probe = TTF_OpenFontIndex(path, 16, spec->index);
-        if(!probe) {
-            spec->index = 0;
-            if(weight >= 600) spec->synth |= TTF_STYLE_BOLD;
-        } else {
-            TTF_CloseFont(probe);
+/* SF Pro is a variable font whose named-instance table is huge (five widths
+ * from Ultra Compressed to Semi Condensed x nine weights x G1..G4 optical
+ * grades, ~370 entries on recent macOS) and whose ORDER differs between
+ * releases: on macOS 15 the plain-width "Regular"/"Bold"/... sit around
+ * instance 206+, while instances 1..9 are "Ultra Compressed Ultralight" and
+ * friends - which is what every -apple-system page rendered with when we
+ * assumed 1..9 = 100..900. Walk the table once per file by style name and
+ * remember the plain-width instance for each CSS weight. */
+#define SDL_SF_WEIGHTS 9
+typedef struct {
+    const char* path;
+    int         scanned;
+    long        inst[SDL_SF_WEIGHTS];   /* named instance per weight, -1 = none */
+} sdl_sf_table_t;
+
+static sdl_sf_table_t s_sf_tables[2] = {
+    { "/System/Library/Fonts/SFNS.ttf",       0, {0} },
+    { "/System/Library/Fonts/SFNSItalic.ttf", 0, {0} },
+};
+
+/* Apple's weight names, in CSS 100..900 order. */
+static const char* const s_sf_weight_names[SDL_SF_WEIGHTS] = {
+    "Ultralight", "Thin", "Light", "Regular", "Medium", "Semibold", "Bold", "Heavy", "Black"
+};
+
+static void sdl2_sf_scan(sdl_sf_table_t* t) {
+    long i;
+    int k;
+    t->scanned = 1;
+    for(k = 0; k < SDL_SF_WEIGHTS; k++) t->inst[k] = -1;
+    /* FreeType rejects an out-of-range named instance, so the first failed
+     * open is the end of the table (or a pre-variable SFNS: nothing found). */
+    for(i = 1; i < 1024; i++) {
+        TTF_Font* probe = TTF_OpenFontIndex(t->path, 16, i << 16);
+        const char* style;
+        if(!probe) break;
+        style = TTF_FontFaceStyleName(probe);
+        for(k = 0; style && k < SDL_SF_WEIGHTS; k++) {
+            size_t n = strlen(s_sf_weight_names[k]);
+            /* Plain width only: the style is exactly "<Weight>" or
+             * "<Weight> Italic"; "Condensed Bold" / "Bold G2" don't match. */
+            if(SDL_strncasecmp(style, s_sf_weight_names[k], n) == 0 &&
+               (style[n] == 0 || SDL_strcasecmp(style + n, " Italic") == 0)) {
+                if(t->inst[k] < 0) t->inst[k] = i;
+                break;
+            }
         }
+        TTF_CloseFont(probe);
     }
-    if(want_italic && !strstr(path, "Italic")) spec->synth |= TTF_STYLE_ITALIC;
+}
+
+static bool sdl2_spec_sf(sdl_face_spec_t* spec, int weight, bool want_italic) {
+    sdl_sf_table_t* t = &s_sf_tables[want_italic ? 1 : 0];
+    int k, d;
+    long inst = -1;
+    if(!sdl2_file_exists(t->path)) {
+        if(!want_italic) return false;
+        t = &s_sf_tables[0];
+        if(!sdl2_file_exists(t->path)) return false;
+    }
+    if(!t->scanned) sdl2_sf_scan(t);
+    k = (weight + 50) / 100 - 1;
+    if(k < 0) k = 0;
+    if(k >= SDL_SF_WEIGHTS) k = SDL_SF_WEIGHTS - 1;
+    /* Exact weight, else the nearest one the table has. */
+    for(d = 0; d < SDL_SF_WEIGHTS && inst < 0; d++) {
+        if(k - d >= 0 && t->inst[k - d] >= 0) inst = t->inst[k - d];
+        else if(k + d < SDL_SF_WEIGHTS && t->inst[k + d] >= 0) inst = t->inst[k + d];
+    }
+    spec->path = t->path;
+    spec->synth = TTF_STYLE_NORMAL;
+    if(inst >= 0) {
+        spec->index = inst << 16;
+    } else {
+        /* No usable instance table: default face + synthetic bold. */
+        spec->index = 0;
+        if(weight >= 600) spec->synth |= TTF_STYLE_BOLD;
+    }
+    if(want_italic && !strstr(t->path, "Italic")) spec->synth |= TTF_STYLE_ITALIC;
     return true;
 }
 
@@ -1254,8 +1305,11 @@ static TTF_Font* sdl2_face_for(TTF_Font* prim, TTF_Font* fb, uint32_t cp) {
 }
 
 /* Split text into maximal same-face runs and call fn(face, run, len, ud).
- * Returns false when the whole string is a single primary run (the caller
- * can then use the plain single-face API with no copying). */
+ * Returns false only when the whole string is a single PRIMARY run (the
+ * caller can then use the plain single-face API with no copying). A string
+ * that is entirely fallback glyphs - litehtml hands us CJK one word at a
+ * time, so "默认字体" arrives on its own - is emitted as one fallback run;
+ * treating it as "not mixed" sent it to the Latin face and drew notdef boxes. */
 typedef void (*sdl2_run_fn)(TTF_Font* face, const char* run, int len, void* ud);
 static bool sdl2_for_each_run(TTF_Font* prim, TTF_Font* fb, const char* text, sdl2_run_fn fn, void* ud) {
     const char* p = text;
@@ -1274,7 +1328,11 @@ static bool sdl2_for_each_run(TTF_Font* prim, TTF_Font* fb, const char* text, sd
         }
         p += n;
     }
-    if(!mixed) return false;
+    if(!mixed) {
+        if(!run_face || run_face == prim) return false;
+        fn(run_face, text, (int)(p - text), ud);
+        return true;
+    }
     /* Second pass, now known to be mixed: emit the runs. */
     p = text; run_face = NULL; run_start = text;
     while(*p) {

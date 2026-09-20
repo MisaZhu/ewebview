@@ -1947,6 +1947,39 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 		grid_parse_tracks(tc, avail, m_font_size, get_document(), tracks, col_gap);
 	if(tracks.empty())
 	{
+		/* grid-auto-flow:column with no explicit template: every auto-placed
+		 * item opens a NEW implicit column sized by grid-auto-columns, so the
+		 * items sit side by side in one row. apple.com's banner-card sections
+		 * ("Switch to Mac") are exactly this - two cards in
+		 * 'grid-auto-flow:column; grid-auto-columns:minmax(0,1fr)' - and the
+		 * single-column fallback below stacked them vertically at full width. */
+		const tchar_t* af = get_style_property(_t("grid-auto-flow"), false, 0);
+		if(af && t_strstr(af, _t("column")))
+		{
+			int count = 0;
+			for(auto& el : m_children)
+			{
+				if(!el || !el->is_visible() || el->is_white_space()) continue;
+				if(el->get_display() == display_contents) continue;
+				element_position ep = el->get_element_position();
+				if(ep == element_position_absolute || ep == element_position_fixed) continue;
+				count++;
+			}
+			if(count > 0)
+			{
+				std::vector<grid_track> proto;
+				const tchar_t* ac = get_style_property(_t("grid-auto-columns"), false, 0);
+				if(ac)
+					grid_parse_tracks(ac, avail, m_font_size, get_document(), proto, col_gap);
+				if(proto.empty())
+					proto.push_back(grid_track());   /* auto -> 1fr */
+				for(int i = 0; i < count; i++)
+					tracks.push_back(proto[i % (int)proto.size()]);
+			}
+		}
+	}
+	if(tracks.empty())
+	{
 		/* A grid with no grid-template-columns still gets ONE implicit column,
 		 * but only when a child actually places itself: apple.com's gallery
 		 * cards are display:grid with no template and stack artwork + overlay
