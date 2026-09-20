@@ -17,6 +17,28 @@ static inline uint64_t sys_tic_ms(uint32_t)
 
 namespace litehtml
 {
+#if !defined(WIN32) && !defined(WINCE)
+inline int litehtml_strncasecmp(const char* lhs, const char* rhs, size_t count)
+{
+	for (size_t i = 0; i < count; ++i) {
+		unsigned char lc = (unsigned char) tolower((unsigned char) lhs[i]);
+		unsigned char rc = (unsigned char) tolower((unsigned char) rhs[i]);
+		if (lc != rc || lc == '\0' || rc == '\0') return (int) lc - (int) rc;
+	}
+	return 0;
+}
+
+inline int litehtml_strcasecmp(const char* lhs, const char* rhs)
+{
+	while (*lhs || *rhs) {
+		unsigned char lc = (unsigned char) tolower((unsigned char) *lhs++);
+		unsigned char rc = (unsigned char) tolower((unsigned char) *rhs++);
+		if (lc != rc) return (int) lc - (int) rc;
+	}
+	return 0;
+}
+#endif
+
 #if defined( WIN32 ) || defined( WINCE )
 
 #ifndef LITEHTML_UTF8
@@ -85,8 +107,8 @@ namespace litehtml
 
 	// CSS keyword / colour-name matching is case-insensitive per spec;
 	// a plain strcmp here silently dropped every lower-case named color.
-	#define t_strcasecmp		strcasecmp
-	#define t_strncasecmp		strncasecmp
+	#define t_strcasecmp		::litehtml::litehtml_strcasecmp
+	#define t_strncasecmp		::litehtml::litehtml_strncasecmp
 	#define t_itoa(value, buffer, size, radix)	snprintf(buffer, size, "%d", value)
 
 	#define t_strtol			strtol
