@@ -2,6 +2,19 @@ ifeq ($(PORTING),)
 export PORTING = sdl2
 endif
 
+# An EwokOS cross build has no host SDL2 stack: port_sdl2.c includes
+# <SDL.h> and links host dylibs, so it must never be compiled with
+# aarch64-none-elf. A PORTING=sdl2 leaked from the environment (e.g.
+# exported during a host sdlbrowser build) used to ride the recursion
+# down to ewebview/Makefile and do exactly that. Pin the port to ewokos
+# whenever we cross for the OS.
+ifeq ($(OS_TYPE),ewokos)
+ifneq ($(PORTING),ewokos)
+$(warning ignoring PORTING=$(PORTING): OS_TYPE=ewokos cross build uses the ewokos port)
+export PORTING := ewokos
+endif
+endif
+
 DIRS = libtinyhttpsc libwebp jsnative litehtml
 
 ARCH ?= aarch64
