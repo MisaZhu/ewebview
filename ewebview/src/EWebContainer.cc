@@ -1555,6 +1555,26 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
         return;
     const eweb_gfx_t* gfx = &m_port->gfx;
 
+    /* CSS transform on the painted box. litehtml lays boxes out UNtransformed
+     * and hands the transform to the container at paint time (push_paint_
+     * transform); the border path already applies it via M[4]/M[5]. The
+     * ubiquitous centering idiom - left:50% + translate(-50%,-50%) (or just
+     * translateX(-50%)) - is a PURE translation, i.e. a plain additive pixel
+     * offset in the absolute paint space. The software HAL has no transformed
+     * blit, but a translate needs none: shift the image/gradient background by
+     * (M[4],M[5]) so it tracks its box. Without this the hero image keeps its
+     * left edge at the container centre and spills off the right edge, so x
+     * lands at ~2x the intended value while y (no translate) stays correct
+     * (apple.com iPhone hero). Non-translate matrices (scale/rotate) can't be
+     * done with a rect blit, so they keep the current untransformed path. */
+    int xf_dx = 0, xf_dy = 0;
+    if (m_xform_on &&
+        fabsf(m_xform[0] - 1.0f) < 1e-3f && fabsf(m_xform[1]) < 1e-3f &&
+        fabsf(m_xform[2]) < 1e-3f && fabsf(m_xform[3] - 1.0f) < 1e-3f) {
+        xf_dx = (int)lroundf(m_xform[4]);
+        xf_dy = (int)lroundf(m_xform[5]);
+    }
+
     /* Outer shadows paint behind the element's background. CSS lists the
      * front-most shadow first, therefore render in reverse declaration order. */
     if (!bg.box_shadow.empty()) {
@@ -1660,7 +1680,7 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
              * scales it by tmp's own dpr); tmp was created at cb.width x
              * cb.height logical, so passing the device-pixel tw/th here
              * double-scaled the src rect on HiDPI (dpr=2). */
-            gfx->blit_fit_alpha(gfx->ud, tmp, 0, 0, cb.width, cb.height, s, cb.x, cb.y, cb.width, cb.height, 0xFF);
+            gfx->blit_fit_alpha(gfx->ud, tmp, 0, 0, cb.width, cb.height, s, cb.x + xf_dx, cb.y + xf_dy, cb.width, cb.height, 0xFF);
         }
         gfx->surface_free(gfx->ud, tmp);
         return;
@@ -1692,29 +1712,34 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
                     if (tw <= 0 || th <= 0)
                         return;
                     const litehtml::position& cb = bg.clip_box;
+                    /* Shift the whole tile grid + clip bounds by the box's
+                     * paint translate so a translateX(-50%) hero image centres
+                     * instead of spilling off the right edge (see xf_dx above). */
+                    int cbx = cb.x + xf_dx;
+                    int cby = cb.y + xf_dy;
                     bool tile_x = (bg.repeat == litehtml::background_repeat_repeat ||
                                    bg.repeat == litehtml::background_repeat_repeat_x);
                     bool tile_y = (bg.repeat == litehtml::background_repeat_repeat ||
                                    bg.repeat == litehtml::background_repeat_repeat_y);
-                    int x0 = bg.position_x;
-                    int y0 = bg.position_y;
+                    int x0 = bg.position_x + xf_dx;
+                    int y0 = bg.position_y + xf_dy;
                     if (tile_x) {
-                        while (x0 > cb.x) x0 -= tw;
-                        while (x0 + tw <= cb.x) x0 += tw;
+                        while (x0 > cbx) x0 -= tw;
+                        while (x0 + tw <= cbx) x0 += tw;
                     }
                     if (tile_y) {
-                        while (y0 > cb.y) y0 -= th;
-                        while (y0 + th <= cb.y) y0 += th;
+                        while (y0 > cby) y0 -= th;
+                        while (y0 + th <= cby) y0 += th;
                     }
-                    int y_end = cb.y + cb.height;
-                    int x_end = cb.x + cb.width;
+                    int y_end = cby + cb.height;
+                    int x_end = cbx + cb.width;
                     for (int ty = y0; ty < y_end; ty += th) {
                         if (!tile_y && ty != y0) break;
                         for (int tx = x0; tx < x_end; tx += tw) {
                             if (!tile_x && tx != x0) break;
                             /* dst = tile rect intersected with the clip box */
-                            int dx = tx > cb.x ? tx : cb.x;
-                            int dy = ty > cb.y ? ty : cb.y;
+                            int dx = tx > cbx ? tx : cbx;
+                            int dy = ty > cby ? ty : cby;
                             int dr = (tx + tw) < x_end ? (tx + tw) : x_end;
                             int db = (ty + th) < y_end ? (ty + th) : y_end;
                             int dw = dr - dx;
@@ -2373,8 +2398,15 @@ void EWebContainer::get_media_features(litehtml::media_features& media) const
     media.type       = litehtml::media_type_screen;
     media.width      = client.width;
     media.height     = client.height;
-    media.device_width  = 640;
-    media.device_height = 480;
+    /* Real window pixel size: on this device the browser IS the whole screen,
+     * so device pixels equal the client viewport (dpr 1:1). The old hardcoded
+     * 640x480 made every device-width media query evaluate as a small phone:
+     * apple.com then painted its mobile nav overlay on top of the desktop nav
+     * (doubled/ghost labels) and its mobile-only absolutely-positioned hero
+     * art at mobile offsets (iPhone bitmap stranded at the right edge), while
+     * plain width-based centring stayed correct. */
+    media.device_width  = client.width;
+    media.device_height = client.height;
     media.color     = 8;
     media.monochrome  = 0;
     media.color_index = 256;

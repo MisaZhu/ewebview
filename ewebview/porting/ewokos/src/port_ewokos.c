@@ -43,67 +43,129 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>   /* strcasecmp */
+#include <math.h>      /* lroundf: logical<->device pixel rounding */
 
 /* ------------------------------------------------------------------ */
 /* Handle <-> concrete type                                            */
 /* ------------------------------------------------------------------ */
 
-#define G(s)  ((graph_t*)(s))
-#define SG(g) ((eweb_surface_t*)(g))
+/* HiDPI mechanism: an eweb_surface_t handle is an ek_surf_t wrapping a
+ * DEVICE-pixel graph_t (g->w/h == lw*dpr x lh*dpr). The core lays out and
+ * draws in LOGICAL (CSS) pixels - surface_dims reports lw/lh - and every
+ * draw/font callback scales the incoming logical coordinates up by the target
+ * surface's dpr, so the page can rasterise at native resolution while layout,
+ * media queries and srcset selection stay in CSS pixels. Decoded images are
+ * natural-pixel buffers with dpr == 1; blit scales the src rect by the
+ * source's dpr and the dst rect by the destination's.
+ *
+ * On EwokOS the embedder sets dpr = 1 by default (see WidgetWebview), so every
+ * path below is numerically identical to a plain 1x port - no scaling. The
+ * machinery only kicks in when a caller opts into a higher ratio. */
+typedef struct {
+    graph_t* g;    /* device-pixel buffer: w = lw*dpr, h = lh*dpr        */
+    int      lw;   /* logical (CSS) width the core sees via surface_dims */
+    int      lh;   /* logical (CSS) height                               */
+    float    dpr;  /* device px per logical px (decoded images: 1)       */
+} ek_surf_t;
+
+/* Device pixels per logical (CSS) pixel, set by the embedder via
+ * eweb_port_ewokos_set_dpr() BEFORE the first ewebview_set_viewport so the
+ * frame pool allocates at the right device size. 1.0 == plain 1x port. */
+static float g_dpr = 1.0f;
+
+#define S(h)  ((ek_surf_t*)(h))
+#define SH(s) ((eweb_surface_t*)(s))
+#define G(h)  (S(h)->g)
 #define FT(f) ((font_t*)(f))
 #define EF(f) ((eweb_font_t*)(f))
+
+/* Scale a logical coordinate/length into a surface's device pixels. */
+#define X(h, v) ((int)lroundf((float)(v) * S(h)->dpr))
+
+/* Wrap a freshly created/decoded device graph_t in a surface handle. The
+ * caller-visible (logical) size equals the buffer size scaled back by dpr. */
+static eweb_surface_t* ek_wrap(graph_t* g, float dpr) {
+    ek_surf_t* s;
+    if(!g) return NULL;
+    s = (ek_surf_t*)calloc(1, sizeof(*s));
+    if(!s) { graph_free(g); return NULL; }
+    s->g = g;
+    s->dpr = (dpr > 0.0f) ? dpr : 1.0f;
+    s->lw = (int)lroundf((float)g->w / s->dpr);
+    s->lh = (int)lroundf((float)g->h / s->dpr);
+    if(s->lw <= 0) s->lw = g->w;
+    if(s->lh <= 0) s->lh = g->h;
+    return SH(s);
+}
 
 /* ------------------------------------------------------------------ */
 /* Graphics / surface                                                  */
 /* ------------------------------------------------------------------ */
 
 static eweb_surface_t* ek_surface_new(void* ud, int w, int h) {
+    ek_surf_t* s;
+    int dw, dh;
     (void)ud;
     if(w <= 0 || h <= 0) return NULL;
-    return SG(graph_new(NULL, w, h));
+    dw = (int)lroundf((float)w * g_dpr);
+    dh = (int)lroundf((float)h * g_dpr);
+    if(dw <= 0) dw = 1;
+    if(dh <= 0) dh = 1;
+    s = (ek_surf_t*)calloc(1, sizeof(*s));
+    if(!s) return NULL;
+    s->g = graph_new(NULL, dw, dh);
+    if(!s->g) { free(s); return NULL; }
+    s->lw = w; s->lh = h; s->dpr = g_dpr;
+    return SH(s);
 }
 static void ek_surface_free(void* ud, eweb_surface_t* s) {
     (void)ud;
-    if(s) graph_free(G(s));
+    if(!s) return;
+    if(G(s)) graph_free(G(s));
+    free(S(s));
 }
 static void ek_surface_dims(void* ud, eweb_surface_t* s, int* w, int* h) {
     (void)ud;
-    graph_t* g = G(s);
-    if(w) *w = g ? g->w : 0;
-    if(h) *h = g ? g->h : 0;
+    /* LOGICAL (CSS) size: the core lays out in these units. */
+    if(w) *w = s ? S(s)->lw : 0;
+    if(h) *h = s ? S(s)->lh : 0;
 }
 static uint32_t* ek_surface_pixels(void* ud, eweb_surface_t* s, int* w, int* h) {
+    graph_t* g;
     (void)ud;
-    graph_t* g = G(s);
+    g = s ? G(s) : NULL;
     if(!g) { if(w) *w = 0; if(h) *h = 0; return NULL; }
+    /* DEVICE pixels: raw buffer for getImageData/putImageData + rounded masks. */
     if(w) *w = g->w;
     if(h) *h = g->h;
     return g->buffer;
 }
-static void* ek_surface_native(void* ud, eweb_surface_t* s) { (void)ud; return (void*)G(s); }
+static void* ek_surface_native(void* ud, eweb_surface_t* s) { (void)ud; return s ? (void*)G(s) : NULL; }
 static void ek_surface_clear(void* ud, eweb_surface_t* s, uint32_t c) { (void)ud; if(s) graph_clear(G(s), c); }
-static void ek_surface_set_clip(void* ud, eweb_surface_t* s, int x, int y, int w, int h) { (void)ud; if(s) graph_set_clip(G(s), x, y, w, h); }
+static void ek_surface_set_clip(void* ud, eweb_surface_t* s, int x, int y, int w, int h) { (void)ud; if(s) graph_set_clip(G(s), X(s,x), X(s,y), X(s,w), X(s,h)); }
 static void ek_surface_unset_clip(void* ud, eweb_surface_t* s) { (void)ud; if(s) graph_unset_clip(G(s)); }
 
-static void ek_fill_rect(void* ud, eweb_surface_t* s, int x, int y, int w, int h, uint32_t c) { (void)ud; if(s) graph_fill_rect(G(s), x, y, w, h, c); }
-static void ek_rect(void* ud, eweb_surface_t* s, int x, int y, int w, int h, uint32_t c) { (void)ud; if(s) graph_rect(G(s), x, y, w, h, c); }
-static void ek_line(void* ud, eweb_surface_t* s, int x0, int y0, int x1, int y1, uint32_t c) { (void)ud; if(s) graph_line(G(s), x0, y0, x1, y1, c); }
-static void ek_wline(void* ud, eweb_surface_t* s, int x0, int y0, int x1, int y1, int w, uint32_t c) { (void)ud; if(s) graph_wline(G(s), x0, y0, x1, y1, (uint32_t)w, c); }
+static void ek_fill_rect(void* ud, eweb_surface_t* s, int x, int y, int w, int h, uint32_t c) { (void)ud; if(s) graph_fill_rect(G(s), X(s,x), X(s,y), X(s,w), X(s,h), c); }
+static void ek_rect(void* ud, eweb_surface_t* s, int x, int y, int w, int h, uint32_t c) { (void)ud; if(s) graph_rect(G(s), X(s,x), X(s,y), X(s,w), X(s,h), c); }
+static void ek_line(void* ud, eweb_surface_t* s, int x0, int y0, int x1, int y1, uint32_t c) { (void)ud; if(s) graph_line(G(s), X(s,x0), X(s,y0), X(s,x1), X(s,y1), c); }
+static void ek_wline(void* ud, eweb_surface_t* s, int x0, int y0, int x1, int y1, int w, uint32_t c) { (void)ud; if(s) graph_wline(G(s), X(s,x0), X(s,y0), X(s,x1), X(s,y1), (uint32_t)X(s,w), c); }
 
-static void ek_circle(void* ud, eweb_surface_t* s, int x, int y, int r, int rw, uint32_t c) { (void)ud; if(s) graph_circle(G(s), x, y, r, rw, c); }
-static void ek_fill_circle(void* ud, eweb_surface_t* s, int x, int y, int r, uint32_t c) { (void)ud; if(s) graph_fill_circle(G(s), x, y, r, c); }
-static void ek_arc(void* ud, eweb_surface_t* s, int x, int y, int r, int rw, float a0, float a1, uint32_t c) { (void)ud; if(s) graph_arc(G(s), x, y, r, rw, a0, a1, c); }
-static void ek_fill_arc(void* ud, eweb_surface_t* s, int x, int y, int r, float a0, float a1, uint32_t c) { (void)ud; if(s) graph_fill_arc(G(s), x, y, r, a0, a1, c); }
+static void ek_circle(void* ud, eweb_surface_t* s, int x, int y, int r, int rw, uint32_t c) { (void)ud; if(s) graph_circle(G(s), X(s,x), X(s,y), X(s,r), X(s,rw), c); }
+static void ek_fill_circle(void* ud, eweb_surface_t* s, int x, int y, int r, uint32_t c) { (void)ud; if(s) graph_fill_circle(G(s), X(s,x), X(s,y), X(s,r), c); }
+static void ek_arc(void* ud, eweb_surface_t* s, int x, int y, int r, int rw, float a0, float a1, uint32_t c) { (void)ud; if(s) graph_arc(G(s), X(s,x), X(s,y), X(s,r), X(s,rw), a0, a1, c); }
+static void ek_fill_arc(void* ud, eweb_surface_t* s, int x, int y, int r, float a0, float a1, uint32_t c) { (void)ud; if(s) graph_fill_arc(G(s), X(s,x), X(s,y), X(s,r), a0, a1, c); }
 
-static void ek_round(void* ud, eweb_surface_t* s, int x, int y, int w, int h, int r, int rw, uint32_t c) { (void)ud; if(s) graph_round(G(s), x, y, w, h, r, rw, c); }
-static void ek_fill_round(void* ud, eweb_surface_t* s, int x, int y, int w, int h, int r, uint32_t c) { (void)ud; if(s) graph_fill_round(G(s), x, y, w, h, r, c); }
+static void ek_round(void* ud, eweb_surface_t* s, int x, int y, int w, int h, int r, int rw, uint32_t c) { (void)ud; if(s) graph_round(G(s), X(s,x), X(s,y), X(s,w), X(s,h), X(s,r), X(s,rw), c); }
+static void ek_fill_round(void* ud, eweb_surface_t* s, int x, int y, int w, int h, int r, uint32_t c) { (void)ud; if(s) graph_fill_round(G(s), X(s,x), X(s,y), X(s,w), X(s,h), X(s,r), c); }
 
 static void ek_stroke_quadratic(void* ud, eweb_surface_t* s, int x0, int y0, int cx, int cy, int x1, int y1, int w, uint32_t c) {
-    (void)ud; if(s) graph_quadratic_curve_w(G(s), x0, y0, cx, cy, x1, y1, w, c);
+    (void)ud; if(s) graph_quadratic_curve_w(G(s), X(s,x0), X(s,y0), X(s,cx), X(s,cy), X(s,x1), X(s,y1), X(s,w), c);
 }
 static void ek_stroke_bezier(void* ud, eweb_surface_t* s, int x0, int y0, int cx1, int cy1, int cx2, int cy2, int x1, int y1, int w, uint32_t c) {
-    (void)ud; if(s) graph_bezier_curve_w(G(s), x0, y0, cx1, cy1, cx2, cy2, x1, y1, w, c);
+    (void)ud; if(s) graph_bezier_curve_w(G(s), X(s,x0), X(s,y0), X(s,cx1), X(s,cy1), X(s,cx2), X(s,cy2), X(s,x1), X(s,y1), X(s,w), c);
 }
+/* Pure geometry (no surface): the core rasterises the returned points through
+ * the scaled primitives above, so flattening stays in logical space. */
 static int ek_flatten_quadratic(void* ud, float x0, float y0, float cx, float cy, float x1, float y1, float* xy, int max_pts) {
     (void)ud; return graph_flatten_quadratic(x0, y0, cx, cy, x1, y1, xy, max_pts);
 }
@@ -111,28 +173,37 @@ static int ek_flatten_cubic(void* ud, float x0, float y0, float cx1, float cy1, 
     (void)ud; return graph_flatten_cubic(x0, y0, cx1, cy1, cx2, cy2, x1, y1, xy, max_pts);
 }
 
-static void ek_set_pixel(void* ud, eweb_surface_t* s, int x, int y, uint32_t c) { (void)ud; if(s) graph_pixel(G(s), x, y, c); }
-static uint32_t ek_get_pixel(void* ud, eweb_surface_t* s, int x, int y) { (void)ud; return s ? graph_get_pixel(G(s), x, y) : 0; }
+static void ek_set_pixel(void* ud, eweb_surface_t* s, int x, int y, uint32_t c) { (void)ud; if(s) graph_pixel(G(s), X(s,x), X(s,y), c); }
+static uint32_t ek_get_pixel(void* ud, eweb_surface_t* s, int x, int y) { (void)ud; return s ? graph_get_pixel(G(s), X(s,x), X(s,y)) : 0; }
 
 static void ek_blit(void* ud, eweb_surface_t* src, int sx, int sy, int sw, int sh,
                     eweb_surface_t* dst, int dx, int dy, int dw, int dh) {
+    int SX, SY, SW, SH, DX, DY, DW, DH;
     (void)ud;
     if(!src || !dst) return;
-    /* graph_blt() intersects the source and destination rectangles as a 1:1
-     * copy before entering its resampler. When a HiDPI image is drawn from a
-     * larger source rectangle into a smaller CSS-sized destination, that step
-     * truncates the source to dw x dh and only the first part of the image is
-     * visible. Use the graph library's scaling primitive whenever the two
-     * rectangles differ; retain graph_blt() for the fast exact-copy path. */
-    if(sw == dw && sh == dh)
-        graph_blt(G(src), sx, sy, sw, sh, G(dst), dx, dy, dw, dh);
+    /* Source rect in the source's device px, destination rect in the dst's
+     * device px. When an image (dpr==1) is drawn into a HiDPI frame (dpr==N)
+     * only the dst side scales, so the source is not truncated to the CSS box.
+     * graph_blt() is a 1:1 copy; anything scaled goes through graph_blt_fit(). */
+    SX = (int)lroundf((float)sx * S(src)->dpr); SY = (int)lroundf((float)sy * S(src)->dpr);
+    SW = (int)lroundf((float)sw * S(src)->dpr); SH = (int)lroundf((float)sh * S(src)->dpr);
+    DX = (int)lroundf((float)dx * S(dst)->dpr); DY = (int)lroundf((float)dy * S(dst)->dpr);
+    DW = (int)lroundf((float)dw * S(dst)->dpr); DH = (int)lroundf((float)dh * S(dst)->dpr);
+    if(SW == DW && SH == DH)
+        graph_blt(G(src), SX, SY, SW, SH, G(dst), DX, DY, DW, DH);
     else
-        graph_blt_fit(G(src), sx, sy, sw, sh, G(dst), dx, dy, dw, dh);
+        graph_blt_fit(G(src), SX, SY, SW, SH, G(dst), DX, DY, DW, DH);
 }
 static void ek_blit_fit_alpha(void* ud, eweb_surface_t* src, int sx, int sy, int sw, int sh,
                               eweb_surface_t* dst, int dx, int dy, int dw, int dh, uint8_t alpha) {
+    int SX, SY, SW, SH, DX, DY, DW, DH;
     (void)ud;
-    if(src && dst) graph_blt_fit_alpha(G(src), sx, sy, sw, sh, G(dst), dx, dy, dw, dh, alpha);
+    if(!src || !dst) return;
+    SX = (int)lroundf((float)sx * S(src)->dpr); SY = (int)lroundf((float)sy * S(src)->dpr);
+    SW = (int)lroundf((float)sw * S(src)->dpr); SH = (int)lroundf((float)sh * S(src)->dpr);
+    DX = (int)lroundf((float)dx * S(dst)->dpr); DY = (int)lroundf((float)dy * S(dst)->dpr);
+    DW = (int)lroundf((float)dw * S(dst)->dpr); DH = (int)lroundf((float)dh * S(dst)->dpr);
+    graph_blt_fit_alpha(G(src), SX, SY, SW, SH, G(dst), DX, DY, DW, DH, alpha);
 }
 
 /* ------------------------------------------------------------------ */
@@ -147,39 +218,56 @@ static eweb_font_t* ek_font_create(void* ud, const char* family) {
 static void ek_font_destroy(void* ud, eweb_font_t* f) { (void)ud; if(f) font_free(FT(f)); }
 
 static void ek_font_metrics(void* ud, eweb_font_t* f, int size, eweb_font_metrics_t* out) {
+    int dsize;
     (void)ud;
     if(!out) return;
     out->ascent = out->descent = out->height = out->x_height = 0;
     if(!f) return;
+    /* Measure at DEVICE size (size*dpr) and report LOGICAL metrics (/dpr), so
+     * the layout units match the glyphs draw_text() rasterises at device size. */
+    dsize = (int)lroundf((float)size * g_dpr);
+    if(dsize <= 0) dsize = size;
     face_info_t face;
-    if(font_get_face(FT(f), (uint32_t)size, &face) == 0) {
+    if(font_get_face(FT(f), (uint32_t)dsize, &face) == 0) {
         const int DENT = 64;   /* FreeType 26.6 fixed point */
-        out->ascent  = face.ascender / DENT;
-        out->descent = face.descender / DENT;
-        out->height  = (int)(face.height / DENT);
+        out->ascent  = (int)lroundf((float)(face.ascender / DENT) / g_dpr);
+        out->descent = (int)lroundf((float)(face.descender / DENT) / g_dpr);
+        out->height  = (int)lroundf((float)(face.height / DENT) / g_dpr);
     }
     uint32_t xh = 0;
-    font_char_size('x', FT(f), (uint32_t)size, &xh, NULL);
-    out->x_height = (int)xh;
+    font_char_size('x', FT(f), (uint32_t)dsize, &xh, NULL);
+    out->x_height = (int)lroundf((float)xh / g_dpr);
 }
 static int ek_font_char_width(void* ud, eweb_font_t* f, int size, uint32_t codepoint) {
+    int dsize;
+    uint32_t w = 0;
     (void)ud;
     if(!f) return 0;
-    uint32_t w = 0;
-    font_char_size(codepoint, FT(f), (uint32_t)size, &w, NULL);
-    return (int)w;
+    dsize = (int)lroundf((float)size * g_dpr);
+    if(dsize <= 0) dsize = size;
+    font_char_size(codepoint, FT(f), (uint32_t)dsize, &w, NULL);
+    return (int)lroundf((float)w / g_dpr);
 }
 static void ek_font_text_size(void* ud, eweb_font_t* f, int size, const char* text, int* w, int* h) {
-    (void)ud;
+    int dsize;
     uint32_t ww = 0, hh = 0;
-    if(f && text) font_text_size(text, FT(f), (uint32_t)size, &ww, &hh);
-    if(w) *w = (int)ww;
-    if(h) *h = (int)hh;
+    (void)ud;
+    dsize = (int)lroundf((float)size * g_dpr);
+    if(dsize <= 0) dsize = size;
+    if(f && text) font_text_size(text, FT(f), (uint32_t)dsize, &ww, &hh);
+    if(w) *w = (int)lroundf((float)ww / g_dpr);
+    if(h) *h = (int)lroundf((float)hh / g_dpr);
 }
 static void ek_font_draw_text(void* ud, eweb_surface_t* s, int x, int y, const char* text,
                               eweb_font_t* f, int size, uint32_t color) {
+    int dsize;
     (void)ud;
-    if(s && f && text) graph_draw_text_font(G(s), x, y, text, FT(f), (uint32_t)size, color);
+    if(!s || !f || !text) return;
+    /* Draw at DEVICE coordinates and rasterise the glyphs at device size for a
+     * crisp result; the pen advance then matches ek_font_text_size() above. */
+    dsize = (int)lroundf((float)size * S(s)->dpr);
+    if(dsize <= 0) dsize = size;
+    graph_draw_text_font(G(s), X(s,x), X(s,y), text, FT(f), (uint32_t)dsize, color);
 }
 
 /* ------------------------------------------------------------------ */
@@ -220,11 +308,13 @@ static eweb_surface_t* ek_image_decode(void* ud, const uint8_t* data, int size) 
     if(!data || size <= 0) return NULL;
     if(ek_looks_like_svg(data, size)) {
         graph_t* svg = graph_image_new_from_data(GRAPH_IMAGE_TYPE_SVG, data, (uint32_t)size);
-        if(svg) return SG(svg);
+        if(svg) return ek_wrap(svg, 1.0f);
     }
     img = ek_webp_new_from_data(data, (uint32_t)size);
     if(!img) img = graph_image_new_from_data(GRAPH_IMAGE_TYPE_AUTO, data, size);
-    return SG(img);
+    /* Natural-pixel image: dpr == 1, so its logical size is its pixel size and
+     * ek_blit scales it up to the destination frame's dpr. */
+    return ek_wrap(img, 1.0f);
 }
 
 /* ------------------------------------------------------------------ */
@@ -555,4 +645,18 @@ void eweb_port_ewokos(eweb_port_t* port, void* ud) {
     port->sys.log          = ek_sys_log;
     port->sys.clipboard_get = ek_sys_clipboard_get;
     port->sys.clipboard_set = ek_sys_clipboard_set;
+}
+
+/* HiDPI mechanism: set the device-pixel ratio the port rasterises at. Call
+ * BEFORE the first ewebview_set_viewport() so the frame pool allocates
+ * device-sized (logical*dpr) buffers. EwokOS embedder passes 1.0 by default,
+ * i.e. a plain 1x port with no scaling. */
+void eweb_port_ewokos_set_dpr(float dpr) {
+    g_dpr = (dpr > 0.0f) ? dpr : 1.0f;
+}
+
+/* Recover the device-pixel graph_t* backing a surface handle so an embedder
+ * can blit an adopted frame straight into its window. NULL-safe. */
+void* eweb_port_ewokos_surface_native(eweb_surface_t* s) {
+    return s ? (void*)G(s) : NULL;
 }

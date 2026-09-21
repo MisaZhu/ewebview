@@ -1,4 +1,15 @@
-# ewebview
+<div align="center">
+  <h1>ewebview</h1>
+  <p>A self-contained embedded Web engine for resource-constrained systems and bare-metal environments.</p>
+  <p><a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a></p>
+  <p><a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a></p>
+  <table>
+    <tr><th>Platform</th><th>Runner</th><th>CI</th></tr>
+    <tr><td>macOS</td><td><code>macos-14</code></td><td><a href="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml"><img src="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml/badge.svg?branch=main&job=build%20%28macos-14%29" alt="macOS CI"></a></td></tr>
+    <tr><td>EwokOS</td><td><code>ubuntu-latest</code> + <code>EwokOS Toolchain</code></td><td><a href="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml"><img src="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml/badge.svg?branch=main&job=build%20%28ewokos%29" alt="EwokOS CI"></a></td></tr>
+    <tr><td>Linux</td><td><code>ubuntu-latest</code></td><td><a href="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml"><img src="https://github.com/MisaZhu/ewebview/actions/workflows/ci.yml/badge.svg?branch=main&job=build%20%28ubuntu-latest%29" alt="Linux CI"></a></td></tr>
+  </table>
+</div>
 
 **ewebview** is a self-contained embedded Web engine (HTML + CSS + JavaScript) targeting resource-constrained operating systems and bare-metal environments. It renders web pages into an abstract ARGB8888 memory canvas (`eweb_surface_t`); all platform-specific concerns — graphics, fonts, image decoding, networking, and clock — are injected through the `eweb_port_t` callback table (HAL). The core code has no dependency on any specific OS, windowing system, or graphics library.
 

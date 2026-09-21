@@ -144,13 +144,10 @@ static void flex_parse_gap(html_tag* el, int avail, int& row_gap, int& col_gap)
 static int grid_max_content_width(litehtml::html_tag* el, int avail);
 
 static int preferred_content_width_impl(const litehtml::element::ptr& el);
-static int pcw_depth = 0;
 static int preferred_content_width(const litehtml::element::ptr& el)
 {
 	if(!el) return 0;
-	pcw_depth++;
 	int r = preferred_content_width_impl(el);
-	pcw_depth--;
 
 	/* A box's intrinsic contribution is clamped by definite min/max widths.
 	 * Without this, a width:100% wrapper around a max-width:344px card reported
@@ -174,16 +171,6 @@ static int preferred_content_width(const litehtml::element::ptr& el)
 	int min_w = width_limit(_t("min-width"));
 	if(min_w >= 0 && r < min_w) r = min_w;
 
-	static const char* dbg = getenv("EWEB_PCWDBG");
-	if(dbg)
-	{
-		const litehtml::tchar_t* cls = el->get_attr(_t("class"), _t(""));
-		const litehtml::tchar_t* tag = el->get_tagName();
-		if(pcw_depth < 12)
-			fprintf(stderr, "PCW %*s<%s class=\"%.40s\"> disp=%d ws=%d ml=%d mr=%d -> %d\n", pcw_depth*2, "",
-				tag ? tag : "", cls ? cls : "", (int)el->get_display(), (int)el->is_white_space(),
-				el->margin_left(), el->margin_right(), r);
-	}
 	return r;
 }
 static int preferred_content_width_impl(const litehtml::element::ptr& el)
@@ -465,13 +452,6 @@ static int flex_min_content_inner(const litehtml::element::ptr& el)
 		int inner = emw - el->padding_left() - el->padding_right() -
 					el->border_left() - el->border_right();
 		if(inner > w) w = inner;
-	}
-	if(getenv("EWEB_PCWDBG") && pcw_depth < 8)
-	{
-		pcw_depth++;
-		fprintf(stderr, "MINC %*s<%s class=\"%.40s\"> disp=%d -> %d (emw=%d)\n", pcw_depth*2, "",
-			el->get_tagName() ? el->get_tagName() : "", el->get_attr(_t("class"), _t("")), (int)el->get_display(), w, emw);
-		pcw_depth--;
 	}
 	return w;
 }

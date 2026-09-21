@@ -377,6 +377,8 @@ namespace litehtml
 		 * then recurse into children. Called by set_animated_opacity. */
 		void						propagate_opacity_cum();
 		bool						push_css_clip(uint_ptr hdc, int x, int y);
+		bool						css_clip_rect(position& out, int x, int y) const;
+		bool						css_clip_hides_all(int x, int y) const;
 		int							render_box(int x, int y, int max_width, bool second_pass = false);
 		int											render_flex(int x, int y, int max_width, bool second_pass = false);
 		int											render_grid(int x, int y, int max_width, bool second_pass = false);

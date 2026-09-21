@@ -11,6 +11,12 @@ namespace litehtml
 		tstring	m_src;
 		tstring	m_srcset;
 
+		/* Viewport snapshot from the last resolve_effective_src: <picture>
+		 * source and srcset density selection depend on media features, and
+		 * the first style pass can run before the window has its size. */
+		int		m_resolved_mw;
+		int		m_resolved_mh;
+
 		/* width/height ATTRIBUTES are presentation hints in the CSS cascade:
 		 * they lose to EVERY author rule, so `.avatar img{width:100%}` must
 		 * beat width="24". Injecting them into m_style made them inline style

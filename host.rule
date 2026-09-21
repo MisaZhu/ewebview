@@ -13,18 +13,26 @@ LD = mkdir -p $(dir $@) && $(LD_BIN)
 OBJDUMP =  $(PREIX)objdump
 
 
-CFLAGS =  -march=armv8-a -Wno-incompatible-pointer-types -Wno-int-conversion \
+HOST_ARCH := $(shell uname -m)
+HOST_ARCH_FLAGS =
+ifeq ($(filter arm64 aarch64,$(HOST_ARCH)), $(HOST_ARCH))
+HOST_ARCH_FLAGS = -march=armv8-a -mstrict-align -mno-outline-atomics
+endif
+HOST_POSIX_FLAGS =
+ifneq ($(shell uname -s),Darwin)
+HOST_POSIX_FLAGS = -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L
+endif
+
+CFLAGS =  $(HOST_ARCH_FLAGS) $(HOST_POSIX_FLAGS) -Wno-incompatible-pointer-types -Wno-int-conversion \
 		-Wno-implicit-function-declaration \
         -Wall -Wextra -fPIC \
 		-fno-builtin-memcpy \
 		-fno-builtin-memmove \
 		-fno-builtin-memset \
         -Wno-unused-parameter \
-		-mstrict-align \
-        -mno-outline-atomics \
-        -std=c99
+	        -std=c99
 
-CXXFLAGS = -march=armv8-a \
+CXXFLAGS = $(HOST_ARCH_FLAGS) $(HOST_POSIX_FLAGS) \
         -Wall -Wextra -fPIC \
 		-fno-builtin-memcpy \
 		-fno-builtin-memmove \
@@ -32,9 +40,7 @@ CXXFLAGS = -march=armv8-a \
         -Wno-unused-parameter \
         -pedantic \
 		-fno-rtti \
-		-mstrict-align \
-        -mno-outline-atomics \
-        -fno-exceptions \
+	        -fno-exceptions \
         -fno-use-cxa-atexit \
         -std=c++14
 
@@ -42,8 +48,23 @@ ifeq ($(DEBUG),yes)
 CFLAGS +=  -g
 CXXFLAGS +=  -g
 else
-CFLAGS +=  -O2
-CXXFLAGS +=  -O2
+# Clang supports the more aggressive -Oz; GCC's size-optimized equivalent is
+# -Os. Keep the release flags portable across the macOS and Ubuntu CI jobs.
+ifeq ($(shell $(CC) --version 2>/dev/null | grep -qi clang && echo yes),yes)
+SIZE_OPT := -Oz
+else
+SIZE_OPT := -Os
+endif
+CFLAGS +=  $(SIZE_OPT) -ffunction-sections -fdata-sections
+CXXFLAGS +=  $(SIZE_OPT) -ffunction-sections -fdata-sections
+endif
+
+# Optional link-time optimization. Enable with `make LTO=yes`; keeping it
+# opt-in avoids changing the default build time and toolchain requirements.
+ifeq ($(LTO),yes)
+CFLAGS += -flto
+CXXFLAGS += -flto
+LDFLAGS += -flto
 endif
 
 # LITEHTML_LIFETIME_DEBUG is NOT a verbose-logging switch (that is XBROWSER_DEBUG):

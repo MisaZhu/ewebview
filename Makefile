@@ -2,7 +2,24 @@ ifeq ($(PORTING),)
 export PORTING = sdl2
 endif
 
+# An EwokOS cross build has no host SDL2 stack: port_sdl2.c includes
+# <SDL.h> and links host dylibs, so it must never be compiled with
+# aarch64-none-elf. A PORTING=sdl2 leaked from the environment (e.g.
+# exported during a host sdlbrowser build) used to ride the recursion
+# down to ewebview/Makefile and do exactly that. Pin the port to ewokos
+# whenever we cross for the OS.
+ifeq ($(OS_TYPE),ewokos)
+ifneq ($(PORTING),ewokos)
+$(warning ignoring PORTING=$(PORTING): OS_TYPE=ewokos cross build uses the ewokos port)
+export PORTING := ewokos
+endif
+endif
+
 DIRS = libtinyhttpsc libwebp jsnative litehtml
+
+ARCH ?= aarch64
+HW ?= virt
+BUILD_ROOT = build_$(ARCH)/$(HW)
 
 # libplutovg (rasteriser half of the vendored EwokOS libsvg) backs the
 # core's anti-aliased inline <svg> fill in EWebContainer::draw_svg, so it
@@ -27,6 +44,23 @@ endif
 
 all: basic_libs
 	@echo "all done."
+	@echo "Build artifacts:"
+	@format_size() { awk -v bytes="$$1" 'BEGIN { if (bytes >= 1073741824) printf "%.2f GiB", bytes / 1073741824; else if (bytes >= 1048576) printf "%.2f MiB", bytes / 1048576; else if (bytes >= 1024) printf "%.2f KiB", bytes / 1024; else printf "%d B", bytes; }'; }; \
+	for file in \
+		"$(BUILD_ROOT)/lib/libewebview.a" \
+		"$(BUILD_ROOT)/lib/liblitehtml.a" \
+		"$(BUILD_ROOT)/lib/libmario_jsn.a" \
+		"$(BUILD_ROOT)/lib/libwebp.a" \
+		"$(BUILD_ROOT)/lib/libtinyhttpsc.a"; do \
+		if [ -f "$$file" ]; then \
+			size=$$(stat -f%z "$$file" 2>/dev/null || stat -c%s "$$file"); \
+			echo "  $$file ($$(format_size "$$size"))"; \
+		fi; \
+	done
+	@if [ "$(PORTING)" = "sdl2" ] && [ -f "$(BUILD_ROOT)/bin/sdlbrowser" ]; then \
+		size=$$(stat -f%z "$(BUILD_ROOT)/bin/sdlbrowser" 2>/dev/null || stat -c%s "$(BUILD_ROOT)/bin/sdlbrowser"); \
+		echo "  $(BUILD_ROOT)/bin/sdlbrowser ($$(awk -v bytes="$$size" 'BEGIN { if (bytes >= 1073741824) printf "%.2f GiB", bytes / 1073741824; else if (bytes >= 1048576) printf "%.2f MiB", bytes / 1048576; else if (bytes >= 1024) printf "%.2f KiB", bytes / 1024; else printf "%d B", bytes; }'))"; \
+	fi
 
 basic_libs:
 	@for dir in $(DIRS); do \

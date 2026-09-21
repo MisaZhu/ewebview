@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkg-config sdl2 sdl2_gfx sdl2_image sdl2_ttf
+
+      - name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential pkg-config \
+            libsdl2-dev libsdl2-gfx-dev libsdl2-image-dev libsdl2-ttf-dev
+
+      - name: Build all targets
+        run: make -j2
+
+      - name: Verify build artifacts
+        run: |
+          test -f build_aarch64/virt/lib/libewebview.a
+          test -x build_aarch64/virt/bin/sdlbrowser
+
+  ewokos-build:
+    name: build (ewokos)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out ewebview
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          path: ewebview
+
+      - name: Check out EwokOS
+        uses: actions/checkout@v4
+        with:
+          repository: MisaZhu/ewokos
+          submodules: recursive
+          path: ewokos
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential
+
+      - name: Install EwokOS toolchain
+        run: |
+          version=14.3.rel1
+          archive="arm-gnu-toolchain-${version}-x86_64-aarch64-none-elf.tar.xz"
+          url="https://developer.arm.com/-/media/Files/downloads/gnu/${version}/binrel/${archive}"
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/$archive" "$url"
+          tar -xJf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/arm-gnu-toolchain-${version}-x86_64-aarch64-none-elf/bin" >> "$GITHUB_PATH"
+
+      - name: Build EwokOS SDK
+        run: |
+          make -C "$GITHUB_WORKSPACE/ewokos/machine.virt/system" -j2 x
+
+      - name: Build EwokOS port
+        working-directory: ewebview
+        run: |
+          make clean
+          make -j2 \
+            OS_TYPE=ewokos \
+            PORTING=ewokos \
+            ewokos="$GITHUB_WORKSPACE/ewokos"
+
+      - name: Verify EwokOS artifacts
+        run: |
+          test -f ewokos/system/build_aarch64/virt/lib/libewebview.a
+          test -f ewokos/system/build_aarch64/virt/lib/liblitehtml.a
+          test -f ewokos/system/build_aarch64/virt/lib/libmario_jsn.a
+          test -f ewokos/system/build_aarch64/virt/lib/libwebp.a
+          test -f ewokos/system/build_aarch64/virt/lib/libtinyhttpsc.a
