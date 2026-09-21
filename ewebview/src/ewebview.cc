@@ -190,6 +190,68 @@ static std::string tag_attr_value(const std::string& lower_tag,
     return std::string();
 }
 
+/* End of the well-formed element whose open tag starts at `tag_start`
+ * (index just past '>' is returned). Depth-counts every non-void open/close
+ * tag pair; self-closing and void tags (img/br/source/...) are neutral. Used
+ * by the Apple SSR fallbacks below to relocate whole subtrees (grid-area /
+ * flex-order reordering that litehtml cannot express yet). */
+static size_t element_span_end(const std::string& s, size_t tag_start)
+{
+    static const char* void_tags[] = { "img", "br", "source", "input", "meta",
+                                       "link", "hr", "path", "circle", "rect",
+                                       "ellipse", "use", "stop", "col", "wbr" };
+    size_t p = s.find('>', tag_start);
+    if(p == std::string::npos) return std::string::npos;
+    if(p > 0 && s[p - 1] == '/') return p + 1;
+    int depth = 1;
+    size_t q = p + 1;
+    while(q < s.size() && depth > 0) {
+        size_t lt = s.find('<', q);
+        if(lt == std::string::npos) return std::string::npos;
+        /* HTML comments (Next.js SSR suspence markers <!--$--> / <!--/$-->)
+         * are not elements: skip them whole or the depth count drifts. */
+        if(s.compare(lt, 4, "<!--") == 0) {
+            size_t ce = s.find("-->", lt + 4);
+            if(ce == std::string::npos) return std::string::npos;
+            q = ce + 3;
+            continue;
+        }
+        size_t gt = s.find('>', lt);
+        if(gt == std::string::npos) return std::string::npos;
+        if(s[lt + 1] == '/') { depth--; q = gt + 1; continue; }
+        if(s[lt + 1] == '!') { q = gt + 1; continue; }   /* doctype etc. */
+        /* tag name */
+        size_t ne = lt + 1;
+        while(ne < gt && (::isalnum((unsigned char)s[ne]) || s[ne] == '-' || s[ne] == ':'))
+            ne++;
+        size_t nlen = ne - (lt + 1);
+        bool self_close = (gt > lt + 1 && s[gt - 1] == '/');
+        /* raw-text elements: their body is opaque (flight payloads carry
+         * serialized HTML fragments whose tags must not be depth-counted). */
+        if(!self_close && nlen == 6 && s.compare(lt + 1, 6, "script") == 0) {
+            size_t ce = s.find("</script", gt);
+            if(ce == std::string::npos) return std::string::npos;
+            size_t ce_gt = s.find('>', ce);
+            q = (ce_gt == std::string::npos) ? s.size() : ce_gt + 1;
+            continue;
+        }
+        if(!self_close && nlen == 5 && s.compare(lt + 1, 5, "style") == 0) {
+            size_t ce = s.find("</style", gt);
+            if(ce == std::string::npos) return std::string::npos;
+            size_t ce_gt = s.find('>', ce);
+            q = (ce_gt == std::string::npos) ? s.size() : ce_gt + 1;
+            continue;
+        }
+        bool is_void = false;
+        for(const char* v : void_tags) {
+            if(nlen == strlen(v) && s.compare(lt + 1, nlen, v) == 0) { is_void = true; break; }
+        }
+        if(!self_close && !is_void) depth++;
+        q = gt + 1;
+    }
+    return q;
+}
+
 /* Preprocess the raw HTML before script extraction:
  *
  * 1. **<noscript> unwrap**: modern SSR pages (Next.js, Apple) ship real image
@@ -593,6 +655,228 @@ static std::string preprocess_noscript_picture(const std::string& html)
                 if(tag_start != std::string::npos)
                     added = inject_style(tag_start, "display:block;overflow:hidden");
                 pos = f + 37 + added;
+            }
+        }
+
+        /* (e) TabNav active pill: the black sliding indicator is sized and
+         *     positioned by hydration (ResizeObserver measurement), so with
+         *     JS dead it stays width:0 and the active tab loses its pill.
+         *     Paint the pill on the active button itself instead. */
+        {
+            size_t pos = 0;
+            while(pos < lower.size()) {
+                size_t f = lower.find("tabnav_active", pos);
+                if(f == std::string::npos) break;
+                size_t tag_start = out.rfind('<', f);
+                size_t added = 0;
+                if(tag_start != std::string::npos)
+                    added = inject_style(tag_start,
+                        "background-color:rgb(29,29,31);border-radius:8px");
+                pos = f + 13 + added;
+            }
+        }
+
+        /* (f) ProductTile: the tile header is a grid whose template areas put
+         *     the product art first (art, swatches, title, copy, price, cta).
+         *     litehtml places grid children in source order, so move the title
+         *     block after the swatch row to restore the designed order. */
+        {
+            size_t pos = 0;
+            while(pos < lower.size()) {
+                size_t f = lower.find("producttile_producttileproductid", pos);
+                if(f == std::string::npos) break;
+                size_t ts = out.rfind('<', f);
+                size_t se = (ts == std::string::npos) ? std::string::npos
+                                                      : element_span_end(out, ts);
+                if(se == std::string::npos) { pos = f + 34; continue; }
+                std::string blk = out.substr(ts, se - ts);
+                std::string blk_low = blk;
+                for(char& ch : blk_low) ch = (char)::tolower((unsigned char)ch);
+                out.erase(ts, se - ts);
+                lower.erase(ts, se - ts);
+                size_t sw = lower.find("producttile_optionalindicatorelementgrid", ts);
+                size_t sws = (sw == std::string::npos) ? std::string::npos
+                                                       : out.rfind('<', sw);
+                size_t swe = (sws == std::string::npos) ? std::string::npos
+                                                        : element_span_end(out, sws);
+                if(swe == std::string::npos) {
+                    /* no swatch row in this tile: put the title back */
+                    out.insert(ts, blk);
+                    lower.insert(ts, blk_low);
+                    pos = ts + blk.size();
+                    continue;
+                }
+                out.insert(swe, blk);
+                lower.insert(swe, blk_low);
+                pos = swe + blk.size();
+            }
+        }
+
+        /* (g) BannerCard oneUp ("Help me choose"): the medium-breakpoint card
+         *     stacks the art above the copy lockup; the SSR DOM lists the copy
+         *     first and the CSS reorders it (grid areas / absolute art). Move
+         *     the figure ahead of the copy and size it from its own responsive
+         *     picture variables so the card reads art-then-copy again. */
+        {
+            size_t f = lower.find("bannercard_oneup");
+            if(f != std::string::npos) {
+                size_t card = out.rfind('<', f);
+                size_t fig = lower.find("<figure", card);
+                size_t copy = lower.find("bannercard_copylockup__", card);
+                if(fig != std::string::npos && copy != std::string::npos && fig > copy) {
+                    size_t fig_se = element_span_end(out, fig);
+                    if(fig_se != std::string::npos) {
+                        std::string blk = out.substr(fig, fig_se - fig);
+                        std::string blk_low = blk;
+                        for(char& ch : blk_low) ch = (char)::tolower((unsigned char)ch);
+                        out.erase(fig, fig_se - fig);
+                        lower.erase(fig, fig_se - fig);
+                        size_t copy_ts = out.rfind('<', copy);
+                        out.insert(copy_ts, blk);
+                        lower.insert(copy_ts, blk_low);
+                        /* cardContent first (it opens before the moved figure,
+                         * so its injection shifts everything after it); then
+                         * the figure; then the copy lockup that now sits right
+                         * after the figure span. Each inject_style return is
+                         * the inserted length, folded into the next offset. */
+                        size_t cc = lower.rfind("bannercard_cardcontent", copy_ts);
+                        size_t added_cc = 0;
+                        if(cc != std::string::npos)
+                            added_cc = inject_style(out.rfind('<', cc), "display:block");
+                        size_t fig_ts = copy_ts + added_cc;
+                        size_t added_fig = inject_style(fig_ts,
+                            "position:relative;left:auto;right:auto;top:auto;"
+                            "width:calc(var(--vp-w-medium)*1px);"
+                            "height:calc(var(--vp-h-medium)*1px);"
+                            "margin:30px auto 0");
+                        /* the copy lockup carries padding-block-start:
+                         * var(--card-fixed-padding) (366px) to clear the
+                         * absolute background art; with the figure now in
+                         * flow that reserved space becomes a huge gap, so
+                         * zero the padding and keep just a 40px margin. */
+                        inject_style(fig_ts + blk.size() + added_fig,
+                            "margin:40px auto 0;padding-block:0");
+                    }
+                }
+            }
+        }
+    }
+
+    /* --- Pass 5: web-component upgrade fallback (Google marketing pages).
+     * workspace.google.com ships SSR content inside custom elements (gws-*,
+     * md-*) whose visuals only exist once customElements upgrade builds their
+     * shadow DOM.  Without a components runtime the pre-upgrade fallback
+     * would stay forever, so emulate the upgraded state:
+     *
+     * (a) NewsletterIntakeForm: the form JS reveals the active step by adding
+     *     .newsletter-step--visible (the page CSS carries the reveal rule,
+     *     later in source order than the hidden base rule).  Add that class
+     *     to the first step so the signup band is not an empty strip.
+     * (b) md-outlined-text-field / gws-phone-input: empty custom elements
+     *     whose shadow DOM would host the actual <input>.  Lower them to a
+     *     native input carrying the label as placeholder.
+     * (c) gws-details-group > li: upgraded accordion rows carry no UA list
+     *     marker (the shadow CSS resets it); kill the disc bullet on the
+     *     pre-upgrade fallback rows with an injected structural rule.
+     * (d) gws-carousel: the page hides un-upgraded carousels outright
+     *     (visibility:hidden), leaving blank bands where the upgraded
+     *     component would show a horizontal card row.  Reveal it and lay the
+     *     slides out as a static flex row (the pre-upgrade sheet absolutely
+     *     stacks every slide but the first). */
+    {
+        std::string lower = out;
+        for(char& ch : lower) ch = (char)::tolower((unsigned char)ch);
+
+        auto escape_attr = [](const std::string& s) {
+            std::string r;
+            r.reserve(s.size());
+            for(char c : s) {
+                if(c == '&') r += "&amp;";
+                else if(c == '"') r += "&quot;";
+                else if(c == '<') r += "&lt;";
+                else r += c;
+            }
+            return r;
+        };
+
+        /* (a) reveal the first newsletter form step */
+        {
+            size_t f = lower.find("class=\"newsletterintakeform_step\"");
+            if(f != std::string::npos) {
+                size_t quote = lower.find('"', f + 7); /* closing quote of the value */
+                if(quote != std::string::npos) {
+                    static const char add[] = " newsletter-step--visible";
+                    out.insert(quote, add);
+                    lower.insert(quote, add);
+                }
+            }
+        }
+
+        /* (b) lower empty material field components to native inputs */
+        {
+            size_t pos = 0;
+            while(pos < lower.size()) {
+                size_t f1 = lower.find("<md-outlined-text-field", pos);
+                size_t f2 = lower.find("<gws-phone-input", pos);
+                size_t f = std::min(f1, f2);
+                if(f == std::string::npos) break;
+                bool phone = (f != f1);
+                size_t namelen = phone ? 16 : 23;
+                char nxt = (f + namelen < lower.size()) ? lower[f + namelen] : '>';
+                if(nxt != ' ' && nxt != '>' && nxt != '/') { pos = f + 1; continue; }
+                size_t gt = lower.find('>', f);
+                if(gt == std::string::npos) break;
+                /* Only empty elements are lowered: light-DOM content means
+                 * the page uses the tag as a container we must not drop. */
+                size_t q = gt + 1;
+                while(q < lower.size() && ::isspace((unsigned char)lower[q])) q++;
+                const char* close = phone ? "</gws-phone-input>"
+                                          : "</md-outlined-text-field>";
+                size_t clen = strlen(close);
+                if(lower.compare(q, clen, close) != 0) { pos = gt + 1; continue; }
+                std::string tag_orig = out.substr(f, gt - f + 1);
+                std::string tag_low  = lower.substr(f, gt - f + 1);
+                std::string label = tag_attr_value(tag_low, tag_orig, "label");
+                std::string name  = tag_attr_value(tag_low, tag_orig, "name");
+                std::string id    = tag_attr_value(tag_low, tag_orig, "id");
+                std::string type  = tag_attr_value(tag_low, tag_orig, "type");
+                if(type.empty()) type = phone ? "tel" : "text";
+                std::string rep = "<input class=\"ewv-wc-field\" type=\"" + type + "\"";
+                if(!name.empty())  rep += " name=\""  + escape_attr(name) + "\"";
+                if(!id.empty())    rep += " id=\""    + escape_attr(id) + "\"";
+                if(!label.empty()) rep += " placeholder=\"" + escape_attr(label) + "\"";
+                rep += ">";
+                out.erase(f, (q + clen) - f);
+                out.insert(f, rep);
+                std::string rep_low = rep;
+                for(char& ch : rep_low) ch = (char)::tolower((unsigned char)ch);
+                lower.erase(f, (q + clen) - f);
+                lower.insert(f, rep_low);
+                pos = f + rep.size();
+            }
+        }
+
+        /* (c) structural fallback styles for the component shells */
+        {
+            bool need_style = (lower.find("<gws-details-group") != std::string::npos) ||
+                              (lower.find("<gws-carousel") != std::string::npos) ||
+                              (lower.find("class=\"ewv-wc-field\"") != std::string::npos);
+            if(need_style) {
+                static const char wc_css[] =
+                    "<style>"
+                    "gws-details-group>li{list-style:none}"
+                    "gws-carousel{visibility:visible !important;display:flex;overflow:hidden}"
+                    "gws-carousel>[slot=slides]{position:static !important;flex:0 0 auto}"
+                    "input.ewv-wc-field{box-sizing:border-box;height:56px;width:100%;"
+                    "padding:0 16px;border:1px solid #dadce0;border-radius:8px;"
+                    "background:#fff;color:#202124;font-size:1rem}"
+                    "</style>";
+                size_t head = lower.find("</head>");
+                if(head == std::string::npos) head = 0;
+                out.insert(head, wc_css);
+                std::string wc_low = wc_css;
+                for(char& ch : wc_low) ch = (char)::tolower((unsigned char)ch);
+                lower.insert(head, wc_low);
             }
         }
     }

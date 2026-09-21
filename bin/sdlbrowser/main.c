@@ -1778,7 +1778,7 @@ int main(int argc, char** argv) {
                     ewebview_scroll(b->view, 0, b->shot_scroll_y);
                     b->shot_scrolled = true;
                     b->shot_start_ms = SDL_GetTicks();
-                    b->shot_settle_ms = 1000;   /* let the new offset render a frame */
+                    b->shot_settle_ms = 3000;   /* let the new offset render a frame */
                 } else {
                     SDL_Surface* surf = NULL;
                     if(b->frame && b->port.gfx.surface_native)

@@ -615,6 +615,39 @@ static int flex_min_content_inner_impl(const litehtml::element::ptr& el)
 	return w;
 }
 
+/* True when the element itself, or any in-flow descendant reachable without
+ * crossing an absolutely positioned / flex / grid formatting boundary, carries
+ * a percentage width. A column flex container with a definite cross size and
+ * align-items other than stretch sizes such an item to the container width:
+ * per CSS Sizing 3 §5.2.1 the percentage IS definite for layout once the
+ * container's cross size is definite, so the item's used width is the full
+ * line, not its intrinsic max-content (workspace.google.com's migration
+ * picture: .Template6040_featureImage{display:flex;flex-direction:column;
+ * align-items:center;width:100%} > picture{width:auto} > img{width:100%} -
+ * measuring the item by its intrinsic content left the 802px column with a
+ * 42px icon, because the img's 100% resolved against that same measurement).
+ * Flex/grid subtrees are skipped: their items are sized by their own layout
+ * algorithm, a percentage width inside does not make the outer box fill. */
+static bool flex_subtree_has_percent_width(const litehtml::element::ptr& el, int depth)
+{
+	if(!el || depth > 12) return false;
+	litehtml::css_length cw = el->get_css_width();
+	if(!cw.is_predefined() && cw.units() == litehtml::css_units_percentage) return true;
+	litehtml::style_display d = el->get_display();
+	if(d == litehtml::display_inline_text) return false;
+	if(d == litehtml::display_flex || d == litehtml::display_inline_flex ||
+	   d == litehtml::display_grid || d == litehtml::display_inline_grid) return false;
+	for(size_t i = 0; i < el->get_children_count(); i++)
+	{
+		litehtml::element::ptr c = el->get_child((int)i);
+		if(!participates_in_layout(c)) continue;
+		if(c->get_element_position() == litehtml::element_position_absolute ||
+		   c->get_element_position() == litehtml::element_position_fixed) continue;
+		if(flex_subtree_has_percent_width(c, depth + 1)) return true;
+	}
+	return false;
+}
+
 static int flex_min_content(const litehtml::element::ptr& el)
 {
 	if(!el) return 0;
@@ -730,6 +763,15 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				w = preferred_content_width(kids[i]) + 1;
 				if(w > avail) w = avail;
 				if(w < 0) w = 0;
+				/* A percentage width inside the item is definite against this
+				 * container's definite cross size, so the item fills the line
+				 * instead of collapsing onto its intrinsic content. Measuring it
+				 * at `avail` also gives the inner percentages a definite basis on
+				 * the measurement pass (see flex_subtree_has_percent_width). */
+				if(!width_auto && w < avail && flex_subtree_has_percent_width(kids[i], 0))
+				{
+					w = avail;
+				}
 			}
 			kids[i]->render(0, 0, w, second_pass);
 			/* Main size is the child's OUTER height: boxes whose space comes from
