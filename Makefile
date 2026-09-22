@@ -15,7 +15,9 @@ export PORTING := ewokos
 endif
 endif
 
-DIRS = libtinyhttpsc libwebp jsnative litehtml
+# easm provides the WebAssembly guest runtime for the JS engine; its static
+# lib + headers must be ready before jsnative's wasm bridge links.
+DIRS = libtinyhttpsc libwebp easm jsnative litehtml
 
 ARCH ?= aarch64
 HW ?= virt
@@ -50,6 +52,7 @@ all: basic_libs
 		"$(BUILD_ROOT)/lib/libewebview.a" \
 		"$(BUILD_ROOT)/lib/liblitehtml.a" \
 		"$(BUILD_ROOT)/lib/libmario_jsn.a" \
+		"$(BUILD_ROOT)/lib/libeasm.a" \
 		"$(BUILD_ROOT)/lib/libwebp.a" \
 		"$(BUILD_ROOT)/lib/libtinyhttpsc.a"; do \
 		if [ -f "$$file" ]; then \

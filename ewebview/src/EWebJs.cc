@@ -35,6 +35,7 @@
 #include <mario/js_dom.h>
 #include <mario/js_event.h>
 #include <mario/js_web.h>
+#include <mario/js_wasm.h>
 
 /* mario's bcdump.h is not exported into the installed include tree; declare the
  * one diagnostic entry point we need (EWEB_SPINDBG cut-point disassembly). */
@@ -388,6 +389,9 @@ void EWebEngine::initJsVm()
      * globals the DOM bridge just created (see js_event.h / js_web.h). */
     registerEventNatives(m_jsVm);
     registerWebNatives(m_jsVm);
+    /* WebAssembly: registers the WebAssembly namespace + Module/Instance/
+     * Memory/Table/Global on the VM. Registered last so window/DOM exist. */
+    js_register_wasm_natives(m_jsVm);
 }
 
 void EWebEngine::resetJsVm()

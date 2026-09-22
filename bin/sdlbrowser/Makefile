@@ -60,7 +60,7 @@ endif
 # rasteriser half (top-level libplutovg/) that both the core's inline <svg>
 # anti-aliased fill and plutosvg itself call into. Order matters: svg
 # references plutovg, and ewebview references both.
-LIBS = -lewebview -lsvg -lplutovg -llitehtml -lmario_jsn -lwebp -ltinyhttpsc \
+LIBS = -lewebview -lsvg -lplutovg -llitehtml -lmario_jsn -leasm -lwebp -ltinyhttpsc \
        $(SDL2_LIBS) -lm -lpthread -lz
 
 # macOS appearance detection (AppleInterfaceStyle) uses CoreFoundation.
@@ -79,6 +79,7 @@ PROJ_LIBS = $(TARGET_DIR)/lib/libewebview.a \
             $(TARGET_DIR)/lib/libplutovg.a \
             $(TARGET_DIR)/lib/liblitehtml.a \
             $(TARGET_DIR)/lib/libmario_jsn.a \
+            $(TARGET_DIR)/lib/libeasm.a \
             $(TARGET_DIR)/lib/libwebp.a \
             $(TARGET_DIR)/lib/libtinyhttpsc.a
 
