@@ -681,7 +681,10 @@ static inline void a64_str_q_reg(Em *e, uint32_t rt, uint32_t rn, uint32_t rm) {
 // three-same / bitwise op from an llvm-mc-calibrated sample word
 // (register fields rm[20:16] / rn[9:5] / rd[4:0] patched in)
 static inline void a64_neon(Em *e, uint32_t sample, uint32_t rd, uint32_t rn, uint32_t rm) {
-    em_word(e, (sample & 0xFFE0FC1Fu) | (rm << 16) | (rn << 5) | rd);
+    // clear rd[4:0] / rn[9:5] / rm[20:16] before OR-ing the new registers —
+    // an OR over a mask that keeps any register bits produces a bitwise
+    // UNION with the calibrated sample's registers (16|2 = 18)
+    em_word(e, (sample & 0xFFE0FC00u) | (rm << 16) | (rn << 5) | rd);
 }
 // dup (splat) from a GPR: se = lane byte width 1/2/4/8
 static inline void a64_neon_dup(Em *e, uint32_t se, uint32_t rd, uint32_t rn) {

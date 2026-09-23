@@ -511,17 +511,17 @@ int ea_store_load(EaStore *s, const uint8_t *bytes, size_t len, EaModule **out, 
 int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_msg, EaTrap *trap);
 void ea_register_instance(EaStore *s, const char *name, EaInstance *inst);
 EaInstance *ea_lookup_instance(EaStore *s, const char *name);
-EaMemInst *ea_memory_new(uint64_t min_pages, uint64_t max_pages, bool has_max, bool is64);
-void ea_memory_free(EaMemInst *mi);
-EaTableInst *ea_table_new(EaValType ref_type, uint64_t min, uint64_t max, bool has_max, bool is64);
-void ea_table_free(EaTableInst *ti);
-void ea_store_unregister(EaStore *s, const char *name);
 
 int ea_instance_invoke(EaStore *s, EaInstance *inst, uint32_t func_idx,
                        const WVal *args, WVal *results, EaTrap *trap);
 // find export index by name/kind; returns -1 when missing
 int ea_instance_export(EaInstance *inst, const char *name, uint8_t kind);
 int ea_instance_export_n(EaInstance *inst, const char *name, uint32_t name_len, uint8_t kind);
+EaMemInst *ea_memory_new(uint64_t min_pages, uint64_t max_pages, bool has_max, bool is64);
+void ea_memory_free(EaMemInst *mi);
+EaTableInst *ea_table_new(EaValType ref_type, uint64_t min, uint64_t max, bool has_max, bool is64);
+void ea_table_free(EaTableInst *ti);
+void ea_store_unregister(EaStore *s, const char *name);
 
 #ifdef __cplusplus
 }
