@@ -407,6 +407,39 @@ typedef struct EaExnInst {
     WVal vals[];
 } EaExnInst;
 
+// ---------------------------------------------------------------- JIT exception handling
+// one try_table catch clause, compiled into the executable region so its
+// address is final at handler-push emission time
+typedef struct {
+    uint32_t tag_idx;   // module tag index (kinds 0/1), UINT32_MAX for catch_all
+    uint32_t height;    // target label depth (absolute operand slot index)
+    uint32_t delta_up;  // WVal slots from the try_table's label sp UP to the target label sp
+    uint32_t target_off;// machine word offset of the branch target (patched after compile)
+    uint8_t  kind;      // EaCatch kind: 0 catch, 1 catch_ref, 2 catch_all, 3 catch_all_ref
+    uint8_t  want_ref;  // push exnref after the payload
+    void    *target;    // absolute runtime target address (patched at publish)
+} EaEhClause;
+
+typedef struct {
+    uint32_t n_clauses;
+    EaEhClause c[];
+} EaEhDesc;
+
+// live handler entry on the exec's handler stack
+typedef struct {
+    WVal *sp0;          // machine sp at try_table entry = its label depth
+    void *fp;           // x29 of the frame that installed the handler
+    struct EaInstance *inst; // instance owning the clause tag indices
+    EaEhDesc *desc;
+} EaEhEntry;
+
+// two-word result of the throw helpers: {new_sp, target}; target == NULL means
+// no handler in the current frame — the caller frame returns a marker upward
+typedef struct {
+    WVal *sp;
+    void *target;
+} EaEhRet;
+
 typedef struct EaInstance {
     EaModule *module;
     uint32_t n_funcs; EaFuncInst *funcs;
@@ -434,6 +467,10 @@ typedef struct EaExec {
     char trap_msg[96];         // optional detailed message
     void *jb;                  // jmp_buf* of the active entry (trap target)
     struct EaExnInst *pending_exn; // uncaught exception in flight
+    // JIT exception handling: handler stack (lives across JIT frames)
+    EaEhEntry *eh;
+    uint32_t eh_top, eh_cap;
+    void *jit_stack_limit;    // native stack floor for JIT'd frames (recursion bound)
 } EaExec;
 
 // interpreter entry: execute function whose args are already pushed on ex->stack.
@@ -445,13 +482,15 @@ void ea_trap(EaExec *ex, EaTrap code);
 bool ea_grow_memory(struct EaMemInst *mi, uint64_t delta, uint64_t *old);
 int ea_jit_call(EaExec *ex, EaFuncInst *fi);
 void ea_jit_compile_module(EaModule *m); // aarch64 baseline JIT (jit_a64.c)
+// JIT exception-handling helpers (called from generated code)
+void ea_jit_eh_push(EaExec *ex, EaInstance *inst, EaEhDesc *desc, WVal *sp0, void *fp);
+void ea_jit_eh_pop(EaExec *ex);
+void ea_jit_eh_pop_frame(EaExec *ex, void *fp);
+void ea_jit_eh_popn(EaExec *ex, uint32_t n);
+EaEhRet ea_jit_eh_throw(EaExec *ex, EaInstance *inst, uint32_t tag_idx, WVal *sp, void *fp);
+EaEhRet ea_jit_eh_throw_ref(EaExec *ex, EaInstance *inst, EaExnInst *exn, void *fp);
+EaEhRet ea_jit_eh_resume(EaExec *ex, EaInstance *inst, void *fp);
 void ea_instance_free(EaInstance *inst);
-
-// embedder lifecycle helpers (JS WebAssembly.* bridge)
-EaMemInst *ea_memory_new(uint64_t min_pages, uint64_t max_pages, bool has_max, bool is64);
-void ea_memory_free(EaMemInst *mi);
-EaTableInst *ea_table_new(EaValType ref_type, uint64_t min, uint64_t max, bool has_max, bool is64);
-void ea_table_free(EaTableInst *ti);
 
 // host import bridge: host functions register a callback
 typedef int (*EaHostFn)(void *user, const WVal *args, WVal *results);
@@ -462,6 +501,7 @@ typedef struct EaStore EaStore;
 EaStore *ea_store_new(void);
 void ea_store_set_max_depth(EaStore *s, uint32_t d);
 const char *ea_store_last_trap_msg(EaStore *s);
+bool ea_store_take_pending_exn(EaStore *s); // uncaught exception in flight? (consumes)
 void ea_store_free(EaStore *s);
 
 // decode + validate. Returns 0 on success (err set on failure).
@@ -471,6 +511,10 @@ int ea_store_load(EaStore *s, const uint8_t *bytes, size_t len, EaModule **out, 
 int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_msg, EaTrap *trap);
 void ea_register_instance(EaStore *s, const char *name, EaInstance *inst);
 EaInstance *ea_lookup_instance(EaStore *s, const char *name);
+EaMemInst *ea_memory_new(uint64_t min_pages, uint64_t max_pages, bool has_max, bool is64);
+void ea_memory_free(EaMemInst *mi);
+EaTableInst *ea_table_new(EaValType ref_type, uint64_t min, uint64_t max, bool has_max, bool is64);
+void ea_table_free(EaTableInst *ti);
 void ea_store_unregister(EaStore *s, const char *name);
 
 int ea_instance_invoke(EaStore *s, EaInstance *inst, uint32_t func_idx,

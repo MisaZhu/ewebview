@@ -1722,6 +1722,7 @@ int ea_validate_module(EaModule *m, char **err) {
             }
             case EA_OP_THROW: {
                 uint32_t ti = in->imm.u32;
+                m->feat.exceptions = true;
                 if (getenv("EA_VDBG")) fprintf(stderr, "[V] THROW ti=%u ntags=%u type_idx=%u n_params=%u sp=%u\n",
                                                ti, m->n_tags, ti < m->n_tags ? m->tags[ti].type_idx : 99,
                                                ti < m->n_tags ? m->types[m->tags[ti].type_idx].func.n_params : 99, v.sp);
@@ -1732,10 +1733,12 @@ int ea_validate_module(EaModule *m, char **err) {
                 break;
             }
             case EA_OP_THROW_REF:
+                m->feat.exceptions = true;
                 pop_val(&v, EA_VT_ABSN(EA_ABS_EXN));
                 if (!v.failed) set_unreachable(&v);
                 break;
             case EA_OP_TRY_TABLE: {
+                m->feat.exceptions = true;
                 const EaValType *bi, *bo;
                 uint32_t nbi, nbo;
                 if (getenv("EA_VDBG")) fprintf(stderr, "[V] TRYTABLE bt.kind=%u vt=%x ti=%u nc=%u\n",

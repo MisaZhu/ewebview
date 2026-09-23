@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <setjmp.h>
 #include <sys/mman.h>
+#include <pthread.h>
 
 // ---------------------------------------------------------------- store
 typedef struct {
@@ -83,6 +84,14 @@ int ea_instance_export_n(EaInstance *inst, const char *name, uint32_t name_len, 
 // ---------------------------------------------------------------- trap plumbing
 const char *ea_store_last_trap_msg(EaStore *s) {
     return s->exec.trap_msg[0] ? s->exec.trap_msg : ea_trap_msg(s->exec.trap);
+}
+
+// for the wast driver's assert_exception: is an uncaught wasm exception in
+// flight? consumes it (clears) either way
+bool ea_store_take_pending_exn(EaStore *s) {
+    struct EaExnInst *px = s->exec.pending_exn;
+    s->exec.pending_exn = NULL;
+    return px != NULL;
 }
 
 void ea_trap(EaExec *ex, EaTrap code) {
@@ -272,38 +281,6 @@ uint8_t *alloc_memory(uint64_t pages);
 uint8_t *alloc_memory_public(uint64_t pages) {
     return alloc_memory(pages);
 }
-uint8_t *alloc_memory(uint64_t pages) {
-    void *p = mmap(NULL, EA_MEM_RESERVE, PROT_NONE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (p == MAP_FAILED) return NULL;
-    if (pages > 0) {
-        if (mprotect(p, (size_t)(pages << 16), PROT_READ | PROT_WRITE) != 0) {
-            munmap(p, EA_MEM_RESERVE);
-            return NULL;
-        }
-    }
-    if (g_n_mem_ranges == g_cap_mem_ranges) {
-        g_cap_mem_ranges = g_cap_mem_ranges ? g_cap_mem_ranges * 2 : 16;
-        g_mem_ranges = (EaMemRange *)realloc(g_mem_ranges,
-                        g_cap_mem_ranges * sizeof(EaMemRange));
-    }
-    g_mem_ranges[g_n_mem_ranges].base = (uint8_t *)p;
-    g_mem_ranges[g_n_mem_ranges].end = (uint8_t *)p + EA_MEM_RESERVE;
-    g_n_mem_ranges++;
-    ea_install_fault_handler();
-    return (uint8_t *)p;
-}
-bool ea_grow_memory(EaMemInst *mi, uint64_t delta, uint64_t *old) {
-    *old = mi->pages;
-    if (mi->pages + delta > mi->max_pages) return false;
-    if (!mi->is64 && mi->pages + delta > 65536) return false; // 32-bit spec limit
-    if (mprotect(mi->base, (size_t)((mi->pages + delta) << 16),
-                 PROT_READ | PROT_WRITE) != 0)
-        return false;
-    mi->pages += delta;
-    mi->size = mi->pages << 16;
-    return true;
-}
 
 // ---- embedder lifecycle helpers (JS WebAssembly.* bridge)
 // Create a standalone linear memory (owned): reserves the guard region and
@@ -348,13 +325,42 @@ void ea_table_free(EaTableInst *ti) {
     free(ti->elems);
     free(ti);
 }
+uint8_t *alloc_memory(uint64_t pages) {
+    void *p = mmap(NULL, EA_MEM_RESERVE, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    if (pages > 0) {
+        if (mprotect(p, (size_t)(pages << 16), PROT_READ | PROT_WRITE) != 0) {
+            munmap(p, EA_MEM_RESERVE);
+            return NULL;
+        }
+    }
+    if (g_n_mem_ranges == g_cap_mem_ranges) {
+        g_cap_mem_ranges = g_cap_mem_ranges ? g_cap_mem_ranges * 2 : 16;
+        g_mem_ranges = (EaMemRange *)realloc(g_mem_ranges,
+                        g_cap_mem_ranges * sizeof(EaMemRange));
+    }
+    g_mem_ranges[g_n_mem_ranges].base = (uint8_t *)p;
+    g_mem_ranges[g_n_mem_ranges].end = (uint8_t *)p + EA_MEM_RESERVE;
+    g_n_mem_ranges++;
+    ea_install_fault_handler();
+    return (uint8_t *)p;
+}
+bool ea_grow_memory(EaMemInst *mi, uint64_t delta, uint64_t *old) {
+    *old = mi->pages;
+    if (mi->pages + delta > mi->max_pages) return false;
+    if (!mi->is64 && mi->pages + delta > 65536) return false; // 32-bit spec limit
+    if (mprotect(mi->base, (size_t)((mi->pages + delta) << 16),
+                 PROT_READ | PROT_WRITE) != 0)
+        return false;
+    mi->pages += delta;
+    mi->size = mi->pages << 16;
+    return true;
+}
 
 void ea_instance_free(EaInstance *inst) {
     if (!inst) return;
-    // imported tables borrow the source (e.g. a JS-instance table) and must not
-    // free its storage; only defined (owned) tables release their elems
-    for (uint32_t i = 0; i < inst->n_tables; i++)
-        if (i >= inst->module->n_imp_tables) free(inst->tables[i].elems);
+    for (uint32_t i = 0; i < inst->n_tables; i++) free(inst->tables[i].elems);
     for (uint32_t i = 0; i < inst->n_memories; i++) {
         // imported memories alias the source instance's storage; only
         // defined (owned) ones belong to this instance
@@ -624,6 +630,15 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
         }
     }
 
+    // JIT fast-path fields — set BEFORE element/data init and the start
+    // function: an instantiation that fails partway still leaks funcinsts
+    // into imported tables (spec: prior writes persist), and those must
+    // stay callable from JIT frames, whose prologue loads these unconditionally
+    {
+        static EaMemInst g_dummy_mem; // base=NULL,size=0: any access traps
+        inst->jit_mem0 = n_mems ? inst->memories[0] : &g_dummy_mem;
+    }
+    inst->jit_globals = inst->globals;
     // ---- element segments
     for (uint32_t i = 0; i < m->n_elems; i++) {
         EaElem *e = &m->elems[i];
@@ -684,12 +699,6 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
         if (d->data_len) memcpy(mi->base + off, m->owned_bytes + d->data_off, d->data_len);
     }
 
-    // JIT fast-path fields
-    {
-        static EaMemInst g_dummy_mem; // base=NULL,size=0: any access traps
-        inst->jit_mem0 = n_mems ? inst->memories[0] : &g_dummy_mem;
-    }
-    inst->jit_globals = inst->globals;
     *out = inst;
     if (inst->start_func != UINT32_MAX) {
         EaTrap t = TRAP_NONE;
@@ -698,6 +707,8 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
             if (trap) *trap = t;
             if (err_msg && !*err_msg)
                 *err_msg = ea_strndup("start function trapped", 22);
+            if (getenv("EA_LDBG"))
+                fprintf(stderr, "[LDBG] start-trap inst=%p jit_mem0=%p\n", (void *)inst, (void *)inst->jit_mem0);
             return 2;
         }
     }
@@ -722,6 +733,15 @@ int ea_instance_invoke(EaStore *s, EaInstance *inst, uint32_t func_idx,
     EaExec *saved_fault_exec = g_fault_exec;
     g_fault_exec = ex; // in-bounds faults during this invoke become traps
     ex->trap = TRAP_NONE;
+    ex->pending_exn = NULL; // stale state from a previous invoke must not leak
+    uint32_t eh_base = ex->eh_top; // traps longjmp past JIT handler pops
+    // native stack floor for JIT'd frames: recursion that would run past the
+    // thread stack traps as TRAP_STACK_EXHAUSTED instead of faulting
+    {
+        void *sp0 = (void *)&ex;
+        size_t ssz = pthread_get_stacksize_np(pthread_self());
+        ex->jit_stack_limit = (char *)sp0 - ssz + 256 * 1024;
+    }
     jmp_buf jb;
     jmp_buf *saved = (jmp_buf *)ex->jb;
     ex->jb = &jb;
@@ -774,6 +794,7 @@ int ea_instance_invoke(EaStore *s, EaInstance *inst, uint32_t func_idx,
         if (trap) *trap = ex->trap;
         ret = 1;
     }
+    ex->eh_top = eh_base; // trapped unwind skips generated handler pops
     g_fault_exec = saved_fault_exec;
     return ret;
 }

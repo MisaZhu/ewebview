@@ -360,6 +360,14 @@ static inline void a64_strh_reg32(Em *e, uint32_t rt, uint32_t rn, uint32_t rm) 
 }
 // stp / ldp 64-bit
 // imm7 in BYTES (scaled by 8 internally); must be multiple of 8
+// stp with signed 7-bit scaled offset (unsigned-offset form, no writeback)
+static inline void a64_stp_off64(Em *e, uint32_t rt1, uint32_t rt2, uint32_t rn, int32_t imm7) {
+    em_word(e, 0xA9000000u | ((uint32_t)(imm7 & 0x7F) << 15) | (rn << 5) | (rt1) | (rt2 << 10));
+}
+// ldp with signed 7-bit scaled offset (imm7 in 8-byte units for 64-bit)
+static inline void a64_ldp_off64(Em *e, uint32_t rt1, uint32_t rt2, uint32_t rn, int32_t imm7) {
+    em_word(e, 0xA9400000u | ((uint32_t)(imm7 & 0x7F) << 15) | (rn << 5) | (rt1) | (rt2 << 10));
+}
 static inline void a64_stp_pre64(Em *e, uint32_t rt1, uint32_t rt2, uint32_t rn, int32_t imm7) {
     int32_t v = imm7 / 8;
     em_word(e, 0xA9800000 | ((uint32_t)(v & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt1);
@@ -603,14 +611,14 @@ static inline void a64_ucvtf(Em *e, uint32_t rd, uint32_t rn, int dstb, int srcb
     em_word(e, base | (rn << 5) | rd);
 }
 static inline void a64_fcvtzs(Em *e, uint32_t rd, uint32_t rn, int srcb, int dstb) {
-    // FCVTZS Wd/Xd, Sn/Dn
-    uint32_t base = srcb == 8 ? (dstb == 8 ? 0x9E780000u : 0x9E380000u)
-                              : (dstb == 8 ? 0x1E780000u : 0x1E380000u);
+    // FCVTZS Wd/Xd, Sn/Dn  (sf = dstb==8, type: 00=S, 01=D)
+    uint32_t base = srcb == 8 ? (dstb == 8 ? 0x9E780000u : 0x1E780000u)
+                              : (dstb == 8 ? 0x9E380000u : 0x1E380000u);
     em_word(e, base | (rn << 5) | rd);
 }
 static inline void a64_fcvtzu(Em *e, uint32_t rd, uint32_t rn, int srcb, int dstb) {
-    uint32_t base = srcb == 8 ? (dstb == 8 ? 0x9E790000u : 0x9E390000u)
-                              : (dstb == 8 ? 0x1E790000u : 0x1E390000u);
+    uint32_t base = srcb == 8 ? (dstb == 8 ? 0x9E790000u : 0x1E790000u)
+                              : (dstb == 8 ? 0x9E390000u : 0x1E390000u);
     em_word(e, base | (rn << 5) | rd);
 }
 static inline void a64_fmov_gpr_fpr(Em *e, uint32_t rd, uint32_t rn, int to_fpr, int b) {
@@ -662,3 +670,41 @@ static inline void a64_sxth64(Em *e, uint32_t rd, uint32_t rn) { em_word(e, 0x93
 static inline void a64_sxtw64(Em *e, uint32_t rd, uint32_t rn) { em_word(e, 0x93407C00 | (rn << 5) | rd); }
 
 #endif
+
+// ---- Advanced SIMD (NEON) helpers — words calibrated against llvm-mc ----
+// 128-bit slot push/pop (V regs share the GPR load/store encoding space)
+static inline void a64_str_q_pre(Em *e, uint32_t rt)  { em_word(e, 0x3C9F0FE0u | rt); }
+static inline void a64_ldr_q_post(Em *e, uint32_t rt) { em_word(e, 0x3CC107E0u | rt); }
+// q <-> memory, register offset: ldr/str q, [Xn, Xm]
+static inline void a64_ldr_q_reg(Em *e, uint32_t rt, uint32_t rn, uint32_t rm) { em_word(e, 0x3CE06800u | (rm << 16) | (rn << 5) | rt); }
+static inline void a64_str_q_reg(Em *e, uint32_t rt, uint32_t rn, uint32_t rm) { em_word(e, 0x3CA06800u | (rm << 16) | (rn << 5) | rt); }
+// three-same / bitwise op from an llvm-mc-calibrated sample word
+// (register fields rm[20:16] / rn[9:5] / rd[4:0] patched in)
+static inline void a64_neon(Em *e, uint32_t sample, uint32_t rd, uint32_t rn, uint32_t rm) {
+    em_word(e, (sample & 0xFFE0FC1Fu) | (rm << 16) | (rn << 5) | rd);
+}
+// dup (splat) from a GPR: se = lane byte width 1/2/4/8
+static inline void a64_neon_dup(Em *e, uint32_t se, uint32_t rd, uint32_t rn) {
+    em_word(e, (1u << 30) | 0x0E000000u | 0xC00u | (se << 16) | (rn << 5) | rd);
+}
+// ins Vd.lane <-> GPR (se = lane byte width 1/2/4/8; the imm5 field is
+// (lane << (log2(se)+1)) | se, calibrated against llvm-mc per lane width)
+static inline uint32_t a64_neon_imm5(uint32_t se, uint32_t lane) {
+    static const uint32_t sh[9] = {0, 1, 2, 0, 3, 0, 0, 0, 4}; // 1/2/4/8 indexed
+    return ((lane << sh[se]) | se) & 0x1F;
+}
+static inline void a64_neon_ins(Em *e, uint32_t se, uint32_t lane, uint32_t vd, uint32_t rn) {
+    em_word(e, 0x4E001C00u | (a64_neon_imm5(se, lane) << 16) | (rn << 5) | vd);
+}
+static inline void a64_neon_umov(Em *e, uint32_t se, uint32_t lane, uint32_t rd, uint32_t vn) {
+    em_word(e, ((se == 8 ? 1u : 0u) << 30) | 0x0E003C00u | (a64_neon_imm5(se, lane) << 16) | (vn << 5) | rd);
+}
+static inline void a64_neon_movi0(Em *e, uint32_t rd) { em_word(e, 0x4F00E400u | rd); }
+
+// three-same op with the lane width patched: sample calibrated at .16b
+// (size 00) for integer ops or .4s (size 00) for FP; width 0/1/2/3 selects
+// 16b/8h/4s/2d (FP: 4s/2d = 0/1)
+static inline void a64_neon_w(Em *e, uint32_t sample16b, uint32_t width,
+                              uint32_t rd, uint32_t rn, uint32_t rm) {
+    em_word(e, (sample16b & ~0x00C00000u) | (width << 22) | (rm << 16) | (rn << 5) | rd);
+}

@@ -1014,6 +1014,7 @@ int ea_decode_module(EaModule *m, const uint8_t *bytes, size_t len, char **err) 
                     imp_tags[m->n_imp_tags].type_idx = tidx;
                     im->kind = EAK_TAG;
                     im->idx = m->n_imp_tags++;
+                    m->feat.exceptions = true;
                     break;
                 }
                 default:
@@ -1270,6 +1271,7 @@ int ea_decode_module(EaModule *m, const uint8_t *bytes, size_t len, char **err) 
             }
             n_def_tags = n;
             if (s.p != s.end) FAIL("section size mismatch");
+            m->feat.exceptions = true;
             break;
         }
         default:
