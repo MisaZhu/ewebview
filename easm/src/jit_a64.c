@@ -15,6 +15,8 @@
 #include <pthread.h>
 #include <libkern/OSCacheControl.h>
 
+void ea_h_spdump(uint64_t tag, uint64_t sp);
+
 // ---------------------------------------------------------------- code region
 static uint8_t *g_code = NULL;
 static size_t g_code_len = 0, g_code_cap = 0;
@@ -197,6 +199,12 @@ EaEhRet ea_jit_eh_resume(EaExec *ex, EaInstance *inst, void *fp) {
     }
     ex->pending_exn = NULL;
     return eh_dispatch(ex, px, fp);
+}
+void ea_h_spdump(uint64_t tag, uint64_t sp) {
+    fprintf(stderr, "[SP] tag=%llu sp=%llu slots:", (unsigned long long)tag, (unsigned long long)sp);
+    for (int i = 0; i < 6; i++)
+        fprintf(stderr, " %llu", (unsigned long long)((uint64_t *)sp)[i]);
+    fprintf(stderr, "\n");
 }
 void ea_h_wdump6(uint64_t fp, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
     // fp points at the JIT frame; locals live at [fp-32-16*(nloc-k)] — we
@@ -738,6 +746,17 @@ static void load_mem_regs(Em *e) {
 
 static void spill_crefs(JC *c);
 static uint32_t cref_reg(JC *c, uint32_t i);
+static int ea_ctrace_on(void) { // compile-time decision trace (EA_CTRACE)
+    static int on = -1;
+    if (on < 0) on = getenv("EA_CTRACE") != NULL;
+    return on;
+}
+static int ea_wdbg2_on(void) { // runtime layout dumps (EA_WDBG2)
+    static int on = -1;
+    if (on < 0) on = getenv("EA_WDBG2") != NULL;
+    return on;
+}
+#define CTRACE(c, ...) do { if (ea_ctrace_on()) fprintf(stderr, "[CT] f%u pc=%u " __VA_ARGS__); } while (0)
 // a physical push materializes pending refs first: a deeper virtual value
 // can only land ABOVE entries that already exist on the stack, so it must
 // be written before the push takes the lowest slot
@@ -887,9 +906,11 @@ static uint32_t cref_reg(JC *c, uint32_t i) {
     return ea_cache_reg[local_cached_slot(c, c->cref_local[i])];
 }
 static void spill_crefs(JC *c) { // deepest first (array order = highest
-    for (uint32_t i = 0; i < c->n_cref; i++) {  // address first); 64-bit
-        a64_str_pre64(&c->em, cref_reg(c, i), SP, -16);  // stores (i32 cache
-    }                          // values are zero-extended by invariant)
+    if (ea_ctrace_on())          // address first); 64-bit
+        fprintf(stderr, "[CT] f%u pc=%u spill n_cref=%u\n", c->fn_idx, c->cur_pc, c->n_cref);
+    for (uint32_t i = 0; i < c->n_cref; i++) {  // stores (i32 cache values
+        a64_str_pre64(&c->em, cref_reg(c, i), SP, -16);  // are zero-extended)
+    }
     c->n_cref = 0;
 }
 static bool cref_conflict_any(JC *c, uint32_t idx) {
@@ -1259,6 +1280,7 @@ static void push_result_w(JC *c) {
             if (!c->in_park) a64_mov_reg64(&c->em, R17, R16);
             c->in_park = false;
             c->def_kind1 = 1; c->def_count = 1; c->def_first = 0;
+            CTRACE(c, "prx park ip=%d\n", 0);
             return;
         }
         if (c->def_count == 0 && !c->def2_live && !c->cache_on && !c->wl_pass &&
@@ -1318,6 +1340,7 @@ static void push_result_x(JC *c) {
             if (!c->in_park) a64_mov_reg64(&c->em, R17, R16);
             c->in_park = false;
             c->def_kind1 = 1; c->def_count = 1; c->def_first = 0;
+            CTRACE(c, "prx park ip=%d\n", 0);
             return;
         }
         if (c->def_count == 0 && !c->def2_live && !c->cache_on && !c->wl_pass &&
@@ -1332,10 +1355,12 @@ static void push_result_x(JC *c) {
         defer2_possible(c, c->cur_pc, (uint32_t)c->f->code.n)) {
         c->def_kind0 = 1; c->def_count = 1; c->def_first = 1;
         c->def_first_reg = 0;
+        CTRACE(c, "prx pair-first\n");
         return;
     }
     if (c->def2_live) flush_deferred(c); // the result would push above x19
     push_x(&c->em, R16);
+    CTRACE(c, "prx push\n");
 }
 // f32/f64 binop result in v0: park in v1 for a following float op, or store
 // straight to a local slot
@@ -1347,6 +1372,7 @@ static void push_result_f(JC *c, int b) {
             // in place when the local is cache-resident: fmov straight into
             // its register (also keeps the register fresh — never bypass
             // set_local_val with a raw frame store)
+            CTRACE(c, "prf set\n");
             if (c->cache_on) {
                 uint32_t k = c->f->code.v[nx].imm.u32;
                 for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) {
@@ -1368,6 +1394,7 @@ static void push_result_f(JC *c, int b) {
             a64_fmov_reg(&c->em, V1, V0, b);
             c->def_kind1 = (uint8_t)(b == 4 ? 2 : 3);
             c->def_count = 1; c->def_first = 0;
+            CTRACE(c, "prf parkV1\n");
             return;
         }
     }
@@ -1843,6 +1870,9 @@ static void eh_emit_stubs(JC *c) {
 }
 
 static void emit_call_static(JC *c, EaInstr *in) {
+    if (ea_ctrace_on())
+        fprintf(stderr, "[CT] call_static f%u pc=%u pass=%u callee=%u wdbg=%d\n",
+                c->fn_idx, c->cur_pc, c->wl_pass, in->imm.u32, ea_wdbg2_on());
     uint32_t callee = in->imm.u32;
     uint32_t a = 0, r = 0;
     if (callee < c->m->n_funcs) {
@@ -1852,6 +1882,11 @@ static void emit_call_static(JC *c, EaInstr *in) {
     } else {
         jfail(c, "bad callee");
         return;
+    }
+    if (ea_wdbg2_on()) { // pre-call: the args' materialized layout
+        a64_movz32(&c->em, R0, 1);
+        a64_add_imm64(&c->em, R1, SP, 0); // NOT mov_reg64: 31 encodes XZR there
+        call_helper(c, (const void *)ea_h_spdump);
     }
     uint32_t foff = __builtin_offsetof(EaInstance, funcs);
     uint32_t isz = (uint32_t)sizeof(EaFuncInst);
@@ -1905,6 +1940,11 @@ static void emit_call_static(JC *c, EaInstr *in) {
         if (a > r) a64_add_imm64(&c->em, SP, SP, (a - r) * SLOT);
         uint32_t join2 = c->em.len;
         c->em.buf[skip_at] = 0x14000000 | ((join2 - skip_at) & 0x3FFFFFF);
+        if (ea_wdbg2_on()) { // post-call: the results' layout
+            a64_movz32(&c->em, R0, 2);
+            a64_add_imm64(&c->em, R1, SP, 0);
+            call_helper(c, (const void *)ea_h_spdump);
+        }
         reload_ctx(c);
     }
 }
@@ -2017,7 +2057,7 @@ static void emit_helper3(JC *c, const void *helper, uint32_t imm0, uint32_t imm1
 static void br_label_target(JC *c, uint32_t l, uint32_t *theight, uint32_t *tarity,
                             bool *tloop, uint32_t *tpc) {
     if (l >= c->csp) { // function-level label: return with the function's results
-        *theight = 0; *tarity = c->n_res; *tloop = false; *tpc = c->n_pc;
+        *theight = 0; *tarity = c->n_res; *tloop = false; *tpc = c->n_pc - 1;
         return;
     }
     *theight = c->ctrl[c->csp - 1 - l].height;
@@ -2445,14 +2485,18 @@ static bool compile_function(JC *c) {
             break;
         }
         case EA_OP_ELSE:
-            // taken-branch fallthrough: jump to end
+            // taken-branch fallthrough: jump to end.  The false branch
+            // (fix_cond_to_pc targeted else_idx + 1) lands on the else body,
+            // which the loop now emits — the else body's logical stack starts
+            // from the block base + its input arity (the then body's results
+            // are NOT on the stack here).
             c->depth = c->ctrl[c->csp - 1].height + c->ctrl[c->csp - 1].rarity;
             {
                 em_b_label(e, 0);
                 fix_to_pc(c, c->ctrl[c->csp - 1].end_idx);
             }
-            pc = c->ctrl[c->csp - 1].end_idx; // emit join label there
-            continue;                          // skip pc++ (label recorded next iteration)
+            c->depth = c->ctrl[c->csp - 1].height + c->ctrl[c->csp - 1].arity_in;
+            break;
         case EA_OP_END:
             if (c->csp > 0) {
                 // normal exit of a try_table: drop its handler.  Branch
@@ -2519,7 +2563,7 @@ static bool compile_function(JC *c) {
                 theight = 0;
                 tarity = c->n_res;
                 tloop = false;
-                tpc = c->n_pc; // implicit end (emit_return tail)
+                tpc = c->n_pc - 1; // implicit end (emit_return tail)
             } else {
                 theight = c->ctrl[c->csp - 1 - l].height;
                 tarity = c->ctrl[c->csp - 1 - l].arity;
@@ -2545,7 +2589,7 @@ static bool compile_function(JC *c) {
                 theight = 0;
                 tarity = c->n_res;
                 tloop = false;
-                tpc = c->n_pc;
+                tpc = c->n_pc - 1;
             } else {
                 theight = c->ctrl[c->csp - 1 - l].height;
                 tarity = c->ctrl[c->csp - 1 - l].arity;
@@ -2839,10 +2883,10 @@ static bool compile_function(JC *c) {
         }
         pc++;
     }
-    if (c->reachable) {
-        c->insn_at[n] = e->len;
-        emit_return(c);
-    }
+    // unconditional: function-level br/br_if/br_table fixups target insn_at[n]
+    // even when the fallthrough tail is unreachable (body ended in a br)
+    c->insn_at[n] = e->len;
+    emit_return(c);
     // private return sequence for catch clauses that target the function-level
     // label (they land here with the payload as the results)
     if (c->n_eh_fx > 0) {
@@ -4099,7 +4143,12 @@ static bool compile_one_function(JC *c) {
     for (uint32_t i = 0; i < c->nfx; i++) {
         uint32_t at = c->fx[i].at;
         uint32_t target = c->insn_at[c->fx[i].target_pc];
-        if (target == UINT32_MAX) return false;
+        if (target == UINT32_MAX) {
+            if (getenv("EA_JIT_STATS"))
+                fprintf(stderr, "JIT fixup miss f%u fix#%u at=%u -> pc=%u\n",
+                        c->fn_idx, i, at, c->fx[i].target_pc);
+            return false;
+        }
         int64_t off = (int64_t)target - (int64_t)at;
         if (c->fx[i].cond)
             c->em.buf[at] |= ((uint32_t)(off & 0x7FFFF) << 5) | (c->fx[i].ccode & 0xF);
