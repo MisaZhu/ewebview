@@ -612,6 +612,12 @@ typedef struct {
                             // unless the pair-first stayed in its cache reg)
     bool in_place;          // binop computed straight into a cache register
     int8_t in_place_slot;   // that register's cache slot
+    bool in_park;           // binop result emitted straight into x17 (the
+                            // park register) — no park mov needed
+    bool def_b_imm;         // the window's b operand is an unmaterialized
+    uint32_t def_imm;       // immediate (the completer skipped its mov)
+    bool pop_imm_ok;        // the popped b operand was such an immediate
+    uint32_t pop_imm;
     uint8_t n_cref;         // cache-ref operand stack: logical entries just
     uint8_t cref_local[4];  // below the scratch window whose value already
                             // lives in a cache register (zero-code pushes)
@@ -732,8 +738,9 @@ static void load_mem_regs(Em *e) {
 
 static void spill_crefs(JC *c);
 static uint32_t cref_reg(JC *c, uint32_t i);
-// a physical push must land ABOVE any pending cache refs or the LIFO layer
-// ordering breaks — spill them (deepest first) first
+// a physical push materializes pending refs first: a deeper virtual value
+// can only land ABOVE entries that already exist on the stack, so it must
+// be written before the push takes the lowest slot
 static void push_x(JC *c, uint32_t rt) { if (c->n_cref) spill_crefs(c); a64_str_pre64(&c->em, rt, SP, -16); }
 static void pop_x(JC *c, uint32_t rt) {
     if (c->n_cref) { a64_mov_reg64(&c->em, rt, cref_reg(c, --c->n_cref)); return; }
@@ -879,10 +886,10 @@ static int16_t local_cached_slot(JC *c, uint32_t idx) {
 static uint32_t cref_reg(JC *c, uint32_t i) {
     return ea_cache_reg[local_cached_slot(c, c->cref_local[i])];
 }
-static void spill_crefs(JC *c) { // deepest first (array order); 64-bit
-    for (uint32_t i = 0; i < c->n_cref; i++) {  // stores (i32 cache values
-        a64_str_pre64(&c->em, cref_reg(c, i), SP, -16);  // are zero-extended)
-    }
+static void spill_crefs(JC *c) { // deepest first (array order = highest
+    for (uint32_t i = 0; i < c->n_cref; i++) {  // address first); 64-bit
+        a64_str_pre64(&c->em, cref_reg(c, i), SP, -16);  // stores (i32 cache
+    }                          // values are zero-extended by invariant)
     c->n_cref = 0;
 }
 static bool cref_conflict_any(JC *c, uint32_t idx) {
@@ -892,6 +899,7 @@ static bool cref_conflict_any(JC *c, uint32_t idx) {
 }
 static void pop_pair_w(JC *c) {
     c->vpops = 0;
+    c->pop_imm_ok = false;
     c->emit_a = R16; c->emit_b = R17;
     if (c->def2_live && c->def_count < 2) {
         // deepest operand parked in x19: a = x19, b = parked x17 or the stack
@@ -905,8 +913,9 @@ static void pop_pair_w(JC *c) {
     if (c->def_count == 2) { // a and b in their park registers when cached
         c->def_count = 0; c->vpops = 2;
         c->emit_a = c->def_first_reg ? c->def_first_reg : R16;
-        c->emit_b = c->def_second_reg ? c->def_second_reg : R17;
-        c->def_first_reg = 0; c->def_second_reg = 0;
+        if (c->def_b_imm) { c->pop_imm_ok = true; c->pop_imm = c->def_imm; c->emit_b = R17; }
+        else { c->pop_imm_ok = false; c->emit_b = c->def_second_reg ? c->def_second_reg : R17; }
+        c->def_first_reg = 0; c->def_second_reg = 0; c->def_b_imm = false;
         return;
     }
     if (c->def_count == 1) { // b in x17; a from a cache ref or the stack
@@ -922,6 +931,7 @@ static void pop_pair_w(JC *c) {
 }
 static void pop_pair_x(JC *c) {
     c->vpops = 0;
+    c->pop_imm_ok = false;
     c->emit_a = R16; c->emit_b = R17;
     if (c->def2_live && c->def_count < 2) {
         c->def2_live = false;
@@ -934,8 +944,9 @@ static void pop_pair_x(JC *c) {
     if (c->def_count == 2) {
         c->def_count = 0; c->vpops = 2;
         c->emit_a = c->def_first_reg ? c->def_first_reg : R16;
-        c->emit_b = c->def_second_reg ? c->def_second_reg : R17;
-        c->def_first_reg = 0; c->def_second_reg = 0;
+        if (c->def_b_imm) { c->pop_imm_ok = true; c->pop_imm = c->def_imm; c->emit_b = R17; }
+        else { c->pop_imm_ok = false; c->emit_b = c->def_second_reg ? c->def_second_reg : R17; }
+        c->def_first_reg = 0; c->def_second_reg = 0; c->def_b_imm = false;
         return;
     }
     if (c->def_count == 1) { // b in x17; a from a cache ref or the stack
@@ -951,7 +962,10 @@ static void pop_pair_x(JC *c) {
 }
 
 static void flush_deferred(JC *c) {
-    spill_crefs(c); // deepest layer first
+    // crefs first: their insert reserves room for the pushes above them, so
+    // the window's pre-decrement spills land below the block (the logical
+    // top = the lowest addresses)
+    spill_crefs(c);
     if (c->def2_live) { // deepest value first, matching logical stack order
         if (c->def2_kind == 0) a64_str_pre32(&c->em, R19, SP, -16);
         else a64_str_pre64(&c->em, R19, SP, -16);
@@ -961,6 +975,9 @@ static void flush_deferred(JC *c) {
     uint32_t r1 = c->def_second_reg ? c->def_second_reg : R17;
     c->def_first_reg = 0; c->def_second_reg = 0;
     if (!c->def_count) return;
+    if (c->def_count == 2 && c->def_b_imm)  // an unmaterialized imm operand
+        a64_mov64_imm(&c->em, R17, c->def_imm);
+    c->def_b_imm = false;
     if (c->def_count == 2) { // deeper value first; deferred slots are the ones sp points at
         if (c->def_kind0 == 0) a64_str_pre32(&c->em, r0, SP, -16);
         else a64_str_pre64(&c->em, r0, SP, -16);
@@ -978,6 +995,8 @@ static void flush_deferred(JC *c) {
 // in x16 (first operand) / x17 (second), so nothing is emitted
 
 static void flush_cache(JC *c) {
+    // the cref spill here is load-bearing: the pre-switch runs before the
+    // keep gate, so join points materialize pending refs unconditionally
     spill_crefs(c);
     for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) {
         if (c->cache_map[i] >= 0) {
@@ -1041,10 +1060,14 @@ static void set_local_val(JC *c, uint32_t idx, uint32_t reg) {
 static uint32_t binop_dst(JC *c, EaInstr *in) {
     c->in_place = false;
     c->in_place_slot = -1;
-    if (!c->cache_on) return R16;
+    c->in_park = false;
     uint32_t nx = c->cur_pc + 1;
     if (nx >= (uint32_t)c->f->code.n || c->is_target[nx]) return R16;
     uint32_t op = c->f->code.v[nx].opcode;
+    // the next op consumes this result from the park register: emit into
+    // x17 directly and the park branch records instead of copying
+    if (int_consumes(op)) { c->in_park = true; return R17; }
+    if (!c->cache_on) return R16;
     if (op != EA_OP_LOCAL_SET && op != EA_OP_LOCAL_TEE) return R16;
     uint32_t k = c->f->code.v[nx].imm.u32;
     // refs strictly below the top two survive the pops: writing the dst
@@ -1233,7 +1256,8 @@ static void push_result_w(JC *c) {
             return;
         }
         if (int_consumes(nop) || load_consumes(nop)) {
-            a64_mov_reg64(&c->em, R17, R16);
+            if (!c->in_park) a64_mov_reg64(&c->em, R17, R16);
+            c->in_park = false;
             c->def_kind1 = 1; c->def_count = 1; c->def_first = 0;
             return;
         }
@@ -1291,7 +1315,8 @@ static void push_result_x(JC *c) {
             return;
         }
         if (int_consumes(nop) || load_consumes(nop)) {
-            a64_mov_reg64(&c->em, R17, R16);
+            if (!c->in_park) a64_mov_reg64(&c->em, R17, R16);
+            c->in_park = false;
             c->def_kind1 = 1; c->def_count = 1; c->def_first = 0;
             return;
         }
@@ -2045,6 +2070,9 @@ static bool compile_function(JC *c) {
     c->def_first_reg = 0;
     c->def_second_reg = 0;
     c->n_cref = 0;
+    c->in_park = false;
+    c->def_b_imm = false;
+    c->pop_imm_ok = false;
     c->emit_a = R16; c->emit_b = R17;
     c->in_place = false;
     c->in_place_slot = -1;
@@ -3627,8 +3655,18 @@ static bool compile_scalar_op(JC *c, EaInstr *in) {
     case EA_OP_F64_LE: emit_fcmp64(c, CC_LE); return true;
     case EA_OP_F64_GE: emit_fcmp64(c, CC_GE); return true;
     // ---- i32 arithmetic
-    case EA_OP_I32_ADD: { uint32_t d = binop_dst(c, in); pop_pair_w(c); a64_add_reg32(e, d, c->emit_a, c->emit_b); push_result_w(c); return true; }
-    case EA_OP_I32_SUB: { uint32_t d = binop_dst(c, in); pop_pair_w(c); a64_sub_reg32(e, d, c->emit_a, c->emit_b); push_result_w(c); return true; }
+    case EA_OP_I32_ADD: { uint32_t d = binop_dst(c, in); pop_pair_w(c);
+        if (c->pop_imm_ok) { uint32_t iv = c->pop_imm;
+            if (iv <= 4095) a64_add_imm32(e, d, c->emit_a, iv);
+            else a64_sub_imm32(e, d, c->emit_a, 0 - iv);  // the negated fold
+        } else a64_add_reg32(e, d, c->emit_a, c->emit_b);
+        push_result_w(c); return true; }
+    case EA_OP_I32_SUB: { uint32_t d = binop_dst(c, in); pop_pair_w(c);
+        if (c->pop_imm_ok) { uint32_t iv = c->pop_imm;
+            if (iv <= 4095) a64_sub_imm32(e, d, c->emit_a, iv);
+            else a64_add_imm32(e, d, c->emit_a, 0 - iv);  // the negated fold
+        } else a64_sub_reg32(e, d, c->emit_a, c->emit_b);
+        push_result_w(c); return true; }
     case EA_OP_I32_MUL: { uint32_t d = binop_dst(c, in); pop_pair_w(c); a64_madd32(e, d, c->emit_a, c->emit_b, 31); push_result_w(c); return true; }
     case EA_OP_I32_AND: { uint32_t d = binop_dst(c, in); pop_pair_w(c); a64_and_reg32(e, d, c->emit_a, c->emit_b); push_result_w(c); return true; }
     case EA_OP_I32_OR: { uint32_t d = binop_dst(c, in); pop_pair_w(c); a64_orr_reg32(e, d, c->emit_a, c->emit_b); push_result_w(c); return true; }
@@ -3654,8 +3692,18 @@ static bool compile_scalar_op(JC *c, EaInstr *in) {
         a64_mov_reg32(e, R16, R0);
     } push_w(e, R16); return true;
     // ---- i64 arithmetic
-    case EA_OP_I64_ADD: { uint32_t d = binop_dst(c, in); pop_pair_x(c); a64_add_reg64(e, d, c->emit_a, c->emit_b); push_result_x(c); return true; }
-    case EA_OP_I64_SUB: { uint32_t d = binop_dst(c, in); pop_pair_x(c); a64_sub_reg64(e, d, c->emit_a, c->emit_b); push_result_x(c); return true; }
+    case EA_OP_I64_ADD: { uint32_t d = binop_dst(c, in); pop_pair_x(c);
+        if (c->pop_imm_ok) { uint32_t iv = c->pop_imm;
+            if (iv <= 4095) a64_add_imm64(e, d, c->emit_a, iv);
+            else a64_sub_imm64(e, d, c->emit_a, 0 - iv);  // the negated fold
+        } else a64_add_reg64(e, d, c->emit_a, c->emit_b);
+        push_result_x(c); return true; }
+    case EA_OP_I64_SUB: { uint32_t d = binop_dst(c, in); pop_pair_x(c);
+        if (c->pop_imm_ok) { uint32_t iv = c->pop_imm;
+            if (iv <= 4095) a64_sub_imm64(e, d, c->emit_a, iv);
+            else a64_add_imm64(e, d, c->emit_a, 0 - iv);  // the negated fold
+        } else a64_sub_reg64(e, d, c->emit_a, c->emit_b);
+        push_result_x(c); return true; }
     case EA_OP_I64_MUL: { uint32_t d = binop_dst(c, in); pop_pair_x(c); a64_madd64(e, d, c->emit_a, c->emit_b, 31); push_result_x(c); return true; }
     case EA_OP_I64_AND: { uint32_t d = binop_dst(c, in); pop_pair_x(c); a64_and_reg64(e, d, c->emit_a, c->emit_b); push_result_x(c); return true; }
     case EA_OP_I64_OR: { uint32_t d = binop_dst(c, in); pop_pair_x(c); a64_orr_reg64(e, d, c->emit_a, c->emit_b); push_result_x(c); return true; }
@@ -3687,8 +3735,18 @@ static bool compile_scalar_op2(JC *c, EaInstr *in) {
     // ---- constants
     case EA_OP_I32_CONST:
         if (c->def_count == 1 && c->def_first) {
-            a64_mov32_imm(e, R17, in->imm.u32);
-            c->def_second_reg = 0;
+            uint32_t nx2 = c->cur_pc + 1;
+            uint32_t nop2 = nx2 < (uint32_t)c->f->code.n ? c->f->code.v[nx2].opcode : 0;
+            uint32_t iv = in->imm.u32;
+            if ((nop2 == EA_OP_I32_ADD || nop2 == EA_OP_I32_SUB) &&
+                (iv <= 4095 || iv >= UINT32_MAX - 4094)) {
+                c->def_b_imm = true; c->def_imm = iv;
+                c->def_second_reg = 0;
+            } else {
+                a64_mov32_imm(e, R17, in->imm.u32);
+                c->def_b_imm = false;
+                c->def_second_reg = 0;
+            }
             c->def_kind1 = 0; c->def_count = 2; c->def_first = 0;
         } else if (c->def_count == 0 && c->def2_live && defer2_possible(c, c->cur_pc, c->f->code.n)) {
             a64_mov32_imm(e, R16, in->imm.u32); // middle of a def2 triple
@@ -3706,8 +3764,20 @@ static bool compile_scalar_op2(JC *c, EaInstr *in) {
         return true;
     case EA_OP_I64_CONST:
         if (c->def_count == 1 && c->def_first) {
-            a64_mov64_imm(e, R17, in->imm.u64);
-            c->def_second_reg = 0;
+            uint32_t nx2 = c->cur_pc + 1;
+            uint32_t nop2 = nx2 < (uint32_t)c->f->code.n ? c->f->code.v[nx2].opcode : 0;
+            uint64_t iv = in->imm.u64;
+            if ((nop2 == EA_OP_I64_ADD || nop2 == EA_OP_I64_SUB) &&
+                (iv <= 4095 || iv >= UINT64_MAX - 4094)) {
+                // the consumer folds the constant into its imm12 form: no
+                // register materialization at all
+                c->def_b_imm = true; c->def_imm = (uint32_t)iv;
+                c->def_second_reg = 0;
+            } else {
+                a64_mov64_imm(e, R17, in->imm.u64);
+                c->def_b_imm = false;
+                c->def_second_reg = 0;
+            }
             c->def_kind1 = 1; c->def_count = 2; c->def_first = 0;
         } else if (c->def_count == 0 && c->def2_live && defer2_possible(c, c->cur_pc, c->f->code.n)) {
             a64_mov64_imm(e, R16, in->imm.u64); // middle of a def2 triple
