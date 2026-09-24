@@ -629,6 +629,9 @@ typedef struct {
     uint8_t n_cref;         // cache-ref operand stack: logical entries just
     uint8_t cref_local[4];  // below the scratch window whose value already
                             // lives in a cache register (zero-code pushes)
+    uint8_t n_fpush;        // physical FP/vector pushes sitting ABOVE the
+                            // cref entries (push_s/d/q no longer evict them);
+                            // pop_s/d must drain these before reading refs
     int16_t cache_map[6];   // local cached in x19-x24 per slot (-1 = none)
     uint8_t cache_dirty;    // bit per slot: register fresher than frame
     uint8_t cache_clock;    // eviction hand
@@ -768,8 +771,16 @@ static void pop_w(JC *c, uint32_t rt) {
     if (c->n_cref) { a64_mov_reg64(&c->em, rt, cref_reg(c, --c->n_cref)); return; }
     a64_ldr_post32(&c->em, rt, SP, 16);
 }
-static void push_q(JC *c, uint32_t rt) { if (c->n_cref) spill_crefs(c); a64_str_q_pre(&c->em, rt); }
-static void pop_q(JC *c, uint32_t rt) { a64_ldr_q_post(&c->em, rt); }
+static void push_q(JC *c, uint32_t rt) {
+    if (c->n_cref) {
+        a64_sub_imm64(&c->em, SP, SP, 16);
+        a64_str_fpr_imm(&c->em, rt, SP, 0, 16);
+        c->n_fpush++;
+        return;
+    }
+    a64_str_q_pre(&c->em, rt);
+}
+static void pop_q(JC *c, uint32_t rt) { if (c->n_fpush) c->n_fpush--; a64_ldr_q_post(&c->em, rt); }
 // Q load/store at a signed FP-relative offset (imm9 form, with far fallback
 // through the R0 scratch for the deep-local frames)
 static void str_q_frame(JC *c, uint32_t rt, int32_t off) {
@@ -910,11 +921,19 @@ static void spill_crefs(JC *c) { // deepest first (array order = highest
         a64_str_pre64(&c->em, cref_reg(c, i), SP, -16);  // are zero-extended)
     }
     c->n_cref = 0;
+    c->n_fpush = 0; // everything above the refs is plain physical stack now
 }
 static bool cref_conflict_any(JC *c, uint32_t idx) {
     for (uint32_t i = 0; i < c->n_cref; i++)
         if (c->cref_local[i] == idx) return true;
     return false;
+}
+// push a logical stack entry that already lives in its local's cache
+// register (zero code): the in-place tee result, for instance.  The local
+// index is recorded so write-after-ref and eviction guards keep working.
+static void push_cref(JC *c, uint32_t local) {
+    if (c->n_cref >= 4) spill_crefs(c);
+    c->cref_local[c->n_cref++] = (uint8_t)local;
 }
 static void pop_pair_w(JC *c) {
     c->vpops = 0;
@@ -1264,9 +1283,8 @@ static void push_result_w(JC *c) {
         }
         if (nop == EA_OP_LOCAL_TEE) {
             if (c->in_place) {
-                uint32_t r = ea_cache_reg[c->in_place_slot];
                 in_place_finish(c);
-                push_x(&c->em, r); // tee keeps the value on the stack too
+                push_cref(c, c->f->code.v[nx].imm.u32); // tee keeps the value on the stack too
                 return;
             }
             set_local_val(c, c->f->code.v[nx].imm.u32, R16); // cache-aware
@@ -1324,9 +1342,8 @@ static void push_result_x(JC *c) {
         }
         if (nop == EA_OP_LOCAL_TEE) {
             if (c->in_place) {
-                uint32_t r = ea_cache_reg[c->in_place_slot];
                 in_place_finish(c);
-                push_x(&c->em, r); // tee keeps the value on the stack too
+                push_cref(c, c->f->code.v[nx].imm.u32); // tee keeps the value on the stack too
                 return;
             }
             set_local_val(c, c->f->code.v[nx].imm.u32, R16); // cache-aware
@@ -1398,10 +1415,40 @@ static void push_result_f(JC *c, int b) {
     }
     if (b == 4) push_s(&c->em, V0); else push_d(&c->em, V0);
 }
-static void push_s(JC *c, uint32_t vt) { if (c->n_cref) spill_crefs(c); a64_str_pre_fpr(&c->em, vt, SP, -16, 4); }
-static void pop_s(JC *c, uint32_t vt) { a64_ldr_post_fpr(&c->em, vt, SP, 16, 4); }
-static void push_d(JC *c, uint32_t vt) { if (c->n_cref) spill_crefs(c); a64_str_pre_fpr(&c->em, vt, SP, -16, 8); }
-static void pop_d(JC *c, uint32_t vt) { a64_ldr_post_fpr(&c->em, vt, SP, 16, 8); }
+// FP/vector pushes do NOT evict cache refs: the value lands above them via
+// sub sp + store at [sp] (the refs' eventual pre-decrement spill then lands
+// strictly below, matching the logical order deepest-to-shallowest)
+static void push_s(JC *c, uint32_t vt) {
+    if (c->n_cref) {
+        a64_sub_imm64(&c->em, SP, SP, 16);
+        a64_str_fpr_imm(&c->em, vt, SP, 0, 4);
+        c->n_fpush++;
+        return;
+    }
+    a64_str_pre_fpr(&c->em, vt, SP, -16, 4);
+}
+// consume the logical top for an FP consumer: physical FP pushes above the
+// cref layer drain first (LIFO); only then does a pending cache ref turn
+// into a fmov straight out of its cache register
+static void pop_s(JC *c, uint32_t vt) {
+    if (c->n_fpush) { c->n_fpush--; a64_ldr_post_fpr(&c->em, vt, SP, 16, 4); return; }
+    if (c->n_cref) { fmov_to_fpr(c, vt, cref_reg(c, --c->n_cref), 4); return; }
+    a64_ldr_post_fpr(&c->em, vt, SP, 16, 4);
+}
+static void push_d(JC *c, uint32_t vt) {
+    if (c->n_cref) {
+        a64_sub_imm64(&c->em, SP, SP, 16);
+        a64_str_fpr_imm(&c->em, vt, SP, 0, 8);
+        c->n_fpush++;
+        return;
+    }
+    a64_str_pre_fpr(&c->em, vt, SP, -16, 8);
+}
+static void pop_d(JC *c, uint32_t vt) {
+    if (c->n_fpush) { c->n_fpush--; a64_ldr_post_fpr(&c->em, vt, SP, 16, 8); return; }
+    if (c->n_cref) { fmov_to_fpr(c, vt, cref_reg(c, --c->n_cref), 8); return; }
+    a64_ldr_post_fpr(&c->em, vt, SP, 16, 8);
+}
 static void peek_x(JC *c, uint32_t rt, uint32_t slot) { a64_ldr_imm64(&c->em, rt, SP, (int64_t)slot * 16); }
 static void peek_q(JC *c, uint32_t rt, uint32_t slot) { a64_ldr_imm64(&c->em, rt, SP, (int64_t)slot * 16); } // Q reg, same encoding
 static void poke_x(JC *c, uint32_t rt, uint32_t slot) { a64_str_imm64(&c->em, rt, SP, (int64_t)slot * 16); }
@@ -2108,6 +2155,7 @@ static bool compile_function(JC *c) {
     c->def_first_reg = 0;
     c->def_second_reg = 0;
     c->n_cref = 0;
+    c->n_fpush = 0;
     c->in_park = false;
     c->def_b_imm = false;
     c->pop_imm_ok = false;
@@ -2244,8 +2292,13 @@ static bool compile_function(JC *c) {
         EaInstr *in = &code->v[pc];
         uint32_t op = in->opcode;
         if (c->def_count || c->def2_live || c->n_cref) {
+            // float binops and FP stores consume their operands through
+            // pop_s/pop_d, which read pending cache refs directly (fmov) —
+            // no flush needed, unlike the other consumers
             bool keep = c->skip_depth < 0 && c->reachable &&
                         (def_consumes(op) ||
+                         float_consumes(op) ||
+                         op == EA_OP_F32_STORE || op == EA_OP_F64_STORE ||
                          (c->cache_on && op == EA_OP_LOCAL_GET && c->skip_depth < 0 &&
                           c->reachable && local_cached_slot(c, in->imm.u32) >= 0) ||
                          (c->def_count == 1 && c->def_first &&
@@ -2445,16 +2498,26 @@ static bool compile_function(JC *c) {
             // body's local set, pass 2 recompiles with those locals pinned
             // to cache registers.  Known unsound corner: >6 live locals in
             // an unrolled body can thrash the want set between passes.
+            // Only LEAF loops (no nested LOOP in the body) warm up: an outer
+            // loop would capture the first 6 locals of the whole nest and
+            // starve the hot inner body (e.g. matmul's j-loop) of slots.
+            // Inner loops of a skipped nest reach this point later with
+            // wl_pass == 0 and warm on their own.
             if (c->wl_pass == 0 && c->cache_on && getenv("EA_NOWARM") == NULL) {
-                if (getenv("EA_WDBG")) fprintf(stderr, "[L] f%u loop pc=%u head=%u end=%u nloc=%u\n", c->fn_idx, pc, pc + 1, in->end_idx, c->n_locals);
-                c->wl_pass = 1;
-                c->wl_head_pc = pc + 1;
-                c->wl_end_idx = in->end_idx;
-                c->wl_loop_pc = pc;
-                c->wl_em0 = c->em.len;
-                c->wl_nfx0 = c->nfx;
-                c->wl_ntfx0 = c->ntfx;
-                c->wl_n_want = 0;
+                bool leaf = true;
+                for (uint32_t q = pc + 1; q < in->end_idx; q++)
+                    if (code->v[q].opcode == EA_OP_LOOP) { leaf = false; break; }
+                if (leaf) {
+                    if (getenv("EA_WDBG")) fprintf(stderr, "[L] f%u loop pc=%u head=%u end=%u nloc=%u\n", c->fn_idx, pc, pc + 1, in->end_idx, c->n_locals);
+                    c->wl_pass = 1;
+                    c->wl_head_pc = pc + 1;
+                    c->wl_end_idx = in->end_idx;
+                    c->wl_loop_pc = pc;
+                    c->wl_em0 = c->em.len;
+                    c->wl_nfx0 = c->nfx;
+                    c->wl_ntfx0 = c->ntfx;
+                    c->wl_n_want = 0;
+                }
             }
             c->ctrl[c->csp].height = in->height;
             c->ctrl[c->csp].arity = in->arity_out;
@@ -3955,8 +4018,7 @@ static void fmov_to_gpr(JC *c, uint32_t gpr, uint32_t vs, int b) { a64_fmov_gpr_
 static void emit_f32_bin(JC *c, uint32_t opc) {
     if (c->def_count == 1 && c->def_kind1 == 2) { // rhs parked in v1
         c->def_count = 0;
-        if (c->n_cref) { c->n_cref--; fmov_to_fpr(c, V0, cref_reg(c, c->n_cref), 4); }
-        else pop_s(&c->em, V0);
+        pop_s(&c->em, V0); // drains physical FP pushes before any cref
     } else {
         flush_deferred(c); // parked int operands must reach the stack first
         pop_s(&c->em, V1); pop_s(&c->em, V0);
@@ -3972,8 +4034,7 @@ static void emit_f32_bin(JC *c, uint32_t opc) {
 static void emit_f64_bin(JC *c, uint32_t opc) {
     if (c->def_count == 1 && c->def_kind1 == 3) { // rhs parked in v1
         c->def_count = 0;
-        if (c->n_cref) { c->n_cref--; fmov_to_fpr(c, V0, cref_reg(c, c->n_cref), 8); }
-        else pop_d(&c->em, V0);
+        pop_d(&c->em, V0); // drains physical FP pushes before any cref
     } else {
         flush_deferred(c); // parked int operands must reach the stack first
         pop_d(&c->em, V1); pop_d(&c->em, V0);
@@ -4301,6 +4362,12 @@ void ea_jit_compile_module(EaModule *m) {
         }
             pthread_jit_write_protect_np(0);
         memcpy(dst, c.em.buf, c.em.len * 4);
+        if (getenv("EA_CODE_DUMP")) { // temp: per-function code dump for llvm-mc
+            char p[64];
+            snprintf(p, sizeof(p), "/tmp/jitf/f%u.bin", fi);
+            FILE *fp = fopen(p, "wb");
+            if (fp) { fwrite(c.em.buf, 4, c.em.len, fp); fclose(fp); }
+        }
         // absolutize exception clause targets now that the code is placed
         for (uint32_t i = 0; i < c.n_eh_fx; i++) {
             struct EhFx *fx = &c.eh_fx[i];
