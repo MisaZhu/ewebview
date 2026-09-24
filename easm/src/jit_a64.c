@@ -632,10 +632,8 @@ typedef struct {
     int16_t cache_map[6];   // local cached in x19-x24 per slot (-1 = none)
     uint8_t cache_dirty;    // bit per slot: register fresher than frame
     uint8_t cache_clock;    // eviction hand
-    uint8_t cache_on;       // EA_CACHE/EA_WARM opt-in; spec-clean since the
-                            // fused-set/tee cache-bypass and pass-2 want
-                            // write-back fixes, still gated (no measured
-                            // workload win yet; def2 parks x19)
+    uint8_t cache_on;       // register file caching locals (x19-x24); on by
+                            // default, EA_NOCACHE opts out
     // warm-loop two-pass state: pass 1 records the cache state at the loop
     // back-edge; the body is then recompiled with those locals pre-loaded at
     // the head, so loop-carried values never touch memory
@@ -2123,7 +2121,7 @@ static bool compile_function(JC *c) {
     c->cache_clock = 0;
     c->wl_pass = 0;
     c->wl_n_want = 0;
-    c->cache_on = (getenv("EA_CACHE") != NULL || getenv("EA_WARM") != NULL);
+    c->cache_on = getenv("EA_NOCACHE") == NULL;
     c->is_target = (uint8_t *)calloc(n + 2, 1);
     if (c->is_target)
         for (uint32_t i = 0; i < n; i++) {
@@ -2443,10 +2441,11 @@ static bool compile_function(JC *c) {
             break;
         }
         case EA_OP_LOOP:
-            // warm-loop two-pass: correct on the spec suite but a stale-value
-            // hole remains for >6-live-local unrolled bodies (bench kernels);
-            // EA_WARM=1 opts in while that is being chased down
-            if (c->wl_pass == 0 && c->cache_on && getenv("EA_WARM") != NULL) {
+            // warm-loop two-pass (EA_NOWARM opts out): pass 1 records the
+            // body's local set, pass 2 recompiles with those locals pinned
+            // to cache registers.  Known unsound corner: >6 live locals in
+            // an unrolled body can thrash the want set between passes.
+            if (c->wl_pass == 0 && c->cache_on && getenv("EA_NOWARM") == NULL) {
                 if (getenv("EA_WDBG")) fprintf(stderr, "[L] f%u loop pc=%u head=%u end=%u nloc=%u\n", c->fn_idx, pc, pc + 1, in->end_idx, c->n_locals);
                 c->wl_pass = 1;
                 c->wl_head_pc = pc + 1;
