@@ -76,7 +76,8 @@ BROWSER_NATIVE_OBJS = \
 	$(ARCH)/natives/js_dom.o \
 	$(ARCH)/natives/js_event.o \
 	$(ARCH)/natives/js_web.o \
-	$(ARCH)/natives/js_canvas.o
+	$(ARCH)/natives/js_canvas.o \
+	$(ARCH)/natives/js_wasm.o
 
 TASK_OBJS = $(VM_OBJS) $(NATIVE_OBJS) $(BROWSER_NATIVE_OBJS)
 
@@ -87,7 +88,8 @@ MARIO_HEADERS = $(MARIO_VM)/mario/mario.h \
 	natives/js_dom.h \
 	natives/js_event.h \
 	natives/js_web.h \
-	natives/js_canvas.h
+	natives/js_canvas.h \
+	natives/js_wasm.h
 
 all: $(TASK)
 
