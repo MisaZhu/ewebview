@@ -85,6 +85,12 @@ typedef struct js_web_callbacks {
     void  (*get_screen)(void* ctx, int* w, int* h, int* depth);
     void  (*get_scroll)(void* ctx, int* x, int* y);
     void  (*scroll_to)(void* ctx, int x, int y);
+    /* Preferred color scheme in the litehtml media_features encoding
+     * (0 = dark, 1 = light), for matchMedia("(prefers-color-scheme: ...)").
+     * NULL reports light, the same default the CSS side applies when no
+     * scheme is configured; JS and CSS must agree or a page that gates its
+     * theme on matchMedia paints the opposite scheme from its stylesheets. */
+    int   (*get_color_scheme)(void* ctx);
 
     /* ---- navigation ----
      * navigate backs location.assign()/location.href = .../window.open().

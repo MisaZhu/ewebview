@@ -29,6 +29,7 @@
 #include "EWebLog.h"
 #include "EWebCookies.h"
 #include <algorithm>   /* std::find (runaway/requeue bookkeeping) */
+#include <stdlib.h>    /* getenv (env-gated net diag) */
 #include "eweb_el_input.h"
 
 #include <mario/mario.h>
@@ -504,7 +505,15 @@ bool EWebEngine::runPageScripts()
         m_jsVm->abort_run = false;
         m_jsVm->propagating_err = nullptr;
         m_jsVm->call_depth = 0;
-        if(!vm_load_run(m_jsVm, src.c_str())) {
+        /* Module/defer scripts run after parsing ends in a real browser, so
+         * they (and everything after them, up to DOMContentLoaded) observe
+         * readyState=="interactive". Flip the bridge state monotonically when
+         * the first such script runs; github's client-env module gates reading
+         * its JSON island on that value. */
+        bool deferredHere = (i < m_jsScriptDeferred.size() && m_jsScriptDeferred[i]);
+        if(deferredHere)
+            js_dom_set_parsing_complete(m_jsVm, true);
+        if(!jsRunScriptBody(src, deferredHere)) {
             EWEB_LOG("[ewebview] js: script %d failed to compile\n", (int)i);
             jsDumpScript(i, src, true);
         }
@@ -576,10 +585,14 @@ bool EWebEngine::runNextPageScript()
          * While the viewport still shows only the server-side skeleton the
          * tail of the queue IS the content bundle, so use the much larger
          * skeleton budget instead (see kJsPostSwapSkeletonBudgetMs). */
-        uint32_t postBudget = pageShowsSkeletonPlaceholder()
+        uint32_t postBudget = (pageShowsSkeletonPlaceholder() ||
+                               (m_jsBuildHasModules && pageHasSkeletonAny()))
                                   ? kJsPostSwapSkeletonBudgetMs
                                   : kJsPostSwapBudgetMs;
         if(m_jsPostSwapAt != 0 && (ticMs() - m_jsPostSwapAt) > postBudget) {
+            if(getenv("EWEB_SCRIPTDBG") != NULL)
+                fprintf(stderr, "[ewebview] jsdbg: post budget %u ms exhausted at script %d of %d\n",
+                        (unsigned)postBudget, (int)i, (int)m_jsScripts.size());
             EWEB_LOG("[ewebview] js: post-swap budget %u ms exhausted at script %d of %d - dropping the rest\n",
                 (unsigned)postBudget, (int)i, (int)m_jsScripts.size());
             m_jsNextScript = m_jsScripts.size();
@@ -602,6 +615,11 @@ bool EWebEngine::runNextPageScript()
          * Past the deadline skip the unresolvable slot exactly like a 404. */
         if(i < m_jsScriptDone.size() && !m_jsScriptDone[i]) {
             if(m_jsScriptWaitSince == 0) m_jsScriptWaitSince = ticMs();
+            if(getenv("EWEB_SCRIPTDBG") != NULL &&
+               (ticMs() - m_jsScriptWaitSince) % 2000 < 50)
+                fprintf(stderr, "[ewebview] jsdbg: post wait script %d (%llu ms) src=%.80s\n",
+                        (int)i, (unsigned long long)(ticMs() - m_jsScriptWaitSince),
+                        (i < m_jsScriptSrcs.size() ? m_jsScriptSrcs[i].c_str() : "?"));
             if(ticMs() - m_jsScriptWaitSince < 10000) return true;
             EWEB_LOG("[ewebview] js: post-swap script %d fetch never resolved (src=%.80s) - skipping past deadline\n",
                 (int)i, (i < m_jsScriptSrcs.size() ? m_jsScriptSrcs[i].c_str() : "?"));
@@ -609,7 +627,18 @@ bool EWebEngine::runNextPageScript()
             if(i < m_jsScripts.size()) m_jsScripts[i].clear();
             jsFireScriptElEvent(i, "error");   /* webpack d.l waits on onerror */
         }
-        m_jsScriptWaitSince = 0;
+        /* Refund the network wait to the post-swap phase clock: the budget
+         * bounds engine work (each script already caps at its own run budget),
+         * but on a live load the ordered queue parks on every external fetch,
+         * so CDN latency - not script cost - consumed the phase window and the
+         * content bundles at the tail were dropped (pinterest.com: budget
+         * exhausted at script 39 of 61 while the viewport was still blank). */
+        if(m_jsScriptWaitSince != 0) {
+            uint64_t waited = ticMs() - m_jsScriptWaitSince;
+            if(m_jsPostSwapAt != 0 && waited > 0)
+                m_jsPostSwapAt += waited;
+            m_jsScriptWaitSince = 0;
+        }
         /* First script of this page: pre-materialise a stand-in <script src>
          * element for every queued external script so the DOM script list is
          * populated BEFORE any SDK reads it (see jsScriptStandInEl). */
@@ -619,7 +648,13 @@ bool EWebEngine::runNextPageScript()
          * <script>), which push_backs to m_jsScripts and can realloc - a
          * reference held across vm_load_run below would then dangle. */
         std::string src = m_jsScripts[i];
-        if(src.empty()) { jsFireScriptElEvent(i, "error"); continue; }
+        if(src.empty()) {
+            if(getenv("EWEB_SCRIPTDBG") != NULL)
+                fprintf(stderr, "[ewebview] jsdbg: post skip script %d (empty body) src=%.80s done=%d\n",
+                        (int)i, (i < m_jsScriptSrcs.size() ? m_jsScriptSrcs[i].c_str() : "?"),
+                        (i < m_jsScriptDone.size() ? (int)m_jsScriptDone[i] : -1));
+            jsFireScriptElEvent(i, "error"); continue;
+        }
         if(jsIsRunaway(src)) {
             EWEB_LOG("[ewebview] js: script %d skipped (runaway body, %u bytes)\n",
                 (int)i, (unsigned)src.size());
@@ -680,7 +715,11 @@ bool EWebEngine::runNextPageScript()
         m_jsVm->abort_run = false;
         m_jsVm->propagating_err = nullptr;
         m_jsVm->call_depth = 0;
-        if(!vm_load_run(m_jsVm, src.c_str())) {
+        /* Same monotonic readyState flip as the pre-paint path (see above). */
+        bool deferredHere = (i < m_jsScriptDeferred.size() && m_jsScriptDeferred[i]);
+        if(deferredHere)
+            js_dom_set_parsing_complete(m_jsVm, true);
+        if(!jsRunScriptBody(src, deferredHere)) {
             EWEB_LOG("[ewebview] js: script %d failed to compile\n", (int)i);
             jsDumpScript(i, src, true);
         }
@@ -721,6 +760,8 @@ bool EWebEngine::runNextPageScript()
                                         ? m_jsScriptSrcs[i] : std::string());
             m_jsScriptIds.push_back(i < m_jsScriptIds.size()
                                        ? m_jsScriptIds[i] : std::string());
+            m_jsScriptDeferred.push_back(i < m_jsScriptDeferred.size()
+                                            ? m_jsScriptDeferred[i] : false);
             m_jsScriptDone.push_back(1);
             m_jsScriptEls.push_back(nullptr);   /* keep the vectors aligned */
             for(auto it = m_jsRunawaySrcs.begin(); it != m_jsRunawaySrcs.end(); ++it) {
@@ -873,6 +914,10 @@ void EWebEngine::jsDynamicScriptInserted(void* script_el)
         m_jsScripts.push_back(external ? std::string() : body);
         m_jsScriptSrcs.push_back(parts[k]);
         m_jsScriptIds.push_back(std::string());
+        /* A dynamically inserted script executes as soon as it loads; by then
+         * parsing is over unless a defer/module script has run yet, so the
+         * readyState flag stays untouched here (matches the classic case). */
+        m_jsScriptDeferred.push_back(false);
         m_jsScriptDone.push_back(external ? 0 : 1);
         /* Remember the element so the ordered run can fire load/error on it
          * (see m_jsScriptEls). Only part 0 of a split combo owns the element;
@@ -1041,12 +1086,17 @@ void EWebEngine::jsVmEnter()
      * short one, because the engine thread cannot serve input while it lasts.
      * While only the server-side skeleton paints, the app entry that replaces
      * it is one long top-level body, so it gets the skeleton run budget instead
-     * (see kJsRunBudgetSkeletonMs). */
+     * (see kJsRunBudgetSkeletonMs). A module-script page that still shows ANY
+     * skeleton placeholder is in the same boat even though real content paints
+     * around it (github.com's file tree): its hydration bundles are single
+     * multi-second bodies, and cutting them at the live budget aborts the boot
+     * three times and drops the page's JS entirely. */
     m_jsRunDeadline = m_jsEnterAt +
         ((m_jsPrePaintAt != 0) ? kJsRunBudgetMs
-                               : (jsSkeletonProbeCached()
+                               : (jsSkeletonProbeCached() ||
+                                  (m_jsBuildHasModules && pageHasSkeletonAny()))
                                       ? kJsRunBudgetSkeletonMs
-                                      : kJsRunBudgetLiveMs));
+                                      : kJsRunBudgetLiveMs);
     m_jsEnterGen = m_buildAbortGen;
     m_jsAbortPrePaint = false;
     m_jsInScript = true;
@@ -1105,10 +1155,72 @@ void EWebEngine::jsVmStepHook(struct st_vm* vm, void* data)
  * pumping the DOM timer table (setTimeout/setInterval AND queued
  * MessageChannel posts, which ride it at 0 ms). When nothing is due but timers
  * are still armed we sleep ~1 ms so delayed callbacks get real wall-clock
- * time; when the table is empty the promise can never settle and we return 0
- * so the await degrades to undefined as before. Per-promise wall-clock cap
- * keeps a genuinely stuck await from hanging the run. Must not load/compile
- * bytecode (same restriction as on_step). */
+ * time; when the table is empty the promise can never settle by timers alone,
+ * so the tick falls back to advancing the post-swap script queue (see
+ * jsPumpAwaitScript) - mario's vm_run reloads its cached code pointer after
+ * every dispatch, which is what makes compiling a further script from inside
+ * the spin safe. When the queue is drained too, the tick returns 0 so the
+ * await degrades to undefined as before. Per-promise wall-clock cap keeps a
+ * genuinely stuck await from hanging the run. */
+/* Await-pump script advance: evaluate the next queued post-swap script whose
+ * body is already fetched, IN DOCUMENT ORDER, from inside an await spin. Some
+ * promises only settle in a LATER script's top level - github.com's react-app
+ * registry is filled by the code-view chunk (script 8) while the element's
+ * connectedCallback awaits it during behaviors (script 4); with no true
+ * suspension the await would degrade to undefined and hydration never starts.
+ * Consuming the queue head keeps document order intact: the outer post-swap
+ * loop re-reads m_jsNextScript when its current iteration finishes, so a
+ * script the pump ran is never run twice. The nested run deliberately skips
+ * jsVmEnter/jsVmExit (their deadline/generation slots belong to the OUTER
+ * frame, whose watchdog keeps bounding all of this work) and restores the
+ * outer frame's per-script context and VM residue on the way out. */
+int EWebEngine::jsPumpAwaitScript()
+{
+    if(m_jsVm == nullptr || m_jsPostSwapAt == 0) return 0;
+    if(m_jsNextScript >= m_jsScripts.size()) return 0;
+    size_t i = m_jsNextScript;
+    if(i >= m_jsScriptDone.size() || !m_jsScriptDone[i]) return 0;
+    std::string src = m_jsScripts[i];
+    m_jsNextScript++;
+    if(src.empty()) { jsFireScriptElEvent(i, "error"); return 1; }
+    if(getenv("EWEB_SCRIPTDBG") != NULL)
+        fprintf(stderr, "[ewebview] jsdbg: await-pump run script %d len=%u url=%.80s\n",
+                (int)i, (unsigned)src.size(),
+                (i < m_jsScriptSrcs.size() ? m_jsScriptSrcs[i].c_str() : "?"));
+    /* Outer frame context to restore afterwards. */
+    const std::string* saveSrc  = m_jsCurScriptSrc;
+    std::string        saveUrl  = m_jsCurScriptUrl;
+    bool               saveProg = m_jsProgressiveActive;
+    const char*        saveTag  = m_jsVm->dbg_tag;
+    int                saveDepth = m_jsVm->call_depth;
+    bool               saveTerm  = m_jsVm->terminated;
+    bool               saveAbort = m_jsVm->abort_run;
+    var_t*             saveErr   = m_jsVm->propagating_err;
+
+    static char s_pumpTag[64];
+    snprintf(s_pumpTag, sizeof(s_pumpTag), "pump_%d", (int)i);
+    m_jsVm->dbg_tag = s_pumpTag;
+    m_jsCurScriptSrc = &src;
+    m_jsCurScriptUrl = (i < m_jsScriptSrcs.size()) ? m_jsScriptSrcs[i] : std::string();
+    jsSetModuleBase(true);
+    bool deferredHere = (i < m_jsScriptDeferred.size() && m_jsScriptDeferred[i]);
+    if(deferredHere)
+        js_dom_set_parsing_complete(m_jsVm, true);
+    if(!jsRunScriptBody(src, deferredHere) && getenv("EWEB_SCRIPTDBG") != NULL)
+        fprintf(stderr, "[ewebview] jsdbg: await-pump script %d failed\n", (int)i);
+    jsSetModuleBase(false);
+
+    m_jsCurScriptSrc    = saveSrc;
+    m_jsCurScriptUrl    = saveUrl;
+    m_jsProgressiveActive = saveProg;
+    m_jsVm->dbg_tag     = saveTag;
+    m_jsVm->call_depth  = saveDepth;
+    m_jsVm->terminated  = saveTerm;
+    m_jsVm->abort_run   = saveAbort;
+    m_jsVm->propagating_err = saveErr;
+    return 1;
+}
+
 int EWebEngine::jsAwaitPendingTick(struct st_vm* vm, var_t* promise)
 {
     if(vm == nullptr) return 0;
@@ -1124,7 +1236,10 @@ int EWebEngine::jsAwaitPendingTick(struct st_vm* vm, var_t* promise)
         usleep(1000);
         return 1;
     }
-    return 0;
+    /* No timer can settle this promise: try the next queued script instead
+     * (see jsPumpAwaitScript). Returns 0 once the queue is drained, letting
+     * the await degrade to undefined exactly as before. */
+    return self->jsPumpAwaitScript();
 }
 
 void EWebEngine::jsOnVmStep(struct st_vm* vm)
@@ -1650,17 +1765,18 @@ int EWebEngine::jsQueryAll(void* ctx, void* root, const char* selector,
 
     /* litehtml's select_all() matches the element it is called on as well as
      * its descendants, while querySelector/querySelectorAll must never match
-     * the context node itself. Start from the children to get DOM semantics. */
+     * the context node itself. Query from `base` and drop `base` from the hit
+     * list to get DOM semantics. (Iterating children and calling
+     * child->select_all(tstring) instead would miss node types that only
+     * override the css_selector& overload - el_script, which backs
+     * <script type="application/json"> data islands - because the base
+     * element::select_all(tstring) is a no-op.) */
     litehtml::tstring sel(selector);
+    litehtml::elements_vector all = base->select_all(sel);
     litehtml::elements_vector hits;
-    size_t n = base->get_children_count();
-    for(size_t i = 0; i < n; ++i) {
-        litehtml::element::ptr c = base->get_child((int)i);
-        if(c == nullptr) continue;
-        litehtml::elements_vector part = c->select_all(sel);
-        for(size_t j = 0; j < part.size(); ++j) {
-            if(part[j] != nullptr) hits.push_back(part[j]);
-        }
+    for(size_t i = 0; i < all.size(); ++i) {
+        if(all[i] == nullptr || all[i] == base) continue;
+        hits.push_back(all[i]);
     }
 
     /* `skip` lets the bridge page through more matches than fit in `out`; see
@@ -2239,6 +2355,19 @@ void EWebEngine::jsWebGetViewport(void* ctx, int* w, int* h)
     if(h) *h = (self != nullptr) ? self->m_clientHeight : 0;
 }
 
+int EWebEngine::jsWebGetColorScheme(void* ctx)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(self == nullptr || self->m_container == nullptr)
+        return 1;   /* unknown: light, the same default the CSS side uses */
+    /* The container is the single source of truth: stylesheet media queries
+     * and matchMedia() must report one scheme or the page's JS theme switch
+     * fights its own CSS (github.com gates dark mode on both). */
+    litehtml::media_features feat;
+    self->m_container->get_media_features(feat);
+    return feat.color_scheme;
+}
+
 void EWebEngine::jsWebGetScreen(void* ctx, int* w, int* h, int* depth)
 {
     EWebEngine* self = (EWebEngine*)ctx;
@@ -2410,6 +2539,13 @@ bool EWebEngine::jsWebRequest(void* ctx, const char* method, const char* url,
             ch.value = cookie_storage.c_str();
             send.push_back(ch);
         }
+        /* Env-gated: show the Cookie the jar produced for this hop so a
+         * server-side CSRF/session refusal can be attributed to a missing
+         * cookie versus a missing header. */
+        if(getenv("EWEB_NETDBG") != NULL)
+            fprintf(stderr, "[netdbg] xhr %s %s cookie=%s body=%d\n",
+                    cur_method.c_str(), cur.c_str(),
+                    cookie.empty() ? "(none)" : cookie.c_str(), cur_body_len);
 
         if(!port->net.request(port->net.ud, cur.c_str(), cur_method.c_str(),
                               cur_body, cur_body_len,
@@ -2488,17 +2624,54 @@ static EWebEngine* js_engine_of_vm(vm_t* vm)
     return (vm != nullptr) ? (EWebEngine*)vm->on_step_data : nullptr;
 }
 
+/* Import-map resolution for a bare specifier: exact key first, then the
+ * longest key ending in '/' that prefixes it (package subpath form). Returns
+ * the mapped address (possibly relative) or empty when unmapped. */
+std::string EWebEngine::jsImportMapLookup(const char* spec)
+{
+    const std::string s(spec != nullptr ? spec : "");
+    const std::string* best = nullptr;
+    size_t best_len = 0;
+    for(size_t i = 0; i < m_jsImportMap.size(); ++i) {
+        const std::string& k = m_jsImportMap[i].first;
+        if(k == s) { return m_jsImportMap[i].second; }
+        if(!k.empty() && k[k.size()-1] == '/' && s.compare(0, k.size(), k) == 0 &&
+           k.size() > best_len) { best = &m_jsImportMap[i].second; best_len = k.size(); }
+    }
+    return (best != nullptr) ? *best : std::string();
+}
+
+bool EWebEngine::jsRunScriptBody(const std::string& src, bool moduleish)
+{
+    if(moduleish && !m_jsCurScriptUrl.empty()) {
+        std::string abs = EWebContainer::getFullURL(&m_port, m_jsCurScriptUrl.c_str(),
+                                                    jsDocumentUrl());
+        if(!abs.empty())
+            return vm_load_run_module(m_jsVm, src.c_str(), abs.c_str());
+    }
+    return vm_load_run(m_jsVm, src.c_str());
+}
+
 mstr_t* EWebEngine::jsModuleResolve(vm_t* vm, const char* spec, const char* base)
 {
     EWebEngine* self = js_engine_of_vm(vm);
     if(self == nullptr || spec == nullptr || spec[0] == 0) return nullptr;
     /* Base for a relative specifier: the importing module's URL, else the
      * <script src> being run, else the document. Bare specifiers ("react")
-     * have no browser resolution without an import map; leave them as-is so
-     * the registry key stays stable and the load simply fails. */
+     * resolve ONLY through the page's import map; without a hit there is no
+     * browser resolution, so leave them to fail (registry key stays stable). */
     bool relative = (spec[0] == '.' || spec[0] == '/');
     bool absolute = (strstr(spec, "://") != nullptr);
-    if(!relative && !absolute) return nullptr;
+    if(!relative && !absolute) {
+        /* Import map: exact specifier first, then longest trailing-slash
+         * prefix (package subpaths, e.g. "react/" + "jsx-runtime"). */
+        const std::string hit = self->jsImportMapLookup(spec);
+        if(hit.empty()) return nullptr;
+        std::string full = EWebContainer::getFullURL(&self->m_port, hit.c_str(),
+                                                     self->jsDocumentUrl());
+        if(full.empty()) return nullptr;
+        return mstr_new(full.c_str());
+    }
     std::string b;
     if(base != nullptr && base[0] != 0) b = base;
     else if(!self->m_jsCurScriptUrl.empty())
@@ -2574,7 +2747,14 @@ char* EWebEngine::jsWebGetCookie(void* ctx)
      * document's URL and filters HttpOnly entries out, so what comes back is
      * already the "k=v; k2=v2" string document.cookie reports. A document with
      * no URL (loadHtmlContent) gets an empty jar view, as an about:blank does. */
-    return js_strdup_mario(EWebCookieJar::instance().jsGet(self->jsDocumentUrl()).c_str());
+    std::string view = EWebCookieJar::instance().jsGet(self->jsDocumentUrl());
+    /* Env-gated: an empty document.cookie where the request Cookie header has
+     * entries means the jar filed them as HttpOnly; print the JS view to tell
+     * the two apart when a server-side CSRF check fails. */
+    if(getenv("EWEB_NETDBG") != NULL)
+        fprintf(stderr, "[netdbg] document.cookie=%s\n",
+                view.empty() ? "(empty)" : view.c_str());
+    return js_strdup_mario(view.c_str());
 }
 
 void EWebEngine::jsWebSetCookie(void* ctx, const char* cookie)
@@ -2641,6 +2821,7 @@ void EWebEngine::registerWebNatives(struct st_vm* vm)
     cb.get_screen   = jsWebGetScreen;
     cb.get_scroll   = jsWebGetScroll;
     cb.scroll_to    = jsWebScrollTo;
+    cb.get_color_scheme = jsWebGetColorScheme;
 
     /* Navigation. Both defer through m_jsPendingNav because a navigation tears
      * down the VM the requesting script is running in.

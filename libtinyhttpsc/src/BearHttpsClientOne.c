@@ -20766,6 +20766,9 @@ typedef struct BearHttpsResponse{
     //http1.1 vars 
     short http1_state;
     long http1_reaming_to_read;
+    //http2 (ALPN "h2") flag: when true the request/response was driven through
+    //bearhttp2.c and raw_content holds a synthesised HTTP/1.1-style header block
+    bool h2_negotiated;
     
 }BearHttpsResponse ;
 
@@ -94857,6 +94860,160 @@ void BearHttpsRequest_send_file_auto_detect_content_type(BearHttpsRequest *self,
 
 
 
+/* =====================================================================
+ * HTTP/2 (RFC 7540) support over the BearSSL transport, driven by the
+ * self-contained framing/HPACK codec in bearhttp2.c. Opt-in through the
+ * EWEB_HTTP2 environment variable so the default HTTPS path stays
+ * bit-for-bit HTTP/1.1. When enabled we advertise ALPN ["h2","http/1.1"];
+ * if the peer picks "h2" the exchange runs through bearhttp2.c and the
+ * decoded response is re-materialised into the very same raw_content /
+ * headers / status_code / body fields the HTTP/1.1 reader fills, so the
+ * redirect logic and every consumer above this layer are oblivious to the
+ * negotiated protocol version.
+ * ===================================================================== */
+#include "tinyhttpsc/bearhttp2.h"
+
+static int private_BearHttps_h2_enabled(void){
+    static int cached = -1;
+    if(cached < 0){
+        const char *e = getenv("EWEB_HTTP2");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* H2SendFn: push TLS-plaintext bytes through the BearSSL record layer.
+ * br_sslio_write may accept fewer bytes than requested, so loop; flush so
+ * each logical write reaches the wire promptly. 0 on success, -1 on error. */
+static int private_BearHttps_h2_dbg(void){
+    static int c = -1;
+    if(c < 0){ const char *e = getenv("EWEB_H2DBG"); c = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return c;
+}
+static int private_BearHttps_h2_send(void *ctx, const unsigned char *buf, size_t len){
+    BearHttpsResponse *self = (BearHttpsResponse *)ctx;
+    size_t off = 0;
+    while(off < len){
+        int w = br_sslio_write(&self->ssl_io, buf + off, len - off);
+        if(private_BearHttps_h2_dbg())
+            fprintf(stderr, "[h2] send want=%zu got=%d state=0x%x err=%d\n",
+                    len - off, w, br_ssl_engine_current_state(&self->ssl_client.eng),
+                    br_ssl_engine_last_error(&self->ssl_client.eng));
+        if(w <= 0) return -1;
+        off += (size_t)w;
+    }
+    if(br_sslio_flush(&self->ssl_io) < 0) return -1;
+    return 0;
+}
+
+/* H2RecvFn: >0 bytes read, 0 EOF, <0 error (exactly br_sslio_read's contract). */
+static int private_BearHttps_h2_recv(void *ctx, unsigned char *buf, size_t len){
+    BearHttpsResponse *self = (BearHttpsResponse *)ctx;
+    int r = br_sslio_read(&self->ssl_io, buf, len);
+    if(private_BearHttps_h2_dbg())
+        fprintf(stderr, "[h2] recv want=%zu got=%d state=0x%x err=%d\n",
+                len, r, br_ssl_engine_current_state(&self->ssl_client.eng),
+                br_ssl_engine_last_error(&self->ssl_client.eng));
+    return r;
+}
+
+/* Drive one HTTP/2 request/response and populate self->raw_content (a
+ * synthesised HTTP/1.1-style header block), ->headers, ->status_code and
+ * ->body exactly as read_til_end_of_headers + read_body would, so the shared
+ * redirect logic and all downstream consumers work unchanged. 0 on success. */
+static int private_BearHttpsResponse_h2_exchange(BearHttpsResponse *self,
+                                                 BearHttpsRequest *req,
+                                                 private_BearHttpsRequisitionProps *props){
+    /* :authority = host[:port] (port only when non-default), RFC 7540 8.1.2.3. */
+    char authority[BEARSSL_DNS_CACHE_HOST_SIZE + 8];
+    if(props->port > 0 && props->port != 443){
+        snprintf(authority, sizeof(authority), "%s:%d", props->hostname, props->port);
+    } else {
+        snprintf(authority, sizeof(authority), "%s", props->hostname);
+    }
+
+    /* Flatten caller headers into a name/value array; h2_conn_request drops the
+     * connection-specific ones that are forbidden in HTTP/2. */
+    const char **extra = NULL;
+    int n_extra = 0;
+    if(req->headers && req->headers->size > 0){
+        extra = (const char **)malloc(sizeof(char *) * (size_t)req->headers->size * 2);
+        if(!extra) return -1;
+        for(int i = 0; i < req->headers->size; i++){
+            private_BearHttpsKeyVal *kv = req->headers->keyvals[i];
+            extra[2 * i] = kv->key;
+            extra[2 * i + 1] = kv->value;
+        }
+        n_extra = req->headers->size;
+    }
+
+    /* Body: RAW or JSON (browser fetches are GET/POST with at most a small body). */
+    unsigned char *body = NULL;
+    size_t body_len = 0;
+    char *json_dump = NULL;
+    if(req->body_type == PRIVATE_BEARSSL_BODY_RAW){
+        body = req->body_raw.value;
+        body_len = (size_t)req->body_raw.size;
+    }
+    #ifndef BEARSSL_HTTPS_MOCK_CJSON
+    else if(req->body_type == PRIVATE_BEARSSL_BODY_JSON){
+        json_dump = cJSON_Print(req->body_json.json);
+        if(json_dump){ body = (unsigned char *)json_dump; body_len = strlen(json_dump); }
+    }
+    #endif
+
+    H2Conn c;
+    h2_conn_init(&c, private_BearHttps_h2_send, private_BearHttps_h2_recv, self);
+    int rc = -1;
+    int pf = h2_conn_preface(&c);
+    if(private_BearHttps_h2_dbg()) fprintf(stderr, "[h2] preface=%d\n", pf);
+    if(pf == 0){
+        H2Buf oh, ob; h2_buf_init(&oh); h2_buf_init(&ob);
+        int status = 0;
+        int rr = h2_conn_request(&c, req->method, "https", authority, props->route,
+                           extra, n_extra, body, body_len, &oh, &ob, &status);
+        if(private_BearHttps_h2_dbg())
+            fprintf(stderr, "[h2] request=%d status=%d oh=%zu ob=%zu\n", rr, status, oh.len, ob.len);
+        if(rr == 0){
+            self->status_code = status;
+            self->raw_content = (unsigned char *)BearsslHttps_allocate(oh.len + 2);
+            if(self->raw_content){
+                memcpy(self->raw_content, oh.data, oh.len);
+                self->raw_content[oh.len] = '\0';
+                self->raw_content[oh.len + 1] = '\0';
+                /* Find the blank-line terminator exactly as read_til_... does. */
+                int hdr_end = -1;
+                for(size_t i = 3; i < oh.len; i++){
+                    if(self->raw_content[i-3]=='\r' && self->raw_content[i-2]=='\n' &&
+                       self->raw_content[i-1]=='\r' && self->raw_content[i]=='\n'){
+                        hdr_end = (int)i; break;
+                    }
+                }
+                if(hdr_end >= 0){
+                    self->body_start_index = hdr_end + 1;
+                    private_BearHttpsResponse_parse_headers(self, hdr_end - 1);
+                    self->body = (unsigned char *)BearsslHttps_allocate(ob.len + 2);
+                    if(self->body){
+                        if(ob.len) memcpy(self->body, ob.data, ob.len);
+                        self->body[ob.len] = '\0';
+                        self->body[ob.len + 1] = '\0';
+                        self->body_size = (long)ob.len;
+                        self->body_readded_size = (long)ob.len;
+                        self->extra_body_remaning_to_send = 0;
+                        self->body_completed_read = true; /* short-circuits read_body() */
+                        rc = 0;
+                    }
+                }
+            }
+        }
+        h2_buf_free(&oh); h2_buf_free(&ob);
+    }
+    h2_conn_free(&c);
+    free(extra);
+    if(json_dump) BearsslHttps_free(json_dump);
+    return rc;
+}
+
 BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
 
     BearHttpsResponse *response = NULL;
@@ -94915,7 +95072,45 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
 
            const char *chosen_host = self->custom_bear_dns ? self->custom_bear_dns : requisition_props->hostname;
            private_BearHttpsResponse_start_bearssl_props(response,chosen_host,self->trust_anchors,self->trusted_anchors_size);
+
+           /* When HTTP/2 is enabled, drive the handshake to completion now so the
+            * ALPN selection is known before we choose how to serialise the
+            * request. br_sslio_flush() runs ClientHello..Finished and returns
+            * once the engine is ready to send application data. Without this the
+            * selection would only be resolved by the first HTTP/1.1 write -- too
+            * late to switch to h2. Disabled builds skip this entirely and keep
+            * the original lazy-handshake-on-first-write behaviour. */
+           if(private_BearHttps_h2_enabled()){
+               if(br_sslio_flush(&response->ssl_io) < 0){
+                   char herr[128];
+                   unsigned ssl_state = br_ssl_engine_current_state(&response->ssl_client.eng);
+                   int ssl_err = br_ssl_engine_last_error(&response->ssl_client.eng);
+                   snprintf(herr, sizeof(herr),
+                       "tls handshake failed (alpn probe) ssl_state=0x%x ssl_err=%d",
+                       ssl_state, ssl_err);
+                   BearHttpsResponse_set_error(response, herr, BEARSSL_HTTPS_IMPOSSIBLE_TO_SEND_DATA);
+                   private_BearHttpsRequisitionProps_free(requisition_props);
+                   return response;
+               }
+               const char *alpn = br_ssl_engine_get_selected_protocol(&response->ssl_client.eng);
+               if(alpn && strcmp(alpn, "h2") == 0){
+                   response->h2_negotiated = true;
+               }
+           }
          }
+
+         if(response->h2_negotiated){
+             /* HTTP/2 path: bearhttp2.c fills raw_content/headers/status/body. */
+             int h2r = private_BearHttpsResponse_h2_exchange(response, self, requisition_props);
+             private_BearHttpsRequisitionProps_free(requisition_props);
+             if(h2r != 0 && !BearHttpsResponse_error(response)){
+                 BearHttpsResponse_set_error(response, "http2 exchange failed", BEARSSL_HTTPS_INVALID_HTTP_RESPONSE);
+             }
+             if(BearHttpsResponse_error(response)){
+                 return response;
+             }
+         }
+         else{
          private_BearHttpsResponse_write(response, (unsigned char*)self->method, private_BearsslHttps_strlen(self->method));
          private_BearHttpsResponse_write(response, (unsigned char*)" ", 1);
          private_BearHttpsResponse_write(response, (unsigned char*)requisition_props->route, private_BearsslHttps_strlen(requisition_props->route));
@@ -95061,6 +95256,7 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
              return response;
          }
          private_BearHttpsRequisitionProps_free(requisition_props);
+         }
          const int REDIRECT_CODEES[] = {301,302,303,307,308};
          bool is_redirect = false;
          for(int i = 0; i < sizeof(REDIRECT_CODEES)/sizeof(int);i++){
@@ -95757,6 +95953,13 @@ void private_BearHttpsResponse_start_bearssl_props(BearHttpsResponse *self, cons
     ewok_https_entropy_fill(entropy_seed, sizeof(entropy_seed));
     br_ssl_engine_inject_entropy(&self->ssl_client.eng, entropy_seed, sizeof(entropy_seed));
     memset(entropy_seed, 0, sizeof(entropy_seed));
+    /* Advertise ALPN only when HTTP/2 is enabled, so the default ClientHello is
+     * unchanged. The array is static: BearSSL links (does not copy) it and it
+     * must outlive the handshake. Order = client preference. */
+    if(private_BearHttps_h2_enabled()){
+        static const char *alpn_names[] = { "h2", "http/1.1" };
+        br_ssl_engine_set_protocol_names(&self->ssl_client.eng, alpn_names, 2);
+    }
     br_ssl_client_reset(&self->ssl_client, hostname, 0);
     br_sslio_init(&self->ssl_io, &self->ssl_client.eng, private_BearHttps_sock_read,
                   &self->connection_file_descriptor,

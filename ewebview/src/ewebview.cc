@@ -258,7 +258,10 @@ static size_t element_span_end(const std::string& s, size_t tag_start)
  *    URLs inside <noscript> for the no-JS fallback while the JS-side <picture>
  *    uses placeholder srcSet="#, # 2x". Since the VM cannot always complete
  *    async hydration, unwrapping <noscript> into the main DOM exposes those
- *    images.
+ *    images. Only noscript blocks that actually carry an image fallback
+ *    (<img>/<picture>/<source>) are unwrapped; every other block (plain-text
+ *    "enable JavaScript" banners a la pinterest.com) is dropped whole, because
+ *    a scripting-enabled browser never renders noscript content at all.
  *
  * 2. **<picture>/<source srcSet> lowering**: litehtml has no <picture> or srcSet
  *    support. For every <picture> element this pass finds the best <source>
@@ -300,7 +303,13 @@ static std::string preprocess_noscript_picture(const std::string& html)
                 stage1.append(html, tag_end + 1, html.size() - (tag_end + 1));
                 break;
             }
-            stage1.append(html, tag_end + 1, close - (tag_end + 1));
+            /* Unwrap only image-carrying fallbacks; drop text-only banners. */
+            std::string inner_low = lower.substr(tag_end + 1, close - (tag_end + 1));
+            if(inner_low.find("<img") != std::string::npos ||
+               inner_low.find("<picture") != std::string::npos ||
+               inner_low.find("<source") != std::string::npos) {
+                stage1.append(html, tag_end + 1, close - (tag_end + 1));
+            }
             pos = close + 11;
         }
     }
@@ -884,9 +893,58 @@ static std::string preprocess_noscript_picture(const std::string& html)
     return out;
 }
 
+/* Parse the "imports" object of an import-map JSON blob into (specifier, url)
+ * pairs. Import maps (github.com maps bare "react-dom" etc. to CDN URLs) are
+ * how browsers resolve bare module specifiers; without them every
+ * `import "react-dom"` fails and the React bundles abort. Only the flat
+ * string:string "imports" mapping is honoured (exact + trailing-slash prefix
+ * keys); "scopes"/"integrity" are ignored - pages in the wild use plain
+ * imports. Minimal scanner: keys/values are JSON strings, escapes folded. */
+static void parse_import_map(const std::string& json,
+                             std::vector<std::pair<std::string,std::string>>* out)
+{
+    if(out == nullptr) return;
+    size_t k = json.find("\"imports\"");
+    if(k == std::string::npos) return;
+    size_t ob = json.find('{', k);
+    if(ob == std::string::npos) return;
+    /* Walk the imports object, tracking brace depth so nested objects (none
+     * expected) cannot desync the pair scan. */
+    int depth = 0;
+    size_t p = ob;
+    auto read_str = [&](size_t& i, std::string& dst) -> bool {
+        if(i >= json.size() || json[i] != '"') return false;
+        i++;
+        dst.clear();
+        for(; i < json.size(); ++i) {
+            char c = json[i];
+            if(c == '\\' && i + 1 < json.size()) { dst += json[i+1]; i++; continue; }
+            if(c == '"') { i++; return true; }
+            dst += c;
+        }
+        return false;
+    };
+    for(; p < json.size(); ++p) {
+        char c = json[p];
+        if(c == '{') { depth++; continue; }
+        if(c == '}') { depth--; if(depth <= 0) break; continue; }
+        if(depth != 1 || c != '"') continue;
+        std::string key, val;
+        size_t i = p;
+        if(!read_str(i, key)) break;
+        while(i < json.size() && (json[i] == ':' || json[i] == ' ' || json[i] == '\t' ||
+                                  json[i] == '\n' || json[i] == '\r')) i++;
+        if(!read_str(i, val)) break;
+        if(!key.empty() && !val.empty()) out->push_back(std::make_pair(key, val));
+        p = i - 1;
+    }
+}
+
 static std::string extract_scripts(const std::string& html, std::vector<std::string>* scripts,
                                    std::vector<std::string>* script_srcs,
                                    std::vector<std::string>* script_ids,
+                                   std::vector<bool>* script_deferred,
+                                   std::vector<std::pair<std::string,std::string>>* import_map,
                                    bool* has_inline_handlers,
                                    bool* has_module_scripts)
 {
@@ -985,6 +1043,11 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
             }
             non_js = !(js_mime || module_ok);
         }
+        /* Import maps are data islands (non_js, kept in the DOM) but the module
+         * loader also needs their specifier->URL table to resolve bare imports
+         * like "react-dom"; capture it here while the body is still at hand. */
+        if(type_val == "importmap" && import_map != nullptr)
+            parse_import_map(body, import_map);
         /* Remember a skipped type="module": if the VM still fails to parse one,
          * a page whose content lives in it renders blank; the engine arms a
          * plain notice for that case (decideModuleNotice). */
@@ -992,6 +1055,24 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
             if(type_val == "module") *has_module_scripts = true;
         }
         if(scripts != nullptr && !non_js) {
+            /* A real browser runs module/defer scripts only after parsing ends,
+             * so they see readyState=="interactive"; classic inline scripts run
+             * mid-parse and see "loading". Record which flavour each extracted
+             * script is so the JS runner can bracket it accordingly. */
+            bool deferred = (type_val == "module");
+            if(!deferred) {
+                /* Word-boundary check for the defer attribute so a src URL
+                 * containing "defer" as a substring doesn't match. */
+                size_t dp = 0;
+                while((dp = open_tag.find("defer", dp)) != std::string::npos) {
+                    bool lb = (dp == 0 || ::isspace((unsigned char)open_tag[dp - 1]));
+                    size_t nx = dp + 5;
+                    bool rb = (nx >= open_tag.size() || open_tag[nx] == '=' ||
+                               open_tag[nx] == '>' || ::isspace((unsigned char)open_tag[nx]));
+                    if(lb && rb) { deferred = true; break; }
+                    dp = nx;
+                }
+            }
             if(external) {
                 /* External <script src>: reserve an ordered slot with an empty
                  * body (filled when the EWEB_TASK_SCRIPT fetch lands) and record
@@ -1001,6 +1082,7 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
                 if(script_srcs != nullptr) script_srcs->push_back(src_val);
                 if(script_ids != nullptr)
                     script_ids->push_back(script_attr_value(open_tag, open_tag_orig, "id"));
+                if(script_deferred != nullptr) script_deferred->push_back(deferred);
             } else {
                 /* Skip blank/whitespace-only bodies to avoid empty vm_load calls. */
                 bool blank = true;
@@ -1012,6 +1094,7 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
                     if(script_srcs != nullptr) script_srcs->push_back(std::string());
                     if(script_ids != nullptr)
                         script_ids->push_back(script_attr_value(open_tag, open_tag_orig, "id"));
+                    if(script_deferred != nullptr) script_deferred->push_back(deferred);
                 }
             }
         }
@@ -1119,6 +1202,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_pendingCss(0)
     , m_firstPaintCssWaitSince(0)
     , m_styleStepInFlight(false)
+    , m_uiIdleSnap(false)
     , m_pressX(0)
     , m_pressY(0)
     , m_pressValid(false)
@@ -1568,6 +1652,19 @@ void EWebEngine::engineLoop()
                     !m_jsPendingNav.empty() || m_jsScrollPending ||
                     (m_doc && (m_engineScrollX != m_cacheScrollX ||
                                m_engineScrollY != m_cacheScrollY || !m_cacheValid));
+        /* Settled-state snapshot for ewebview_is_idle(): the same expression
+         * minus m_animActive (an animating page IS settled as far as a
+         * screenshot is concerned) plus the sub-resource queues, so a
+         * capture hook can wait for the frame that reflects the final
+         * resource set instead of a mid-cascade one. */
+        m_uiIdleSnap = !((m_buildPhase != BUILD_IDLE) ||
+                    m_contentDirty || m_needsLayout || m_needsStyleUpdate ||
+                    m_buildNeedsLayout || m_buildNeedsStyleUpdate ||
+                    m_styleStepInFlight || m_deferBuildStep || m_flushDeferredImages ||
+                    !m_jsPendingNav.empty() || m_jsScrollPending ||
+                    (m_doc && (m_engineScrollX != m_cacheScrollX ||
+                               m_engineScrollY != m_cacheScrollY || !m_cacheValid))) &&
+                    m_taskQueue.empty() && m_taskBusy == 0 && m_pendingCss == 0;
         bool vm_active = (m_jsVm != nullptr && m_jsEnabled && !m_jsPageDisabled);
 
         uint32_t timeout_ms;
@@ -2915,6 +3012,8 @@ void EWebEngine::cleanupBuildResources()
     m_jsScripts.clear();
     m_jsScriptSrcs.clear();
     m_jsScriptIds.clear();
+    m_jsScriptDeferred.clear();
+    m_jsImportMap.clear();
     m_jsScriptDone.clear();
     m_jsScriptEls.clear();
     m_jsHasInlineHandlers = false;
@@ -3670,6 +3769,8 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     m_jsScripts.clear();
     m_jsScriptSrcs.clear();
     m_jsScriptIds.clear();
+    m_jsScriptDeferred.clear();
+    m_jsImportMap.clear();
     m_jsScriptDone.clear();
     m_jsScriptEls.clear();
     m_jsHasInlineHandlers = false;
@@ -3705,6 +3806,8 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     m_buildHtmlContent = extract_scripts(preprocessed, m_jsEnabled ? &m_jsScripts : nullptr,
                                          m_jsEnabled ? &m_jsScriptSrcs : nullptr,
                                          m_jsEnabled ? &m_jsScriptIds : nullptr,
+                                         m_jsEnabled ? &m_jsScriptDeferred : nullptr,
+                                         m_jsEnabled ? &m_jsImportMap : nullptr,
                                          m_jsEnabled ? &m_jsHasInlineHandlers : nullptr,
                                          &m_jsBuildHasModules);
     /* TEMP: dump final HTML to /tmp for debugging */
@@ -3804,6 +3907,9 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
             m_jsScriptSrcs.insert(m_jsScriptSrcs.begin() + (long)(i + k), parts[k]);
             m_jsScripts.insert(m_jsScripts.begin() + (long)(i + k), std::string());
             m_jsScriptIds.insert(m_jsScriptIds.begin() + (long)(i + k), std::string());
+            /* Split parts inherit the parent tag's defer/module flavour. */
+            m_jsScriptDeferred.insert(m_jsScriptDeferred.begin() + (long)(i + k),
+                                      (i < m_jsScriptDeferred.size()) ? m_jsScriptDeferred[i] : false);
             m_jsScriptDone.insert(m_jsScriptDone.begin() + (long)(i + k), 0);
         }
         i += parts.size() - 1;
@@ -4677,6 +4783,57 @@ static bool pageHasVisibleSkeleton(litehtml::element* el, int minArea)
     return false;
 }
 
+/* True when a laid-out subtree carries any real content: visible non-
+ * whitespace text, a replaced element (img/canvas/svg/video/iframe) or a
+ * visible element with a CSS background-image. Data-island <script> tags
+ * (type="application/json") are kept in the tree by extract_scripts, so the
+ * tag skip matters: their JSON bodies are not page content. Used by the
+ * blank-shell probe below - early-exit on the first hit keeps the walk cheap
+ * on content-heavy pages. */
+static bool pageHasRealContent(litehtml::element* el)
+{
+    if(el == nullptr)
+        return false;
+    const litehtml::tchar_t* tag = el->get_tagName();
+    if(tag != nullptr &&
+       (t_strcasecmp(tag, _t("style")) == 0 ||
+        t_strcasecmp(tag, _t("script")) == 0 ||
+        t_strcasecmp(tag, _t("head")) == 0))
+        return false;
+    if(el->is_visible()) {
+        if(tag != nullptr &&
+           (t_strcasecmp(tag, _t("img")) == 0 ||
+            t_strcasecmp(tag, _t("canvas")) == 0 ||
+            t_strcasecmp(tag, _t("svg")) == 0 ||
+            t_strcasecmp(tag, _t("video")) == 0 ||
+            t_strcasecmp(tag, _t("iframe")) == 0))
+            return true;
+        const litehtml::tchar_t* bg = el->get_style_property(_t("background-image"), false, nullptr);
+        if(bg != nullptr && bg[0] != 0 && t_strstr(bg, _t("none")) == nullptr &&
+           el->width() * el->height() > 0)
+            return true;
+        /* Leaves only: an interior element's get_text would re-walk its whole
+         * subtree, making the probe quadratic on large documents. */
+        if(el->get_children_count() == 0) {
+            std::string text;
+            el->get_text(text);
+            int nonws = 0;
+            for(size_t i = 0; i < text.size() && nonws < kBlankShellTextChars; ++i) {
+                if(!::isspace((unsigned char)text[i]))
+                    ++nonws;
+            }
+            if(nonws >= kBlankShellTextChars)
+                return true;
+        }
+    }
+    size_t n = el->get_children_count();
+    for(size_t i = 0; i < n; ++i) {
+        if(pageHasRealContent(el->get_child((int)i)))
+            return true;
+    }
+    return false;
+}
+
 bool EWebEngine::pageShowsSkeletonPlaceholder() const
 {
     if(m_doc == nullptr || m_clientWidth <= 0 || m_clientHeight <= 0)
@@ -4686,7 +4843,29 @@ bool EWebEngine::pageShowsSkeletonPlaceholder() const
         return false;
     /* A placeholder only misleads when it is most of the viewport; a small
      * spinner beside real content must never arm the notice. */
-    return pageHasVisibleSkeleton(root, m_clientWidth * m_clientHeight * 3 / 10);
+    if(pageHasVisibleSkeleton(root, m_clientWidth * m_clientHeight * 3 / 10))
+        return true;
+    /* Blank CSR shell without a "skeleton"-named placeholder (pinterest.com
+     * ships an empty <div id="shell-loader"> plus an empty app root): the
+     * viewport shows no text, no image and no background art at all, so the
+     * script queue tail is still the ONLY path to content and deserves the
+     * skeleton budgets just like a named placeholder does. A page that paints
+     * a tiny header already fails the text probe and keeps the live budgets. */
+    return !pageHasRealContent(root);
+}
+
+/* Any visible skeleton-named placeholder regardless of area. github.com ships
+ * real chrome (nav, file names) AROUND dozens of small `.Skeleton` bars, so the
+ * 30%-of-viewport probe above says "real page" while the content columns are
+ * still placeholders; the post-swap script budget uses this weaker probe (only
+ * for module pages) so the hydration bundles at the queue tail are not dropped
+ * by the 8 s live budget. */
+bool EWebEngine::pageHasSkeletonAny() const
+{
+    if(m_doc == nullptr)
+        return false;
+    litehtml::element::ptr root = m_doc->root();
+    return root != nullptr && pageHasVisibleSkeleton(root, 1);
 }
 
 bool EWebEngine::jsSkeletonProbeCached()
@@ -4772,6 +4951,25 @@ void EWebEngine::decideCsrNotice()
     m_moduleNoticeDecided = true;
     if(!pageShowsSkeletonPlaceholder())
         return;
+    /* Blanking is destructive (an opaque panel covers the viewport), so it must
+     * never fire on a page that shows real text. The skeleton probe tolerates a
+     * short-text-only page - a leaf below kBlankShellTextChars does not count as
+     * "real content" there, which keeps granting script budgets to a shell that
+     * painted only a tiny header. That tolerance is wrong for the notice: a
+     * small static page (a nav of "Code"/"Issues" links) holds server content,
+     * is not a CSR shell, and must render instead of being covered. Reuse the
+     * same all-blank test decideModuleNotice() applies before it arms. */
+    if(m_doc != nullptr) {
+        litehtml::element::ptr root = m_doc->root();
+        if(root != nullptr) {
+            std::string text;
+            collectVisibleText(root, text);
+            for(size_t i = 0; i < text.size(); ++i) {
+                if(!::isspace((unsigned char)text[i]))
+                    return;   /* real text on screen: never blank it */
+            }
+        }
+    }
     m_showModuleNotice = true;
     m_noticeKind = 2;
     EWEB_LOG("[ewebview] client-rendered shell stuck on its skeleton: notice armed url=%s\n",
@@ -5001,6 +5199,11 @@ void ewebview_scroll(ewebview_t* v, int x, int y)
 {
     if(v != NULL)
         v->engine.scrollTo(x, y);
+}
+
+bool ewebview_is_idle(ewebview_t* v)
+{
+    return (v != NULL) && v->engine.uiIdleSnapshot();
 }
 
 void ewebview_tick(ewebview_t* v)

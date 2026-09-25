@@ -680,6 +680,15 @@ void litehtml::el_svg::draw(uint_ptr hdc, int x, int y, const position* clip)
 	 * has_color: 0 = currentColor fallback, 1 = resolved colour, 2 = "none"
 	 * (skip). */
 	web_color cc = get_color(_t("color"), true, web_color(0, 0, 0));
+	/* Form controls (github.com's icon buttons: <button> whose author CSS never
+	 * sets `color`) carry an uninitialised computed colour (alpha 0), so a
+	 * fill="currentColor" octicon inside them resolved to fully transparent and
+	 * vanished. Browsers fall back to the control's foreground (black here), so
+	 * treat a zero-alpha inherited colour as "unset" and use opaque black. */
+	if(cc.alpha == 0)
+	{
+		cc = web_color(0, 0, 0, 255);
+	}
 	auto run_color = [&](size_t i) -> web_color
 	{
 		return m_subpath_has_color[i] == 1 ? m_subpath_colors[i] : cc;

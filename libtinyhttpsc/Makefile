@@ -9,7 +9,7 @@ TARGET_DIR = $(BUILD_DIR)
 # embedded in src/BearHttpsClientOne.c, so there is no external TLS dependency.
 CFLAGS += -Iinclude
 
-LIB_OBJS = $(ARCH)/src/tinyhttpsc.o $(ARCH)/src/BearHttpsClientOne.o
+LIB_OBJS = $(ARCH)/src/tinyhttpsc.o $(ARCH)/src/BearHttpsClientOne.o $(ARCH)/src/bearhttp2.o
 LIB = $(TARGET_DIR)/lib/libtinyhttpsc.a
 
 all: $(LIB)

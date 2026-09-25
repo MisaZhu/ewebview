@@ -1535,6 +1535,103 @@ static var_t* nav_get_bool(vm_t* vm, var_t* env, void* data) {
     return var_new_bool(vm, which == 0);   /* 0 onLine -> true, 1 cookieEnabled -> true */
 }
 
+/* navigator.userAgentData: the Chromium client-hints object. Analytics and
+ * bot-detection code reads `navigator.userAgentData.brands` and calls
+ * getHighEntropyValues(); leaving it undefined makes the engine look like a
+ * pre-Chromium browser and can flip a page onto a degraded path. The brand
+ * version is taken from the reported UA so the two never disagree.
+ * web_promise() is defined further down (Promise.resolve/reject helper). */
+static var_t* web_promise(vm_t* vm, const char* which, var_t* value);
+
+static void ua_brand_list(vm_t* vm, var_t* arr, const char* ver) {
+    vm->gc.gc_defer++;
+    for(int i = 0; i < 3; ++i) {
+        var_t* b = var_new_obj_no_proto(vm, NULL, NULL);
+        var_add(b, "brand", var_new_str(vm, (i == 1) ? "Chromium" : "Not A(Brand"));
+        /* Chromium's fixed greasing pattern: the minor is "0.0.0" for the
+         * grease entry and "<major>.0.0" for the real ones. */
+        char v[32];
+        if(i == 1) snprintf(v, sizeof(v), "%s.0.0", ver);
+        else       snprintf(v, sizeof(v), "%d.0.0", (i == 0) ? 8 : 24);
+        var_add(b, "version", var_new_str(vm, v));
+        var_array_add(arr, b);
+    }
+    vm->gc.gc_defer--;
+}
+
+static void ua_major(char* out, size_t cap, const char* ua) {
+    const char* p = (ua != NULL) ? strstr(ua, "Chrome/") : NULL;
+    size_t n = 0;
+    if(p != NULL) {
+        p += 7;
+        while(*p >= '0' && *p <= '9' && n + 1 < cap) out[n++] = *p++;
+    }
+    if(n == 0 && cap >= 4) { out[n++] = '1'; out[n++] = '5'; out[n++] = '2'; }
+    out[n] = 0;
+}
+
+/* The high-entropy value object (an owned var). `full` decides between the
+ * low-entropy set every browser exposes and the getHighEntropyValues() one. */
+static var_t* nav_ua_values(vm_t* vm, int full) {
+    js_web_state* st = web_state(vm);
+    void* ctx = web_ctx(vm);
+    char* owned = (st != NULL && st->cb.get_user_agent != NULL) ? st->cb.get_user_agent(ctx) : NULL;
+    char* plat  = (full && st != NULL && st->cb.get_platform != NULL) ? st->cb.get_platform(ctx) : NULL;
+    char* lang  = (full && st != NULL && st->cb.get_language != NULL) ? st->cb.get_language(ctx) : NULL;
+    char major[16];
+    ua_major(major, sizeof(major), (owned != NULL && owned[0] != 0) ? owned : DEFAULT_UA);
+
+    var_t* o = var_new_obj_no_proto(vm, NULL, NULL);
+    vm->gc.gc_defer++;
+    var_t* brands = var_new_array(vm);
+    ua_brand_list(vm, brands, major);
+    var_add(o, "brands", brands);
+    var_add(o, "mobile", var_new_bool(vm, false));
+    var_add(o, "platform", var_new_str(vm,
+            (plat != NULL && plat[0] != 0) ? plat : DEFAULT_PLATFORM));
+    if(full) {
+        var_t* full_list = var_new_array(vm);
+        ua_brand_list(vm, full_list, major);
+        var_add(o, "architecture",    var_new_str(vm, "x86"));
+        var_add(o, "bitness",         var_new_str(vm, "64"));
+        var_add(o, "model",           var_new_str(vm, ""));
+        var_add(o, "platformVersion", var_new_str(vm, "15.5.0"));
+        var_add(o, "uaFullVersion",   var_new_str(vm, major));
+        var_add(o, "fullVersionList", full_list);
+        var_add(o, "wow64",           var_new_bool(vm, false));
+        var_t* lv = var_new_array(vm);
+        var_array_add(lv, var_new_str(vm, (lang != NULL && lang[0] != 0) ? lang : DEFAULT_LANG));
+        var_add(o, "languages", lv);
+    }
+    vm->gc.gc_defer--;
+    if(owned != NULL) mario_free(owned);
+    if(plat  != NULL) mario_free(plat);
+    if(lang  != NULL) mario_free(lang);
+    return o;
+}
+
+static var_t* nav_ua_getHighEntropyValues(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* o = nav_ua_values(vm, 1);
+    var_t* p = web_promise(vm, "resolve", o);
+    return (p != NULL) ? p : o;   /* no Promise in the engine: hand back the value */
+}
+
+static var_t* nav_ua_toJSON(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    return nav_ua_values(vm, 1);
+}
+
+static var_t* nav_get_userAgentData(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* o = nav_ua_values(vm, 0);
+    vm->gc.gc_defer++;
+    vm_reg_native_on(vm, o, "getHighEntropyValues(h)", nav_ua_getHighEntropyValues, NULL);
+    vm_reg_native_on(vm, o, "toJSON()",                nav_ua_toJSON,               NULL);
+    vm->gc.gc_defer--;
+    return o;
+}
+
 static var_t* screen_get_orientation(vm_t* vm, var_t* env, void* data) {
     (void)env; (void)data;
     var_t* o = var_new_obj_no_proto(vm, NULL, NULL);
@@ -1571,6 +1668,57 @@ static var_t* perf_noop(vm_t* vm, var_t* env, void* data) {
     return NULL;   /* mark/measure/clearMarks: no timeline is kept */
 }
 
+/* performance.getEntries*(): no timeline is kept; hand back an empty list so
+ * instrumentation that filters entry types does not throw. */
+static var_t* perf_entries_empty(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    return var_new_array(vm);
+}
+
+/* ---- PerformanceObserver ----
+ * Bundles read the static `supportedEntryTypes` array during chunk eval (e.g.
+ * `PerformanceObserver.supportedEntryTypes.includes("soft-navigation")`). With
+ * the global absent the member access lands on an empty object, `.includes`
+ * throws, and webpack's chunk-eval wrapper rethrows it - rejecting the chunk
+ * promise and silently stalling the whole bootstrap. Provide the class with a
+ * real entry-type array; no observation is performed (callbacks never fire). */
+static var_t* perfobs_supported_types(vm_t* vm) {
+    static const char* const types[] = {"mark", "measure", "navigation", "resource",
+                                        "paint", "longtask", "event", "first-input",
+                                        "layout-shift", "largest-contentful-paint",
+                                        "soft-navigation"};
+    var_t* arr = var_new_array(vm);
+    vm->gc.gc_defer++;
+    for(unsigned i = 0; i < sizeof(types) / sizeof(types[0]); i++)
+        var_array_add(arr, var_new_str(vm, types[i]));
+    vm->gc.gc_defer--;
+    return arr;
+}
+
+static var_t* native_perfobs_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* obj = var_new_obj(vm, get_obj(env, THIS), NULL, NULL);
+    /* Park the callback in a hidden member so takeRecords/observe stay inert. */
+    node_t* n = var_add(obj, "@@cb", get_func_arg(env, 0));
+    if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+    return obj;
+}
+
+static var_t* native_perfobs_noop(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)env; (void)data;
+    return NULL;   /* observe/disconnect: no timeline is kept */
+}
+
+static var_t* native_perfobs_takeRecords(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    return var_new_array(vm);
+}
+
+static var_t* native_perfobs_supported(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    return perfobs_supported_types(vm);
+}
+
 /* ------------------------------------------------------------------ */
 /* Element argument helper                                            */
 /*                                                                    */
@@ -1604,6 +1752,16 @@ static void web_viewport(vm_t* vm, int* w, int* h) {
     js_web_state* st = web_state(vm);
     *w = 0; *h = 0;
     if(st != NULL && st->cb.get_viewport != NULL) st->cb.get_viewport(web_ctx(vm), w, h);
+}
+
+/* 0 = dark, 1 = light (the litehtml media_features encoding). Must agree with
+ * the CSS side: a page that picks its theme through matchMedia while its
+ * stylesheets gate on the media query paints a mismatched pair otherwise. */
+static int web_color_scheme(vm_t* vm) {
+    js_web_state* st = web_state(vm);
+    if(st != NULL && st->cb.get_color_scheme != NULL)
+        return st->cb.get_color_scheme(web_ctx(vm));
+    return 1;   /* no hook: light, the CSS-side default */
 }
 
 static void web_scroll_pos(vm_t* vm, int* x, int* y) {
@@ -1761,7 +1919,7 @@ static void mq_trim(char* s) {
 }
 
 /* `c` points just past '('; the condition text runs to the next ')'. */
-static bool mq_cond_match(const char* c, int vw, int vh) {
+static bool mq_cond_match(vm_t* vm, const char* c, int vw, int vh) {
     char buf[128];
     size_t i = 0;
     while(c[i] != 0 && c[i] != ')' && i + 1 < sizeof(buf)) { buf[i] = c[i]; ++i; }
@@ -1797,10 +1955,17 @@ static bool mq_cond_match(const char* c, int vw, int vh) {
     if(js_ascii_casecmp(name, "hover") == 0)       return (js_ascii_casecmp(val, "hover") == 0);
     if(js_ascii_casecmp(name, "any-hover") == 0)   return (js_ascii_casecmp(val, "hover") == 0);
     if(js_ascii_casecmp(name, "display-mode") == 0) return (js_ascii_casecmp(val, "browser") == 0);
+    /* prefers-color-scheme reads the same OS-seeded scheme the stylesheet
+     * media queries see; github.com's theme bootstrap sets data-color-mode
+     * from it and paints the opposite theme from its CSS when it lies. */
+    if(js_ascii_casecmp(name, "prefers-color-scheme") == 0)
+        return (js_ascii_casecmp(val, "dark") == 0)
+                   ? (web_color_scheme(vm) == 0)
+                   : (web_color_scheme(vm) != 0);
     return false;
 }
 
-static bool mq_eval_one(const char* s, size_t len, int vw, int vh) {
+static bool mq_eval_one(vm_t* vm, const char* s, size_t len, int vw, int vh) {
     char buf[256];
     if(len >= sizeof(buf)) len = sizeof(buf) - 1;
     memcpy(buf, s, len);
@@ -1827,7 +1992,7 @@ static bool mq_eval_one(const char* s, size_t len, int vw, int vh) {
     while(*p != 0) {
         char* open = strchr(p, '(');
         if(open == NULL) break;
-        if(!mq_cond_match(open + 1, vw, vh)) { ok = false; break; }
+        if(!mq_cond_match(vm, open + 1, vw, vh)) { ok = false; break; }
         char* close = strchr(open, ')');
         p = (close != NULL) ? close + 1 : open + 1;
     }
@@ -1842,7 +2007,7 @@ static bool mq_eval(vm_t* vm, const char* q) {
     while(*p != 0) {
         const char* comma = strchr(p, ',');
         size_t len = (comma != NULL) ? (size_t)(comma - p) : strlen(p);
-        if(len > 0 && mq_eval_one(p, len, vw, vh)) return true;
+        if(len > 0 && mq_eval_one(vm, p, len, vw, vh)) return true;
         p = (comma != NULL) ? comma + 1 : p + len;
     }
     return false;
@@ -1855,6 +2020,42 @@ static bool mq_eval(vm_t* vm, const char* q) {
 static var_t* native_css_supports(vm_t* vm, var_t* env, void* data) {
     (void)env; (void)data;
     return var_new_bool(vm, false);
+}
+
+/* CSS.escape(ident): the CSSOM serializer for identifiers, used to build a
+ * selector out of an untrusted name (`[name="..."]` from a form field, an id
+ * with a dot in it). Without it the caller either throws or feeds the raw
+ * string to querySelector, which is a syntax error for the common cases. */
+static var_t* native_css_escape(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* v = js_arg(env, 0);
+    const char* s = (v != NULL) ? var_get_str(v) : NULL;
+    if(s == NULL) return var_new_str(vm, "undefined");   /* String(undefined) per spec */
+    size_t n = strlen(s);
+    char* out = (char*)mario_malloc(n * 6 + 3);
+    if(out == NULL) return var_new_str(vm, "");
+    size_t o = 0;
+    for(size_t i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if(c == 0) {                                  /* NUL -> REPLACEMENT CHAR */
+            out[o++] = (char)0xEF; out[o++] = (char)0xBF; out[o++] = (char)0xBD;
+        } else if((c >= 0x01 && c <= 0x1F) || c == 0x7F ||
+                  (i == 0 && c >= '0' && c <= '9') ||
+                  (i == 1 && c >= '0' && c <= '9' && s[0] == '-')) {
+            o += (size_t)sprintf(out + o, "\\%x ", (unsigned)c);
+        } else if(i == 0 && c == '-' && n == 1) {
+            out[o++] = '\\'; out[o++] = '-';
+        } else if(c >= 0x80 || c == '-' || c == '_' ||
+                  (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '\\'; out[o++] = (char)c;
+        }
+    }
+    out[o] = 0;
+    var_t* r = var_new_str(vm, out);
+    mario_free(out);
+    return r;
 }
 
 static var_t* native_matchMedia(vm_t* vm, var_t* env, void* data) {
@@ -2303,8 +2504,13 @@ static var_t* native_xhr_send(vm_t* vm, var_t* env, void* data) {
     char* out_hdrs = NULL;
     /* No hook at all: report a network failure (status 0), which is what a
      * browser does for an unreachable URL, rather than throwing. */
-    if(getenv("MARIO_HTTPDBG") != NULL)
+    if(getenv("MARIO_HTTPDBG") != NULL) {
         fprintf(stderr, "[httpdbg] XHR %s %s\n", method, url ? url : "(null)");
+        /* The JS-set header block: shows whether the page supplied its own
+         * Content-Type / X-CSRFToken / Accept before the hook adds Cookie. */
+        if(hdrs->len > 0)
+            fprintf(stderr, "[httpdbg] reqhdrs:\n%s", hdrs->cstr);
+    }
     bool ok = (st->cb.http_request != NULL) &&
               st->cb.http_request(web_ctx(vm), method, url,
                                   (hdrs->len > 0) ? hdrs->cstr : NULL, bs,
@@ -2426,6 +2632,18 @@ static var_t* native_resp_json(vm_t* vm, var_t* env, void* data) {
         var_array_add(args, t);
         parsed = call_m_func(vm, json_cls, parse, args);
         var_unref(args);
+        if(getenv("MARIO_RESPJSONDBG") != NULL) {
+            const char* ts = var_get_str(t);
+            int has_n = 0, has_list = 0;
+            if(parsed != NULL && parsed->type == V_OBJECT) {
+                var_t* nn = var_find_own_member_var(parsed, "n");
+                var_t* ll = var_find_own_member_var(parsed, "list");
+                has_n = (nn != NULL); has_list = (ll != NULL);
+            }
+            fprintf(stderr, "[respjson] tlen=%d ts=%.40s parsed=%p type=%d has_n=%d has_list=%d\n",
+                ts ? (int)strlen(ts) : -1, ts ? ts : "(null)",
+                (void*)parsed, parsed ? (int)parsed->type : -1, has_n, has_list);
+        }
     }
     if(parsed == NULL || parsed->type == V_UNDEF) {
         /* Malformed body: reject, exactly as JSON.parse throwing would. */
@@ -2531,8 +2749,11 @@ static var_t* native_fetch(vm_t* vm, var_t* env, void* data) {
     int status = 0;
     char* out_body = NULL;
     char* out_hdrs = NULL;
-    if(getenv("MARIO_HTTPDBG") != NULL)
+    if(getenv("MARIO_HTTPDBG") != NULL) {
         fprintf(stderr, "[httpdbg] FETCH %s %s\n", method, url ? url : "(null)");
+        fprintf(stderr, "[httpdbg] fetch hdrs(len=%d):\n%s", (int)hdrs->len,
+                (hdrs->len > 0) ? hdrs->cstr : "(empty)\n");
+    }
     bool ok = (st->cb.http_request != NULL) &&
               st->cb.http_request(web_ctx(vm), method, url,
                                   (hdrs->len > 0) ? hdrs->cstr : NULL, bs,
@@ -2948,6 +3169,48 @@ static var_t* usp_collect(vm_t* vm, var_t* e, int mode) {
 static var_t* native_usp_keys(vm_t* vm, var_t* env, void* data)    { (void)data; return usp_collect(vm, usp_entries(js_this(env)), 0); }
 static var_t* native_usp_values(vm_t* vm, var_t* env, void* data)  { (void)data; return usp_collect(vm, usp_entries(js_this(env)), 1); }
 static var_t* native_usp_entries(vm_t* vm, var_t* env, void* data) { (void)data; return usp_collect(vm, usp_entries(js_this(env)), 2); }
+
+/* for..of over a URLSearchParams walks [name, value] pairs: github's query
+ * builders do `for (const [k, v] of params)`. mario's iteration protocol
+ * looks up "@@S:iterator" and then drives next(), so the symbol method hands
+ * back a small cursor object over the collected pair array. */
+static var_t* native_usp_iter_next(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* arr = (self != NULL) ? var_find_own_member_var(self, "@@it_arr") : NULL;
+    var_t* iv = (self != NULL) ? var_find_own_member_var(self, "@@it_i") : NULL;
+    int i = (iv != NULL && iv->type == V_INT && iv->value != NULL) ? *(int*)iv->value : 0;
+    int n = (arr != NULL) ? (int)var_array_size(arr) : 0;
+    var_t* step = var_new_obj_no_proto(vm, NULL, NULL);
+    if(step == NULL) return NULL;
+    if(i < n) {
+        node_t* pn = var_array_get(arr, i);
+        var_add(step, "value", (pn != NULL && pn->var != NULL) ? pn->var : var_new(vm));
+        var_add(step, "done", var_new_bool(vm, 0));
+    }
+    else {
+        var_add(step, "value", var_new(vm));
+        var_add(step, "done", var_new_bool(vm, 1));
+    }
+    if(iv != NULL && iv->type == V_INT && iv->value != NULL)
+        *(int*)iv->value = i + 1;
+    return step;
+}
+
+static var_t* native_usp_symbol_iterator(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* arr = usp_collect(vm, usp_entries(js_this(env)), 2);
+    var_t* it = var_new_obj_no_proto(vm, NULL, NULL);
+    if(it == NULL) return arr;
+    var_add(it, "@@it_arr", arr);
+    var_add(it, "@@it_i", var_new_int(vm, 0));
+    /* vm_reg_native_on: the cursor is a no-proto object, so vm_reg_static would
+     * resolve var_get_prototype(it)==NULL and fall through to vm->root, leaving
+     * the iterator without a callable next() ("can not find function 'next' on
+     * object{}"). */
+    vm_reg_native_on(vm, it, "next()", native_usp_iter_next, NULL);
+    return it;
+}
 
 /* Stable insertion sort of the entries by name (spec: sort by code units). */
 static var_t* native_usp_sort(vm_t* vm, var_t* env, void* data) {
@@ -3415,6 +3678,10 @@ static void web_register_url(vm_t* vm, var_t* bridge) {
         vm_reg_native(vm, cls, "entries()",           native_usp_entries,  bridge);
         vm_reg_native(vm, cls, "toString()",          native_usp_toString, bridge);
         js_acc_cls(vm, cls, "size", native_usp_get_size, NULL, bridge);
+        /* for..of over the params object itself (not just entries()). */
+        var_t* proto = var_find_member_var(cls, "prototype");
+        if(proto != NULL)
+            vm_reg_static(vm, proto, "@@S:iterator()", native_usp_symbol_iterator, bridge);
     }
 
     cls = vm_new_class(vm, CLS_URL);
@@ -3497,6 +3764,294 @@ static var_t* native_crypto_randomUUID(vm_t* vm, var_t* env, void* data) {
     }
     out[o] = 0;
     return var_new_str(vm, out);
+}
+
+/* ------------------------------------------------------------------ */
+/* crypto.subtle.digest (SHA-1 / SHA-256 / SHA-512)                    */
+/*                                                                     */
+/* Self-contained FIPS 180-4 implementations: the rest of the engine    */
+/* hashes through BearSSL inside libtinyhttpsc, which is not visible    */
+/* from this bridge and is TLS-only by contract. digests are the only   */
+/* SubtleCrypto operation pages use without a key (integrity checks,    */
+/* cache keys, subresource hashes); the key-based ones stay absent so    */
+/* a feature test reports them honestly instead of failing mid-call.    */
+/* ------------------------------------------------------------------ */
+
+static uint32_t sha_ror32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+static uint64_t sha_ror64(uint64_t x, int n) { return (x >> n) | (x << (64 - n)); }
+
+static uint32_t sha_be32(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+static uint64_t sha_be64(const uint8_t* p) {
+    return ((uint64_t)sha_be32(p) << 32) | (uint64_t)sha_be32(p + 4);
+}
+
+static void sha1_block(uint32_t h[5], const uint8_t* p) {
+    uint32_t w[80], a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+    for(int i = 0; i < 16; ++i) w[i] = sha_be32(p + 4 * i);
+    for(int i = 16; i < 80; ++i) {
+        uint32_t t = w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16];
+        w[i] = (t << 1) | (t >> 31);
+    }
+    for(int i = 0; i < 80; ++i) {
+        uint32_t f, k;
+        if(i < 20)      { f = (b & c) | ((~b) & d);               k = 0x5A827999u; }
+        else if(i < 40) { f = b ^ c ^ d;                          k = 0x6ED9EBA1u; }
+        else if(i < 60) { f = (b & c) | (b & d) | (c & d);         k = 0x8F1BBCDCu; }
+        else            { f = b ^ c ^ d;                          k = 0xCA62C1D6u; }
+        uint32_t tmp = ((a << 5) | (a >> 27)) + f + e + k + w[i];
+        e = d; d = c; c = (b << 30) | (b >> 2); b = a; a = tmp;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+}
+
+static void sha1_hash(const uint8_t* data, uint32_t len, uint8_t out[20]) {
+    uint32_t h[5] = { 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u };
+    uint8_t tail[128];
+    uint32_t i = 0;
+    for(; len - i >= 64; i += 64) sha1_block(h, data + i);
+    uint32_t rem = len - i;
+    memset(tail, 0, sizeof(tail));
+    if(rem != 0) memcpy(tail, data + i, rem);
+    tail[rem] = 0x80;
+    uint32_t tl = (rem < 56) ? 64 : 128;
+    uint64_t bits = (uint64_t)len * 8u;
+    for(int j = 0; j < 8; ++j) tail[tl - 1 - j] = (uint8_t)(bits >> (8 * j));
+    for(uint32_t k = 0; k < tl; k += 64) sha1_block(h, tail + k);
+    for(int j = 0; j < 5; ++j) {
+        out[4*j]   = (uint8_t)(h[j] >> 24);
+        out[4*j+1] = (uint8_t)(h[j] >> 16);
+        out[4*j+2] = (uint8_t)(h[j] >> 8);
+        out[4*j+3] = (uint8_t)(h[j]);
+    }
+}
+
+static const uint32_t sha256_k[64] = {
+    0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+    0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+    0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+    0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+    0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+    0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+    0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+    0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
+};
+
+static void sha256_block(uint32_t h[8], const uint8_t* p) {
+    uint32_t w[64];
+    for(int i = 0; i < 16; ++i) w[i] = sha_be32(p + 4 * i);
+    for(int i = 16; i < 64; ++i) {
+        uint32_t s0 = sha_ror32(w[i-15], 7) ^ sha_ror32(w[i-15], 18) ^ (w[i-15] >> 3);
+        uint32_t s1 = sha_ror32(w[i-2], 17) ^ sha_ror32(w[i-2], 19) ^ (w[i-2] >> 10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for(int i = 0; i < 64; ++i) {
+        uint32_t S1 = sha_ror32(e, 6) ^ sha_ror32(e, 11) ^ sha_ror32(e, 25);
+        uint32_t ch = (e & f) ^ ((~e) & g);
+        uint32_t t1 = hh + S1 + ch + sha256_k[i] + w[i];
+        uint32_t S0 = sha_ror32(a, 2) ^ sha_ror32(a, 13) ^ sha_ror32(a, 22);
+        uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = S0 + mj;
+        hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+}
+
+static void sha256_hash(const uint8_t* data, uint32_t len, uint8_t out[32]) {
+    uint32_t h[8] = { 0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,
+                      0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u };
+    uint8_t tail[128];
+    uint32_t i = 0;
+    for(; len - i >= 64; i += 64) sha256_block(h, data + i);
+    uint32_t rem = len - i;
+    memset(tail, 0, sizeof(tail));
+    if(rem != 0) memcpy(tail, data + i, rem);
+    tail[rem] = 0x80;
+    uint32_t tl = (rem < 56) ? 64 : 128;
+    uint64_t bits = (uint64_t)len * 8u;
+    for(int j = 0; j < 8; ++j) tail[tl - 1 - j] = (uint8_t)(bits >> (8 * j));
+    for(uint32_t k = 0; k < tl; k += 64) sha256_block(h, tail + k);
+    for(int j = 0; j < 8; ++j) {
+        out[4*j]   = (uint8_t)(h[j] >> 24);
+        out[4*j+1] = (uint8_t)(h[j] >> 16);
+        out[4*j+2] = (uint8_t)(h[j] >> 8);
+        out[4*j+3] = (uint8_t)(h[j]);
+    }
+}
+
+static const uint64_t sha512_k[80] = {
+    0x428a2f98d728ae22ULL,0x7137449123ef65cdULL,0xb5c0fbcfec4d3b2fULL,0xe9b5dba58189dbbcULL,
+    0x3956c25bf348b538ULL,0x59f111f1b605d019ULL,0x923f82a4af194f9bULL,0xab1c5ed5da6d8118ULL,
+    0xd807aa98a3030242ULL,0x12835b0145706fbeULL,0x243185be4ee4b28cULL,0x550c7dc3d5ffb4e2ULL,
+    0x72be5d74f27b896fULL,0x80deb1fe3b1696b1ULL,0x9bdc06a725c71235ULL,0xc19bf174cf692694ULL,
+    0xe49b69c19ef14ad2ULL,0xefbe4786384f25e3ULL,0x0fc19dc68b8cd5b5ULL,0x240ca1cc77ac9c65ULL,
+    0x2de92c6f592b0275ULL,0x4a7484aa6ea6e483ULL,0x5cb0a9dcbd41fbd4ULL,0x76f988da831153b5ULL,
+    0x983e5152ee66dfabULL,0xa831c66d2db43210ULL,0xb00327c898fb213fULL,0xbf597fc7beef0ee4ULL,
+    0xc6e00bf33da88fc2ULL,0xd5a79147930aa725ULL,0x06ca6351e003826fULL,0x142929670a0e6e70ULL,
+    0x27b70a8546d22ffcULL,0x2e1b21385c26c926ULL,0x4d2c6dfc5ac42aedULL,0x53380d139d95b3dfULL,
+    0x650a73548baf63deULL,0x766a0abb3c77b2a8ULL,0x81c2c92e47edaee6ULL,0x92722c851482353bULL,
+    0xa2bfe8a14cf10364ULL,0xa81a664bbc423001ULL,0xc24b8b70d0f89791ULL,0xc76c51a30654be30ULL,
+    0xd192e819d6ef5218ULL,0xd69906245565a910ULL,0xf40e35855771202aULL,0x106aa07032bbd1b8ULL,
+    0x19a4c116b8d2d0c8ULL,0x1e376c085141ab53ULL,0x2748774cdf8eeb99ULL,0x34b0bcb5e19b48a8ULL,
+    0x391c0cb3c5c95a63ULL,0x4ed8aa4ae3418acbULL,0x5b9cca4f7763e373ULL,0x682e6ff3d6b2b8a3ULL,
+    0x748f82ee5defb2fcULL,0x78a5636f43172f60ULL,0x84c87814a1f0ab72ULL,0x8cc702081a6439ecULL,
+    0x90befffa23631e28ULL,0xa4506cebde82bde9ULL,0xbef9a3f7b2c67915ULL,0xc67178f2e372532bULL,
+    0xca273eceea26619cULL,0xd186b8c721c0c207ULL,0xeada7dd6cde0eb1eULL,0xf57d4f7fee6ed178ULL,
+    0x06f067aa72176fbaULL,0x0a637dc5a2c898a6ULL,0x113f9804bef90daeULL,0x1b710b35131c471bULL,
+    0x28db77f523047d84ULL,0x32caab7b40c72493ULL,0x3c9ebe0a15c9bebcULL,0x431d67c49c100d4cULL,
+    0x4cc5d4becb3e42b6ULL,0x597f299cfc657e2aULL,0x5fcb6fab3ad6faecULL,0x6c44198c4a475817ULL
+};
+
+static void sha512_block(uint64_t h[8], const uint8_t* p) {
+    uint64_t w[80];
+    for(int i = 0; i < 16; ++i) w[i] = sha_be64(p + 8 * i);
+    for(int i = 16; i < 80; ++i) {
+        uint64_t s0 = sha_ror64(w[i-15], 1) ^ sha_ror64(w[i-15], 8) ^ (w[i-15] >> 7);
+        uint64_t s1 = sha_ror64(w[i-2], 19) ^ sha_ror64(w[i-2], 61) ^ (w[i-2] >> 6);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint64_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for(int i = 0; i < 80; ++i) {
+        uint64_t S1 = sha_ror64(e, 14) ^ sha_ror64(e, 18) ^ sha_ror64(e, 41);
+        uint64_t ch = (e & f) ^ ((~e) & g);
+        uint64_t t1 = hh + S1 + ch + sha512_k[i] + w[i];
+        uint64_t S0 = sha_ror64(a, 28) ^ sha_ror64(a, 34) ^ sha_ror64(a, 39);
+        uint64_t mj = (a & b) ^ (a & c) ^ (b & c);
+        uint64_t t2 = S0 + mj;
+        hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+}
+
+static void sha512_hash(const uint8_t* data, uint32_t len, uint8_t out[64]) {
+    uint64_t h[8] = { 0x6a09e667f3bcc908ULL,0xbb67ae8584caa73bULL,
+                      0x3c6ef372fe94f82bULL,0xa54ff53a5f1d36f1ULL,
+                      0x510e527fade682d1ULL,0x9b05688c2b3e6c1fULL,
+                      0x1f83d9abfb41bd6bULL,0x5be0cd19137e2179ULL };
+    uint8_t tail[256];
+    uint32_t i = 0;
+    for(; len - i >= 128; i += 128) sha512_block(h, data + i);
+    uint32_t rem = len - i;
+    memset(tail, 0, sizeof(tail));
+    if(rem != 0) memcpy(tail, data + i, rem);
+    tail[rem] = 0x80;
+    uint32_t tl = (rem < 112) ? 128 : 256;
+    uint64_t bits = (uint64_t)len * 8u;
+    for(int j = 0; j < 8; ++j) tail[tl - 1 - j] = (uint8_t)(bits >> (8 * j));
+    for(uint32_t k = 0; k < tl; k += 128) sha512_block(h, tail + k);
+    for(int j = 0; j < 8; ++j)
+        for(int b = 0; b < 8; ++b)
+            out[8*j+b] = (uint8_t)(h[j] >> (56 - 8*b));
+}
+
+/* ASCII case-insensitive compare without pulling in <strings.h> (the bridge is
+ * built for freestanding targets where it is not guaranteed to exist). */
+static int sha_name_eq(const char* a, const char* b) {
+    while(*a != 0 && *b != 0) {
+        char ca = (*a >= 'a' && *a <= 'z') ? (char)(*a - 32) : *a;
+        char cb = (*b >= 'a' && *b <= 'z') ? (char)(*b - 32) : *b;
+        if(ca != cb) return 0;
+        ++a; ++b;
+    }
+    return *a == 0 && *b == 0;
+}
+
+/* Borrow the bytes of a BufferSource (ArrayBuffer / TypedArray view) or of a
+ * plain string. Returns a pointer that stays valid for the call; `owned` is
+ * set when the caller has to mario_free() it (the TypedArray copy path). */
+static const uint8_t* web_bytes(var_t* v, uint32_t* len, uint8_t** owned) {
+    *len = 0; *owned = NULL;
+    if(v == NULL) return NULL;
+    if(var_is_arraybuffer(v)) {
+        *len = (uint32_t)v->size;
+        return (const uint8_t*)v->value;
+    }
+    if(var_is_typedarray(v)) {
+        var_t* buf = var_find_own_member_var(v, "buffer");
+        if(buf == NULL || buf->value == NULL) return NULL;
+        int64_t off = var_get_int64(var_find_own_member_var(v, "byteOffset"));
+        int64_t bl  = var_get_int64(var_find_own_member_var(v, "byteLength"));
+        if(off < 0 || bl < 0 || (uint64_t)off + (uint64_t)bl > (uint64_t)buf->size) return NULL;
+        uint8_t* p = (uint8_t*)mario_malloc((size_t)(bl ? bl : 1));
+        if(p == NULL) return NULL;
+        if(bl > 0) memcpy(p, (const uint8_t*)buf->value + off, (size_t)bl);
+        *owned = p; *len = (uint32_t)bl;
+        return p;
+    }
+    const char* s = var_get_str(v);
+    if(s == NULL) return NULL;
+    *len = (uint32_t)strlen(s);
+    return (const uint8_t*)s;
+}
+
+/* Build an ArrayBuffer holding `len` bytes (the layout native_ArrayBuffer.c
+ * uses: bytes in ->value, hidden @@exotic marker, unenumerable byteLength). */
+static var_t* web_arraybuffer(vm_t* vm, const uint8_t* bytes, uint32_t len) {
+    var_t* cls = var_find_own_member_var(vm->root, "ArrayBuffer");
+    if(cls == NULL) return NULL;
+    uint8_t* buf = (len != 0) ? (uint8_t*)mario_malloc(len) : NULL;
+    if(len != 0 && buf == NULL) return NULL;
+    if(len != 0) memcpy(buf, bytes, len);
+    var_t* o = var_new_obj(vm, var_get_prototype(cls), buf, mario_free);
+    if(o == NULL) { if(buf != NULL) mario_free(buf); return NULL; }
+    o->size = len;
+    node_t* mn = var_add(o, EXOTIC_MARKER, var_new_str(vm, EXOTIC_ARRAYBUFFER));
+    if(mn != NULL) { mn->invisable = 1; mn->be_unenumerable = 1; }
+    node_t* bn = var_add(o, "byteLength", var_new_int(vm, (int)len));
+    if(bn != NULL) bn->be_unenumerable = 1;
+    return o;
+}
+
+/* crypto.subtle.digest(algorithm, data) -> Promise<ArrayBuffer>. `algorithm`
+ * is the usual {name:"SHA-256"} object or the bare name string. */
+static var_t* native_crypto_subtle_digest(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* algo = js_arg(env, 0);
+    var_t* name = (algo != NULL) ? var_find_member_var(algo, "name") : NULL;
+    const char* s = (name != NULL) ? var_get_str(name) : var_get_str(algo);
+    uint8_t out[64];
+    uint32_t outlen = 0;
+    if(s != NULL) {
+        if(sha_name_eq(s, "SHA-1"))        outlen = 20;
+        else if(sha_name_eq(s, "SHA-256")) outlen = 32;
+        else if(sha_name_eq(s, "SHA-384")) outlen = 48;
+        else if(sha_name_eq(s, "SHA-512")) outlen = 64;
+    }
+    if(outlen == 0) {
+        var_t* reason = var_new_obj_no_proto(vm, NULL, NULL);
+        vm->gc.gc_defer++;
+        var_add(reason, "name",    var_new_str(vm, "NotSupportedError"));
+        var_add(reason, "message", var_new_str(vm, "crypto.subtle.digest: unsupported algorithm"));
+        vm->gc.gc_defer--;
+        var_t* p = web_promise(vm, "reject", reason);
+        return (p != NULL) ? p : var_new_null(vm);
+    }
+    uint32_t len = 0;
+    uint8_t* owned = NULL;
+    const uint8_t* bytes = web_bytes(js_arg(env, 1), &len, &owned);
+    if(outlen == 20)      sha1_hash(bytes, len, out);
+    else if(outlen == 32) sha256_hash(bytes, len, out);
+    else if(outlen == 48) { uint8_t full[64]; sha512_hash(bytes, len, full); memcpy(out, full, 48); }
+    else                  sha512_hash(bytes, len, out);
+    if(owned != NULL) mario_free(owned);
+    var_t* ab = web_arraybuffer(vm, out, outlen);
+    var_t* p = web_promise(vm, "resolve", ab);
+    return (p != NULL) ? p : ab;
+}
+
+static var_t* native_crypto_subtle_unsupported(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    /* The key-bearing operations need a real key store and a constant-time
+     * backend; rejecting with a clear reason beats a silent hang. */
+    var_t* reason = var_new_obj_no_proto(vm, NULL, NULL);
+    vm->gc.gc_defer++;
+    var_add(reason, "name",    var_new_str(vm, "NotSupportedError"));
+    var_add(reason, "message", var_new_str(vm, "crypto.subtle: only digest() is implemented"));
+    vm->gc.gc_defer--;
+    var_t* p = web_promise(vm, "reject", reason);
+    return (p != NULL) ? p : var_new_null(vm);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3650,8 +4205,10 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
     /* CSS namespace. CSS.supports() must be callable even when the queried
      * feature is unavailable; throwing here aborts framework initialization. */
     cls = vm_new_class(vm, "CSS");
-    if(cls != NULL)
+    if(cls != NULL) {
         vm_reg_static(vm, cls, "supports(a, b)", native_css_supports, bridge);
+        vm_reg_static(vm, cls, "escape(s)",      native_css_escape,   bridge);
+    }
 
     /* ---- window methods ---- */
     vm_reg_static(vm, NULL, "scrollTo(a, b)",    native_win_scrollTo, bridge);
@@ -3792,6 +4349,7 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
         js_acc_cls(vm, cls, "maxTouchPoints",      metric_get, NULL, (void*)(intptr_t)1);
         js_acc_cls(vm, cls, "deviceMemory",        metric_get, NULL, (void*)(intptr_t)2);
         js_acc_cls(vm, cls, "languages",  nav_get_languages, NULL, bridge);
+        js_acc_cls(vm, cls, "userAgentData", nav_get_userAgentData, NULL, bridge);
         js_acc_cls(vm, cls, "onLine",        nav_get_bool, NULL, (void*)(intptr_t)0);
         js_acc_cls(vm, cls, "cookieEnabled", nav_get_bool, NULL, (void*)(intptr_t)1);
         /* Not const: pages do assign to these during feature detection and a
@@ -3832,6 +4390,9 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
         vm_reg_native(vm, cls, "measure(n, a, b)",  perf_noop, bridge);
         vm_reg_native(vm, cls, "clearMarks(n)",     perf_noop, bridge);
         vm_reg_native(vm, cls, "clearMeasures(n)",  perf_noop, bridge);
+        vm_reg_native(vm, cls, "getEntries()",          perf_entries_empty, bridge);
+        vm_reg_native(vm, cls, "getEntriesByType(t)",   perf_entries_empty, bridge);
+        vm_reg_native(vm, cls, "getEntriesByName(n, t)", perf_entries_empty, bridge);
     }
     var_t* performance = new_obj(vm, CLS_PERF, 0);
     if(performance != NULL) {
@@ -3849,6 +4410,20 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
         var_add(bridge, "@@performance", performance);
     }
     web_publish(vm, window, "performance", performance);
+
+    /* ---- PerformanceObserver: see perfobs_supported_types() for why the
+     * global must exist even though no observation is ever performed. ---- */
+    cls = vm_new_class(vm, "PerformanceObserver");
+    if(cls != NULL) {
+        vm_reg_native(vm, cls, "constructor(cb)", native_perfobs_ctor, bridge);
+        vm_reg_native(vm, cls, "observe(o)",      native_perfobs_noop, bridge);
+        vm_reg_native(vm, cls, "disconnect()",    native_perfobs_noop, bridge);
+        vm_reg_native(vm, cls, "takeRecords()",   native_perfobs_takeRecords, bridge);
+        vm_reg_static(vm, cls, "getSupportedEntryTypes()", native_perfobs_supported, bridge);
+        vm->gc.gc_defer++;
+        var_add(cls, "supportedEntryTypes", perfobs_supported_types(vm));
+        vm->gc.gc_defer--;
+    }
 
     /* ---- document extras ---- */
     cls = var_find_own_member_var(vm->root, CLS_DOCUMENT);
@@ -3925,6 +4500,25 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
     if(crypto != NULL) {
         vm_reg_native_on(vm, crypto, "getRandomValues(a)", native_crypto_getRandomValues, bridge);
         vm_reg_native_on(vm, crypto, "randomUUID()",       native_crypto_randomUUID,      bridge);
+        /* SubtleCrypto: digest() only (see the SHA block above). The object has
+         * to exist for `window.crypto.subtle` feature tests; a page that calls
+         * an unimplemented operation gets a rejected promise, not a TypeError. */
+        var_t* subtle = var_new_obj_no_proto(vm, NULL, NULL);
+        if(subtle != NULL) {
+            vm_reg_native_on(vm, subtle, "digest(a, d)",         native_crypto_subtle_digest,      bridge);
+            vm_reg_native_on(vm, subtle, "encrypt(a, k, d)",     native_crypto_subtle_unsupported, bridge);
+            vm_reg_native_on(vm, subtle, "decrypt(a, k, d)",     native_crypto_subtle_unsupported, bridge);
+            vm_reg_native_on(vm, subtle, "sign(a, k, d)",        native_crypto_subtle_unsupported, bridge);
+            vm_reg_native_on(vm, subtle, "verify(a, k, s, d)",   native_crypto_subtle_unsupported, bridge);
+            vm_reg_native_on(vm, subtle, "generateKey(a, e, u)", native_crypto_subtle_unsupported, bridge);
+            vm_reg_native_on(vm, subtle, "importKey(f, k, a, e, u)", native_crypto_subtle_unsupported, bridge);
+            vm_reg_native_on(vm, subtle, "exportKey(f, k)",      native_crypto_subtle_unsupported, bridge);
+            vm_reg_native_on(vm, subtle, "deriveBits(a, k, l)",  native_crypto_subtle_unsupported, bridge);
+            vm_reg_native_on(vm, subtle, "deriveKey(a, k, d, e, u)", native_crypto_subtle_unsupported, bridge);
+            vm_reg_native_on(vm, subtle, "wrapKey(f, k, w, a)",  native_crypto_subtle_unsupported, bridge);
+            vm_reg_native_on(vm, subtle, "unwrapKey(f, k, w, a, d, e, u)", native_crypto_subtle_unsupported, bridge);
+            var_add(crypto, "subtle", subtle);
+        }
         var_add(bridge, "@@crypto", crypto);
     }
     web_publish(vm, window, "crypto", crypto);

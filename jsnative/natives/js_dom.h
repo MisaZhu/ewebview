@@ -289,6 +289,12 @@ void js_dom_reset_element_cache(vm_t* vm);
  * flight-stream bootstrap) gate on. Safe when the bridge is not installed. */
 void js_dom_mark_dom_loaded(vm_t* vm);
 
+/* Bracket the execution of deferred/module scripts: pass true before running
+ * them and false afterwards so document.readyState reports "interactive"
+ * during their execution (what a real browser shows once parsing ends).
+ * Safe when the bridge is not installed. */
+void js_dom_set_parsing_complete(vm_t* vm, bool complete);
+
 /* ------------------------------------------------------------------ */
 /* Accessors for sibling bridges (js_event.c, js_web.c, js_canvas.c)   */
 /*                                                                    */

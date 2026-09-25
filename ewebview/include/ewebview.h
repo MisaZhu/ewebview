@@ -277,6 +277,13 @@ void ewebview_post_key(ewebview_t* v, const eweb_key_event_t* ev);
  * page's scroll handlers). */
 void ewebview_scroll(ewebview_t* v, int x, int y);
 
+/* True when the engine has no build, style walk, layout or sub-resource work
+ * outstanding: the most recently delivered frame is then the final visual
+ * state for the current resource set. Heuristic for capture/automation hooks
+ * (a screenshot taken while this is false can catch a mid-cascade frame);
+ * animations do not count as work. UI-thread, cheap, never blocks. */
+bool ewebview_is_idle(ewebview_t* v);
+
 /* ------------------------------------------------------------------ */
 /* UI pump + frame ownership (UI-thread)                               */
 /* ------------------------------------------------------------------ */

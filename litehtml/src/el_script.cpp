@@ -73,6 +73,29 @@ void litehtml::el_script::select_all(const css_selector& selector, elements_vect
 		{
 			if(own == nullptr || t_strcasecmp(own, attr_sel.val.c_str()) != 0) return;
 		}
+		else if(attr_sel.condition == select_contain_str)
+		{
+			/* `[attr~=v]` / `[attr*=v]`: css_selector folds both to a substring
+			 * test. github's catalyst `@target` accessor looks its JSON island up
+			 * with `[data-target~="react-app.embeddedData"]`; refusing substring
+			 * conditions made every data island invisible to querySelectorAll and
+			 * the element's connectedCallback aborted with "No embedded data". */
+			if(own == nullptr || t_strstr(own, attr_sel.val.c_str()) == nullptr) return;
+		}
+		else if(attr_sel.condition == select_start_str)
+		{
+			if(own == nullptr || t_strncmp(own, attr_sel.val.c_str(), attr_sel.val.length()) != 0) return;
+		}
+		else if(attr_sel.condition == select_end_str)
+		{
+			if(own == nullptr)
+				return;
+			size_t own_len = t_strlen(own);
+			size_t val_len = attr_sel.val.length();
+			if(val_len > own_len ||
+			   t_strncmp(own + (own_len - val_len), attr_sel.val.c_str(), val_len) != 0)
+				return;
+		}
 		else
 		{
 			return; /* unsupported condition: do not claim a match */

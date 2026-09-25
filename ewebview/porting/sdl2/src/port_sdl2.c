@@ -1994,9 +1994,19 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
      * own error string/code here (same stderr stream as the [ewebview] logs) on
      * a transport error or a non-2xx status, so a failed fetch is diagnosable
      * without a rebuild. */
-    if(getenv("EWEB_NETDBG") != NULL)
+    if(getenv("EWEB_NETDBG") != NULL) {
         fprintf(stderr, "[netdbg] url=%s status=%d body=%d\n", url,
                 (int)resp->status, (int)resp->body_size);
+        /* On a refusal, the first bytes of the body say WHO refused: a WAF
+         * page carries a vendor reference id, an app-level refusal carries a
+         * csrf/permission message. Dump a prefix so the layer is identifiable
+         * without a rebuild. */
+        if(resp->status >= 400 && resp->body && resp->body_size > 0) {
+            int len = resp->body_size < 512 ? (int)resp->body_size : 512;
+            fprintf(stderr, "[netdbg] body[0..%d]=\n%.*s\n", len, len,
+                    (const char*)resp->body);
+        }
+    }
     if(resp->error || resp->status < 200 || resp->status > 299) {
         fprintf(stderr,
             "[ewebview] net.request diag: url=%s status=%d error=%d code=%d "

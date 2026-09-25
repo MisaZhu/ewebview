@@ -1560,6 +1560,13 @@ void litehtml::document::create_node(GumboNode* node, elements_vector& elements,
 	GumboNodeType node_type = node->type;
 	switch (node_type)
 	{
+	case GUMBO_NODE_TEMPLATE:
+		/* A <template> is an ordinary element as far as the DOM tree is concerned
+		 * (gumbo only splits the node type so renderers can skip inert content).
+		 * Dropping it lost SSR hydration markers (`<template id="B:0">` inside
+		 * React's Suspense placeholders), which left the app container with zero
+		 * element children and made Pinterest's `root.childElementCount > 0`
+		 * hydration gate skip the mount entirely - a blank page with no error. */
 	case GUMBO_NODE_ELEMENT:
 		{
 			g_create_node_profile.element_nodes++;

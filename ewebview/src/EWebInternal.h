@@ -35,6 +35,7 @@
 #include <string>
 #include <string.h>   /* memset: EWebCmd ctor */
 #include <vector>
+#include <utility>    /* std::pair: import-map entries */
 #include <deque>
 #include <unordered_map>
 
@@ -82,7 +83,7 @@ static const uint32_t kJsRunBudgetLiveMs = 3000;
  * needs several seconds on this VM; cutting it at kJsRunBudgetLiveMs discards
  * the whole boot and the skeleton stays forever. Once real content paints the
  * ordinary short live budget applies again so input stays responsive. */
-static const uint32_t kJsRunBudgetSkeletonMs = 15000;
+static const uint32_t kJsRunBudgetSkeletonMs = 60000;
 
 /* Re-evaluation interval for jsSkeletonProbeCached(): short enough that the
  * budget drops back to the live one promptly once real content paints, long
@@ -117,7 +118,15 @@ static const uint32_t kJsPostSwapBudgetMs = 8000;
  * budget. While nothing real is on screen we therefore keep starting scripts
  * up to this much larger cap; the moment real content paints the ordinary
  * kJsPostSwapBudgetMs applies again so ad-heavy portals still go idle fast. */
-static const uint32_t kJsPostSwapSkeletonBudgetMs = 45000;
+static const uint32_t kJsPostSwapSkeletonBudgetMs = 90000;
+
+/* Visible non-whitespace characters at or above which the blank-shell probe
+ * (pageShowsSkeletonPlaceholder) counts a page as carrying real content.
+ * A CSR shell paints at most chrome fragments (a skip-link, an empty aria
+ * live region); real server content - even a bare <noscript> banner - easily
+ * clears this bar, so the skeleton budgets stay armed only while the
+ * viewport is effectively blank. */
+static const int kBlankShellTextChars = 24;
 
 /* Expand a CDN combo URL ("https://host/path/??a.js,b.js,c.js") into one URL
  * per component. A combo downloads as ONE script body, so a watchdog cut on a
@@ -285,6 +294,14 @@ public:
     /* UI-thread mirror of the visible page's URL (refreshed by EUET_URL). */
     const char* currentUrlUi() const { return m_uiCurrentUrl.c_str(); }
 
+    /* Settled-state snapshot written by the engine loop each iteration and
+     * read by the UI thread through ewebview_is_idle(): true when no build,
+     * chunked style walk, layout, scroll catch-up or sub-resource task is
+     * outstanding, i.e. the last delivered frame is the final visual state
+     * for the current resource set. A stale read only shifts a heuristic
+     * capture point, so the plain bool needs no synchronisation. */
+    bool uiIdleSnapshot() const { return m_uiIdleSnap; }
+
     /* ---- EWebContainerHost (engine thread, called from litehtml) ---- */
     virtual bool queueImageTask(const std::string& url) override;
     virtual void loadCSS(const std::string& url) override;
@@ -343,6 +360,10 @@ public:
     void decideModuleNotice();
     void decideCsrNotice();
     bool pageShowsSkeletonPlaceholder() const;
+    /* Weaker probe: any visible skeleton-named placeholder at any area (see
+     * ewebview.cc); lets module pages keep the skeleton script budget while
+     * real chrome surrounds the placeholder columns. */
+    bool pageHasSkeletonAny() const;
     /* TTL-cached pageShowsSkeletonPlaceholder(): the probe is a full DOM walk,
      * and jsVmEnter() consults it on EVERY VM run (timer ticks included), so an
      * uncached call would re-walk the whole tree per tick on non-skeleton
@@ -399,6 +420,7 @@ public:
      * message-queue so a promise awaited by __await() settles instead of
      * degrading to undefined. See EWebJs.cc. */
     static int  jsAwaitPendingTick(struct st_vm* vm, struct st_var* promise);
+    int         jsPumpAwaitScript();
     void registerEventNatives(struct st_vm* vm);
     void registerWebNatives(struct st_vm* vm);
 
@@ -560,6 +582,7 @@ public:
     static bool  jsWebConfirm(void* ctx, const char* message);
     static char* jsWebPrompt(void* ctx, const char* message, const char* def);
     static void  jsWebGetViewport(void* ctx, int* w, int* h);
+    static int   jsWebGetColorScheme(void* ctx);
     static void  jsWebGetScreen(void* ctx, int* w, int* h, int* depth);
     static void  jsWebGetScroll(void* ctx, int* x, int* y);
     static void  jsWebScrollTo(void* ctx, int x, int y);
@@ -585,6 +608,16 @@ public:
      * mario, so the engine is recovered from vm->on_step_data. */
     static struct st_mstr* jsModuleResolve(struct st_vm* vm, const char* spec, const char* base);
     static struct st_mstr* jsModuleLoad(struct st_vm* vm, const char* spec);
+    /* Resolve a bare module specifier through the page import map (exact key,
+     * then longest trailing-slash prefix). Empty string when unmapped. */
+    std::string jsImportMapLookup(const char* spec);
+    /* Run one queued script body. Module/defer scripts are registered in the
+     * mario module registry under their absolute URL (vm_load_run_module) so a
+     * later `import` of the same chunk URL from another bundle shares THIS
+     * evaluation's webpack runtime state instead of re-evaluating a second,
+     * registry-less copy (github rspack chunks). Classic scripts use the plain
+     * vm_load_run global-scope path. */
+    bool jsRunScriptBody(const std::string& src, bool moduleish);
     /* Point vm->cur_module_spec at the absolute URL of the top-level script
      * about to run (import.meta.url / relative-import base); NULL clears it. */
     void jsSetModuleBase(bool on);
@@ -708,6 +741,8 @@ public:
      * wait (kFirstPaintCssWaitMs); 0 = not waiting yet. */
     uint64_t                    m_firstPaintCssWaitSince;
     bool                        m_styleStepInFlight;
+    /* Engine-loop settled-state snapshot; see uiIdleSnapshot(). */
+    bool                        m_uiIdleSnap;
     /* Click-vs-drag bookkeeping (ECMD_INPUT). */
     int                         m_pressX;
     int                         m_pressY;
@@ -749,6 +784,16 @@ public:
      * stripped before litehtml parses the document, so stand-ins must restore
      * the id for getElementById/self-locating bundle bootstrap code. */
     std::vector<std::string>    m_jsScriptIds;
+    /* Parallel to m_jsScripts: true for a parser-extracted type="module" or
+     * defer script. A real browser runs those only after parsing ends, so the
+     * JS runner flips document.readyState to "interactive" when the first one
+     * executes (github's client-env module gates its JSON island read on
+     * that). False for dynamically inserted scripts (classic semantics). */
+    std::vector<bool>           m_jsScriptDeferred;
+    /* Import-map specifier->URL pairs parsed from <script type="importmap">.
+     * jsModuleResolve consults it for bare specifiers ("react-dom") that have
+     * no relative/URL form; github.com ships react/react-dom/scheduler here. */
+    std::vector<std::pair<std::string,std::string>> m_jsImportMap;
     std::vector<char>           m_jsScriptDone;
     /* Parallel to m_jsScripts (kept the same length at every mutation):
      * the litehtml element of a dynamically inserted <script>, nullptr for

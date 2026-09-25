@@ -1774,7 +1774,17 @@ int main(int argc, char** argv) {
                     b->shot_settle_ms = b->inject_final_settle;
                 }
             } else if((now - b->shot_start_ms) >= b->shot_settle_ms) {
-                if(b->shot_scroll_y >= 0 && !b->shot_scrolled) {
+                /* Wait for a frame that reflects the FINAL resource set:
+                 * capturing while the engine is still cascading or rendering
+                 * can catch a mid-walk frame (github.com's active-tab
+                 * underline pseudo-element missing) or no frame at all on a
+                 * slow load. The cap bounds the wait for pages that never
+                 * report idle (persistent polling, stuck fetch). */
+                bool settled = (b->frame != NULL) && ewebview_is_idle(b->view);
+                bool capped  = (now - b->shot_start_ms) >= b->shot_settle_ms + 90000;
+                if(!settled && !capped) {
+                    /* keep pumping until the engine settles */
+                } else if(b->shot_scroll_y >= 0 && !b->shot_scrolled) {
                     ewebview_scroll(b->view, 0, b->shot_scroll_y);
                     b->shot_scrolled = true;
                     b->shot_start_ms = SDL_GetTicks();
