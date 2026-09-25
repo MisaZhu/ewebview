@@ -1,8 +1,10 @@
 # easm - embed WebAssembly runtime for ewebview
 #
 # Core sources (decode/validate/interp/arith/runtime) are always compiled.
-# JIT selection: jit_a64.c (real aarch64 JIT) on Apple Silicon (macOS aarch64),
-# jit_stub.c (interpreter-only fallback) elsewhere.
+# JIT selection: jit_a64.c + jit_a64_rt.c (real aarch64 JIT) on Apple Silicon
+# (macOS aarch64), jit_stub.c (interpreter-only fallback) elsewhere.
+# jit_a64_rt.c is the runtime half of the aarch64 backend (helpers called
+# from generated code); it is only built alongside jit_a64.c.
 #
 # WASI backends: wasi.c references BOTH platform hooks (its EA_BACKEND switch
 # names ea_wasi_plat_posix / ea_wasi_plat_ewok), so both translation units must
@@ -41,7 +43,7 @@ ifneq ($(OS_TYPE),ewokos)
 ifneq ($(ARCH),)
 ifeq ($(ARCH),aarch64)
 ifneq ($(UNAME_S),Linux)   # skip JIT on Linux even if aarch64 (no MAP_JIT guarantee)
-JIT_SRC = src/jit_a64.c
+JIT_SRC = src/jit_a64.c src/jit_a64_rt.c
 endif
 endif
 endif
