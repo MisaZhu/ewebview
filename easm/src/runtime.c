@@ -227,6 +227,14 @@ int ea_eval_const_expr(EaInstance *inst, EaModule *m, const InsList *code, WVal 
 // ---------------------------------------------------------------- memory alloc
 #define EA_MEM_RESERVE ((size_t)(12ull << 30)) // 12 GiB VA per memory
 
+/* EwokOS's <sys/mman.h> has no MAP_NORESERVE; the reservation is PROT_NONE so
+ * it never backs real pages, making the hint a no-op there anyway. */
+#ifdef __ewokos__
+#define EA_MAP_NORESERVE 0
+#else
+#define EA_MAP_NORESERVE MAP_NORESERVE
+#endif
+
 // ---- signal-based out-of-bounds detection
 // every memory reserves 12 GiB of PROT_NONE address space, so any i32
 // address (or i32 address + validated offset, both < 2^33) that escapes the
@@ -239,6 +247,7 @@ static EaMemRange *g_mem_ranges;
 static uint32_t g_n_mem_ranges, g_cap_mem_ranges;
 static _Thread_local EaExec *g_fault_exec; // exec owning the active invoke
 
+#ifndef __ewokos__
 static void ea_segv_handler(int sig, siginfo_t *si, void *uc) {
     (void)uc;
     uintptr_t addr = (uintptr_t)si->si_addr;
@@ -276,6 +285,43 @@ static void ea_install_fault_handler(void) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
 }
+#else
+/* EwokOS's <signal.h> only provides the POSIX sa_handler form: there is no
+ * siginfo_t, no sa_sigaction and no SA_SIGINFO, so the faulting address is
+ * unavailable. During a wasm invoke the only SIGSEGV/SIGBUS that can reach us
+ * comes from an access that escaped the committed pages into the guard
+ * reservation, so treat it as an out-of-bounds trap; when no invoke is active
+ * fall through to the default disposition and crash for real. */
+static void ea_segv_handler(int sig) {
+    EaExec *ex = g_fault_exec;
+    if (getenv("EA_FDBG")) fprintf(stderr, "[F] fault sig=%d ranges=%u\n", sig, g_n_mem_ranges);
+    if (ex && ex->jb) {
+        ex->trap = TRAP_OOB_MEMORY;
+        snprintf(ex->trap_msg, sizeof(ex->trap_msg), "%s",
+                 ea_trap_msg(TRAP_OOB_MEMORY));
+        sigset_t set; // the fault stays blocked inside the handler
+        sigemptyset(&set);
+        sigaddset(&set, SIGSEGV);
+        sigaddset(&set, SIGBUS);
+        sigprocmask(SIG_UNBLOCK, &set, NULL);
+        longjmp(*(jmp_buf *)ex->jb, 1);
+    }
+    signal(sig, SIG_DFL); // not during an invoke: crash for real
+    raise(sig);
+}
+
+static void ea_install_fault_handler(void) {
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = ea_segv_handler;
+    sa.sa_flags = 0;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+#endif
 
 uint8_t *alloc_memory(uint64_t pages);
 uint8_t *alloc_memory_public(uint64_t pages) {
@@ -327,7 +373,7 @@ void ea_table_free(EaTableInst *ti) {
 }
 uint8_t *alloc_memory(uint64_t pages) {
     void *p = mmap(NULL, EA_MEM_RESERVE, PROT_NONE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+                   MAP_PRIVATE | MAP_ANONYMOUS | EA_MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) return NULL;
     if (pages > 0) {
         if (mprotect(p, (size_t)(pages << 16), PROT_READ | PROT_WRITE) != 0) {
@@ -739,7 +785,19 @@ int ea_instance_invoke(EaStore *s, EaInstance *inst, uint32_t func_idx,
     // thread stack traps as TRAP_STACK_EXHAUSTED instead of faulting
     {
         void *sp0 = (void *)&ex;
+#if defined(__APPLE__)
+        /* pthread_get_stacksize_np is a BSD/Darwin extension. It is needed here
+         * only because the native aarch64 JIT (jit_a64.c) reads jit_stack_limit
+         * to bound recursion, and that backend is built solely on Apple
+         * Silicon, so this is the only platform where the call is both
+         * available and consumed. */
         size_t ssz = pthread_get_stacksize_np(pthread_self());
+#else
+        /* Interpreter-only builds (jit_stub on EwokOS/Linux) never read
+         * jit_stack_limit, so skip the non-portable pthread API and use a
+         * conservative fixed floor to keep the field initialized. */
+        size_t ssz = 512 * 1024;
+#endif
         ex->jit_stack_limit = (char *)sp0 - ssz + 256 * 1024;
     }
     jmp_buf jb;
