@@ -785,19 +785,7 @@ int ea_instance_invoke(EaStore *s, EaInstance *inst, uint32_t func_idx,
     // thread stack traps as TRAP_STACK_EXHAUSTED instead of faulting
     {
         void *sp0 = (void *)&ex;
-#if defined(__APPLE__)
-        /* pthread_get_stacksize_np is a BSD/Darwin extension. It is needed here
-         * only because the native aarch64 JIT (jit_a64.c) reads jit_stack_limit
-         * to bound recursion, and that backend is built solely on Apple
-         * Silicon, so this is the only platform where the call is both
-         * available and consumed. */
         size_t ssz = pthread_get_stacksize_np(pthread_self());
-#else
-        /* Interpreter-only builds (jit_stub on EwokOS/Linux) never read
-         * jit_stack_limit, so skip the non-portable pthread API and use a
-         * conservative fixed floor to keep the field initialized. */
-        size_t ssz = 512 * 1024;
-#endif
         ex->jit_stack_limit = (char *)sp0 - ssz + 256 * 1024;
     }
     jmp_buf jb;
