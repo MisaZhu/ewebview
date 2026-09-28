@@ -1308,7 +1308,7 @@ static TTF_Font* sdl2_face_for(TTF_Font* prim, TTF_Font* fb, uint32_t cp) {
  * Returns false only when the whole string is a single PRIMARY run (the
  * caller can then use the plain single-face API with no copying). A string
  * that is entirely fallback glyphs - litehtml hands us CJK one word at a
- * time, so "默认字体" arrives on its own - is emitted as one fallback run;
+ * time, so a CJK word like "default font" arrives on its own - is emitted as one fallback run;
  * treating it as "not mixed" sent it to the Latin face and drew notdef boxes. */
 typedef void (*sdl2_run_fn)(TTF_Font* face, const char* run, int len, void* ud);
 static bool sdl2_for_each_run(TTF_Font* prim, TTF_Font* fb, const char* text, sdl2_run_fn fn, void* ud) {
