@@ -50,14 +50,18 @@ endif
 endif
 
 SRC = $(CORE_SRC) $(WASI_SRC) $(JIT_SRC)
-OBJ = $(SRC:src/%.c=build/%.o)
+OBJ = $(SRC:src/%.c=$(ARCH)/src/%.o)
 
 all: $(TARGET)
 
-build:
-	mkdir -p build
-
-build/%.o: src/%.c src/easm.h src/opcodes.h src/a64_emit.h | build
+# Objects are namespaced by $(ARCH), exactly like every sibling ewebview lib
+# (libwebp/litehtml/jsnative/libtinyhttpsc).  The old flat build/ dir was
+# shared by all arch/HW/OS_TYPE configs, so back-to-back builds reused stale
+# objects: an x86 build's build/*.o were archived into the aarch64 libeasm.a
+# (make saw them newer than the .c and skipped recompiling), which the aarch64
+# ld then rejected with "skipping incompatible ... when searching for -leasm".
+$(ARCH)/%.o: %.c src/easm.h src/opcodes.h src/a64_emit.h
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TARGET): $(OBJ)
@@ -71,6 +75,6 @@ $(TARGET): $(OBJ)
 -include $(OBJ:.o=.d)
 
 clean:
-	rm -rf build
+	rm -rf $(ARCH)
 	rm -f $(TARGET)
 	rm -rf $(PUBLIC_HDR_DIR)
