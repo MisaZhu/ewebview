@@ -50,7 +50,7 @@ typedef struct {
     uint32_t block_idx;
     uint8_t is_loop;
     uint8_t is_try;
-    struct EaInstr *try_in; // try_table instruction (catch clauses)
+    EaInstr *try_in; // try_table instruction (catch clauses)
 } RCtl;
 
 #define MAX_CTRL 4096

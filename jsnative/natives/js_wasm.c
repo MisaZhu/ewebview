@@ -243,7 +243,8 @@ struct WasmFuncData {
     EaFuncType* type;
 };
 
-static void wasm_func_destroy(var_t* v) {
+static void wasm_func_destroy(void* p) {
+    var_t* v = (var_t*)p;
     if(v == NULL) return;
     func_t* f = (v->is_func) ? var_get_func(v) : NULL;
     if(f == NULL) return;
@@ -1041,12 +1042,12 @@ static var_t* wasm_build_instance(vm_t* vm, var_t* this_v, WasmModRef* r,
             im->globals = (WVal**)mario_malloc((ng ? ng : 1) * sizeof(WVal*));
             im->globals_def = (EaGlobal*)mario_malloc((ng ? ng : 1) * sizeof(EaGlobal));
             im->slots = (WasmImportSlot*)mario_malloc((nf ? nf : 1) * sizeof(WasmImportSlot));
-            /* synthetic module: no type space -> func imports match structurally */
+            /* synthetic module carries no func/table/memory definition space;
+             * the runtime resolves imports through the synthetic EaInstance
+             * (src->funcs/tables/memories) registered below, so only the type
+             * space, exports and defined globals are wired here. */
             im->mod.n_types = 0;
             im->mod.types = NULL;
-            im->mod.funcs = im->funcs;
-            im->mod.tables = im->tables;
-            im->mod.memories = im->mems;
             im->mod.globals_def = im->globals_def;
             im->mod.exports = im->exports;
             /* mod.n_* updated as exports accumulate */
