@@ -75,6 +75,6 @@ $(TARGET): $(OBJ)
 -include $(OBJ:.o=.d)
 
 clean:
-	rm -rf $(ARCH)
+	rm -rf $(ALL_ARCH_DIRS) build
 	rm -f $(TARGET)
 	rm -rf $(PUBLIC_HDR_DIR)
