@@ -207,7 +207,7 @@ void ewok_https_entropy_fill(void *buf, size_t len) {
         memcpy(out, &word, chunk);
         out += chunk;
         len -= chunk;
-        proc_usleep(1);
+        usleep(1);
     }
 }
 

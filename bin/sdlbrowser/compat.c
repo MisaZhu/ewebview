@@ -54,10 +54,10 @@ int ewok_ptr_in_heap(const void* p) {
 /* tinyhttpsc entropy sleep                                            */
 /* ------------------------------------------------------------------ */
 
-/* BearHttpsClientOne.c calls proc_usleep(1) as a timing-entropy source for
+/* BearHttpsClientOne.c calls usleep(1) as a timing-entropy source for
  * the BearSSL RNG seed.  On desktop we use nanosleep. */
 
-void proc_usleep(uint32_t us) {
+void usleep(uint32_t us) {
     struct timespec ts;
     ts.tv_sec  = (time_t)(us / 1000000u);
     ts.tv_nsec = (long)((us % 1000000u) * 1000u);

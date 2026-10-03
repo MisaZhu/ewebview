@@ -16,10 +16,10 @@
 #include <stdint.h>
 #include <time.h>
 
-/* BearHttpsClientOne.c's entropy fill calls proc_usleep(); the browser provides
+/* BearHttpsClientOne.c's entropy fill calls usleep(); the browser provides
  * it via bin/sdlbrowser/compat.c, which drags in gumbo. Supply the same trivial
  * nanosleep-backed definition here so the harness links libtinyhttpsc alone. */
-void proc_usleep(uint32_t us) {
+void usleep(uint32_t us) {
     struct timespec ts;
     ts.tv_sec  = (time_t)(us / 1000000u);
     ts.tv_nsec = (long)(us % 1000000u) * 1000L;

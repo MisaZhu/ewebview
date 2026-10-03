@@ -77,7 +77,7 @@ ewebview 核心不认识任何操作系统：它只把页面渲染进一块抽�
 | net.request | tinyhttpsc/BearSSL；`SetTimeout(10000)` + **`SetMaxRedirections(0)`** | 同一份 tinyhttpsc/BearSSL；同样 **`SetMaxRedirections(0)`** |
 | net.read_file | `vfs_readfile` | 标准 C `fopen`/`fread` |
 | net.resolve_resource | `x_get_res_name`（`res://`） | `<program-dir>/res/<name>`（经 `SDL_GetBasePath`） |
-| clock | `sys_tic_ms(0)` / `proc_usleep` | `clock_gettime(CLOCK_MONOTONIC)` / `SDL_Delay` |
+| clock | `sys_tic_ms(0)` / `usleep` | `clock_gettime(CLOCK_MONOTONIC)` / `SDL_Delay` |
 | sys.log | `klog` | `SDL_Log` |
 | sys.ptr_sane | `ewok_ptr_in_heap` | 非 NULL 启发式（桌面无廉价堆归属检查，OPTIONAL，核心退化为只信活性标记） |
 

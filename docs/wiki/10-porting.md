@@ -77,7 +77,7 @@ The repository ships two complete reference ports, both pure C99, both structure
 | net.request | tinyhttpsc/BearSSL; `SetTimeout(10000)` + **`SetMaxRedirections(0)`** | the same tinyhttpsc/BearSSL; likewise **`SetMaxRedirections(0)`** |
 | net.read_file | `vfs_readfile` | standard C `fopen`/`fread` |
 | net.resolve_resource | `x_get_res_name` (`res://`) | `<program-dir>/res/<name>` (via `SDL_GetBasePath`) |
-| clock | `sys_tic_ms(0)` / `proc_usleep` | `clock_gettime(CLOCK_MONOTONIC)` / `SDL_Delay` |
+| clock | `sys_tic_ms(0)` / `usleep` | `clock_gettime(CLOCK_MONOTONIC)` / `SDL_Delay` |
 | sys.log | `klog` | `SDL_Log` |
 | sys.ptr_sane | `ewok_ptr_in_heap` | a non-NULL heuristic (desktops have no cheap heap-membership check; OPTIONAL, the core degrades to trusting only the liveness flag) |
 

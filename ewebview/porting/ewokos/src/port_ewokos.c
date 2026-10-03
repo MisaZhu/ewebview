@@ -549,7 +549,7 @@ static const char* ek_net_resolve_resource(void* ud, const char* res, char* buf,
  * and lives in a C++ header, so this C99 port cannot see it - use the EwokOS
  * kernel clock from <ewoksys/kernel_tic.h> instead. */
 static uint64_t ek_clock_tic_ms(void* ud) { (void)ud; return kernel_tic_ms(0); }
-static void ek_clock_sleep_ms(void* ud, uint32_t ms) { (void)ud; proc_usleep(ms * 1000); }
+static void ek_clock_sleep_ms(void* ud, uint32_t ms) { (void)ud; usleep(ms * 1000); }
 
 /* ------------------------------------------------------------------ */
 /* Platform utilities                                                  */
