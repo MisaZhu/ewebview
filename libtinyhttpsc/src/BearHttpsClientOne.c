@@ -95550,7 +95550,10 @@ int BearHttpsResponse_read_body_chunck_http1(BearHttpsResponse *self,unsigned ch
             char number_buffer[10] = {0};
             bool number_buffer_filled = false;
             for(int i =0; i < 10;i++){
-                BearHttpsResponse_read_body_chunck_raw(self, (unsigned char*)number_buffer + i, 1);
+                long header_read = BearHttpsResponse_read_body_chunck_raw(self, (unsigned char*)number_buffer + i, 1);
+                fprintf(stderr, "tiny chunk header i=%d read=%ld ch=%02x extra=%ld\n",
+                        i, header_read, (unsigned char)number_buffer[i],
+                        self->extra_body_remaning_to_send);
                 if(number_buffer[i] == '\r' && i > 0){
                     number_buffer[i] = 0;
                     self->http1_reaming_to_read = strtol((const char*)number_buffer, NULL, 16);
@@ -95560,6 +95563,7 @@ int BearHttpsResponse_read_body_chunck_http1(BearHttpsResponse *self,unsigned ch
                         return -1;
                     }
                     if(self->http1_reaming_to_read == 0){
+                        fprintf(stderr, "tiny chunk terminator\n");
                         self->http1_state = PRIVATE_BEARHTTPS_COLLECTING_NUMBER;
                         self->body_completed_read = true;
                         return size - remaning_to_read; //return the size of the body readed
@@ -95602,6 +95606,9 @@ int BearHttpsResponse_read_body_chunck_http1(BearHttpsResponse *self,unsigned ch
                 return size - remaning_to_read;
             }
             long readded = BearHttpsResponse_read_body_chunck_raw(self, buffer + (size - remaning_to_read), read_size);
+            fprintf(stderr, "tiny chunk data request=%ld read=%ld remaining=%ld extra=%ld\n",
+                    read_size, readded, self->http1_reaming_to_read,
+                    self->extra_body_remaning_to_send);
             if(readded < 0){
                 BearHttpsResponse_set_error(self,"error reading body chunk",BEARSSL_HTTPS_ERROR_READING_CHUNK);
                 return -1;  
@@ -95649,15 +95656,16 @@ int BearHttpsResponse_read_body_chunck_raw(BearHttpsResponse *self,unsigned char
     if(readded> 0){
         self->body_readded_size+=readded;
     }
-    int total_readded = readded + total_prev_sended;
-    buffer[total_readded] = 0;
-    return total_readded;
+    return readded + total_prev_sended;
 
 }
 
 int BearHttpsResponse_read_body_chunck(BearHttpsResponse *self,unsigned char *buffer,long size){
     if(BearHttpsResponse_error(self)){
         return -1;
+    }
+    if(self->body_completed_read){
+        return 0;
     }
 
     /* Header parsing may already have buffered the entire (usually tiny) body.
