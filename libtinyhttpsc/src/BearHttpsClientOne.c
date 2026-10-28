@@ -95292,7 +95292,6 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
 
          fprintf(stderr, "HTTPS_TRACE request sent\n");
          private_BearHttpsResponse_read_til_end_of_headers_or_reach_limit(response,self->header_chunk_read_size,self->header_chunk_reallocator_factor);
-<<<<<<< HEAD
 
          if(tlsphase_dbg && requisition_props->is_https){
              struct timespec tp_t4;
@@ -95302,10 +95301,8 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
                  (long)((tp_t4.tv_sec-tp_t3.tv_sec)*1000 + (tp_t4.tv_nsec-tp_t3.tv_nsec)/1000000));
          }
 
-=======
          fprintf(stderr, "HTTPS_TRACE headers done\n");
          
->>>>>>> 72a90eed63a24cdb4558e853b5cfaa3dc48a8af4
          if(BearHttpsResponse_error(response)){
              private_BearHttpsRequisitionProps_free(requisition_props);
              return response;
