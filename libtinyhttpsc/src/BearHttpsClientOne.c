@@ -207,7 +207,7 @@ void ewok_https_entropy_fill(void *buf, size_t len) {
         memcpy(out, &word, chunk);
         out += chunk;
         len -= chunk;
-        proc_usleep(1);
+        usleep(1);
     }
 }
 
@@ -94747,7 +94747,7 @@ static int private_BearHttps_sock_read(void *ctx, unsigned char *buf, size_t len
 
         read_len = Universal_recv(*(int*)ctx, buf, len,0);
         if (read_len <= 0) {
-            if (read_len < 0 && (errno == EINTR || errno == EAGAIN)) {
+            if (read_len < 0 && errno == EINTR) {
                 continue;
             }
             return -1;
@@ -94763,7 +94763,7 @@ static int private_BearHttps_sock_write(void *ctx, const unsigned char *buf, siz
         ssize_t write_len;
         write_len = Universal_send(*(int *)ctx, buf, len,0);
         if (write_len <= 0) {
-            if (write_len < 0 && (errno == EINTR || errno == EAGAIN)) {
+            if (write_len < 0 && errno == EINTR) {
                 continue;
             }
             return -1;
@@ -95073,12 +95073,14 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
         }
 
         if(requisition_props->is_ipv4 == false){
+            fprintf(stderr, "HTTPS_TRACE dns/connect %s\n", requisition_props->hostname);
             response->connection_file_descriptor =private_BearHttps_connect_host(
                 self,
                 response,
                 requisition_props->hostname,
                 requisition_props->port
             );
+            fprintf(stderr, "HTTPS_TRACE connected fd=%d\n", response->connection_file_descriptor);
         }
 
          if(response->connection_file_descriptor < 0){
@@ -95288,7 +95290,9 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
 
          }
 
+         fprintf(stderr, "HTTPS_TRACE request sent\n");
          private_BearHttpsResponse_read_til_end_of_headers_or_reach_limit(response,self->header_chunk_read_size,self->header_chunk_reallocator_factor);
+<<<<<<< HEAD
 
          if(tlsphase_dbg && requisition_props->is_https){
              struct timespec tp_t4;
@@ -95298,6 +95302,10 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
                  (long)((tp_t4.tv_sec-tp_t3.tv_sec)*1000 + (tp_t4.tv_nsec-tp_t3.tv_nsec)/1000000));
          }
 
+=======
+         fprintf(stderr, "HTTPS_TRACE headers done\n");
+         
+>>>>>>> 72a90eed63a24cdb4558e853b5cfaa3dc48a8af4
          if(BearHttpsResponse_error(response)){
              private_BearHttpsRequisitionProps_free(requisition_props);
              return response;
@@ -95605,7 +95613,7 @@ int BearHttpsResponse_read_body_chunck_http1(BearHttpsResponse *self,unsigned ch
             char number_buffer[10] = {0};
             bool number_buffer_filled = false;
             for(int i =0; i < 10;i++){
-                BearHttpsResponse_read_body_chunck_raw(self, (unsigned char*)number_buffer + i, 1);
+                long header_read = BearHttpsResponse_read_body_chunck_raw(self, (unsigned char*)number_buffer + i, 1);
                 if(number_buffer[i] == '\r' && i > 0){
                     number_buffer[i] = 0;
                     self->http1_reaming_to_read = strtol((const char*)number_buffer, NULL, 16);
@@ -95695,6 +95703,13 @@ int BearHttpsResponse_read_body_chunck_raw(BearHttpsResponse *self,unsigned char
     }
 
     long readded = private_BearHttpsResponse_recv(self,buffer+total_prev_sended,size-total_prev_sended);
+    if(readded == 0 && self->body_read_mode != PRIVATE_BEARSSL_BY_READ_ERROR &&
+            !(self->body_read_mode == PRIVATE_BEARSSL_BY_CONTENT_LENGTH &&
+              self->extra_body_remaning_to_send == 0 &&
+              self->body_readded_size == self->respnse_content_lenght)) {
+        BearHttpsResponse_set_error(self, "truncated response body", BEARSSL_HTTPS_INVALID_READ_CODE);
+        return -1;
+    }
     if(readded < 0){
         /* A TLS peer may signal close as a negative read after the complete body
          * was already buffered with the headers. Do not discard those bytes: the
@@ -95704,15 +95719,16 @@ int BearHttpsResponse_read_body_chunck_raw(BearHttpsResponse *self,unsigned char
     if(readded> 0){
         self->body_readded_size+=readded;
     }
-    int total_readded = readded + total_prev_sended;
-    buffer[total_readded] = 0;
-    return total_readded;
+    return readded + total_prev_sended;
 
 }
 
 int BearHttpsResponse_read_body_chunck(BearHttpsResponse *self,unsigned char *buffer,long size){
     if(BearHttpsResponse_error(self)){
         return -1;
+    }
+    if(self->body_completed_read){
+        return 0;
     }
 
     /* Header parsing may already have buffered the entire (usually tiny) body.
