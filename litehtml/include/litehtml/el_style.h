@@ -6,6 +6,12 @@ namespace litehtml
 	class el_style : public element
 	{
 		elements_vector		m_children;
+		/* Text already contributed to the document master sheet, so a runtime
+		 * mutation (React re-writing style.textContent) re-registers exactly
+		 * once per distinct payload instead of appending duplicates. */
+		tstring				m_reg_text;
+		bool				m_registered = false;
+		void				register_if_changed();
 	public:
 		el_style(litehtml::document* doc);
 		virtual ~el_style();

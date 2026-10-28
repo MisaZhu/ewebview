@@ -323,6 +323,20 @@ input[type="hidden"] {
 	display: none;
 }
 
+/* Chromium's UA sheet (html.css) sizes only the BUTTON-like controls as
+ * border-box; text-like inputs and every other element keep the CSS initial
+ * content-box. Mirror that with a positive selector list so an <input> with
+ * no type attribute (defaults to text) stays content-box exactly as in Chrome
+ * - a broad `input{border-box}` plus text overrides would miss it. Without the
+ * button rule a styled `button{width:100%;height:48px}` grew by its own
+ * padding+border (Pinterest's "Continue with Google" painted 464x66 over a
+ * 402x48 layout box). */
+button, select,
+input[type="button"], input[type="submit"],
+input[type="reset"], input[type="file"] {
+	box-sizing: border-box;
+}
+
 
 article, aside, footer, header, hgroup, nav, section 
 {

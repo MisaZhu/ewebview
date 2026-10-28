@@ -62,6 +62,24 @@ static const int      kJsMaxReparse      = 8;
 static const uint32_t kJsFlushMinGapMs   = 200;
 static const uint32_t kJsFlushMaxGapMs   = 1500;
 
+/* Ceiling for the step-9 imminent-timers repaint defer. A page whose JS keeps
+ * a ~0-ms macrotask armed forever (github.com's react-query observer notify
+ * loop re-arms one every slice) would otherwise defer the repaint
+ * indefinitely, so a timed capture snapshots a stale surface even though the
+ * DOM already committed the new content (the commit-columns "sidebar" state).
+ * Content that has stayed dirty this long without a paint is flushed anyway;
+ * short scheduler chains still run back-to-back unpainted. */
+static const uint32_t kRepaintDeferMaxMs = 3000;
+
+/* Vertical overscan (logical CSS px) rendered ABOVE and BELOW the viewport in
+ * each frame surface.  The embedder positions the texture so the viewport
+ * content aligns with the content rect; the overscan pixels absorb scroll-shift
+ * blits without exposing a gap (white flash).  Frame buffer height ==
+ * clientHeight + 2 * kFrameOverscan; the viewport origin sits at row
+ * kFrameOverscan in the buffer.  The logical viewport (innerHeight, layout,
+ * IntersectionObserver, scroll clamp) is unaffected. */
+static const int kFrameOverscan = 128;
+
 /* Hard wall-clock budget for ONE VM run (a page script, a timer callback or
  * an event handler). Past it the step hook terminates the VM; after
  * kJsRunAbortMax violations the page's JS is dropped until the next
@@ -82,8 +100,15 @@ static const uint32_t kJsRunBudgetLiveMs = 3000;
  * first synchronous render pass) is one single top-level body that legitimately
  * needs several seconds on this VM; cutting it at kJsRunBudgetLiveMs discards
  * the whole boot and the skeleton stays forever. Once real content paints the
- * ordinary short live budget applies again so input stays responsive. */
-static const uint32_t kJsRunBudgetSkeletonMs = 60000;
+ * ordinary short live budget applies again so input stays responsive.
+ * 180s (was 60s): github.com's post-deferred-data client re-render (the fill
+ * commit of the commit-message/date columns and sidebar) is a single VM run
+ * that legitimately exceeds 60s on this interpreter; cutting it mid-render
+ * leaves React's executionContext leaked at RenderContext (the terminated
+ * unwind skips its restore), so every later performConcurrentWorkOnRoot throws
+ * #327 and the fill commit NEVER happens - the dynamic columns stay skeleton
+ * forever. Letting the run finish is what makes the deferred content appear. */
+static const uint32_t kJsRunBudgetSkeletonMs = 180000;
 
 /* Re-evaluation interval for jsSkeletonProbeCached(): short enough that the
  * budget drops back to the live one promptly once real content paints, long
@@ -183,7 +208,7 @@ static const uint64_t kStyleBudgetIdleMs   = 25;
  * worker or spawns a new one (up to kTaskPoolMax) only when every live
  * worker is busy. A worker idle for kTaskIdleExitMs tears itself down, so
  * the pool shrinks back to zero once a page's fetches drain. */
-static const int      kTaskPoolMax         = 8;
+static const int      kTaskPoolMax         = 32;
 static const uint32_t kTaskIdleExitMs      = 4000;
 
 /* ------------------------------------------------------------------ */
@@ -412,7 +437,7 @@ public:
     bool applyJsWriteBuffer();
     void jsDropWriteBuffer();
     bool jsIsRunaway(const std::string& src) const;
-    void jsVmEnter();
+    void jsVmEnter(bool appScript = false);
     bool jsVmExit();
     void jsOnVmStep(struct st_vm* vm);
     static void jsVmStepHook(struct st_vm* vm, void* data);
@@ -434,6 +459,15 @@ public:
         return (!m_buildHtmlUrl.empty()) ? m_buildHtmlUrl : m_currentHtmlUrl;
     }
     void jsMarkLayoutDirty() { markLayoutDirty(jsActiveIsBuild()); jsProgressiveFlush(false); }
+    /* A <style> element's text was rewritten from JS (gestalt injects per-field
+     * sheets like `#label-x > div{color:transparent}` this way). litehtml's
+     * add_stylesheet grows the master sheet but only the engine loop drives the
+     * chunked restyle, so flag it here or the new rules never reach the tree. */
+    void jsMarkStyleDirty() {
+        if(jsActiveIsBuild()) { m_buildNeedsStyleUpdate = true; return; }
+        if(!m_needsStyleUpdate) m_styleNeedSince = ticMs();
+        m_needsStyleUpdate = true;
+    }
 
     void jsFireLoadEvents();
     void jsRestoreNoJsFallback();
@@ -443,9 +477,41 @@ public:
      * poll with jsVmEnter/jsVmExit and returns how many timers fired (0 when
      * the VM is off/disabled/page-disabled). */
     int  jsPollTimers();
+    /* Drain completed async-fetch jobs and settle their promises on the VM
+     * thread (engine loop step 7b, right after jsPollTimers). Returns how many
+     * promises were settled. */
+    int  jsFetchPoll();
+    /* Run the connectedCallback upgrade reaction for custom elements inserted
+     * after their define() one-shot upgrade (engine loop step 7c, after
+     * jsFetchPoll). github's React fill commit appends <relative-time> etc.
+     * long after define() saw matched=0; without this they never format and
+     * stay grey skeletons. Returns how many element names were processed. */
+    int  jsDrainCeUpgrades();
+    /* True while a one-shot ~0-ms JS macrotask (a queued MessageChannel post -
+     * React's scheduler continuation) is armed to fire on the next poll. Engine
+     * loop step 9 defers the repaint while this holds, so a JS task chain runs
+     * back-to-back and paints once it drains instead of after every slice. */
+    bool jsHasImminentTimers();
     /* Fire "load"/"error" on the dynamic <script> element of slot i so
      * webpack's d.l chunk loader settles (see m_jsScriptEls). */
     void jsFireScriptElEvent(size_t i, const char* type);
+    /* Record a dynamically-inserted <link rel=stylesheet> (url -> element) so
+     * its load/error event can be fired when the sheet fetch settles. Rspack's
+     * miniCss chunk loader parks the chunk promise on link.onload/onerror;
+     * without this dispatch a CSS chunk never settles and every await on
+     * __webpack_require__.e() strands. */
+    void jsNoteDynamicStylesheet(const std::string& url, void* link_el);
+    /* Fire "load"/"error" on the tracked <link> for url (if any) and untrack it. */
+    void jsFireLinkElEvent(const std::string& url, const char* type);
+    /* Record an <img> whose src was set from script (url -> element) so its
+     * load/error event can be fired when the image fetch settles. React's
+     * preload pattern (new Image(); img.onload=...; img.src=...) parks the
+     * commit that appends the real <img> on that onload; without this dispatch
+     * a detached image's onload never fires and the carousel cover never
+     * mounts (pinterest.com left column stays a grey placeholder). */
+    void jsNoteImageEl(const std::string& url, void* img_el);
+    /* Fire "load"/"error" on every <img> tracked for url and untrack them. */
+    void jsFireImgElEvent(const std::string& url, const char* type);
     /* Dispatch the DOM mouse events for one pointer gesture (state/button are
      * the public EWEB_MOUSE_x / EWEB_BUTTON_x values). Returns false when a
      * listener cancelled it. */
@@ -532,6 +598,7 @@ public:
     static void* jsGetHead(void* ctx);
     static int   jsQueryAll(void* ctx, void* root, const char* selector,
                             int skip, void** out, int max);
+    static bool  jsElMatches(void* ctx, void* el, const char* selector);
     static void* jsCreateElement(void* ctx, const char* tag);
     static void* jsCreateTextNode(void* ctx, const char* text);
     static void* jsCreateComment(void* ctx, const char* text);
@@ -547,6 +614,12 @@ public:
     static bool  jsElRemoveChild(void* ctx, void* parent, void* child);
     static void  jsElRemoveAttr(void* ctx, void* el, const char* name);
     static void  jsElGetRect(void* ctx, void* el, int* x, int* y, int* w, int* h);
+    static void  jsElTransformRect(void* ctx, void* el, int* x, int* y, int* w, int* h);
+    static void  jsElOffsetParentOrigin(void* ctx, void* el, int* x, int* y);
+    static void* jsElFromPoint(void* ctx, int x, int y);
+    static void  jsElGetClientSize(void* ctx, void* el, int* w, int* h);
+    static void  jsGetScroll(void* ctx, int* x, int* y);
+    static void  jsGetDocumentSize(void* ctx, int* w, int* h);
     static char* jsElGetStyle(void* ctx, void* el, const char* prop);
     static void  jsElFocus(void* ctx, void* el);
     static void  jsElBlur(void* ctx, void* el);
@@ -600,6 +673,13 @@ public:
     static bool  jsWebRequest(void* ctx, const char* method, const char* url,
                               const char* headers, const char* body,
                               int* status, char** out_body, char** out_headers);
+    /* Thread-safe core of jsWebRequest: same redirect/cookie handling but the
+     * document base URL is passed in (workers have no script context) and the
+     * outputs are plain malloc'd (mario's allocator is engine-thread only). */
+    static bool  jsWebRequestRaw(const eweb_port_t* port, const char* method,
+                                 const std::string& url, const char* headers,
+                                 const char* body, const std::string& base_url,
+                                 int* status, char** out_body, char** out_headers);
     /* ES module loader hooks (mario `_resolve_m_func` / `_load_m_func`): a
      * static `import` / dynamic `import()` in a running script canonicalises
      * its specifier to an absolute URL against the importing module (falling
@@ -608,6 +688,28 @@ public:
      * mario, so the engine is recovered from vm->on_step_data. */
     static struct st_mstr* jsModuleResolve(struct st_vm* vm, const char* spec, const char* base);
     static struct st_mstr* jsModuleLoad(struct st_vm* vm, const char* spec);
+    /* Background ES-module prefetch: worker threads pull module bodies into a
+     * URL-keyed cache ahead of the VM's synchronous import evaluation, and
+     * each fetched body is scanned for further import specifiers so the graph
+     * fans out without waiting for execution. jsModuleLoad takes cache hits
+     * (waiting only when a worker is already fetching that exact URL) and
+     * falls back to the direct synchronous fetch otherwise. EWEB_MODULE_PREFETCH=0
+     * disables it; EWEB_MODULE_PREFETCH=N sets the worker count (default 4). */
+    struct ModulePrefetch;
+    ModulePrefetch*           m_jsPrefetch;
+    void jsPrefetchStart();
+    void jsPrefetchStop();
+    static void* jsPrefetchWorker(void* arg);
+    /* Scan a fetched module body for import specifiers and enqueue them. */
+    void jsPrefetchScan(const std::string& module_url, const char* body);
+    /* Enqueue one absolute-or-relative specifier (resolved against base, or
+     * the import map for bare specifiers) for background fetch. */
+    void jsPrefetchEnqueue(const std::string& spec, const std::string& base);
+    /* Seed workers + enqueue every parser-extracted module <script src>. */
+    void jsSeedPrefetch();
+    /* Cache lookup: 1 = hit (*body/*status malloc'd copies), -1 = waited for
+     * an in-flight worker fetch that failed, 0 = not cached (fetch sync). */
+    int  jsPrefetchTake(const std::string& url, int* status, char** body);
     /* Resolve a bare module specifier through the page import map (exact key,
      * then longest trailing-slash prefix). Empty string when unmapped. */
     std::string jsImportMapLookup(const char* spec);
@@ -790,6 +892,17 @@ public:
      * executes (github's client-env module gates its JSON island read on
      * that). False for dynamically inserted scripts (classic semantics). */
     std::vector<bool>           m_jsScriptDeferred;
+    /* Parallel to m_jsScripts: 1 for a parser-extracted `async` external
+     * <script src>. In a real browser an async chunk executes only once its
+     * fetch lands, which for app-sized bundles is after the parser finished,
+     * so it observes readyState=="interactive" (NOT "loading") and any
+     * "loading?-wait-for-DOMContentLoaded:run-now" bootstrap takes its
+     * immediate branch. Next.js's inlined flight bootstrap closes its RSC
+     * ReadableStream on exactly that test; keeping "loading" until the async
+     * chunk runs defers the close past hydrateRoot and the root use(stream)
+     * suspends into a dehydrated boundary (rokid #418). Flipped monotonically
+     * with m_jsScriptDeferred at the run sites. */
+    std::vector<char>           m_jsScriptAsync;
     /* Import-map specifier->URL pairs parsed from <script type="importmap">.
      * jsModuleResolve consults it for bare specifiers ("react-dom") that have
      * no relative/URL form; github.com ships react/react-dom/scheduler here. */
@@ -803,6 +916,16 @@ public:
      * deps never resolve, stalling hydration (rokid.com's Header). Validate
      * with jsElIsLive before use: the node may have been removed. */
     std::vector<void*>          m_jsScriptEls;
+    /* url -> element for dynamically-inserted <link rel=stylesheet> (see
+     * jsNoteDynamicStylesheet). The sheet's load/error event is fired when the
+     * fetch settles so Rspack's miniCss chunk loader (link.onload = resolve)
+     * can settle its chunk promise. Validate with jsElIsLive before use. */
+    std::vector<std::pair<std::string, void*>> m_jsLinkEls;
+    /* url -> element for <img> nodes whose src was set from script (see
+     * jsNoteImageEl). The image's load/error event is fired when the fetch
+     * settles so a script that parked work on img.onload (React's preload-
+     * then-append) can proceed. Validate with jsElIsLive before use. */
+    std::vector<std::pair<std::string, void*>> m_jsImgEls;
     bool                        m_jsHasInlineHandlers;
     /* True when the original <html> tag carried the `no-js` CSS class. Pages
      * (e.g. Next.js) that ship with this class assume their client JS will
@@ -823,12 +946,43 @@ public:
      * dynamically injected <script> re-arms it - so a late lazy-load gets its
      * own budget instead of inheriting a stale one. */
     uint64_t                    m_jsPostSwapAt;
+    /* Latched true for the whole post-swap phase once the viewport is observed
+     * as a blank CSR shell (pageShowsSkeletonPlaceholder). A client-rendered
+     * app paints its chrome (nav/header) FIRST and streams its main content
+     * from lazy chunks still queued behind it, so "has real content now" must
+     * not collapse the skeleton budget mid-phase: doing so drops the tail that
+     * carries the content (pinterest.com's shell-loader placeholder is not
+     * *-skeleton-* named, so once React painted the nav the phase budget fell
+     * 90s->8s and the already-elapsed clock instantly exhausted at script 60
+     * of 74, dropping the lazy chunk that registers the feed's module). Reset
+     * wherever m_jsPostSwapAt is (re)armed or cleared; only meaningful while
+     * m_jsPostSwapRun is true. */
+    bool                        m_postSwapSkelLatch;
+    /* Streaming-SSR (React $RC) pages keep appending lazy chunks to the script
+     * queue for the whole 90s skeleton budget, so gating DOMContentLoaded/load
+     * on "queue drained" delays them up to 90s and any script polling
+     * document.readyState=="complete" spins that entire window (pinterest.com
+     * wedges on exactly such a poll, starving React's post-load work). A real
+     * browser fires load once the INITIAL document's scripts have run; later
+     * dynamically-added chunks do not delay it. Record the parser-extracted
+     * queue length at swap and fire the load events when that prefix finishes,
+     * letting the dynamic tail run post-load. */
+    size_t                      m_jsInitialScriptCount;
+    bool                        m_jsLoadFired;
     /* ES-module awareness: extract_scripts flags a build whose scripts were
      * skipped as type="module". When such a page is on screen and its body
      * still holds no text a few seconds after the swap, the engine draws a
      * plain notice instead of leaving an unexplained blank viewport (the VM
      * cannot parse ES2020 module bundles, so SPAs render nothing). */
     bool                        m_jsBuildHasModules;
+    /* Streaming-SSR awareness: the build's HTML carries React streaming reveal
+     * segments (hidden <div id="S:n"> swapped in by trailing inline $RC(...)
+     * scripts, with <template id="B:n"> placeholders). The reveal inline
+     * scripts sit at the VERY tail of the script queue; if the post-swap live
+     * budget drops them the streamed content stays hidden forever and the page
+     * paints blank (pinterest.com). Such pages get the large skeleton budget so
+     * the reveal tail always runs. */
+    bool                        m_jsStreamingSsr;
     bool                        m_jsPageHasModules;
     bool                        m_moduleNoticeDecided;
     bool                        m_showModuleNotice;

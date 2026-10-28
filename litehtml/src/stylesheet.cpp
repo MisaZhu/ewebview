@@ -271,11 +271,27 @@ static tstring index_key_lower(const tstring& src)
 	return out;
 }
 
+static unsigned long long g_idx_rebuilds = 0;
+static unsigned long long g_idx_rules = 0;
+static void dump_idx_stats()
+{
+	static int s_prof = -1;
+	if(s_prof < 0) s_prof = (getenv("EWEB_STYLE_PROF") != NULL) ? 1 : 0;
+	if(!s_prof) return;
+	fprintf(stderr, "[idxstats] rebuilds=%llu rules_indexed=%llu\n", g_idx_rebuilds, g_idx_rules);
+}
+
 css::selector_index& css::get_selector_index() const
 {
 	if(m_index.built)
 	{
 		return m_index;
+	}
+	g_idx_rebuilds++;
+	g_idx_rules += m_selectors.size();
+	{
+		static int s_armed = 0;
+		if(!s_armed) { s_armed = 1; atexit(dump_idx_stats); }
 	}
 	m_index.buckets.clear();
 	m_index.universal.clear();

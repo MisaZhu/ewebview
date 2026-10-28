@@ -678,6 +678,19 @@ int EWebContainer::text_width(const litehtml::tchar_t* text, litehtml::uint_ptr 
 void EWebContainer::draw_text(litehtml::uint_ptr hdc, const litehtml::tchar_t* text, litehtml::uint_ptr hFont, litehtml::web_color color, const litehtml::position& pos)
 {
     EWebFontInfo* fontInfo = (EWebFontInfo*)hFont;
+    /* TEMP DIAGNOSTIC (EWEB_DTEXT): count + sample every draw_text to see what
+     * text (if any) reaches the paint path. */
+    static int s_dtext = -1;
+    static int s_dtext_n = 0;
+    if(s_dtext < 0) s_dtext = (getenv("EWEB_DTEXT") != NULL) ? 1 : 0;
+    if(s_dtext && text && text[0]) {
+        s_dtext_n++;
+        if(s_dtext_n <= 60 || (s_dtext_n % 500) == 0) {
+            fprintf(stderr, "[DTEXT] #%d \"%.*s\" argb=%08x fontNull=%d pos=%d,%d\n",
+                    s_dtext_n, 18, text, (unsigned)web_color_to_argb(color),
+                    (int)(!fontInfo || !fontInfo->font), pos.x, pos.y);
+        }
+    }
     if (!fontInfo || !fontInfo->font || !text) {
         return;
     }
@@ -690,13 +703,38 @@ void EWebContainer::draw_text(litehtml::uint_ptr hdc, const litehtml::tchar_t* t
 
     uint32_t argb = web_color_to_argb(color);
 
-    // Force opaque color if alpha is 0
+    /* Honour the resolved alpha instead of clamping alpha==0 to opaque black.
+     * litehtml's web_color::from_string maps both `color:transparent` and any
+     * unrecognised value (leftover var(), `initial`, color-mix()) to alpha 0 by
+     * design ("behave like an invalid colour, i.e. fully transparent, instead of
+     * painting an opaque black rectangle"), and the background/border paths in
+     * this same container already skip painting when alpha==0. Forcing text
+     * opaque here broke `color:transparent` (e.g. Pinterest's resting floating
+     * chip / native date hint) by drawing it solid black. A fully transparent
+     * run draws nothing; partial alpha is passed through to the port, which
+     * blits glyphs with SDL_BLENDMODE_BLEND. */
     if ((argb >> 24) == 0) {
-        argb = 0xFF000000 | (argb & 0xFFFFFF);
+        return;
     }
 
     uint64_t start_ms = m_port->clock.tic_ms(m_port->clock.ud);
-    m_port->font.draw_text(m_port->font.ud, s, pos.x, pos.y, text,
+    /* A pure-translation CSS transform active on this text's element (or an
+     * ancestor) shifts the glyphs by (M[4],M[5]). The software HAL has no
+     * transformed text blit, but a translate needs none: offset the pen. This
+     * is what makes the ubiquitous top:50% + translateY(-50%) (and
+     * translate(-50%,-50%)) centering idiom actually centre the text - without
+     * it only the box background/borders moved and the glyphs stayed at the
+     * untransformed layout origin (Pinterest's resting birthday placeholder
+     * overlay sat ~11px too low). Non-translate matrices (scale/rotate) leave
+     * the pen untransformed, matching the background path's limitation. */
+    int tx = pos.x, ty = pos.y;
+    if (m_xform_on &&
+        fabsf(m_xform[0] - 1.0f) < 1e-3f && fabsf(m_xform[1]) < 1e-3f &&
+        fabsf(m_xform[2]) < 1e-3f && fabsf(m_xform[3] - 1.0f) < 1e-3f) {
+        tx += (int)lroundf(m_xform[4]);
+        ty += (int)lroundf(m_xform[5]);
+    }
+    m_port->font.draw_text(m_port->font.ud, s, tx, ty, text,
                            fontInfo->font, fontInfo->size, argb);
     m_draw_text_calls++;
     m_draw_text_ms += (uint32_t)(m_port->clock.tic_ms(m_port->clock.ud) - start_ms);
@@ -1525,18 +1563,37 @@ static void paint_box_shadow(eweb_surface_t* dst, const eweb_gfx_t* gfx,
         radius = std::max(0.0f, std::min(radius, std::min(bw, bh) * 0.5f));
         float cx = bx + bw * 0.5f, cy = by + bh * 0.5f;
         float hx = bw * 0.5f, hy = bh * 0.5f;
+        /* An OUTER shadow is clipped so it never paints inside the element's
+         * own border box - even when the background is transparent. Without
+         * this, a zero-blur offset shadow (MDN's reference-toc left bar,
+         * `box-shadow:-2px 0 0 c`) shows as a full rectangle through the
+         * transparent background instead of a thin sliver. Build a second SDF
+         * for the border box and gate coverage on being outside it. */
+        float bcx = bg.border_box.x + bg.border_box.width * 0.5f;
+        float bcy = bg.border_box.y + bg.border_box.height * 0.5f;
+        float bhx = bg.border_box.width * 0.5f;
+        float bhy = bg.border_box.height * 0.5f;
+        float brad = (float)std::max(bg.border_radius.top_left_x, bg.border_radius.top_left_y);
+        brad = std::max(0.0f, std::min(brad, std::min(bhx, bhy)));
         float sigma = std::max(0.5f, sh.blur * 0.5f);
         const float inv = 1.0f / (1.41421356237f * sigma);
         float kx = (float)ow / (float)tw, ky = (float)oh / (float)th;
         for (int yy = 0; yy < th; yy++) {
             float Y = oy + (yy + 0.5f) * ky;
             float qy = fabsf(Y - cy) - (hy - radius);
+            float qby = fabsf(Y - bcy) - (bhy - brad);
             for (int xx = 0; xx < tw; xx++) {
                 float X = ox + (xx + 0.5f) * kx;
                 float qx = fabsf(X - cx) - (hx - radius);
                 float ax = std::max(qx, 0.0f), ay = std::max(qy, 0.0f);
                 float dist = sqrtf(ax * ax + ay * ay) + std::min(std::max(qx, qy), 0.0f) - radius;
                 float coverage = sh.blur > 0 ? 0.5f * erfcf(dist * inv) : (dist <= 0 ? 1.0f : 0.0f);
+                /* signed distance to the border box: <0 inside, >0 outside */
+                float qbx = fabsf(X - bcx) - (bhx - brad);
+                float bdist = sqrtf(std::max(qbx, 0.0f) * std::max(qbx, 0.0f) +
+                                    std::max(qby, 0.0f) * std::max(qby, 0.0f)) +
+                              std::min(std::max(qbx, qby), 0.0f) - brad;
+                coverage *= std::min(std::max(bdist + 0.5f, 0.0f), 1.0f);
                 int alpha = (int)floorf((float)wc.alpha * coverage + 0.5f);
                 px[yy * tw + xx] = ((uint32_t)alpha << 24) | ((uint32_t)wc.red << 16) |
                                      ((uint32_t)wc.green << 8) | (uint32_t)wc.blue;
@@ -1545,6 +1602,148 @@ static void paint_box_shadow(eweb_surface_t* dst, const eweb_gfx_t* gfx,
         gfx->blit_fit_alpha(gfx->ud, tmp, 0, 0, ow, oh, dst, ox, oy, ow, oh, 0xFF);
     }
     gfx->surface_free(gfx->ud, tmp);
+}
+
+/* Extract the url() reference from a computed mask value ("url(...) border-box
+ * exclude" are concatenated by litehtml's parse_background). Returns empty for
+ * the geometry-only content-box exclude/xor form (no url() token). */
+static std::string mask_image_url(const std::string& mask)
+{
+    size_t p = mask.find("url(");
+    if (p == std::string::npos)
+        return std::string();
+    p += 4;
+    while (p < mask.size() && (mask[p] == ' ' || mask[p] == '\t'))
+        p++;
+    if (p < mask.size() && (mask[p] == '"' || mask[p] == '\'')) {
+        /* Quoted form: the payload (an inline SVG data-URI) may itself contain
+         * ')' - delimit by the closing quote, not the paren. */
+        char q = mask[p++];
+        size_t e = mask.find(q, p);
+        if (e == std::string::npos)
+            return std::string();
+        return mask.substr(p, e - p);
+    }
+    size_t e = mask.find(')', p);
+    if (e == std::string::npos)
+        return std::string();
+    return eweb_trim(mask.substr(p, e - p));
+}
+
+/* Resolve the mask value's url() reference to a decoded bitmap in the image
+ * cache. Returns NULL when there is no url() token (geometry-only content-box
+ * exclude/xor masks) or the async fetch has not landed yet. */
+eweb_surface_t* EWebContainer::mask_bitmap(const litehtml::background_paint& bg, int* piw, int* pih)
+{
+    *piw = 0;
+    *pih = 0;
+    if (bg.mask.empty() || bg.is_root)
+        return NULL;
+    std::string url = mask_image_url(bg.mask);
+    if (url.empty())
+        return NULL;
+    std::string full_url = getFullURL(m_port, url, m_base_url);
+    if (full_url.empty())
+        return NULL;
+    eweb_surface_t* img = getImage(full_url);
+    if (!img)
+        return NULL;
+    const eweb_gfx_t* gfx = &m_port->gfx;
+    if (gfx->surface_dims)
+        gfx->surface_dims(gfx->ud, img, piw, pih);
+    if (*piw <= 0 || *pih <= 0)
+        return NULL;
+    return img;
+}
+
+/* Multiply an already-rendered background surface's alpha by the mask bitmap
+ * (mask-image over a gradient: colours stay, alpha is shaped). The mask is
+ * stretched over the surface's logical box (mask-size contain/100% on a
+ * glyph-sized box == fill; mask-position centre == offset 0). */
+bool EWebContainer::apply_mask_alpha(eweb_surface_t* rendered, const litehtml::background_paint& bg,
+                                     int log_w, int log_h)
+{
+    const eweb_gfx_t* gfx = &m_port->gfx;
+    if (!gfx->surface_new || !gfx->surface_pixels || !gfx->surface_free || !gfx->blit_fit_alpha)
+        return false;
+    int iw = 0, ih = 0;
+    eweb_surface_t* mask_img = mask_bitmap(bg, &iw, &ih);
+    if (!mask_img)
+        return false;
+
+    eweb_surface_t* tmp = gfx->surface_new(gfx->ud, log_w, log_h);
+    if (!tmp)
+        return false;
+    gfx->surface_clear(gfx->ud, tmp, 0);
+    gfx->blit_fit_alpha(gfx->ud, mask_img, 0, 0, iw, ih, tmp, 0, 0, log_w, log_h, 0xFF);
+    int tw = 0, th = 0;
+    uint32_t* px = gfx->surface_pixels(gfx->ud, tmp, &tw, &th);
+    int rw = 0, rh = 0;
+    uint32_t* rpx = px ? gfx->surface_pixels(gfx->ud, rendered, &rw, &rh) : NULL;
+    if (!rpx || rw <= 0 || rh <= 0 || tw <= 0 || th <= 0) {
+        gfx->surface_free(gfx->ud, tmp);
+        return false;
+    }
+    /* Both buffers sit at the same device resolution (same HAL, same dpr). */
+    if (tw != rw || th != rh) {
+        gfx->surface_free(gfx->ud, tmp);
+        return false;
+    }
+    for (int i = 0; i < rw * rh; i++) {
+        uint32_t a = ((rpx[i] >> 24) * (px[i] >> 24)) / 255;
+        rpx[i] = (rpx[i] & 0x00FFFFFFu) | (a << 24);
+    }
+    gfx->surface_free(gfx->ud, tmp);
+    return true;
+}
+
+/* CSS mask-image (alpha subset, the icon-glyph idiom): the element paints a
+ * solid background-color shaped by the mask bitmap's alpha instead of a filled
+ * rect - bing's mic button, wikipedia's icon glyphs. The HAL blit is
+ * source-over, so tint per pixel (out.rgb = bg colour, out.a = mask alpha
+ * scaled by the bg alpha) into a temp surface stretched over the clip box and
+ * composite that. Returns false when the mask bitmap has not landed yet - the
+ * caller then paints the unmasked background so the glyph swaps in on the
+ * repaint triggered by the async fetch. */
+bool EWebContainer::paint_image_mask(eweb_surface_t* dst, const litehtml::background_paint& bg,
+                                     uint32_t color, int xf_dx, int xf_dy)
+{
+    const eweb_gfx_t* gfx = &m_port->gfx;
+    if (!gfx->surface_new || !gfx->surface_pixels || !gfx->surface_free || !gfx->blit_fit_alpha)
+        return false;
+    int iw = 0, ih = 0;
+    eweb_surface_t* mask_img = mask_bitmap(bg, &iw, &ih);
+    if (!mask_img)
+        return false;
+    const litehtml::position& cb = bg.clip_box;
+    if (cb.width <= 0 || cb.height <= 0)
+        return false;
+
+    uint8_t a_bg = (uint8_t)(color >> 24);
+    uint8_t r_bg = (uint8_t)(color >> 16);
+    uint8_t g_bg = (uint8_t)(color >> 8);
+    uint8_t b_bg = (uint8_t)color;
+
+    eweb_surface_t* tmp = gfx->surface_new(gfx->ud, cb.width, cb.height);
+    if (!tmp)
+        return false;
+    gfx->surface_clear(gfx->ud, tmp, 0);
+    /* Stretch the mask bitmap over the whole box; the HAL may back tmp at
+     * device resolution (dpr>1), so the tint pass walks the native buffer. */
+    gfx->blit_fit_alpha(gfx->ud, mask_img, 0, 0, iw, ih, tmp, 0, 0, cb.width, cb.height, 0xFF);
+    int tw = 0, th = 0;
+    uint32_t* px = gfx->surface_pixels(gfx->ud, tmp, &tw, &th);
+    if (!px || tw <= 0 || th <= 0) {
+        gfx->surface_free(gfx->ud, tmp);
+        return false;
+    }
+    for (int i = 0; i < tw * th; i++) {
+        uint32_t a = ((px[i] >> 24) * (uint32_t)a_bg) / 255;
+        px[i] = (a << 24) | ((uint32_t)r_bg << 16) | ((uint32_t)g_bg << 8) | b_bg;
+    }
+    gfx->blit_fit_alpha(gfx->ud, tmp, 0, 0, cb.width, cb.height, dst, cb.x + xf_dx, cb.y + xf_dy, cb.width, cb.height, 0xFF);
+    gfx->surface_free(gfx->ud, tmp);
+    return true;
 }
 
 void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::background_paint& bg)
@@ -1680,6 +1879,10 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
              * scales it by tmp's own dpr); tmp was created at cb.width x
              * cb.height logical, so passing the device-pixel tw/th here
              * double-scaled the src rect on HiDPI (dpr=2). */
+            if (apply_mask_alpha(tmp, bg, cb.width, cb.height)) {
+                /* mask-image shapes the gradient: tmp's own pixels keep their
+                 * colour, only their alpha is multiplied by the mask. */
+            }
             gfx->blit_fit_alpha(gfx->ud, tmp, 0, 0, cb.width, cb.height, s, cb.x + xf_dx, cb.y + xf_dy, cb.width, cb.height, 0xFF);
         }
         gfx->surface_free(gfx->ud, tmp);
@@ -1849,6 +2052,12 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
 
     if(!do_image) {
         if(alpha == 0)
+            return;
+        /* mask-image over a solid background-color: paint the colour through
+         * the mask's alpha instead of a filled rect. While the mask bitmap is
+         * still fetching, fall through to the unmasked paint (the async load
+         * triggers a repaint that swaps the shaped glyph in). */
+        if(paint_image_mask(s, bg, color, xf_dx, xf_dy))
             return;
         if(m_xform_on && !bg.is_root) {
             /* CSS transform: the software HAL has no transformed blit, so fill
@@ -2124,7 +2333,14 @@ void EWebContainer::push_paint_transform(const float m[6])
 {
     /* Record the box's CSS transform; the border edges drawn between this push
      * and the matching pop go through the matrix as quads (border-trick
-     * chevrons rotated 45 degrees). Backgrounds/text stay untransformed. */
+     * chevrons rotated 45 degrees). A pure translation also shifts background
+     * images and text (draw_background/draw_text). Save the previous state so
+     * a nested transform restores its ancestor's matrix on pop instead of
+     * clearing it (the transform of an ancestor applies to the whole subtree). */
+    xform_save sv;
+    sv.on = m_xform_on;
+    for(int i = 0; i < 6; i++) sv.m[i] = m_xform[i];
+    m_xform_stack.push_back(sv);
     if(!m) { m_xform_on = false; return; }
     for(int i = 0; i < 6; i++) m_xform[i] = m[i];
     m_xform_on = true;
@@ -2132,8 +2348,16 @@ void EWebContainer::push_paint_transform(const float m[6])
 
 void EWebContainer::pop_paint_transform()
 {
-    m_xform_on = false;
-    memset(m_xform, 0, sizeof(m_xform));
+    if(m_xform_stack.empty())
+    {
+        m_xform_on = false;
+        memset(m_xform, 0, sizeof(m_xform));
+        return;
+    }
+    xform_save sv = m_xform_stack.back();
+    m_xform_stack.pop_back();
+    m_xform_on = sv.on;
+    for(int i = 0; i < 6; i++) m_xform[i] = sv.m[i];
 }
 
 int EWebContainer::top_clip_radius() const

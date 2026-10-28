@@ -27,6 +27,7 @@ namespace litehtml
 		 * size, which is what they mean when no author rule sizes the box. */
 		int		m_attr_width;
 		int		m_attr_height;
+		bool	m_dbg_logged_loaded;	/* EWEB_IMGDBG once-per-element paint trace */
 		void	attr_size(litehtml::size& sz) const;
 
 		/* HTML5 responsive images: pick a concrete URL from the img srcset

@@ -31,10 +31,19 @@ namespace litehtml
 		tstring					val;
 		string_vector			class_val;
 		attr_select_condition	condition;
+		/* Pseudo-class split cache: for condition == select_pseudo_class the
+		 * "name(param)" text in val is deterministic, so the match path splits
+		 * and indexes it once per selector instead of once per evaluation.
+		 * -2 = not split yet; otherwise the value_index() of the name. The
+		 * cached param keeps the ORIGINAL (untrimmed) bytes - consumers that
+		 * trim (e.g. :lang) must do so on a local copy as before. */
+		mutable int					pseudo_idx;
+		mutable tstring				pseudo_param;
 
 		css_attribute_selector()
 		{
 			condition = select_exists;
+			pseudo_idx = -2;
 		}
 	};
 

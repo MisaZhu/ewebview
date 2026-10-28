@@ -4,6 +4,16 @@
 
 namespace litehtml
 {
+	/* EWEB_STYLE_PROF gate, readable from hot paths without a cross-TU call:
+	 * style_prof_enabled() resolves and caches the env var on first use;
+	 * style_prof_fast() is an inlined single-load afterwards. */
+	extern int g_style_prof_flag;
+	bool style_prof_enabled();
+	inline bool style_prof_fast()
+	{
+		return (g_style_prof_flag >= 0) ? (g_style_prof_flag > 0) : style_prof_enabled();
+	}
+
 	class box;
 
 	class element
@@ -26,7 +36,22 @@ protected:
 		margins						m_padding;
 		margins						m_borders;
 		bool						m_skip;
-		
+		/* Positioned-phase prune flag: true when this subtree contains at least
+		 * one stacking participant (see html_tag::is_stacking_participant).
+		 * Rebuilt by fetch_positioned on every render pass together with
+		 * m_positioned, so it is always exactly as fresh as the paint data it
+		 * guards. The draw_positioned descent in draw_children_box skips
+		 * subtrees whose flag is clear - they cannot contribute to the pass. */
+		bool						m_has_pospart;
+		/* Floats-phase prune flag: true when this subtree contains at least
+		 * one floated box (get_float() != float_none). Rebuilt by
+		 * fetch_positioned together with m_has_pospart / m_positioned, so it
+		 * is always exactly as fresh as the paint data it guards. The
+		 * draw_floats descent in draw_children_box skips subtrees whose flag
+		 * is clear - they cannot contribute to the pass. Conservative: a
+		 * float that is also a stacking participant still sets the flag. */
+		bool						m_has_floater;
+			
 		virtual void select_all(const css_selector& selector, elements_vector& res);
 	public:
 		element(litehtml::document* doc);
@@ -48,6 +73,8 @@ protected:
 		bool						m_sheets_applied;
 		bool						sheets_applied() const { return m_sheets_applied; }
 		void						set_sheets_applied(bool v) { m_sheets_applied = v; }
+		bool						has_pospart() const { return m_has_pospart; }
+		bool						has_floater() const { return m_has_floater; }
 
 		/* Liveness tag for the JavaScript DOM bridge. The embedder hands
 		 * litehtml::element* pointers to the VM as opaque handles; a wrapper can
@@ -99,6 +126,7 @@ protected:
 
 		bool						in_normal_flow()			const;
 		litehtml::web_color			get_color(const tchar_t* prop_name, bool inherited, const litehtml::web_color& def_color = litehtml::web_color());
+		litehtml::web_color			resolve_color_value(const tchar_t* val, const litehtml::web_color& def_color);
 		bool						is_inline_box()				const;
 		position					get_placement()				const;
 		bool						collapse_top_margin()		const;
@@ -156,6 +184,12 @@ protected:
 		virtual bool				is_comment() const;
 		virtual void				set_tagName(const tchar_t* tag);
 		virtual void				set_data(const tchar_t* data);
+		/* Replace this node's OWN character data (DOM CharacterData.data /
+		 * nodeValue assignment semantics). set_data() APPENDS because the parser
+		 * feeds comment/CDATA text in chunks; the DOM bridge needs a replacing
+		 * form so `comment.data = "$"` and `text.nodeValue = "x"` do what a
+		 * browser does. Only character-data nodes override it. */
+		virtual void				set_data_replace(const tchar_t* data);
 		virtual element_float		get_float() const;
 		virtual vertical_align		get_vertical_align() const;
 		virtual element_clear		get_clear() const;
@@ -167,6 +201,11 @@ protected:
 		 * operator new from libewokstl, so referencing __cxa_guard via a
 		 * function-local static would drag in libcxx's conflicting copy. */
 		virtual const string_map*	get_custom_props() const { return 0; }
+		/* Shared-ownership variant: html_tag's merged custom-property map is
+		 * shared down the tree (an element with no own --* declarations
+		 * inherits the parent's map unchanged), so resolve_custom_properties
+		 * grabs the parent's map through this instead of copying it. */
+		virtual std::shared_ptr<const string_map> get_custom_props_shared() const { return std::shared_ptr<const string_map>(); }
 		virtual overflow			get_overflow() const;
 		/* Content-box height a child's percentage height resolves against:
 		 * the specified height minus padding+border under box-sizing:border-box.
@@ -216,6 +255,10 @@ protected:
 		 * 'normal' or a length/percentage). Unitless line-height inherits as the
 		 * NUMBER and is re-multiplied by each descendant's own font size. */
 		virtual float				line_height_factor() const;
+		/* CSS text-3 letter-spacing resolved to whole px (0 for 'normal' or
+		 * unset). Text runs read it off their parent to widen measurement and
+		 * to advance glyphs while drawing; non-text elements carry none. */
+		virtual int					letter_spacing() const;
 		virtual text_align			get_text_align() const;
 		virtual text_transform		get_text_transform() const;
 		virtual white_space			get_white_space() const;
@@ -300,6 +343,29 @@ protected:
 				/* Raw attribute table for the DOM dataset bridge (camelCased data-*
 				 * keys); the base has no attributes and returns 0. */
 				virtual const string_map*	eweb_attrs() { return 0; }
+		/* This element's OWN CSS transform as an affine matrix in document
+		 * coordinates (x' = m[0]*x + m[2]*y + m[4]); false when untransformed.
+		 * The building block eweb_transform_bounds composes up the chain. */
+		virtual bool				eweb_self_xform(float m[6]) const { (void) m; return false; }
+		/* Rewrite a document-coordinate border box into the axis-aligned bounds
+		 * of the box under its own AND ancestor CSS transforms -- what
+		 * getBoundingClientRect reports, as opposed to the untransformed layout
+		 * box the offset* properties use. False leaves bb untouched. */
+		virtual bool				eweb_transform_bounds(litehtml::position& bb) const { (void) bb; return false; }
+		/* position:sticky scroll-driven pin shift, in device pixels, relative to
+		 * the element's in-flow box: Chrome reports the pinned position through
+		 * BOTH getBoundingClientRect and offsetTop, so the paint path, the rect
+		 * bridge and the hit test all add this. scroll_y / view_h describe the
+		 * scrollport in the same document coordinate space. False (or *dy==0)
+		 * means "not sticky or not pinned". */
+		virtual bool				eweb_sticky_offset(int scroll_y, int view_h, int* dy) const { (void) scroll_y; (void) view_h; (void) dy; return false; }
+		/* CSS pointer-events:none boxes must never become a hit-test target:
+		 * invisible overlay roots (toast / portal / tracking layers) sit on top
+		 * of the page and would otherwise swallow every click, :hover and
+		 * elementFromPoint query. The property inherits, and descendants that
+		 * re-enable it stay testable because each element is judged by its own
+		 * flag. */
+		virtual bool				eweb_hit_testable() const { return true; }
 		virtual element::ptr		get_element_by_point(int x, int y, int client_x, int client_y);
 		virtual element::ptr		get_child_by_point(int x, int y, int client_x, int client_y, draw_flag flag, int zindex);
 		virtual const background*	get_background(bool own_only = false);

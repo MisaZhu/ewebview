@@ -90,7 +90,7 @@ all: $(TARGET)
 $(TARGET): $(OBJS) $(PROJ_LIBS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(OBJS) -o $@ $(LDFLAGS) $(LIBS)
-	strip -x $@
+	$(if $(NOSTRIP),@echo "NOSTRIP: keeping symbols for dladdr profiling",strip -x $@)
 	cp -r res $(dir $@)
 
 $(ARCH)/%.o: %.c

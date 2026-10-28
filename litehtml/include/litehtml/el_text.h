@@ -13,6 +13,9 @@ namespace litehtml
 		text_transform	m_text_transform;
 		bool			m_use_transformed;
 		bool			m_draw_spaces;
+		/* Parent's computed letter-spacing in px (0 = normal). Widens the
+		 * measured run and advances glyphs per code point while drawing. */
+		int				m_letter_spacing;
 	public:
 		el_text(const tchar_t* text, litehtml::document* doc);
 		virtual ~el_text();
@@ -28,6 +31,13 @@ namespace litehtml
 			m_use_transformed = false;
 			m_size.width = 0;
 			m_size.height = 0;
+		}
+
+		/* DOM CharacterData.data / text-node nodeValue assignment: REPLACE this
+		 * node's own text (the base set_data() is a parser no-op on el_text). */
+		virtual void				set_data_replace(const tchar_t* data) override
+		{
+			set_text(tstring(data ? data : _t("")));
 		}
 
 		virtual void				get_text(tstring& text) override;

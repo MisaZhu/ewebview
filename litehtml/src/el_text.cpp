@@ -6,7 +6,30 @@
 #include <new>
 
 namespace litehtml {
+bool style_prof_enabled();
 void profile_text_parse(uint32_t transform_ms, uint32_t measure_ms, uint64_t start_ms);
+}
+
+/* UTF-8 helpers for letter-spacing: internal strings are UTF-8 (tchar_t is a
+ * byte), so a glyph is a whole sequence, not a byte. Continuation bytes
+ * (10xxxxxx) never start a code point. */
+static int utf8_code_points(const char* s)
+{
+	int n = 0;
+	for(; *s; s++)
+	{
+		if(((unsigned char)*s & 0xC0) != 0x80) n++;
+	}
+	return n;
+}
+
+static size_t utf8_seq_len(unsigned char b)
+{
+	if(b < 0x80) return 1;
+	if((b & 0xE0) == 0xC0) return 2;
+	if((b & 0xF0) == 0xE0) return 3;
+	if((b & 0xF8) == 0xF0) return 4;
+	return 1;
 }
 
 litehtml::el_text::el_text(const tchar_t* text, litehtml::document* doc) : element(doc)
@@ -18,6 +41,7 @@ litehtml::el_text::el_text(const tchar_t* text, litehtml::document* doc) : eleme
 	m_text_transform	= text_transform_none;
 	m_use_transformed	= false;
 	m_draw_spaces		= true;
+	m_letter_spacing	= 0;
 }
 
 litehtml::el_text::~el_text()
@@ -79,7 +103,8 @@ void litehtml::el_text::parse_styles(bool is_reparse)
 			step_doc->style_step_stamp(this);
 		}
 	}
-	uint64_t start_ms = sys_tic_ms(0);
+	const bool sprof = litehtml::style_prof_fast();
+	uint64_t start_ms = sprof ? sys_tic_ms(0) : 0;
 	uint32_t transform_ms = 0;
 	uint32_t measure_ms = 0;
 	if(m_parent)
@@ -97,9 +122,9 @@ void litehtml::el_text::parse_styles(bool is_reparse)
 		document* doc = get_document();
 		if (doc && doc->container())
 		{
-			uint64_t transform_start = sys_tic_ms(0);
+			uint64_t transform_start = sprof ? sys_tic_ms(0) : 0;
 			doc->container()->transform_text(m_transformed_text, m_text_transform);
-			transform_ms += (uint32_t)(sys_tic_ms(0) - transform_start);
+			if(sprof) transform_ms += (uint32_t)(sys_tic_ms(0) - transform_start);
 		}
 	}
 
@@ -127,6 +152,11 @@ void litehtml::el_text::parse_styles(bool is_reparse)
 	if (el_parent)
 	{
 		font = el_parent->get_font(&fm);
+		m_letter_spacing = el_parent->letter_spacing();
+	}
+	else
+	{
+		m_letter_spacing = 0;
 	}
 	if(is_break())
 	{
@@ -138,9 +168,18 @@ void litehtml::el_text::parse_styles(bool is_reparse)
 		document* doc = get_document();
 		if (doc && doc->container())
 		{
-			uint64_t measure_start = sys_tic_ms(0);
-			m_size.width	= doc->container()->text_width(m_use_transformed ? m_transformed_text.c_str() : m_text.c_str(), font);
-			measure_ms += (uint32_t)(sys_tic_ms(0) - measure_start);
+			uint64_t measure_start = sprof ? sys_tic_ms(0) : 0;
+			const tchar_t* drawn = m_use_transformed ? m_transformed_text.c_str() : m_text.c_str();
+			m_size.width	= doc->container()->text_width(drawn, font);
+			/* CSS text-3 letter-spacing: every glyph advance grows by the
+			 * spacing, so the run's measured width grows by spacing times the
+			 * code-point count. Line breaking and alignment read m_size.width,
+			 * so widening it here propagates everywhere. */
+			if(m_letter_spacing != 0)
+			{
+				m_size.width += m_letter_spacing * utf8_code_points(drawn);
+			}
+			if(sprof) measure_ms += (uint32_t)(sys_tic_ms(0) - measure_start);
 		} else
 		{
 			m_size.width = 0;
@@ -181,7 +220,31 @@ void litehtml::el_text::draw( uint_ptr hdc, int x, int y, const position* clip )
 			{
 				uint_ptr font = el_parent->get_font();
 				litehtml::web_color color = el_parent->get_color(_t("color"), true, doc->get_def_color());
-				doc->container()->draw_text(hdc, m_use_transformed ? m_transformed_text.c_str() : m_text.c_str(), font, color, pos);
+				const tchar_t* drawn = m_use_transformed ? m_transformed_text.c_str() : m_text.c_str();
+				if(m_letter_spacing != 0)
+				{
+					/* Space the glyphs by re-advancing per code point: the port
+					 * draws whole strings at natural advance, so each glyph is
+					 * emitted at a running x offset that adds the spacing. */
+					int xoff = 0;
+					for(const tchar_t* s = drawn; *s; )
+					{
+						size_t L = utf8_seq_len((unsigned char)*s);
+						tstring one(s, L);
+						position p = pos;
+						p.x += xoff;
+						p.width = doc->container()->text_width(one.c_str(), font);
+						if(p.does_intersect(clip))
+						{
+							doc->container()->draw_text(hdc, one.c_str(), font, color, p);
+						}
+						xoff += p.width + m_letter_spacing;
+						s += L;
+					}
+				} else
+				{
+					doc->container()->draw_text(hdc, drawn, font, color, pos);
+				}
 			}
 		}
 	}

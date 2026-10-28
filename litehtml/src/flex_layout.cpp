@@ -7,13 +7,46 @@
 #include <algorithm>
 #include <vector>
 
+/* Flex render statistics (EWEB_FLEX_STATS=1): per-process counts of the
+ * four render call sites (column measure/place at kids[i]->render, row
+ * measure it.el->render(0,0,avail), row place in render_item) plus the
+ * maximum render_flex nesting depth. Nested flex compounds: an outer
+ * measure pass fully lays out an inner container (measure+place), so a
+ * leaf at depth d is rendered 2^d times per frame - the measurement share
+ * of all flex renders is (2^d-2)/2^d in the worst case. Printed at exit. */
+static uint64_t g_flex_col_m = 0, g_flex_col_p = 0;
+static uint64_t g_flex_row_m = 0, g_flex_row_p = 0;
+static int g_flex_depth = 0, g_flex_maxdepth = 0;
+static void flex_stats_report(void)
+{
+	fprintf(stderr, "[flexstat] col_m=%llu col_p=%llu row_m=%llu row_p=%llu maxdepth=%d\n",
+		(unsigned long long)g_flex_col_m, (unsigned long long)g_flex_col_p,
+		(unsigned long long)g_flex_row_m, (unsigned long long)g_flex_row_p,
+		g_flex_maxdepth);
+}
+static int flex_stats_enabled(void)
+{
+	static int s = -1;
+	if (s < 0)
+	{
+		s = (getenv("EWEB_FLEX_STATS") != NULL) ? 1 : 0;
+		if (s) atexit(flex_stats_report);
+	}
+	return s;
+}
+struct flex_depth_guard {
+	flex_depth_guard() { if(++g_flex_depth > g_flex_maxdepth) g_flex_maxdepth = g_flex_depth; }
+	~flex_depth_guard() { --g_flex_depth; }
+};
+
 /*
  * Flexbox (row axis) layout for litehtml.
  *
  * Implements the subset modern sites actually lean on: flex-direction row /
  * row-reverse (column degrades to block flow, which is equivalent for a
  * single column), flex-wrap, flex-basis / flex-grow / flex-shrink plus the
- * "flex" shorthand, order, justify-content and align-items. Items are laid
+ * "flex" shorthand, order, justify-content, align-items and the per-item
+ * align-self override. Items are laid
  * out as block-level boxes at their resolved main size, so nested flex
  * containers and ordinary block content both work unchanged.
  */
@@ -36,6 +69,10 @@ namespace litehtml
 		bool			aml, amr;	// auto margins: container-resolved, see collection
 		int				main;		// final outer main size
 		int				cross;		// final outer cross size
+		/* align-self computed value; "auto" (the initial value) computes to the
+		 * container's align-items, resolved at placement. Points into the item's
+		 * style storage, which outlives layout. Runs leave it null. */
+		const tchar_t*	align_self;
 	};
 }
 
@@ -173,6 +210,45 @@ static int preferred_content_width(const litehtml::element::ptr& el)
 
 	return r;
 }
+
+/* Clamp a resolved flex base/main size (content-box px, margins excluded) by
+ * the item's max-width. Per CSS Flexbox §9.7 step 5 the hypothetical main
+ * size is clamped before flexing. preferred_content_width already clamps the
+ * intrinsic contribution of auto-width items; an item with an explicit width
+ * (or flex-basis) skipped the clamp entirely, so `width:100%; max-width:Xpx`
+ * kept the full container width as its base AND handed it to render() —
+ * render_box's max-width check only narrows max_width, leaving ret_width and
+ * m_pos.width (the percentage base every descendant resolves against) at the
+ * unclamped width, so wrapped text laid out one line wide and slid under the
+ * neighbouring panel (Pinterest's "Collaborate with group boards" column).
+ * Percentages resolve against the flex container content box (avail), the
+ * item's containing block per spec — matching render_box's m_pct_cb_width. */
+static void flex_clamp_main_by_max_width(const litehtml::element::ptr& el, int& base, int avail)
+{
+	if(!el) return;
+	const tchar_t* raw = el->get_style_property(_t("max-width"), false, nullptr);
+	if(!raw || !*raw) return;
+	css_length mw;
+	mw.fromString(raw);
+	if(mw.is_predefined() || mw.units() == css_units_none) return;
+	int v = el->get_document()->cvt_units(mw, el->get_font_size(), avail);
+	/* A percentage max-width cannot be resolved without a used base: on
+	 * intrinsic/measurement passes avail is 0 and the percentage would
+	 * resolve to 0, clamping every hypothetical main size to zero and
+	 * collapsing shrink-to-fit containers (github text-vanish). Skip the
+	 * clamp there; a definite px max-width still applies. */
+	if(mw.units() == css_units_percentage && avail <= 0) return;
+	if(v < 0) return;
+	/* `base` carries the OUTER-box (border-box) hypothetical main size for
+	 * border-box items (width:100% resolves to the outer box). max-width then
+	 * caps the outer box directly: converting it to a content-box cap here
+	 * (v -= padding+border) mixed box spaces and clamped a 1280 outer box to
+	 * 1140, so justify-content:center computed free=140 and offset the item by
+	 * 70px (Pinterest footer box_k: width:100%;max-width:1440px;padding:150px
+	 * landed at x=220 instead of 150, pushing document width to 1350). */
+	if(v < 0) v = 0;
+	if(base > v) base = v;
+}
 static int preferred_content_width_impl(const litehtml::element::ptr& el)
 {
 	if(!el) return 0;
@@ -274,7 +350,16 @@ static int preferred_content_width_impl(const litehtml::element::ptr& el)
 	}
 	if(d == litehtml::display_inline_block)
 	{
-		return el->width();
+		/* A definite width already returned above, so an inline-block reaching
+		 * here has an indefinite (auto/percentage) width: its max-content is the
+		 * shrink-to-fit preferred width derived from its CHILDREN, not the fill
+		 * width() left by the previous layout pass. Returning stale width()
+		 * ratcheted whenever a descendant used width:100% (Pinterest's nav
+		 * `<a style=display:inline-block;width:100%>` logo link and the Log in /
+		 * Sign up `<button>`s): once the box filled the row on one pass, its
+		 * max-content was reported as that fill, so the flex base never shrank
+		 * back and the whole nav overflowed the viewport (items pushed to
+		 * x=1300..6000). Fall through to the generic child walk below. */
 	}
 	if(d == litehtml::display_flex || d == litehtml::display_inline_flex)
 	{
@@ -291,6 +376,16 @@ static int preferred_content_width_impl(const litehtml::element::ptr& el)
 		}
 		int w = 0;
 		int cnt = 0;
+		/* Pending inter-word gap inside an anonymous text run. Layout keeps a
+		 * white-space child only when it sits INSIDE a run of text items
+		 * (render_flex drops it between element siblings and pops it off a
+		 * run's tail), and flex_run_wrap inserts its width between the words
+		 * it separates. Skipping white-space here measured every multi-word
+		 * label ~2 gaps short, so a flex box's max-content under-sized the
+		 * owning flex item's base and the laid-out text wrapped (w3.org's nav
+		 * buttons: "Standards & groups" measured 131, laid out at 141). */
+		int pend = 0;
+		bool in_text_run = false;
 		size_t n = el->get_children_count();
 		for(size_t i = 0; i < n; i++)
 		{
@@ -298,10 +393,37 @@ static int preferred_content_width_impl(const litehtml::element::ptr& el)
 			if(!participates_in_layout(c)) continue;
 			if(c->get_element_position() == litehtml::element_position_absolute ||
 			   c->get_element_position() == litehtml::element_position_fixed) continue;
-			if(c->is_white_space()) continue;
+			if(c->is_white_space())
+			{
+				if(!column && in_text_run)
+				{
+					litehtml::size ssz;
+					ssz.width = 0; ssz.height = 0;
+					c->get_content_size(ssz, 0x3fffffff);
+					pend = ssz.width;
+				}
+				continue;
+			}
 			int cw = c->margin_left() + c->margin_right() + preferred_content_width(c);
 			if(column) { if(cw > w) w = cw; }
-			else       { w += cw; cnt++; }
+			else
+			{
+				if(c->get_display() == litehtml::display_inline_text)
+				{
+					w += pend + cw;
+					pend = 0;
+					in_text_run = true;
+				}
+				else
+				{
+					/* An element child closes the run: a gap pending before it
+					 * is between element siblings and contributes nothing. */
+					pend = 0;
+					in_text_run = false;
+					w += cw;
+				}
+				cnt++;
+			}
 		}
 		if(!column && cnt > 1) w += gap * (cnt - 1);
 		return w + el->padding_left() + el->padding_right() +
@@ -444,16 +566,23 @@ static int flex_min_content_inner_impl(const litehtml::element::ptr& el);
 static int flex_min_content_inner(const litehtml::element::ptr& el)
 {
 	if(!el) return 0;
-	int w = flex_min_content_inner_impl(el);
-	/* the min-content CONTRIBUTION is clamped by the box's own min-width */
+	/* A specified min-width (INCLUDING 0) replaces the automatic content-based
+	 * minimum size (CSS Flexbox 4.5: the automatic minimum applies only when
+	 * min-width is auto). github's Primer flex children carry min-width:0, so a
+	 * wide nowrap <pre>/table inside the README (max-content ~15000px, though its
+	 * laid-out width is capped to the column) must NOT become the shrink floor
+	 * and blow the readme column past the container (Box_2 measured 15486px in a
+	 * 904px row, pushing the article to x=7270, off-screen -> blank body). */
 	int emw = flex_explicit_min_width(el);
-	if(emw > 0)
+	if(emw >= 0)
 	{
+		/* flex_explicit_min_width returns the outer (border-box) value; strip
+		 * padding/border to get the inner shrink floor. */
 		int inner = emw - el->padding_left() - el->padding_right() -
 					el->border_left() - el->border_right();
-		if(inner > w) w = inner;
+		return inner > 0 ? inner : 0;
 	}
-	return w;
+	return flex_min_content_inner_impl(el);
 }
 static int flex_min_content_inner_impl(const litehtml::element::ptr& el)
 {
@@ -496,14 +625,39 @@ static int flex_min_content_inner_impl(const litehtml::element::ptr& el)
 		sz.width = 0; sz.height = 0;
 		el->get_content_size(sz, 0);
 		litehtml::css_length ch = el->get_css_height();
+		int res = sz.width;
 		if(!ch.is_predefined() && ch.units() != litehtml::css_units_percentage &&
 		   sz.width > 0 && sz.height > 0)
 		{
 			int hv = el->get_document()->cvt_units(ch, el->get_font_size(), 0);
 			if(hv > 0)
-				return (int)((float)hv * (float)sz.width / (float)sz.height);
+				res = (int)((float)hv * (float)sz.width / (float)sz.height);
 		}
-		return sz.width;
+		/* Honour max-width: a replaced element capped by max-width (github's
+		 * .markdown-body img{max-width:100%}, a wide README banner/SVG with no
+		 * width attribute) scales with its containing block, so its intrinsic
+		 * size must NOT become the flex item's automatic minimum and blow the
+		 * row past the container (the readme column measured ~15000-19000px wide
+		 * and overflowed/clipped to blank). A percentage max-width is scalable to
+		 * the container, so it contributes nothing to the shrink floor; a
+		 * definite max-width clamps the intrinsic. */
+		const litehtml::tchar_t* mxw = el->get_style_property(_t("max-width"), false, nullptr);
+		if(mxw && *mxw && t_strcmp(mxw, _t("none")))
+		{
+			litehtml::css_length ml;
+			ml.fromString(mxw);
+			if(!ml.is_predefined())
+			{
+				if(ml.units() == litehtml::css_units_percentage)
+					res = 0;
+				else if(ml.units() != litehtml::css_units_none)
+				{
+					int mv = el->get_document()->cvt_units(ml, el->get_font_size(), 0);
+					if(mv >= 0 && res > mv) res = mv;
+				}
+			}
+		}
+		return res;
 	}
 	if(d == litehtml::display_inline_text)
 	{
@@ -635,8 +789,31 @@ static int flex_min_content(const litehtml::element::ptr& el)
 		   el->border_left() + el->border_right();
 }
 
+/* Min-content CONTRIBUTION of a grid item (css-sizing-3 5.2): the outer
+ * min-content size with a specified min-width acting as a FLOOR only - unlike
+ * the flexbox automatic minimum size, where a specified min-width REPLACES the
+ * content floor (flex_min_content_inner). Reusing the flex rule for track
+ * sizing collapsed apple.com's .button{min-width:26px;white-space:nowrap} in a
+ * 'grid-template-columns:min-content' track to the 26px floor and let the
+ * nowrap label spill out of the pill onto its neighbour. */
+static int grid_min_content_contrib(const litehtml::element::ptr& el)
+{
+	if(!el) return 0;
+	int inner = flex_min_content_inner_impl(el);
+	int emw = flex_explicit_min_width(el);
+	if(emw >= 0)
+	{
+		int emw_inner = emw - el->padding_left() - el->padding_right() -
+						el->border_left() - el->border_right();
+		if(emw_inner > inner) inner = emw_inner;
+	}
+	return inner + el->padding_left() + el->padding_right() +
+		   el->border_left() + el->border_right();
+}
+
 int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pass /*= false*/ )
 {
+	flex_depth_guard _fdg;
 	int parent_width = max_width;
 
 	calc_outlines(parent_width);
@@ -652,7 +829,14 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 
 	if(!m_css_width.is_predefined())
 	{
-		int w = calc_width(parent_width);
+		/* Resolve a percentage width against the containing block's used
+		 * content width (parent_width), not calc_width's recursive walk of
+		 * ancestors' specified widths — that walk ignores an ancestor's
+		 * max-width clamp and over-measures every percentage descendant
+		 * (see the matching fix in html_tag::render_box). */
+		int w = (m_css_width.units() == css_units_percentage && !is_body() && have_parent() && parent_width > 0)
+			? get_document()->cvt_units(m_css_width, m_font_size, parent_width)
+			: calc_width(parent_width);
 		if(m_box_sizing == box_sizing_border_box)
 		{
 			w -= m_padding.width() + m_borders.width();
@@ -723,7 +907,7 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		bool ai_stretch = flex_flag(col_ai, "stretch", "normal");
 
 		int n = (int)kids.size();
-		std::vector<int> cw(n, 0), chh(n, 0), mtv(n, 0), mbv(n, 0);
+		std::vector<int> cw(n, 0), chh(n, 0), mtv(n, 0), mbv(n, 0), wv(n, -1);
 		int total = 0;
 		for(int i = 0; i < n; i++)
 		{
@@ -753,6 +937,8 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 					w = avail;
 				}
 			}
+			if (flex_stats_enabled()) g_flex_col_m++;
+			wv[i] = w;
 			kids[i]->render(0, 0, w, second_pass);
 			/* Main size is the child's OUTER height: boxes whose space comes from
 			 * padding alone (the .l-frame aspect-ratio trick: content height 0 +
@@ -787,6 +973,11 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			if(fixed_h < 0) fixed_h = 0;
 		}
 		int cont_h = has_fixed_h ? std::max(total, fixed_h) : total;
+		/* Cap before the min floor: on a min>max conflict the min wins. */
+		{
+			int mxh = content_box_max_height();
+			if(mxh >= 0 && cont_h > mxh) cont_h = mxh;
+		}
 		if(!m_css_min_height.is_predefined() && m_css_min_height.units() != css_units_none)
 		{
 			int mh = get_document()->cvt_units(m_css_min_height, m_font_size, 0);
@@ -811,12 +1002,42 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		for(int i = 0; i < n; i++)
 		{
 			int ix = 0;
-			if(!ai_stretch)
+			/* align-self overrides the container's align-items on the cross
+			 * (horizontal) axis; "auto" falls back to col_ai. cw[i] was measured
+			 * under the container-wide stretch flag, so a non-stretch override
+			 * can only reposition within avail, never re-fit the item. */
+			const tchar_t* as = kids[i]->get_style_property(_t("align-self"), false, _t("auto"));
+			const tchar_t* eff_ai = (as && !flex_flag(as, "auto")) ? as : col_ai;
+			if(!flex_flag(eff_ai, "stretch", "normal"))
 			{
-				if(flex_flag(col_ai, "center")) ix = (avail - cw[i]) / 2;
-				else if(flex_flag(col_ai, "flex-end", "end")) ix = avail - cw[i];
+				if(flex_flag(eff_ai, "center")) ix = (avail - cw[i]) / 2;
+				else if(flex_flag(eff_ai, "flex-end", "end")) ix = avail - cw[i];
 			}
-			kids[i]->render(ix, yy, cw[i], second_pass);
+			/* Same shift trick as the row path: when the item's measured
+			 * outer width cw[i] equals the width it was measured at (wv[i]),
+			 * the placement render would repeat the measurement render under
+			 * identical width and environment - only the origin (ix, yy)
+			 * differs, and m_pos is parent-relative, so placement is a pure
+			 * origin shift. cw[i] != wv[i] (fit-content probes that came out
+			 * a different width) still re-renders. EWEB_COLSHIFT_OFF restores
+			 * the unconditional re-render. Note col_p counts ACTUAL renders
+			 * only: col_m - col_p is the shift-hit count. */
+			static int s_colshift_off = -1;
+			if (s_colshift_off < 0)
+			{
+				s_colshift_off = (getenv("EWEB_COLSHIFT_OFF") != NULL) ? 1 : 0;
+			}
+			if (!s_colshift_off && wv[i] == cw[i])
+			{
+				html_tag* iht = static_cast<html_tag*>(kids[i]);
+				iht->m_pos.x += ix;
+				iht->m_pos.y += yy;
+			}
+			else
+			{
+				if (flex_stats_enabled()) g_flex_col_p++;
+				kids[i]->render(ix, yy, cw[i], second_pass);
+			}
 			yy += chh[i] + row_gap + jgap;
 		}
 
@@ -883,6 +1104,7 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				it.ml = it.mr = it.mt = it.mb = 0;
 				it.aml = it.amr = false;
 				it.order	= 0;
+				it.align_self = 0;
 				items.push_back(it);
 			}
 			continue;
@@ -928,6 +1150,11 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 
 		const tchar_t* v = el->get_style_property(_t("order"), false, _t("0"));
 		it.order = v ? atoi(v) : 0;
+
+		/* align-self: per-item cross-axis override of the container's
+		 * align-items; the initial "auto" computes to the parent's value and is
+		 * resolved at placement. */
+		it.align_self = el->get_style_property(_t("align-self"), false, _t("auto"));
 
 		const tchar_t* sh = el->get_style_property(_t("flex"), false, 0);
 		bool basis_set = false;
@@ -1006,6 +1233,11 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		{
 			it.base = get_document()->cvt_units(cw, el->get_font_size(), avail) + it.ml + it.mr;
 			it.has_main = true;
+			/* the resolved base is the hypothetical main size: clamp it by
+			 * max-width before packing/flexing (§9.7), margins stay outside */
+			int bw = it.base - (it.ml + it.mr);
+			flex_clamp_main_by_max_width(el, bw, avail);
+			it.base = bw + it.ml + it.mr;
 		}
 		items.push_back(it);
 	}
@@ -1024,7 +1256,27 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 	if(items.empty())
 	{
 		m_pos.width = avail;
-		m_pos.height = 0;
+		/* An empty container still honours its own specified block size: the
+		 * height/min-height/max-height resolution is independent of item
+		 * content (css-flexbox 9.2). Pinning the height to 0 here collapsed
+		 * `display:flex;height:100%` spacers and bypassed every min/max clamp
+		 * (probe: empty flex in a 300px wrapper measured 0). */
+		{
+			int h = 0;
+			m_pos.height = get_predefined_height(h) ? border_box_content_height(h) : 0;
+			/* Cap before the min floor: on a min>max conflict the min wins. */
+			{
+				int mxh = content_box_max_height();
+				if(mxh >= 0 && m_pos.height > mxh) m_pos.height = mxh;
+			}
+			if(!m_css_min_height.is_predefined() && m_css_min_height.units() != css_units_none)
+			{
+				int mh = get_document()->cvt_units(m_css_min_height, m_font_size, 0);
+				if(m_box_sizing == box_sizing_border_box)
+					mh -= m_padding.top + m_padding.bottom + m_borders.top + m_borders.bottom;
+				if(mh > m_pos.height) m_pos.height = mh;
+			}
+		}
 		calc_auto_margins(parent_width);
 		return ret_width + content_margins_left() + content_margins_right();
 	}
@@ -1060,6 +1312,7 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				css_length sml = mht->m_css_margins.left, smr = mht->m_css_margins.right;
 				if(it.aml){ css_length v; v = (float)it.ml; mht->m_css_margins.left = v; }
 				if(it.amr){ css_length v; v = (float)it.mr; mht->m_css_margins.right = v; }
+				if (flex_stats_enabled()) g_flex_row_m++;
 				it.base = it.el->render(0, 0, avail, second_pass);
 				mht->m_css_margins.left = sml;
 				mht->m_css_margins.right = smr;
@@ -1083,6 +1336,17 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 						if(pw > 0) it.base = pw + it.ml + it.mr;
 					}
 				}
+			}
+			/* Clamp the content-derived base of auto-width items by max-width as
+			 * well: the explicit-width path above clamps at §9.7 step 5, but an
+			 * auto-width item carrying max-width:100% (github's Box_2__zaRucd
+			 * readme column, whose max-content is a ~15000px nowrap <pre>/table)
+			 * kept the unclamped content base, overflowed the 904px row and pushed
+			 * the centred article to x=7270, off screen -> blank README body. */
+			{
+				int bw = it.base - (it.ml + it.mr);
+				flex_clamp_main_by_max_width(it.el, bw, avail);
+				it.base = bw + it.ml + it.mr;
 			}
 		}
 		if(it.base < it.ml + it.mr) it.base = it.ml + it.mr;
@@ -1142,6 +1406,7 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		css_length sml = ht->m_css_margins.left, smr = ht->m_css_margins.right;
 		if(it.aml){ css_length v; v = (float)it.ml; ht->m_css_margins.left = v; }
 		if(it.amr){ css_length v; v = (float)it.mr; ht->m_css_margins.right = v; }
+		if (flex_stats_enabled()) g_flex_row_p++;
 		it.el->render(ix, iy, it.main, second_pass);
 		ht->m_css_margins.left = sml;
 		ht->m_css_margins.right = smr;
@@ -1168,18 +1433,24 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			 * parent is still laying out its children its m_pos.height is 0,
 			 * which zeroed workspace.google.com's nav{height:100%} inside the
 			 * 64px header row and dropped every menu label 16px too low. */
-			element::ptr p = parent();
 			int spec_h = 0;
 			if(get_predefined_height(spec_h))
 			{
 				fixed_h = spec_h;
 			}
-			else if(p && !p->get_css_height().is_predefined())
-			{
-				fixed_h = m_css_height.calc_percent(p->m_pos.height);
-			}
 			else
 			{
+				/* get_predefined_height walks the whole percentage chain and
+				 * returns false only when no ancestor supplies a definite
+				 * height, so per the CSS fallback the percentage computes to
+				 * auto and the container must be content-driven. The old
+				 * `else if(!p->get_css_height().is_predefined())` branch instead
+				 * resolved against the parent's m_pos.height -- which is 0 while
+				 * an indefinite (percentage-height) parent is still laying out --
+				 * collapsing Pinterest's height:100% signup wrapper chain to zero
+				 * and dropping the 913px card over the footer. A parent with a
+				 * definite SPECIFIED height is already handled by the
+				 * get_predefined_height branch above (workspace.google.com nav). */
 				has_fixed_h = false;
 			}
 		}
@@ -1230,6 +1501,12 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			{
 				flex_item& it = items[line[i]];
 				it.main = it.base + (int)((float)free * it.grow / total_grow);
+				/* §9.7: clamp the grown main size by max-width (margins are
+				 * part of the outer size the clamp applies to only for
+				 * border-box, which the helper already accounts for) */
+				int mw = it.main - (it.ml + it.mr);
+				flex_clamp_main_by_max_width(it.el, mw, avail);
+				it.main = mw + it.ml + it.mr;
 			}
 			free = 0;
 		}
@@ -1407,8 +1684,13 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			int iy = 0;
 			bool is_run = !it.run.empty();
 			bool placed = false;
+			/* align-self overrides the container's align-items for this item;
+			 * "auto" (and anonymous runs, which carry no align_self) fall back
+			 * to the container value. */
+			const tchar_t* eff_ai = (it.align_self && !flex_flag(it.align_self, "auto"))
+				? it.align_self : ai_s;
 			css_length ch = it.el->get_css_height();
-			if(!is_run && flex_flag(ai_s, "stretch", "normal") && ch.is_predefined())
+			if(!is_run && flex_flag(eff_ai, "stretch", "normal") && ch.is_predefined())
 			{
 				iy = 0;
 				/* True stretch: give the item a definite height for the duration
@@ -1443,11 +1725,11 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				 * .tile-content lost its justify-content:flex-end anchoring). */
 				placed = true;
 			}
-			else if(flex_flag(ai_s, "center"))
+			else if(flex_flag(eff_ai, "center"))
 			{
 				iy = (line_h - it.cross) / 2;
 			}
-			else if(flex_flag(ai_s, "flex-end", "end"))
+			else if(flex_flag(eff_ai, "flex-end", "end"))
 			{
 				iy = line_h - it.cross;
 			}
@@ -1463,7 +1745,29 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			}
 			else if(!placed)
 			{
-				render_item(it, xs[i], bottom + iy);
+				/* The cross-size pass above already rendered this item at
+				 * the SAME width (it.main) under the SAME environment
+				 * (pinned margins, m_pct_cb_width) - only the origin
+				 * differs. m_pos is parent-relative (children receive
+				 * line-context coordinates that start from 0), so placing
+				 * the item is a pure origin shift of its own m_pos; the
+				 * whole subtree layout stays valid untouched.
+				 * EWEB_FLEXSHIFT_OFF restores the re-render. */
+				static int s_flexshift_off = -1;
+				if (s_flexshift_off < 0)
+				{
+					s_flexshift_off = (getenv("EWEB_FLEXSHIFT_OFF") != NULL) ? 1 : 0;
+				}
+				if (s_flexshift_off)
+				{
+					render_item(it, xs[i], bottom + iy);
+				}
+				else
+				{
+					html_tag* iht = static_cast<html_tag*>(it.el);
+					iht->m_pos.x += xs[i];
+					iht->m_pos.y += bottom + iy;
+				}
 			}
 		}
 
@@ -1498,6 +1802,20 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 	 * white-space:nowrap) grow to 90-117px around an oversized inner icon,
 	 * which stacked the nav into overlapping bands instead of one 44px row. */
 	m_pos.height = has_fixed_h ? fixed_h : bottom;
+	/* CSS sizing-4 §4: a flex container carrying `aspect-ratio` with an auto
+	 * block size takes its preferred height from the inline size. The laid-out
+	 * content height (`bottom`) is the automatic minimum, so only ever grow -
+	 * never shrink - or the items would clip. An explicit height keeps
+	 * precedence. Applied before the min/max clamps below so those still win. */
+	if(!has_fixed_h && m_pos.width > 0)
+	{
+		double ar = aspect_ratio();
+		if(ar > 0.0)
+		{
+			int ah = (int)(m_pos.width / ar + 0.5);
+			if(ah > m_pos.height) m_pos.height = ah;
+		}
+	}
 	calc_auto_margins(parent_width);
 
 	/* m_pos.height is the CONTENT height, so min-height has to be unit-converted
@@ -1516,6 +1834,11 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			min_height -= m_padding.top + m_padding.bottom + m_borders.top + m_borders.bottom;
 		}
 		if(min_height < 0) min_height = 0;
+	}
+	/* Cap before the min floor: on a min>max conflict the min wins. */
+	{
+		int mxh = content_box_max_height();
+		if(mxh >= 0 && m_pos.height > mxh) m_pos.height = mxh;
 	}
 	if(min_height > m_pos.height)
 	{
@@ -1824,12 +2147,94 @@ static bool grid_place_calc(const tstring& in, int& out)
 	return true;
 }
 
-static void grid_item_placement(html_tag* el, int n, int& col, int& span, int& row)
+/* Named grid areas (grid-template-areas on the container + grid-area:<name>
+ * on an item). GitHub's issue-list rows are display:grid with a
+ * grid-template-areas map and place the title via "grid-area:primary"; with
+ * only numeric placement understood the title auto-flows into the first
+ * min-content track and clips to a couple of glyphs. Rows are the quoted
+ * strings of the template; a name's rectangle is the union of the cells that
+ * carry it. */
+struct grid_area_rect { int row0, row1, col0, col1; };
+struct grid_area_entry { tstring name; grid_area_rect r; };
+typedef std::vector<grid_area_entry> grid_area_map;
+
+static const grid_area_rect* grid_area_find(const grid_area_map& m, const tstring& name)
+{
+	for(size_t i = 0; i < m.size(); i++)
+		if(m[i].name == name) return &m[i].r;
+	return nullptr;
+}
+
+static void grid_parse_areas(const tchar_t* spec, grid_area_map& out)
+{
+	if(!spec) return;
+	int row = 0;
+	for(const tchar_t* p = spec; *p; )
+	{
+		if(*p != _t('"') && *p != _t('\'')) { p++; continue; }
+		tchar_t q = *p++;
+		tstring line;
+		while(*p && *p != q) { line += *p; p++; }
+		if(*p) p++;
+		string_vector names;
+		split_string(line, names, _t(" \t"));
+		for(size_t i = 0; i < names.size(); i++)
+		{
+			if(names[i] == _t(".")) continue;
+			grid_area_rect* r = const_cast<grid_area_rect*>(grid_area_find(out, names[i]));
+			if(!r)
+			{
+				grid_area_entry e;
+				e.name = names[i];
+				e.r.row0 = e.r.row1 = row;
+				e.r.col0 = e.r.col1 = (int)i;
+				out.push_back(e);
+			}
+			else
+			{
+				if(row < r->row0) r->row0 = row;
+				if(row > r->row1) r->row1 = row;
+				if((int)i < r->col0) r->col0 = (int)i;
+				if((int)i > r->col1) r->col1 = (int)i;
+			}
+		}
+		row++;
+	}
+}
+
+static void grid_item_placement(html_tag* el, int n, int& col, int& span, int& row,
+		const grid_area_map* areas = nullptr)
 {
 	col = -1; span = 1; row = -1;
 	if(!el)
 	{
 		return;
+	}
+	/* A single-ident grid-area that names a template area pins the item to
+	 * that rectangle; explicit lines (parsed below) only apply when the
+	 * shorthand is numeric or the name is unknown. */
+	if(areas && !areas->empty())
+	{
+		if(const tchar_t* gan = el->get_style_property(_t("grid-area"), false, 0))
+		{
+			string_vector atk;
+			split_string(gan, atk, _t("/"));
+			for(size_t i = 0; i < atk.size(); i++) trim(atk[i]);
+			if(atk.size() == 1)
+			{
+				const grid_area_rect* ar = grid_area_find(*areas, atk[0]);
+				if(ar)
+				{
+					row = ar->row0;
+					col = ar->col0;
+					span = ar->col1 - ar->col0 + 1;
+					if(span > n) span = n;
+					if(col + span > n) span = n - col;
+					if(span < 1) span = 1;
+					return;
+				}
+			}
+		}
 	}
 	tstring start_s, end_s;
 	/* grid-area: row-start / col-start / row-end / col-end. apple.com stacks a
@@ -1922,6 +2327,8 @@ std::vector<grid_track> tracks;
 grid_parse_tracks(tc, avail, el->get_font_size(), el->get_document(), tracks, col_gap);
 int n = (int)tracks.size();
 if(n < 2) return -1;
+grid_area_map areas;
+grid_parse_areas(el->get_style_property(_t("grid-template-areas"), false, 0), areas);
 
 std::vector<element::ptr> items;
 for(size_t i = 0; i < el->get_children_count(); i++)
@@ -1955,7 +2362,7 @@ for(size_t k = 0; k < items.size(); k++)
 {
 int col = -1, span = 1, row = -1;
 if(items[k]->get_display() != display_inline_text)
-grid_item_placement(static_cast<html_tag*>(items[k]), n, col, span, row);
+grid_item_placement(static_cast<html_tag*>(items[k]), n, col, span, row, &areas);
 if(span < 1) span = 1;
 if(span > n) span = n;
 int r;
@@ -2026,7 +2433,14 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 
 	if(!m_css_width.is_predefined())
 	{
-		int w = calc_width(parent_width);
+		/* Resolve a percentage width against the containing block's used
+		 * content width (parent_width), not calc_width's recursive walk of
+		 * ancestors' specified widths — that walk ignores an ancestor's
+		 * max-width clamp and over-measures every percentage descendant
+		 * (see the matching fix in html_tag::render_box). */
+		int w = (m_css_width.units() == css_units_percentage && !is_body() && have_parent() && parent_width > 0)
+			? get_document()->cvt_units(m_css_width, m_font_size, parent_width)
+			: calc_width(parent_width);
 		if(m_box_sizing == box_sizing_border_box)
 		{
 			w -= m_padding.width() + m_borders.width();
@@ -2057,6 +2471,8 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 	const tchar_t* tc = get_style_property(_t("grid-template-columns"), false, 0);
 	if(tc)
 		grid_parse_tracks(tc, avail, m_font_size, get_document(), tracks, col_gap);
+	grid_area_map areas;
+	grid_parse_areas(get_style_property(_t("grid-template-areas"), false, 0), areas);
 	if(tracks.empty())
 	{
 		/* grid-auto-flow:column with no explicit template: every auto-placed
@@ -2162,6 +2578,15 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 	{
 		int bh = 0;
 		if(get_predefined_height(bh)) cont_h = border_box_content_height(bh);
+		/* A definite height still obeys max-height: bing.com's search form is
+		 * "height:100%; max-height:52px" in a full-viewport wrapper, and the
+		 * uncapped 844px both stretched the box and fed fr/auto rows a bogus
+		 * free-space budget. */
+		if(cont_h > 0)
+		{
+			int mxh = content_box_max_height();
+			if(mxh >= 0 && cont_h > mxh) cont_h = mxh;
+		}
 	}
 	int cont_min_h = 0;
 	if(!m_css_min_height.is_predefined() && m_css_min_height.units() != css_units_none)
@@ -2242,7 +2667,7 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 	{
 		int col = -1, span = 1, row = -1;
 		if(items[k]->get_display() != display_inline_text)
-			grid_item_placement(static_cast<html_tag*>(items[k]), n, col, span, row);
+			grid_item_placement(static_cast<html_tag*>(items[k]), n, col, span, row, &areas);
 		if(span < 1) span = 1;
 		if(span > n) span = n;
 
@@ -2331,9 +2756,17 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 					static_cast<html_tag*>(el)->m_css_height = orig_h[k];
 					static_cast<html_tag*>(el)->m_css_width = orig_w[k];
 					el->render(0, 0, avail, second_pass);
-					iw = tracks[i].content_min ? flex_min_content(el)
+					iw = tracks[i].content_min ? grid_min_content_contrib(el)
 												: preferred_content_width(el);
-					if(iw < (int)el->get_position().width && !tracks[i].content_min)
+					/* A block item rendered at `avail` fills it (m_pos.width ==
+					 * avail), so clamping max-content up to the laid-out width
+					 * inflates the track to the whole grid and starves every fr
+					 * track (GitHub's issue rows: the max-content metadata track
+					 * ate the full 874px and the 1fr title track got 0). Only a
+					 * box that shrank to fit (laid-out width below avail) carries
+					 * a real max-content in m_pos.width. */
+					if(iw < (int)el->get_position().width &&
+					   (int)el->get_position().width < avail && !tracks[i].content_min)
 						iw = (int)el->get_position().width;
 				}
 				iw += el->margin_left() + el->margin_right();
@@ -2358,7 +2791,7 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 				if(el->get_display() != display_inline_text)
 				{
 					el->render(0, 0, avail, second_pass);
-					iw = tracks[i].content_min ? flex_min_content(el)
+					iw = tracks[i].content_min ? grid_min_content_contrib(el)
 												: preferred_content_width(el);
 				}
 				iw += el->margin_left() + el->margin_right() - outer;
@@ -2375,7 +2808,14 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 	for(int i = 0; i < n; i++)
 	{
 		if(tracks[i].is_fixed || tracks[i].is_content) continue;
-		col_w[i] = fr_sum > 0 ? (int)((float)flex_avail * tracks[i].fr / fr_sum) : 0;
+		int share = fr_sum > 0 ? (int)((float)flex_avail * tracks[i].fr / fr_sum) : 0;
+		/* css-grid 12.7.1: a flexible track's base size is floored at its min
+		 * (minmax(30%,1fr) keeps 30% even when the non-flexible tracks - an
+		 * over-measured max-content metadata column on GitHub's issue rows -
+		 * eat the whole free space). Without the floor the fr share went to 0
+		 * and the title column collapsed to nothing. */
+		if(tracks[i].min_w > share) share = tracks[i].min_w;
+		col_w[i] = share;
 	}
 
 	/* justify-content shifts/grows the whole track group inside the container:
@@ -2647,6 +3087,11 @@ int litehtml::html_tag::render_grid( int x, int y, int max_width, bool second_pa
 	/* A definite height is the box height (content overflows, it does not
 	 * grow the box); min-height floors an auto one. */
 	m_pos.height = cont_h >= 0 ? cont_h : bottom;
+	/* Cap before the min floor: on a min>max conflict the min wins. */
+	{
+		int mxh = content_box_max_height();
+		if(mxh >= 0 && m_pos.height > mxh) m_pos.height = mxh;
+	}
 	if(cont_h < 0 && cont_min_h > m_pos.height) m_pos.height = cont_min_h;
 	calc_auto_margins(parent_width);
 

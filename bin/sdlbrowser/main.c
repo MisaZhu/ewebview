@@ -55,19 +55,86 @@
 #if defined(__APPLE__)
 #include <sys/ucontext.h>
 #endif
+static void browser_install_crash_handler(void);  /* fwd: re-arm after recovery */
+/* Async-signal-safe integer/pointer formatting. The handler used snprintf,
+ * which takes the locale os_unfair_lock inside __vfprintf: a signal that
+ * interrupts the thread while IT holds that lock (any fprintf/printf path -
+ * mario's console.log, an engine log line) deadlocks the handler forever on
+ * os_unfair_lock_lock. Observed live: pinterest shell-state runs froze at
+ * 100% CPU with every sample inside localeconv_l, no [crasharm] line ever
+ * reaching the log, so even the checkpoint recovery below never ran. Only
+ * write(2) and these local formatters are safe here. */
+static char* crash_fmt_ull(char* p, unsigned long long v, int base) {
+    char tmp[24]; int n = 0;
+    if(v == 0) tmp[n++] = '0';
+    while(v) { int d = (int)(v % (unsigned)base); tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); v /= (unsigned)base; }
+    while(n) *p++ = tmp[--n];
+    return p;
+}
+static char* crash_fmt_hex(char* p, unsigned long long v) {
+    *p++ = '0'; *p++ = 'x';
+    return crash_fmt_ull(p, v, 16);
+}
+static char* crash_fmt_dec(char* p, long long v) {
+    if(v < 0) { *p++ = '-'; v = -v; }
+    return crash_fmt_ull(p, (unsigned long long)v, 10);
+}
+static char* crash_fmt_str(char* p, const char* s) {
+    while(*s) *p++ = *s++;
+    return p;
+}
+static void crash_write(char* buf, char* end) {
+    (void)!write(STDERR_FILENO, buf, (size_t)(end - buf));
+}
 static void browser_crash_handler(int sig, siginfo_t* si, void* uc) {
     /* If a JS run boundary (a page script / the timer poll) armed a SEGV
      * recovery checkpoint, jump back to it and skip the faulting unit instead
      * of aborting the whole browser. Returns 0 (no-op) when nothing is armed,
      * in which case fall through to the diagnostic dump below. */
     extern int eweb_segv_try_recover(void);
-    if(eweb_segv_try_recover()) return;   /* not reached when a checkpoint is armed */
+    /* SA_RESETHAND disarmed us on entry.  Re-arm BEFORE the recovery longjmp:
+     * otherwise a recovered (non-fatal) segv consumes the one-shot handler and
+     * the NEXT segv dies silently with no [crash] dump (observed: scroll-recipe
+     * runs exiting 139 with zero handler output). */
+    browser_install_crash_handler();
+    void* fpc = (void*)0;
+#if defined(__APPLE__) && defined(__arm64__)
+    if(uc != NULL) {
+        _STRUCT_MCONTEXT64* mcp = (_STRUCT_MCONTEXT64*)((ucontext_t*)uc)->uc_mcontext;
+        if(mcp != NULL) fpc = (void*)mcp->__ss.__pc;
+    }
+#endif
+    /* Only SEGV/BUS may be checkpoint-recovered. SIGTRAP/SIGABRT come from
+     * C++ terminate/pthread traps (e.g. length_error on a corrupted string
+     * size); longjmp-resuming those continues in an already-corrupted state
+     * and turns a loud crash into a silent zombie stall (observed: o9 sig=5
+     * recovered, then SIGBUS with pc=ASCII string data). */
+    {
+        /* Log EVERY handler entry (recovered or fatal) with the safe
+         * formatter: hidden non-fatal segvs may still kill the engine thread
+         * later (observed: stall runs exiting 133 = pthread_join trap on a
+         * dead engine thread). try_recover longjmps away and never returns,
+         * so this must run BEFORE it. */
+        char ab[224]; char* ap = ab;
+        ap = crash_fmt_str(ap, "[crasharm] sig=");
+        ap = crash_fmt_dec(ap, sig);
+        ap = crash_fmt_str(ap, " addr=");
+        ap = crash_fmt_hex(ap, (unsigned long long)(uintptr_t)(si ? si->si_addr : (void*)0));
+        ap = crash_fmt_str(ap, " pc=");
+        ap = crash_fmt_hex(ap, (unsigned long long)(uintptr_t)fpc);
+        *ap++ = '\n';
+        crash_write(ab, ap);
+    }
+    if((sig == SIGSEGV || sig == SIGBUS) && eweb_segv_try_recover()) return;
     void* frames[128];
     int n = backtrace(frames, 128);
-    char hdr[512];
-    int len = snprintf(hdr, sizeof(hdr),
-        "\n[crash] signal=%d addr=%p\n", sig, si ? si->si_addr : (void*)0);
-    if(len > 0) (void)!write(STDERR_FILENO, hdr, (size_t)len);
+    char hdr[512]; char* hp = hdr;
+    hp = crash_fmt_str(hp, "\n[crash] signal=");
+    hp = crash_fmt_dec(hp, sig);
+    hp = crash_fmt_str(hp, " addr=");
+    hp = crash_fmt_hex(hp, (unsigned long long)(uintptr_t)(si ? si->si_addr : (void*)0));
+    *hp++ = '\n';
+    crash_write(hdr, hp);
 #if defined(__APPLE__) && defined(__arm64__)
     /* TEMP DIAGNOSTIC: dump the real faulting PC/LR/SP and the callee-saved +
      * argument registers straight from the signal ucontext. The backtrace below
@@ -83,29 +150,61 @@ static void browser_crash_handler(int sig, siginfo_t* si, void* uc) {
             struct __darwin_arm_thread_state64 ss = mc->__ss;
             static volatile int knownsym_anchor = 0;
             (void)knownsym_anchor;
-            char rb[1024];
-            int rl = snprintf(rb, sizeof(rb),
-                "[crashreg] pc=%p lr=%p sp=%p fp=%p knownsym=%p\n",
-                (void*)ss.__pc, (void*)ss.__lr, (void*)ss.__sp, (void*)ss.__fp,
-                (void*)&browser_crash_handler);
-            if(rl > 0) (void)!write(STDERR_FILENO, rb, (size_t)rl);
+            char rb[1024]; char* rp = rb;
+            rp = crash_fmt_str(rp, "[crashreg] pc=");
+            rp = crash_fmt_hex(rp, (unsigned long long)ss.__pc);
+            rp = crash_fmt_str(rp, " lr=");
+            rp = crash_fmt_hex(rp, (unsigned long long)ss.__lr);
+            rp = crash_fmt_str(rp, " sp=");
+            rp = crash_fmt_hex(rp, (unsigned long long)ss.__sp);
+            rp = crash_fmt_str(rp, " fp=");
+            rp = crash_fmt_hex(rp, (unsigned long long)ss.__fp);
+            rp = crash_fmt_str(rp, " knownsym=");
+            rp = crash_fmt_hex(rp, (unsigned long long)(uintptr_t)&browser_crash_handler);
+            *rp++ = '\n';
+            crash_write(rb, rp);
             for(int i = 0; i < 29; i += 4) {
-                char xb[512];
-                int xl = snprintf(xb, sizeof(xb),
-                    "[crashreg] x%d=%p x%d=%p x%d=%p x%d=%p\n",
-                    i,   (void*)ss.__x[i],
-                    i+1, (i+1 < 29) ? (void*)ss.__x[i+1] : (void*)0,
-                    i+2, (i+2 < 29) ? (void*)ss.__x[i+2] : (void*)0,
-                    i+3, (i+3 < 29) ? (void*)ss.__x[i+3] : (void*)0);
-                if(xl > 0) (void)!write(STDERR_FILENO, xb, (size_t)xl);
+                char xb[512]; char* xp = xb;
+                for(int j = i; j < i + 4; j++) {
+                    xp = crash_fmt_str(xp, "[crashreg] x");
+                    xp = crash_fmt_dec(xp, j);
+                    xp = crash_fmt_str(xp, "=");
+                    xp = crash_fmt_hex(xp, (j < 29) ? (unsigned long long)ss.__x[j] : 0ULL);
+                    if(j < i + 3) *xp++ = ' ';
+                }
+                *xp++ = '\n';
+                crash_write(xb, xp);
+            }
+            /* TEMP DIAG (fpwalk): backtrace() yields ~0 frames when the fault is
+             * in a leaf/prologue - here std::map<string,string> __tree::destroy
+             * recursing onto a wild node (0x1<<32) during a litehtml html_tag
+             * teardown. Walk the frame-pointer chain straight from the ucontext
+             * instead: at each frame fp[0]=caller fp, fp[1]=return address. Dump
+             * the whole return-address chain so atos can reconstruct the FULL
+             * call stack and name WHICH teardown path double-destroyed / used
+             * the string_map after free. Remove with the other temp probes. */
+            {
+                uint64_t fp = (uint64_t)ss.__fp;
+                char fb[8192]; char* fbp = fb;
+                for(int i = 0; i < 48 && fp && fbp < fb + (int)sizeof(fb) - 128; i++) {
+                    uint64_t* f = (uint64_t*)fp;
+                    uint64_t next_fp = f[0];
+                    uint64_t ret = f[1];
+                    fbp = crash_fmt_str(fbp, "[fpwalk] #");
+                    fbp = crash_fmt_dec(fbp, i);
+                    fbp = crash_fmt_str(fbp, " fp=");
+                    fbp = crash_fmt_hex(fbp, fp);
+                    fbp = crash_fmt_str(fbp, " ret=");
+                    fbp = crash_fmt_hex(fbp, ret);
+                    *fbp++ = '\n';
+                    if(next_fp <= fp || (next_fp & 0xF) != 0) break;
+                    fp = next_fp;
+                }
+                crash_write(fb, fbp);
             }
         }
     }
 #endif
-    /* Dump the mario VM scope/closure chain health at the fault (read-only, never
-     * dereferences a corrupt key) so the use-after-free var is identified. */
-    extern void mario_report_scope_integrity(void);
-    mario_report_scope_integrity();
     backtrace_symbols_fd(frames, n, STDERR_FILENO);
     _exit(128 + sig);
 }
@@ -137,6 +236,14 @@ static void browser_install_crash_handler(void) {
      * (a BRK from libmalloc's corruption path or a __builtin_trap), which the
      * SEGV/BUS pair never sees, so the run dies with no backtrace at all. */
     sigaction(SIGTRAP, &sa, NULL);
+    /* SIGABRT too: the OFFLINE harness (pinsrv.py serving the captured doc from
+     * localhost, no live-host 503 throttling) reproduces a DETERMINISTIC abort
+     * (rc=134) at teardown that SEGV/BUS/TRAP never see - libmalloc's higher-
+     * level corruption guard, or an uncaught C++ exception via std::terminate,
+     * calls abort(). Without a handler the process dies silently (no backtrace,
+     * no malloc message on stderr). Catching SIGABRT dumps the abort() call
+     * site + registers + VM scope chain exactly like the fault path above. */
+    sigaction(SIGABRT, &sa, NULL);
 }
 #else
 static void browser_install_crash_handler(void) {}
@@ -301,6 +408,8 @@ typedef struct {
     int           view_w, view_h;       /* ewebview viewport in LOGICAL CSS px */
     int           tex_w, tex_h;         /* frame texture size in DEVICE px */
     bool          pool_flush;           /* dpr changed: force frame pool turnover */
+    uint32_t      content_bg_top;       /* sampled frame top-edge color (ARGB) */
+    uint32_t      content_bg_bot;       /* sampled frame bottom-edge color (ARGB) */
 
     /* toolbar widgets */
     ui_button_t   btn_back, btn_stop, btn_refresh;
@@ -331,6 +440,12 @@ typedef struct {
     uint32_t      shot_start_ms;
     int           shot_scroll_y;   /* -1 = capture at top; else scroll first */
     bool          shot_scrolled;
+    /* Sustained-idle gate: github-style hydration idles briefly BETWEEN waves,
+     * and capturing on the first idle snapshot can catch a lull (sidebar-only
+     * layout) instead of the final committed state. Require the engine to stay
+     * idle for shot_idle_ms continuously before the frame is saved. */
+    uint32_t      shot_idle_since; /* 0 = not currently idle */
+    uint32_t      shot_idle_ms;
 
     /* injected input script (see --inject). Runs after the first settle and
      * before the capture; `inject_final_settle` is the settle used afterwards. */
@@ -341,6 +456,17 @@ typedef struct {
     bool          inject_done;
     uint32_t      inject_next_ms;
     uint32_t      inject_final_settle;
+
+    /* Interactive-mode timeline capture: EWEB_SHOT_EVERY_MS=<ms> dumps the
+     * frame the window actually presents every <ms> into EWEB_SHOT_DIR
+     * (default /tmp/m15_frames) as f<elapsed_ms>.bmp, without settle gating
+     * and without exiting. macOS TCC hides foreign windows from
+     * screencapture, so this is the only offline view of what the
+     * continuous interactive redraw path shows over time. */
+    uint32_t      shot_every_ms;
+    uint32_t      shot_every_last;
+    uint32_t      shot_every_start;
+    const char*   shot_dir;
 } browser_t;
 
 /* ------------------------------------------------------------------ */
@@ -584,12 +710,12 @@ static void ensure_frame_texture(browser_t* b) {
     b->frame_tex = SDL_CreateTexture(b->renderer,
         SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
         b->tex_w, b->tex_h);
-    /* Pre-fill with the content background (opaque white = 0xFFFFFFFF in
-     * ARGB8888) so the transient window right after a resize - when the previous,
-     * differently-sized frame is uploaded before the engine's refilled frame
-     * lands - shows white in any region the old frame does not cover, instead of
-     * uninitialised texture memory. */
     if(b->frame_tex) {
+        /* Opaque blit: the frame surface is always fully opaque (alpha=255),
+         * so NONE avoids any GPU blend overhead and prevents the bg fill
+         * underneath from leaking through semi-transparent pixels. */
+        SDL_SetTextureBlendMode(b->frame_tex, SDL_BLENDMODE_NONE);
+        /* Pre-fill with white so uninitialised texture memory never shows. */
         void* px; int pt;
         if(SDL_LockTexture(b->frame_tex, NULL, &px, &pt) == 0) {
             for(int y = 0; y < b->tex_h; y++)
@@ -606,21 +732,41 @@ static void upload_frame(browser_t* b) {
     SDL_Surface* surf = NULL;
     if(b->port.gfx.surface_native)
         surf = (SDL_Surface*)b->port.gfx.surface_native(b->port.gfx.ud, b->frame);
-    if(!surf) return;
+    if(!surf || !surf->pixels) return;
 
-    void* pixels;
-    int pitch;
-    if(SDL_LockTexture(b->frame_tex, NULL, &pixels, &pitch) < 0) return;
+    /* Sample edge colors from the frame for seamless gap filling during
+     * scroll-shift.  Top-left pixel represents the header/nav background;
+     * bottom-left pixel represents the body/footer background.  ARGB8888
+     * native byte order == 0xAARRGGBB. */
+    {
+        const uint32_t* px = (const uint32_t*)surf->pixels;
+        int pitch_px = surf->pitch / 4;
+        b->content_bg_top = px[0] | 0xFF000000u;
+        b->content_bg_bot = px[(size_t)(surf->h - 1) * pitch_px] | 0xFF000000u;
+    }
 
-    /* Copy row by row (src pitch may differ from dst pitch). */
-    uint8_t* dst = (uint8_t*)pixels;
-    uint8_t* src = (uint8_t*)surf->pixels;
-    int copy_pitch = surf->pitch < pitch ? surf->pitch : pitch;
-    int rows = surf->h < b->tex_h ? surf->h : b->tex_h;
-    for(int y = 0; y < rows; y++)
-        memcpy(dst + y * pitch, src + y * surf->pitch, (size_t)copy_pitch);
-
-    SDL_UnlockTexture(b->frame_tex);
+    /* SDL_UpdateTexture copies the pixel data without requiring an exclusive
+     * lock on the GPU resource, avoiding the pipeline stall that
+     * SDL_LockTexture can cause when the texture was used in the previous
+     * frame's RenderCopy (the driver must serialise GPU→CPU access). */
+    SDL_Rect full = { 0, 0, surf->w, surf->h };
+    if(surf->w == b->tex_w && surf->h == b->tex_h) {
+        SDL_UpdateTexture(b->frame_tex, NULL, surf->pixels, surf->pitch);
+    } else {
+        /* Size mismatch (transient after resize): copy row by row into the
+         * locked texture, clipped to the smaller of the two dimensions. */
+        void* pixels;
+        int pitch;
+        if(SDL_LockTexture(b->frame_tex, NULL, &pixels, &pitch) < 0) return;
+        uint8_t* dst = (uint8_t*)pixels;
+        uint8_t* src = (uint8_t*)surf->pixels;
+        int copy_pitch = surf->pitch < pitch ? surf->pitch : pitch;
+        int rows = surf->h < b->tex_h ? surf->h : b->tex_h;
+        for(int y = 0; y < rows; y++)
+            memcpy(dst + y * pitch, src + y * surf->pitch, (size_t)copy_pitch);
+        SDL_UnlockTexture(b->frame_tex);
+    }
+    (void)full;
     b->content_dirty = false;
 
     /* The new frame's pixels are now in the texture; the parked previous
@@ -778,11 +924,57 @@ static void draw_statusbar(SDL_Renderer* r, TTF_Font* font, browser_t* b) {
 static void browser_render(browser_t* b) {
     SDL_Renderer* r = b->renderer;
 
-    /* clear */
-    SDL_SetRenderDrawColor(r, 0xFF, 0xFF, 0xFF, 0xFF);
-    SDL_RenderClear(r);
+    /* --- content area --- */
+    SDL_Rect cr = content_rect(b);
+    if(b->content_dirty)
+        upload_frame(b);
 
-    /* toolbar background */
+    if(b->frame_tex) {
+        /* The frame surface carries EWEB_FRAME_OVERSCAN extra rows above and
+         * below the viewport.  Position the texture so the viewport content
+         * (starting at row overscan_px) aligns with cr.y, then apply the
+         * scroll-shift.  The overscan rows absorb shifts up to ±overscan_px
+         * without exposing any gap — no white flash during scroll. */
+        int overscan_px = (int)lroundf((float)EWEB_FRAME_OVERSCAN * b->ui_scale);
+        int shift_x = (int)lroundf((float)(b->frame_sx - b->scroll_x) * b->ui_scale);
+        int shift_y = (int)lroundf((float)(b->frame_sy - b->scroll_y) * b->ui_scale);
+
+        /* Clamp the shift to the overscan budget. scroll_y is advanced
+         * immediately by every wheel/pagedown event, but frame_sy only moves
+         * once the engine finishes re-rasterising at the new offset - a full
+         * viewport redraw, tens of ms on a heavy page (rokid). While a frame is
+         * in flight scroll_y can run further ahead of frame_sy than the overscan
+         * rows absorb; an unclamped shift then pushes the texture off one edge
+         * of the content rect and exposes a gap. That gap used to be filled with
+         * a flat sampled edge colour, so fast scrolling alternated real content
+         * <-> flat band EVERY frame - the "severe flicker". Clamping keeps the
+         * texture covering the whole content rect at all times (the overscan
+         * invariant the blit was designed for), so the viewport instead shows
+         * the frame's own overscan edge - stale content dragged by at most
+         * overscan_px - until the next frame lands. No flat-colour flash. */
+        if(shift_x < -overscan_px) shift_x = -overscan_px;
+        else if(shift_x > overscan_px) shift_x = overscan_px;
+        if(shift_y < -overscan_px) shift_y = -overscan_px;
+        else if(shift_y > overscan_px) shift_y = overscan_px;
+
+        int dx = cr.x + shift_x;
+        int dy = cr.y - overscan_px + shift_y;
+
+        SDL_RenderSetClipRect(r, &cr);
+        SDL_Rect dr = { dx, dy, b->tex_w, b->tex_h };
+        SDL_RenderCopy(r, b->frame_tex, NULL, &dr);
+        SDL_RenderSetClipRect(r, NULL);
+    } else {
+        /* No frame yet (initial load): fill with bg so the window is not
+         * uninitialised GPU memory. */
+        SDL_SetRenderDrawColor(r,
+            (b->content_bg_top >> 16) & 0xFF,
+            (b->content_bg_top >>  8) & 0xFF,
+            (b->content_bg_top      ) & 0xFF, 0xFF);
+        SDL_RenderFillRect(r, &cr);
+    }
+
+    /* --- toolbar (opaque, covers its full area) --- */
     draw_rect(r, 0, 0, b->win_w, b->toolbar_h, C_TOOLBAR_BG);
     SDL_SetRenderDrawColor(r, (C_TOOLBAR_BOT>>16)&0xFF, (C_TOOLBAR_BOT>>8)&0xFF,
                            C_TOOLBAR_BOT&0xFF, 0xFF);
@@ -796,27 +988,7 @@ static void browser_render(browser_t* b) {
     /* address bar */
     draw_edit(r, b->ui_font, &b->address);
 
-    /* content area */
-    SDL_Rect cr = content_rect(b);
-    if(b->content_dirty)
-        upload_frame(b);
-
-    if(b->frame_tex) {
-        /* Blit shifted by (frameScroll - liveScroll) so already-rendered
-         * content tracks a fast wheel/drag before the refill frame lands. */
-        /* Scroll offsets are LOGICAL CSS px; the blit runs in device px. */
-        int dx = cr.x + (int)lroundf((float)(b->frame_sx - b->scroll_x) * b->ui_scale);
-        int dy = cr.y + (int)lroundf((float)(b->frame_sy - b->scroll_y) * b->ui_scale);
-
-        SDL_RenderSetClipRect(r, &cr);
-        SDL_Rect dr = { dx, dy, b->tex_w, b->tex_h };
-        SDL_RenderCopy(r, b->frame_tex, NULL, &dr);
-        SDL_RenderSetClipRect(r, NULL);
-    } else {
-        draw_rect(r, cr.x, cr.y, cr.w, cr.h, C_CONTENT_BG);
-    }
-
-    /* status bar */
+    /* --- status bar (opaque, covers its full area) --- */
     draw_statusbar(r, b->ui_font, b);
 
     SDL_RenderPresent(r);
@@ -1297,7 +1469,10 @@ static void browser_set_size(browser_t* b, int fb_w, int fb_h) {
     b->view_w = vw;
     b->view_h = vh;
     b->tex_w = (int)lroundf((float)vw * b->ui_scale);
-    b->tex_h = (int)lroundf((float)vh * b->ui_scale);
+    /* The engine renders each frame with EWEB_FRAME_OVERSCAN extra rows above
+     * and below the viewport so scroll-shift blits never expose a gap.  The
+     * texture must match the full surface height. */
+    b->tex_h = (int)lroundf((float)(vh + 2 * EWEB_FRAME_OVERSCAN) * b->ui_scale);
     if(b->view) {
         if(b->pool_flush) {
             /* dpr changed (window moved between displays): pooled frames still
@@ -1498,6 +1673,8 @@ static bool browser_init(browser_t* b, int argc, char** argv) {
     b->running = true;
     /* The page owns the keyboard until the user focuses the address bar. */
     b->content_focus = true;
+    b->content_bg_top = 0xFFFFFFFFu;   /* default white until first frame sampled */
+    b->content_bg_bot = 0xFFFFFFFFu;
 
     if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) < 0) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
@@ -1651,7 +1828,21 @@ static bool browser_init(browser_t* b, int argc, char** argv) {
     /* --shot <out.bmp> [settle_ms] */
     b->shot_path = NULL;
     b->shot_settle_ms = 8000;
+    /* interactive timeline dump (see browser_t comment); 0 = disabled */
+    b->shot_every_ms = 0;
+    b->shot_every_last = 0;
+    b->shot_every_start = 0;
+    b->shot_dir = getenv("EWEB_SHOT_DIR");
+    if(!b->shot_dir || !b->shot_dir[0]) b->shot_dir = "/tmp/m15_frames";
+    { const char* ev = getenv("EWEB_SHOT_EVERY_MS");
+      if(ev && atoi(ev) > 0) b->shot_every_ms = (uint32_t)atoi(ev); }
     b->shot_start_ms = 0;
+    b->shot_idle_since = 0;
+    b->shot_idle_ms = 3000;
+    {
+        const char* ims = getenv("EWEB_SHOT_IDLE_MS");
+        if(ims && atoi(ims) >= 0) b->shot_idle_ms = (uint32_t)atoi(ims);
+    }
     for(int i = 1; i < argc; i++) {
         if(strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
             b->shot_path = argv[i + 1];
@@ -1717,6 +1908,35 @@ static void browser_destroy(browser_t* b) {
 /* Main loop                                                           */
 /* ------------------------------------------------------------------ */
 
+/* Save the currently presented frame (cropped to the viewport, same as the
+ * --shot capture) to `path`. Shared by the one-shot --shot path and the
+ * EWEB_SHOT_EVERY_MS interactive timeline dump. */
+static void browser_save_frame_bmp(browser_t* b, const char* path) {
+    if(!b->frame || !b->port.gfx.surface_native) return;
+    SDL_Surface* surf = (SDL_Surface*)b->port.gfx.surface_native(b->port.gfx.ud, b->frame);
+    if(!surf) return;
+    /* The frame surface carries EWEB_FRAME_OVERSCAN extra rows above and
+     * below the viewport. Crop to the viewport portion so the saved BMP
+     * matches the logical page size (regression baselines, CI diffs). */
+    int os_px = (int)lroundf((float)EWEB_FRAME_OVERSCAN * b->ui_scale);
+    int vp_h  = (int)lroundf((float)b->view_h * b->ui_scale);
+    if(vp_h < 1) vp_h = surf->h;
+    if(os_px < 0) os_px = 0;
+    if(os_px + vp_h > surf->h) vp_h = surf->h - os_px;
+    if(vp_h > 0 && os_px >= 0) {
+        SDL_Rect crop = { 0, os_px, surf->w, vp_h };
+        SDL_Surface* view = SDL_CreateRGBSurfaceWithFormat(
+            0, crop.w, crop.h, 32, SDL_PIXELFORMAT_ARGB8888);
+        if(view) {
+            SDL_BlitSurface(surf, &crop, view, NULL);
+            SDL_SaveBMP(view, path);
+            SDL_FreeSurface(view);
+            return;
+        }
+    }
+    SDL_SaveBMP(surf, path);
+}
+
 int main(int argc, char** argv) {
     browser_t browser;
     browser_install_crash_handler();
@@ -1743,6 +1963,24 @@ int main(int argc, char** argv) {
 
         /* render */
         browser_render(b);
+
+        /* interactive timeline dump: record what the window presents at a
+         * fixed cadence (no settle gate, no exit) so a continuous-redraw
+         * session can be reviewed offline frame by frame. */
+        if(b->shot_every_ms && b->frame) {
+            uint32_t te = SDL_GetTicks();
+            if(b->shot_every_last == 0) {
+                b->shot_every_last  = te;
+                b->shot_every_start = te;
+            }
+            if(te - b->shot_every_last >= b->shot_every_ms) {
+                char fpath[512];
+                snprintf(fpath, sizeof(fpath), "%s/f%06u.bmp",
+                         b->shot_dir, te - b->shot_every_start);
+                browser_save_frame_bmp(b, fpath);
+                b->shot_every_last = te;
+            }
+        }
 
         /* headless screenshot: once the page has settled, save one frame and exit */
         if(b->shot_path) {
@@ -1780,20 +2018,31 @@ int main(int argc, char** argv) {
                  * underline pseudo-element missing) or no frame at all on a
                  * slow load. The cap bounds the wait for pages that never
                  * report idle (persistent polling, stuck fetch). */
-                bool settled = (b->frame != NULL) && ewebview_is_idle(b->view);
+                bool idle_now = (b->frame != NULL) && ewebview_is_idle(b->view);
+                if(idle_now) {
+                    if(b->shot_idle_since == 0) b->shot_idle_since = now;
+                } else {
+                    b->shot_idle_since = 0;
+                }
+                bool settled = idle_now &&
+                               (now - b->shot_idle_since) >= b->shot_idle_ms;
                 bool capped  = (now - b->shot_start_ms) >= b->shot_settle_ms + 90000;
                 if(!settled && !capped) {
                     /* keep pumping until the engine settles */
                 } else if(b->shot_scroll_y >= 0 && !b->shot_scrolled) {
                     ewebview_scroll(b->view, 0, b->shot_scroll_y);
                     b->shot_scrolled = true;
+                    b->shot_idle_since = 0;
                     b->shot_start_ms = SDL_GetTicks();
-                    b->shot_settle_ms = 3000;   /* let the new offset render a frame */
+                    /* let the new offset render a frame; EWEB_POSTSCROLL_MS
+                     * extends this so late-mounting lazy regions (and the
+                     * chunked restyle that follows them) settle before the
+                     * capture instead of being shot mid-restyle. */
+                    b->shot_settle_ms = 3000;
+                    const char* ps = getenv("EWEB_POSTSCROLL_MS");
+                    if(ps && atoi(ps) > 0) b->shot_settle_ms = (uint32_t)atoi(ps);
                 } else {
-                    SDL_Surface* surf = NULL;
-                    if(b->frame && b->port.gfx.surface_native)
-                        surf = (SDL_Surface*)b->port.gfx.surface_native(b->port.gfx.ud, b->frame);
-                    if(surf) SDL_SaveBMP(surf, b->shot_path);
+                    browser_save_frame_bmp(b, b->shot_path);
                     b->running = false;
                 }
             }

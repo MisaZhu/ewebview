@@ -160,6 +160,13 @@ typedef struct js_dom_callbacks {
     int (*query_all)(void* ctx, js_element_t root, const char* selector,
                      int skip, js_element_t* out, int max);
 
+    /* el.matches(selector): single-element selector test. OPTIONAL: NULL makes
+     * the bridge answer matches() through query_all (one paged subtree query
+     * per call) - correct for every selector, but each call costs a full
+     * subtree scan, which pages that poll matches() in hot loops (React's
+     * delegated-event dispatch) turn into the DOM bridge's top cost. */
+    bool (*el_matches)(void* ctx, js_element_t el, const char* selector);
+
     /* document.createElement(tag) / createTextNode(text). The returned node
      * is detached: it becomes part of the document only once appended. Both
      * may return NULL when the embedder cannot build the node. */
@@ -199,6 +206,25 @@ typedef struct js_dom_callbacks {
      * renders in), backing getBoundingClientRect() and the offset/client
      * size properties. Any of the out pointers may be NULL. */
     void  (*el_get_rect)(void* ctx, js_element_t el, int* x, int* y, int* w, int* h);
+    /* Rewrite a document-coordinate border box (as el_get_rect reports) into
+     * its CSS-transformed axis-aligned bounds: getBoundingClientRect and
+     * IntersectionObserver semantics. The offset* properties deliberately keep
+     * the untransformed layout box. OPTIONAL: without it rects ignore
+     * transforms. */
+    void  (*el_transform_rect)(void* ctx, js_element_t el, int* x, int* y, int* w, int* h);
+    /* Document-coordinate border-box origin of `el`'s offsetParent (nearest
+     * positioned ancestor, else body); 0,0 when the offsetParent is null so
+     * offsetLeft/Top stay document-relative (fixed elements). Lets the offset*
+     * properties report offsets relative to the offsetParent per CSSOM.
+     * OPTIONAL: without it offsetLeft/Top are document coordinates. */
+    void  (*el_offset_parent_origin)(void* ctx, js_element_t el, int* x, int* y);
+    /* Current page scroll offset and viewport size in CSS px. getBoundingClientRect()
+     * and IntersectionObserver rects are viewport-relative, so the bridge shifts
+     * document-coordinate boxes by the scroll offset; clientWidth/Height of the
+     * scrolling element report the viewport, not the document box. OPTIONAL:
+     * without them rects stay document-relative (only correct at scroll 0). */
+    void  (*get_scroll)(void* ctx, int* x, int* y);
+    void  (*get_viewport)(void* ctx, int* w, int* h);
     /* Resolved (computed) value of a CSS property, mario_malloc'd or NULL. */
     char* (*el_get_style)(void* ctx, js_element_t el, const char* prop);
     void  (*el_focus)(void* ctx, js_element_t el);
@@ -208,6 +234,10 @@ typedef struct js_dom_callbacks {
     /* document.activeElement: the focused element, or <body> when nothing is
      * focused. OPTIONAL: without it activeElement reports <body>. */
     js_element_t (*get_active_element)(void* ctx);
+    /* document.elementFromPoint(x,y): the topmost element under a VIEWPORT
+     * point (client coordinates), or NULL outside the page. OPTIONAL:
+     * without it elementFromPoint() reports null. */
+    js_element_t (*el_from_point)(void* ctx, int x, int y);
     /* Live selection of a text form control (input/textarea) in codepoint
      * offsets. el_get_sel returns false when the element carries no editable
      * selection, so selectionStart/End report 0 and setSelectionRange()/
@@ -226,6 +256,16 @@ typedef struct js_dom_callbacks {
      * the top-level link onto the button it creates. OPTIONAL. */
     char* (*el_attr_snapshot)(void* ctx, js_element_t el);
     void  (*el_scroll_into_view)(void* ctx, js_element_t el);
+    /* Padding box (client box) size in CSS px: the border box minus the
+     * borders, which is what clientWidth/clientHeight report on a
+     * non-scrolling element. OPTIONAL: without it client* falls back to the
+     * border box el_get_rect reports. */
+    void  (*el_get_client_size)(void* ctx, js_element_t el, int* w, int* h);
+    /* Whole-document content size (the scrollable extent) in CSS px: what
+     * scrollWidth/scrollHeight report on the scrolling element (html/body),
+     * as opposed to the viewport box el_get_rect reports for it. OPTIONAL:
+     * without it scroll* on the scrolling element fall back to el_rect. */
+    void  (*get_document_size)(void* ctx, int* w, int* h);
 } js_dom_callbacks_t;
 
 /* Register `document`, `window`, `alert`, the timers and the Element class
@@ -264,6 +304,13 @@ int js_dom_poll_timers(vm_t* vm, uint64_t now_ms);
  * lets an await-spin hook distinguish "idle, more work coming" from "empty". */
 int js_dom_has_pending_timers(vm_t* vm);
 
+/* Non-zero when a ONE-SHOT ~0-ms macrotask (e.g. a queued MessageChannel post -
+ * React's scheduler continuation, stored with remaining_ms 1) is armed to fire
+ * on the next poll. Lets the engine DEFER a repaint while a JS task chain is
+ * still running, instead of paying a full repaint of a large DOM between every
+ * slice. setInterval and long-delayed one-shots do not qualify. */
+int js_dom_has_imminent_timers(vm_t* vm);
+
 /* Drop every cached handle -> Element-wrapper mapping.
  *
  * Element handles are raw pointers into the embedder's document tree, and the
@@ -294,6 +341,16 @@ void js_dom_mark_dom_loaded(vm_t* vm);
  * during their execution (what a real browser shows once parsing ends).
  * Safe when the bridge is not installed. */
 void js_dom_set_parsing_complete(vm_t* vm, bool complete);
+
+/* Mark whether an ASYNC event-loop callback (timer / MessageChannel / promise
+ * reaction / event handler) is running, so document.readyState reports
+ * "interactive" for it - what a real browser shows, since async callbacks only
+ * run after the parser finished. The embedder brackets every
+ * jsVmEnter(appScript=false) run with true and clears it on exit; sync script
+ * bodies keep reporting "loading" (Next.js's inline flight bootstrap defers its
+ * stream-close to DOMContentLoaded on that value). Safe when the bridge is not
+ * installed. */
+void js_dom_set_async_cb(vm_t* vm, bool async);
 
 /* ------------------------------------------------------------------ */
 /* Accessors for sibling bridges (js_event.c, js_web.c, js_canvas.c)   */
@@ -348,6 +405,30 @@ int64_t js_dom_monotonic_ms(void);
  * and `new Date()` use. performance.timeOrigin is derived from this so that
  * timeOrigin + now() lines up with Date.now(). */
 int64_t js_dom_wall_ms(void);
+
+/* Defer customElements.define()'s bulk connectedCallback upgrade until the
+ * embedder drains (js_dom_drain_deferred_upgrades). Used around the post-swap
+ * script queue so a lifecycle callback that awaits a registration performed
+ * by a later document-order script sees it already settled instead of forcing
+ * the synchronous await spin / re-entrant script pump. */
+void js_dom_set_defer_upgrades(vm_t* vm, bool on);
+void js_dom_drain_deferred_upgrades(vm_t* vm);
+
+/* Upgrade registered custom elements whose instances were INSERTED after their
+ * define() already ran its one-shot bulk upgrade (React's post-deferred-data
+ * fill commit appends <relative-time> etc. long after define saw matched=0).
+ * Call from the engine tick after timers/fetch settle; returns non-zero if any
+ * element name was processed so the caller can mark content dirty to repaint.
+ * Idempotent and cheap when nothing was inserted (early-out on an empty set). */
+int js_dom_upgrade_dirty(vm_t* vm);
+
+/* Drop the pending dirty-custom-element set WITHOUT running any upgrade.
+ * Called by the embedder from its SEGV checkpoint recovery path: when
+ * js_dom_upgrade_dirty faulted mid-drain, the dirty list is the faulting
+ * input and re-entering with it would fault forever (observed: a corrupted
+ * ce_dirty entry pinned the engine thread in an endless strcpy fault/recover
+ * loop, timers never polled again). */
+void js_dom_clear_dirty_ce(vm_t* vm);
 
 #ifdef __cplusplus
 }

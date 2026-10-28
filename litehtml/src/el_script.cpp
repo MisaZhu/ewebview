@@ -36,12 +36,34 @@ bool litehtml::el_script::appendChild(const ptr &el)
 	tstring t;
 	el->get_text(t);
 	m_text = t;
+	/* Also keep the text node as a REAL child. The DOM specifies that an inline
+	 * <script> has exactly one text child (script.childNodes.length == 1); React
+	 * hydration walks it and desyncs (#418) when firstChild is null. get_text()
+	 * still serves textContent from m_text alone, so this adds no duplication. */
+	if(el)
+	{
+		m_children.push_back(el);
+	}
 	return true;
 }
 
 void litehtml::el_script::get_text( tstring& text )
 {
 	text += m_text;
+}
+
+size_t litehtml::el_script::get_children_count() const
+{
+	return m_children.size();
+}
+
+litehtml::element::ptr litehtml::el_script::get_child(int idx) const
+{
+	if(idx < 0 || (size_t)idx >= m_children.size())
+	{
+		return nullptr;
+	}
+	return m_children[(size_t)idx];
 }
 
 const litehtml::tchar_t* litehtml::el_script::get_tagName() const

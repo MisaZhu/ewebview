@@ -147,6 +147,17 @@ typedef struct js_web_callbacks {
     bool  (*http_request)(void* ctx, const char* method, const char* url,
                           const char* headers, const char* body,
                           int* status, char** out_body, char** out_headers);
+
+    /* ---- asynchronous HTTP (fetch off-thread) ----
+     * Same signature and semantics as http_request, but MAY be called from a
+     * worker thread (not the VM thread). The implementation MUST be thread-safe.
+     * When non-NULL, native_fetch() spawns a detached pthread that calls this
+     * hook, returning a pending Promise immediately so React hydration sees all
+     * deferred queries as pending (matching a real browser's behaviour).
+     * NULL => fetch falls back to the synchronous http_request path. */
+    bool  (*http_request_worker)(void* ctx, const char* method, const char* url,
+                                 const char* headers, const char* body,
+                                 int* status, char** out_body, char** out_headers);
 } js_web_callbacks_t;
 
 /* Zero a callback struct. Handy for embedders that only fill a few hooks. */
@@ -160,6 +171,11 @@ void js_web_callbacks_init(js_web_callbacks_t* cb);
  * embedder context, its Location class and its window/document globals.
  * Returns false when vm is NULL or the DOM bridge is missing. */
 bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb);
+
+/* Drain completed async-fetch jobs and settle their promises on the VM thread.
+ * Call from the engine loop (bracketed by jsVmEnter/jsVmExit) after timer poll.
+ * Returns the number of promises settled (0 when idle or no async fetch). */
+int js_web_fetch_poll(vm_t* vm);
 
 /* ------------------------------------------------------------------ */
 /* Storage helpers                                                    */

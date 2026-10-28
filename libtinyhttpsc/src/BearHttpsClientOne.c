@@ -20769,6 +20769,11 @@ typedef struct BearHttpsResponse{
     //http2 (ALPN "h2") flag: when true the request/response was driven through
     //bearhttp2.c and raw_content holds a synthesised HTTP/1.1-style header block
     bool h2_negotiated;
+    //SNI host + port the TLS session was established for: used to store the
+    //negotiated session parameters in the resumption cache once the response
+    //is known good (see private_BearHttps_session_cache_store).
+    char tls_hostname[256];
+    int tls_port;
     
 }BearHttpsResponse ;
 
@@ -21256,6 +21261,9 @@ BearHttpsResponse *private_newBearHttpsResponse();
 
 
 void private_BearHttpsResponse_start_bearssl_props(BearHttpsResponse *self, const char *hostname,br_x509_trust_anchor *trust_anchors, size_t trusted_anchors_size) ;
+
+/* TLS session resumption cache (defined next to start_bearssl_props). */
+static void private_BearHttps_session_cache_store(const char *host, int port, const br_ssl_session_parameters *params);
 
 
 void BearHttpsResponse_free(BearHttpsResponse *self);
@@ -95017,6 +95025,15 @@ static int private_BearHttpsResponse_h2_exchange(BearHttpsResponse *self,
 BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
 
     BearHttpsResponse *response = NULL;
+    /* Optional phase timing (EWEB_TLSPHASE_DBG=1): dns+connect / handshake /
+     * request+headers, to tell network latency from BearSSL CPU cost. */
+    int tlsphase_dbg = 0;
+    struct timespec tp_t0, tp_t1, tp_t2, tp_t3;
+    {
+        const char *e = getenv("EWEB_TLSPHASE_DBG");
+        tlsphase_dbg = (e && e[0] && e[0] != '0');
+    }
+    if(tlsphase_dbg) clock_gettime(CLOCK_MONOTONIC, &tp_t0);
 
     int uni_start = Universal_start_all();
     if (uni_start != 0) {
@@ -95037,6 +95054,7 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
             BearHttpsResponse_set_error(response, "invalid url",BEARSSL_HTTPS_INVALID_URL);
             return response;
         }
+        response->tls_port = requisition_props->port;
 
         if(requisition_props->is_ipv4){
                 response->connection_file_descriptor = private_BearHttpsRequest_connect_ipv4(
@@ -95067,11 +95085,25 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
              private_BearHttpsRequisitionProps_free(requisition_props);
              return response;
          }
+         if(tlsphase_dbg) clock_gettime(CLOCK_MONOTONIC, &tp_t1);
 
          if(requisition_props->is_https){
 
            const char *chosen_host = self->custom_bear_dns ? self->custom_bear_dns : requisition_props->hostname;
            private_BearHttpsResponse_start_bearssl_props(response,chosen_host,self->trust_anchors,self->trusted_anchors_size);
+           if(tlsphase_dbg){
+               /* init_full/reset are pure CPU; force the handshake to complete
+                * now so the phase timer measures it (the lazy path would fold
+                * it into the first write's flush below anyway). */
+               clock_gettime(CLOCK_MONOTONIC, &tp_t2);
+               br_sslio_flush(&response->ssl_io);
+               clock_gettime(CLOCK_MONOTONIC, &tp_t3);
+               fprintf(stderr, "[tlsphase] %s setup=%ldms connect=%ldms handshake=%ldms\n",
+                   requisition_props->hostname,
+                   (long)((tp_t2.tv_sec-tp_t1.tv_sec)*1000 + (tp_t2.tv_nsec-tp_t1.tv_nsec)/1000000),
+                   (long)((tp_t1.tv_sec-tp_t0.tv_sec)*1000 + (tp_t1.tv_nsec-tp_t0.tv_nsec)/1000000),
+                   (long)((tp_t3.tv_sec-tp_t2.tv_sec)*1000 + (tp_t3.tv_nsec-tp_t2.tv_nsec)/1000000));
+           }
 
            /* When HTTP/2 is enabled, drive the handshake to completion now so the
             * ALPN selection is known before we choose how to serialise the
@@ -95108,6 +95140,13 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
              }
              if(BearHttpsResponse_error(response)){
                  return response;
+             }
+             /* Response good: cache the negotiated TLS session so the next
+              * request to this host resumes instead of a full handshake. */
+             {
+                 br_ssl_session_parameters sp;
+                 br_ssl_engine_get_session_parameters(&response->ssl_client.eng, &sp);
+                 private_BearHttps_session_cache_store(response->tls_hostname, response->tls_port, &sp);
              }
          }
          else{
@@ -95251,9 +95290,25 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
 
          private_BearHttpsResponse_read_til_end_of_headers_or_reach_limit(response,self->header_chunk_read_size,self->header_chunk_reallocator_factor);
 
+         if(tlsphase_dbg && requisition_props->is_https){
+             struct timespec tp_t4;
+             clock_gettime(CLOCK_MONOTONIC, &tp_t4);
+             fprintf(stderr, "[tlsphase] %s req+headers=%ldms\n",
+                 response->tls_hostname,
+                 (long)((tp_t4.tv_sec-tp_t3.tv_sec)*1000 + (tp_t4.tv_nsec-tp_t3.tv_nsec)/1000000));
+         }
+
          if(BearHttpsResponse_error(response)){
              private_BearHttpsRequisitionProps_free(requisition_props);
              return response;
+         }
+         /* Headers parsed => the handshake succeeded; cache the negotiated TLS
+          * session so the next request to this host resumes (abbreviated
+          * handshake) instead of paying full certificate verification again. */
+         if(requisition_props->is_https){
+             br_ssl_session_parameters sp;
+             br_ssl_engine_get_session_parameters(&response->ssl_client.eng, &sp);
+             private_BearHttps_session_cache_store(response->tls_hostname, response->tls_port, &sp);
          }
          private_BearHttpsRequisitionProps_free(requisition_props);
          }
@@ -95932,6 +95987,70 @@ BearHttpsResponse *private_newBearHttpsResponse(){
 
 
 
+/* ------------------------------------------------------------------
+ * TLS session cache (abbreviated handshake / session resumption).
+ *
+ * Every request builds a brand new BearSSL client context and used to run a
+ * full handshake (2 RTT + server certificate chain verification against the
+ * 143 embedded trust anchors + ECDHE/RSA key exchange). For a page that
+ * pulls ~80 ES modules from one CDN host that dominated wall time (~400ms
+ * per module). BearSSL supports caching the negotiated session parameters
+ * (session id, master secret, cipher suite) and replaying them on the next
+ * connection to the same host:port, which turns the handshake into a single
+ * RTT abbreviated one. The cache below keeps the last session per host:port;
+ * it is best effort -- when the server refuses resumption it silently falls
+ * back to a full handshake. The engine thread is the only user today, but a
+ * mutex guards it so future prefetch threads stay safe.
+ * ------------------------------------------------------------------ */
+#define PRIVATE_BEARSSL_SESSION_CACHE_MAX 16
+typedef struct {
+    char host[256];
+    int port;
+    br_ssl_session_parameters params;
+    int valid;
+} private_BearHttpsSessionCacheEntry;
+static private_BearHttpsSessionCacheEntry private_BearHttps_session_cache[PRIVATE_BEARSSL_SESSION_CACHE_MAX];
+static int private_BearHttps_session_cache_next = 0;
+#if defined(__MACH__) || defined(__linux__) || defined(__unix__)
+#include <pthread.h>
+static pthread_mutex_t private_BearHttps_session_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+#define PRIVATE_SESSION_CACHE_LOCK()   pthread_mutex_lock(&private_BearHttps_session_cache_lock)
+#define PRIVATE_SESSION_CACHE_UNLOCK() pthread_mutex_unlock(&private_BearHttps_session_cache_lock)
+#else
+#define PRIVATE_SESSION_CACHE_LOCK()   ((void)0)
+#define PRIVATE_SESSION_CACHE_UNLOCK() ((void)0)
+#endif
+
+static private_BearHttpsSessionCacheEntry *private_BearHttps_session_cache_find(const char *host, int port){
+    for(int i = 0; i < PRIVATE_BEARSSL_SESSION_CACHE_MAX; i++){
+        private_BearHttpsSessionCacheEntry *e = &private_BearHttps_session_cache[i];
+        if(e->valid && e->port == port && strncmp(e->host, host, sizeof(e->host)) == 0)
+            return e;
+    }
+    return NULL;
+}
+
+static void private_BearHttps_session_cache_store(const char *host, int port, const br_ssl_session_parameters *params){
+    if(host == NULL || host[0] == '\0' || params == NULL) return;
+    if(getenv("EWEB_TLSCACHE_DBG"))
+        fprintf(stderr, "[tlscache] store %s:%d ver=%u sid_len=%u suite=0x%x\n",
+                host, port, params->version, params->session_id_len, params->cipher_suite);
+    if(params->version == 0 || params->session_id_len == 0) return; /* nothing negotiated */
+    PRIVATE_SESSION_CACHE_LOCK();
+    private_BearHttpsSessionCacheEntry *e = private_BearHttps_session_cache_find(host, port);
+    if(e == NULL){
+        e = &private_BearHttps_session_cache[private_BearHttps_session_cache_next];
+        private_BearHttps_session_cache_next =
+            (private_BearHttps_session_cache_next + 1) % PRIVATE_BEARSSL_SESSION_CACHE_MAX;
+        strncpy(e->host, host, sizeof(e->host) - 1);
+        e->host[sizeof(e->host) - 1] = '\0';
+        e->port = port;
+        e->valid = 1;
+    }
+    e->params = *params;
+    PRIVATE_SESSION_CACHE_UNLOCK();
+}
+
 void private_BearHttpsResponse_start_bearssl_props(BearHttpsResponse *self, const char *hostname,br_x509_trust_anchor *trust_anchors, size_t trusted_anchors_size) {
     unsigned char entropy_seed[48];
     uint32_t cert_days = 0;
@@ -95960,7 +96079,24 @@ void private_BearHttpsResponse_start_bearssl_props(BearHttpsResponse *self, cons
         static const char *alpn_names[] = { "h2", "http/1.1" };
         br_ssl_engine_set_protocol_names(&self->ssl_client.eng, alpn_names, 2);
     }
-    br_ssl_client_reset(&self->ssl_client, hostname, 0);
+    /* Offer a cached session for this host so the handshake can be the
+     * abbreviated (1 RTT, no certificate verification) flavour. */
+    int resume = 0;
+    strncpy(self->tls_hostname, hostname != NULL ? hostname : "", sizeof(self->tls_hostname) - 1);
+    self->tls_hostname[sizeof(self->tls_hostname) - 1] = '\0';
+    if(hostname != NULL){
+        PRIVATE_SESSION_CACHE_LOCK();
+        private_BearHttpsSessionCacheEntry *ce =
+            private_BearHttps_session_cache_find(hostname, self->tls_port);
+        if(ce != NULL){
+            br_ssl_engine_set_session_parameters(&self->ssl_client.eng, &ce->params);
+            resume = 1;
+            if(getenv("EWEB_TLSCACHE_DBG"))
+                fprintf(stderr, "[tlscache] resume offered for %s:%d\n", hostname, self->tls_port);
+        }
+        PRIVATE_SESSION_CACHE_UNLOCK();
+    }
+    br_ssl_client_reset(&self->ssl_client, hostname, resume);
     br_sslio_init(&self->ssl_io, &self->ssl_client.eng, private_BearHttps_sock_read,
                   &self->connection_file_descriptor,
                   private_BearHttps_sock_write,

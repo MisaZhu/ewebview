@@ -1,4 +1,5 @@
 #pragma once
+#include <set>
 #include "style.h"
 #include "css_selector.h"
 
@@ -72,6 +73,10 @@ namespace litehtml
 	private:
 		css_selector::vector	m_selectors;
 		bool					m_has_before_after;
+		/* Every attribute name any parsed selector tests ([data-x=...],
+		 * [aria-...]); the DOM bridge consults it to decide whether an
+		 * attribute mutation must re-run the cascade. */
+		std::set<tstring>		m_attr_names;
 		mutable selector_index	m_index;
 	public:
 		css()
@@ -94,7 +99,13 @@ namespace litehtml
 		{
 			m_selectors.clear();
 			m_has_before_after = false;
+			m_attr_names.clear();
 			m_index.built = false;
+		}
+
+		bool	uses_attribute(const tstring& name) const
+		{
+			return m_attr_names.find(name) != m_attr_names.end();
 		}
 
 		void	parse_stylesheet(const tchar_t* str, const tchar_t* baseurl, document* doc, const media_query_list::ptr& media);
@@ -123,6 +134,15 @@ namespace litehtml
 	{
 		selector->m_order = (int) m_selectors.size();
 		m_index.built = false;
+		/* Record every attribute the selector chain tests, ancestors included:
+		 * mutating such an attribute on an ancestor must restyle the subtree. */
+		for(css_selector::ptr s = selector; s; s = s->m_left)
+		{
+			for(css_attribute_selector::vector::const_iterator at = s->m_right.m_attrs.begin(); at != s->m_right.m_attrs.end(); ++at)
+			{
+				m_attr_names.insert(at->attribute);
+			}
+		}
 		if(!m_has_before_after)
 		{
 			for(css_attribute_selector::vector::const_iterator it = selector->m_right.m_attrs.begin(); it != selector->m_right.m_attrs.end(); ++it)

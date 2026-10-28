@@ -15,7 +15,7 @@ namespace litehtml
 	private:
 		void	add_text(const tstring& txt);
 		void	add_function(const tstring& fnc, const tstring& params);
-		tchar_t convert_escape(const tchar_t* txt);
+		tstring convert_escape(const tchar_t* txt);
 		/* a pseudo-element whose computed content stays none/normal (or
 		 * absent) generates no box at all, per CSS; without this the
 		 * universal `*, *::before, *::after` reset inserts phantom

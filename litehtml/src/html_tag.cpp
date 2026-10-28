@@ -2,18 +2,109 @@
 #include "html_tag.h"
 #include "document.h"
 #include "el_text.h"
+#include "el_space.h"
 #include "iterators.h"
 #include "stylesheet.h"
 #include "table.h"
 #include <algorithm>
+#include <unordered_map>
 #include <locale>
 #include <new>
 #include <stdint.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
 #include "el_before_after.h"
+
+/* Positioned-descent statistics (EWEB_POSPRUNE_STATS=1): counts, per
+ * process, how many positioned-phase descents were taken vs pruned at the
+ * draw_children_box gate. Reported at exit for OFF/ON comparisons. Note
+ * the two counters are NOT expected to satisfy taken_off == taken_on +
+ * pruned_on: each prune at a subtree root eliminates the entire recursive
+ * descent that OFF would have performed inside that subtree, so one
+ * 'pruned' typically stands for thousands of avoided 'taken' (measured
+ * 2026-10-21 on a 2500-row page: OFF 28.0M taken vs ON 1650 taken +
+ * 1650 pruned over the same ~160 frames). */
+static uint64_t g_posd_taken = 0, g_posd_pruned = 0;
+static void posd_stats_report(void)
+{
+	fprintf(stderr, "[posd] taken=%llu pruned=%llu\n",
+		(unsigned long long)g_posd_taken, (unsigned long long)g_posd_pruned);
+}
+static int posd_stats_enabled(void)
+{
+	static int s = -1;
+	if (s < 0)
+	{
+		s = (getenv("EWEB_POSPRUNE_STATS") != NULL) ? 1 : 0;
+		if (s) atexit(posd_stats_report);
+	}
+	return s;
+}
+
+/* Floats-phase prune statistics (EWEB_FLOATPRUNE_STATS=1): per-frame
+ * counts of draw_floats descents taken vs pruned via m_has_floater. */
+static uint64_t g_floatprune_taken = 0, g_floatprune_pruned = 0;
+static void floatprune_stats_report(void)
+{
+	fprintf(stderr, "[floatprune] taken=%llu pruned=%llu\n",
+		(unsigned long long)g_floatprune_taken, (unsigned long long)g_floatprune_pruned);
+}
+static int floatprune_stats_enabled(void)
+{
+	static int s = -1;
+	if (s < 0)
+	{
+		s = (getenv("EWEB_FLOATPRUNE_STATS") != NULL) ? 1 : 0;
+		if (s) atexit(floatprune_stats_report);
+	}
+	return s;
+}
+
+/* Z-level scan statistics (EWEB_ZSCAN_STATS=1): counts, per process, the
+ * draw_stacking_context calls that walked positioned participants and the
+ * total participant count - i.e. the std::map insertions (one allocation
+ * each) the sorted-scan path avoids per frame. */
+static uint64_t g_zscan_calls = 0, g_zscan_items = 0;
+static void zscan_stats_report(void)
+{
+	fprintf(stderr, "[zscan] calls=%llu items=%llu\n",
+		(unsigned long long)g_zscan_calls, (unsigned long long)g_zscan_items);
+}
+static int zscan_stats_enabled(void)
+{
+	static int s = -1;
+	if (s < 0)
+	{
+		s = (getenv("EWEB_ZSCAN_STATS") != NULL) ? 1 : 0;
+		if (s) atexit(zscan_stats_report);
+	}
+	return s;
+}
+
+/* Custom-property share statistics (EWEB_CPSTATS=1): counts, per process,
+ * how many resolve_custom_properties calls took the share path (zero map
+ * copies) vs the merge path (copy inherited map, then apply own --*), and
+ * how many entries the merge path copied in total. */
+static uint64_t g_cpshare_shared = 0, g_cpshare_merged = 0, g_cpshare_entries = 0;
+static void cpshare_stats_report(void)
+{
+	fprintf(stderr, "[cpshare] shared=%llu merged=%llu merged_entries=%llu\n",
+		(unsigned long long)g_cpshare_shared, (unsigned long long)g_cpshare_merged,
+		(unsigned long long)g_cpshare_entries);
+}
+static int cpshare_stats_enabled(void)
+{
+	static int s = -1;
+	if (s < 0)
+	{
+		s = (getenv("EWEB_CPSTATS") != NULL) ? 1 : 0;
+		if (s) atexit(cpshare_stats_report);
+	}
+	return s;
+}
 
 /* Opacity support ---------------------------------------------------------
  * litehtml historically ignored CSS 'opacity' entirely, so Material-style
@@ -58,6 +149,7 @@ size_t litehtml_lifetime_count();
 #endif
 
 namespace litehtml {
+bool style_prof_enabled();
 void profile_apply_stylesheet(uint32_t selector_count, uint64_t start_ms);
 void profile_select(uint64_t start_ms);
 void profile_select_element(uint64_t start_ms);
@@ -223,6 +315,36 @@ static uint32_t g_apply_cand_ms = 0;
 static uint32_t g_apply_match_ms = 0;
 static uint32_t g_apply_add_ms = 0;
 static uint32_t g_apply_recur_ms = 0;
+/* Grand totals accumulated across chunk epochs (the per-epoch counters above
+ * are wiped by dump_apply_phase_profile at every chunked-update boundary). */
+static uint32_t g_applyT_calls = 0;
+static uint32_t g_applyT_cand_ms = 0;
+static uint32_t g_applyT_match_ms = 0;
+static uint32_t g_applyT_add_ms = 0;
+static uint32_t g_applyT_recur_ms = 0;
+static uint32_t g_applyT_fast = 0;
+static uint32_t g_pf_total = 0;
+static uint32_t g_pf_rej_tag = 0;
+static uint32_t g_pf_rej_class = 0;
+static uint32_t g_pf_rej_id = 0;
+
+static void apply_profile_atexit()
+{
+	if(!litehtml::style_prof_enabled()) return;
+	/* Fold in whatever the per-epoch counters still hold (work done after
+	 * the last chunked-update boundary, e.g. non-stepped restyles). */
+	g_applyT_calls += g_apply_calls;
+	g_applyT_cand_ms += g_apply_cand_ms;
+	g_applyT_match_ms += g_apply_match_ms;
+	g_applyT_add_ms += g_apply_add_ms;
+	g_applyT_recur_ms += g_apply_recur_ms;
+	fprintf(stderr, "[applyprof] calls=%u cand_ms=%u match_ms=%u add_ms=%u recur_ms=%u | fast=%u | pf n=%u rej_tag=%u rej_class=%u rej_id=%u\n",
+		g_applyT_calls, g_applyT_cand_ms, g_applyT_match_ms, g_applyT_add_ms, g_applyT_recur_ms, g_applyT_fast, g_pf_total, g_pf_rej_tag, g_pf_rej_class, g_pf_rej_id);
+}
+static struct apply_profile_atexit_arm_t
+{
+	apply_profile_atexit_arm_t() { atexit(apply_profile_atexit); }
+} s_apply_profile_atexit_arm;
 
 static inline bool parse_style_profile_enabled()
 {
@@ -240,15 +362,15 @@ static inline void parse_style_profile_add(uint32_t& slot, uint64_t start_ms)
 struct select_scope_t
 {
 	uint64_t start_ms;
-	select_scope_t(): start_ms(sys_tic_ms(0)) {}
-	~select_scope_t() { litehtml::profile_select(start_ms); }
+	select_scope_t(): start_ms(litehtml::style_prof_fast() ? sys_tic_ms(0) : 0) {}
+	~select_scope_t() { if(start_ms) litehtml::profile_select(start_ms); }
 };
 
 struct select_element_scope_t
 {
 	uint64_t start_ms;
-	select_element_scope_t(): start_ms(sys_tic_ms(0)) {}
-	~select_element_scope_t() { litehtml::profile_select_element(start_ms); }
+	select_element_scope_t(): start_ms(litehtml::style_prof_fast() ? sys_tic_ms(0) : 0) {}
+	~select_element_scope_t() { if(start_ms) litehtml::profile_select_element(start_ms); }
 };
 
 }
@@ -282,6 +404,7 @@ litehtml::html_tag::html_tag(litehtml::document* doc) : litehtml::element(doc)
 	m_z_index_auto			= true;
 	m_isolate				= false;
 	m_has_css_clip			= false;
+	m_has_css_clip_path		= false;
 	m_overflow				= overflow_visible;
 	m_box					= 0;
 	m_text_align			= text_align_left;
@@ -301,6 +424,10 @@ litehtml::html_tag::html_tag(litehtml::document* doc) : litehtml::element(doc)
 	m_lh_predefined			= false;
 	m_lh_factor				= 0.0f;
 	m_line_height			= 0;
+	m_letter_spacing		= 0;
+	m_column_count			= 0;
+	m_column_width			= 0;
+	m_column_gap			= 0;
 	m_visibility			= visibility_visible;
 	m_opacity				= 1.0f;
 	m_opacity_cum			= 1.0f;
@@ -342,10 +469,18 @@ litehtml::html_tag::~html_tag()
 
 /* A script-inserted text node (document.createTextNode, textContent, the
  * string form of append()) is one unbreakable run: the line packer only
- * breaks between nodes, so a Chinese sentence would never wrap. Split it
- * into kinsoku-aware per-character chunks (split_cjk_text); the inserted
- * node keeps the first chunk so caller handles stay valid, the rest go in
- * as siblings at the same position. Non-text nodes pass through. */
+ * breaks BETWEEN nodes, so neither a Chinese sentence (no spaces) nor an
+ * ordinary space-separated sentence would ever wrap. Pinterest's hero <h1>
+ * "Create the life you love on Pinterest" reached here through React's
+ * createTextNode/appendChild as a SINGLE el_text, laid out 830px wide on one
+ * line and clipped by its 473px column. Segment the run exactly like the
+ * gumbo parser does for HTML character data (document::create_node GUMBO_NODE_
+ * TEXT): ASCII whitespace becomes el_space siblings and each word an el_text,
+ * with words further broken into kinsoku-aware per-character chunks by
+ * split_cjk_text. The inserted node keeps the FIRST segment so caller handles
+ * stay valid as the run leader (jsElGetText coalesces the whole run back into
+ * one value for React hydration); the rest go in as siblings at the same
+ * position. Non-text and already-white-space nodes pass through unchanged. */
 static void cjk_split_insert(litehtml::document* doc, const litehtml::element::ptr& el,
                              std::vector<litehtml::element::ptr>& nodes)
 {
@@ -361,24 +496,90 @@ static void cjk_split_insert(litehtml::document* doc, const litehtml::element::p
 	}
 	litehtml::tstring txt;
 	el->get_text(txt);
-	std::vector<litehtml::tstring> chunks;
-	litehtml::split_cjk_text(txt, chunks);
-	if(chunks.size() <= 1)
+
+	/* Segment the run into (chunk, is_space) pairs: whitespace accumulates into
+	 * a space segment, everything else into a word that split_cjk_text then
+	 * breaks per character for CJK. Mirrors the GUMBO_NODE_TEXT loop so a
+	 * script-inserted run wraps identically to the same text in the HTML source. */
+	std::vector<litehtml::tstring> seg_text;
+	std::vector<char> seg_space;
+	litehtml::tstring word;
+	litehtml::tstring space;
+	auto flush_word = [&]()
+	{
+		if(word.empty()) return;
+		std::vector<litehtml::tstring> chunks;
+		litehtml::split_cjk_text(word, chunks);
+		for(size_t k = 0; k < chunks.size(); k++)
+		{
+			seg_text.push_back(chunks[k]);
+			seg_space.push_back(0);
+		}
+		word.clear();
+	};
+	auto flush_space = [&]()
+	{
+		if(space.empty()) return;
+		seg_text.push_back(space);
+		seg_space.push_back(1);
+		space.clear();
+	};
+	for(size_t i = 0; i < txt.size(); i++)
+	{
+		litehtml::tchar_t c = txt[i];
+		if(c == _t(' ') || c == _t('\t') || c == _t('\r') || c == _t('\f'))
+		{
+			flush_word();
+			space += c;
+		}
+		else if(c == _t('\n'))
+		{
+			flush_word();
+			flush_space();
+			space += c;
+			flush_space();
+		}
+		else
+		{
+			flush_space();
+			word += c;
+		}
+	}
+	flush_word();
+	flush_space();
+
+	if(seg_text.size() <= 1)
 	{
 		nodes.push_back(el);
 		return;
 	}
-	static_cast<litehtml::el_text*>(el)->set_text(chunks[0]);
+	/* The first segment stays in `el` so the caller's handle remains the run
+	 * leader; the rest become siblings (el_space for whitespace so it collapses
+	 * and allows a break, el_text for words). */
+	static_cast<litehtml::el_text*>(el)->set_text(seg_text[0]);
 	nodes.push_back(el);
-	for(size_t i = 1; i < chunks.size(); i++)
+	for(size_t i = 1; i < seg_text.size(); i++)
 	{
-		void* mem = malloc(sizeof(litehtml::el_text));
-		if(!mem)
+		if(seg_space[i])
 		{
-			break;
+			void* mem = malloc(sizeof(litehtml::el_space));
+			if(!mem)
+			{
+				break;
+			}
+			litehtml::element::ptr t = new (mem) litehtml::el_space(seg_text[i].c_str(), doc);
+			nodes.push_back(t);
 		}
-		litehtml::element::ptr t = new (mem) litehtml::el_text(chunks[i].c_str(), doc);
-		nodes.push_back(t);
+		else
+		{
+			void* mem = malloc(sizeof(litehtml::el_text));
+			if(!mem)
+			{
+				break;
+			}
+			litehtml::element::ptr t = new (mem) litehtml::el_text(seg_text[i].c_str(), doc);
+			nodes.push_back(t);
+		}
 	}
 }
 
@@ -735,6 +936,11 @@ size_t litehtml_lifetime_count()
  * document::update_master_styles_step when a chunked update completes. */
 void litehtml::dump_apply_phase_profile()
 {
+	g_applyT_calls += g_apply_calls;
+	g_applyT_cand_ms += g_apply_cand_ms;
+	g_applyT_match_ms += g_apply_match_ms;
+	g_applyT_add_ms += g_apply_add_ms;
+	g_applyT_recur_ms += g_apply_recur_ms;
 	g_apply_calls = 0;
 	g_apply_cand_ms = 0;
 	g_apply_match_ms = 0;
@@ -832,6 +1038,66 @@ static litehtml::tstring selector_pseudo_element_val( const litehtml::css_select
 	return litehtml::tstring();
 }
 
+/* TEMP DIAGNOSTIC (EWEB_CARDDBG): reconstruct a matched selector's right-side
+ * signature (tag + #id + .classes) and dump every display/flex/width/overflow
+ * declaration a carousel-class element matches, with specificity+order. This
+ * reveals which rule wins the "More winning ideas" <ul> display and whether
+ * display:flex was ever a candidate (the carousel stacks vertically instead of
+ * laying out its items horizontally). Pure diagnostic, env-gated. */
+static int eweb_cardbg_enabled()
+{
+	static int s = -1;
+	if(s < 0) s = (getenv("EWEB_CARDDBG") != nullptr) ? 1 : 0;
+	return s;
+}
+static void eweb_sel_right_sig(const litehtml::css_selector::ptr& sel, litehtml::tstring& out)
+{
+	const litehtml::css_element_selector& r = sel->m_right;
+	if(!r.m_tag.empty()) { out += r.m_tag; }
+	for(size_t i = 0; i < r.m_attrs.size(); i++)
+	{
+		const litehtml::css_attribute_selector& a = r.m_attrs[i];
+		if(a.attribute == _t("class"))
+		{
+			for(size_t k = 0; k < a.class_val.size(); k++) { out += _t("."); out += a.class_val[k]; }
+		}
+		else if(a.attribute == _t("id")) { out += _t("#"); out += a.val; }
+	}
+}
+static void eweb_cardbg_dump(litehtml::html_tag* el, const litehtml::css_selector::ptr& sel, int order)
+{
+	const litehtml::tchar_t* cls = el->get_attr(_t("class"));
+	if(cls == nullptr || t_strstr(cls, _t("carousel")) == nullptr) return;
+	if(sel->m_style == nullptr) return;
+	const litehtml::tchar_t* disp = sel->m_style->get_property(_t("display"));
+	const litehtml::tchar_t* fd = sel->m_style->get_property(_t("flex-direction"));
+	const litehtml::tchar_t* w = sel->m_style->get_property(_t("width"));
+	const litehtml::tchar_t* ox = sel->m_style->get_property(_t("overflow-x"));
+	const litehtml::tchar_t* ov = sel->m_style->get_property(_t("overflow"));
+	if(disp == nullptr && fd == nullptr && w == nullptr && ox == nullptr && ov == nullptr) return;
+	litehtml::tstring sig;
+	eweb_sel_right_sig(sel, sig);
+	fprintf(stderr,
+		"[CARDDBG] el=<%s class=\"%.40s\"> sel=\"%s\" spec=%d,%d,%d,%d ord=%d media=%d | display=%s flexdir=%s width=%s overflow=%s overflow-x=%s\n",
+		el->get_tagName() ? el->get_tagName() : "?", cls, sig.c_str(),
+		sel->m_specificity.a, sel->m_specificity.b, sel->m_specificity.c, sel->m_specificity.d,
+		order, sel->is_media_valid() ? 1 : 0,
+		disp ? disp : "-", fd ? fd : "-", w ? w : "-", ov ? ov : "-", ox ? ox : "-");
+	/* Full declaration dump for the carousel class selector itself: reveals
+	 * whether the parsed rule is a coherent carousel block or a mis-parsed
+	 * mishmash (e.g. width:var(--scroll-button-size) bleeding in). */
+	if(t_strstr(sig.c_str(), _t("carousel--mode")) != nullptr)
+	{
+		const litehtml::props_map& pm = sel->m_style->properties();
+		fprintf(stderr, "[CARDDBG-FULL] sel=\"%s\" nprops=%d :", sig.c_str(), (int)pm.size());
+		for(litehtml::props_map::const_iterator it = pm.begin(); it != pm.end(); ++it)
+		{
+			fprintf(stderr, " [%s=%s]", it->first.c_str(), it->second.m_value.c_str());
+		}
+		fprintf(stderr, "\n");
+	}
+}
+
 void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 {
 #ifdef LITEHTML_LIFETIME_DEBUG
@@ -849,18 +1115,36 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 	{
 		return;
 	}
-	uint64_t apply_start = sys_tic_ms(0);
+	/* Clock instrumentation below is gated: default-off skips several
+	 * mach_absolute_time reads per candidate selector (~38% of this walk
+	 * in a github style-burst sample). EWEB_STYLE_PROF=1 re-enables. */
+	const bool sprof = litehtml::style_prof_enabled();
+	uint64_t apply_start = sprof ? sys_tic_ms(0) : 0;
 
 	const tstring k_class_attr = _t("class");
 	const tstring k_id_attr = _t("id");
-	auto right_selector_maybe_matches = [&](const litehtml::css_selector::ptr& sel) -> bool
+	/* Tri-state: 0 = right side provably cannot match; 1 = fully proven by the
+	 * checks below and NO pseudo present, so select() may be skipped outright;
+	 * 3 = same plus only pseudo-class conditions beyond the proven ones, whose
+	 * first pass is the compile-time constant select_match|pseudo flag;
+	 * 2 = passes but needs full evaluation (pseudo-elements, other attribute
+	 * conditions, contain/start/end idiom differences, or the class-exists
+	 * corner where class="" diverges).
+	 * The reject-cause counters answer where per-candidate cost concentrates
+	 * (github measurement: tag 4 / class 865 / id 0 of 3.46M - the bucket index
+	 * does the filtering; this prefilter almost never rejects). */
+	auto right_selector_maybe_matches = [&](const litehtml::css_selector::ptr& sel) -> int
 	{
+		if(sprof) g_pf_total++;
 		const css_element_selector& right = sel->m_right;
 		if(!right.m_tag.empty() && right.m_tag != _t("*") && right.m_tag != m_tag)
 		{
-			return false;
+			if(sprof) g_pf_rej_tag++;
+			return 0;
 		}
 
+		bool simple = true;
+		bool has_pseudo_class = false;
 		const tchar_t* own_id = nullptr;
 		bool own_id_loaded = false;
 
@@ -875,8 +1159,12 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 				{
 					if(m_class_values.empty())
 					{
-						return false;
+						if(sprof) g_pf_rej_class++;
+						return 0;
 					}
+					/* class="" has the attribute but empty tokens: the full path
+						 * diverges here, so never take the simple fast lane. */
+					simple = false;
 				}
 				else if(is_id_attr)
 				{
@@ -887,8 +1175,13 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 					}
 					if(!own_id)
 					{
-						return false;
+						if(sprof) g_pf_rej_id++;
+						return 0;
 					}
+				}
+				else
+				{
+					simple = false;
 				}
 				break;
 			case select_equal:
@@ -914,7 +1207,8 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 					}
 					if(!found)
 					{
-						return false;
+						if(sprof) g_pf_rej_class++;
+						return 0;
 					}
 				}
 				else if(is_id_attr)
@@ -926,8 +1220,13 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 					}
 					if(!own_id || t_strcasecmp(attr_sel.val.c_str(), own_id))
 					{
-						return false;
+						if(sprof) g_pf_rej_id++;
+						return 0;
 					}
+				}
+				else
+				{
+					simple = false;
 				}
 				break;
 			case select_contain_str:
@@ -940,9 +1239,11 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 					}
 					if(!own_id || !t_strstr(own_id, attr_sel.val.c_str()))
 					{
-						return false;
+						if(sprof) g_pf_rej_id++;
+						return 0;
 					}
 				}
+				simple = false;
 				break;
 			case select_start_str:
 				if(is_id_attr)
@@ -954,9 +1255,11 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 					}
 					if(!own_id || t_strncmp(own_id, attr_sel.val.c_str(), attr_sel.val.length()))
 					{
-						return false;
+						if(sprof) g_pf_rej_id++;
+						return 0;
 					}
 				}
+				simple = false;
 				break;
 			case select_end_str:
 				if(is_id_attr)
@@ -968,29 +1271,40 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 					}
 					if(!own_id)
 					{
-						return false;
+						if(sprof) g_pf_rej_id++;
+						return 0;
 					}
 					size_t attr_len = t_strlen(own_id);
 					size_t val_len = attr_sel.val.length();
 					if(attr_len < val_len || t_strcasecmp(own_id + attr_len - val_len, attr_sel.val.c_str()))
 					{
-						return false;
+						if(sprof) g_pf_rej_id++;
+						return 0;
 					}
 				}
+				simple = false;
 				break;
 			case select_pseudo_element:
+				/* pseudo-elements can reject on the first pass (unknown name),
+					 * which a constant-folded result cannot reproduce. */
+				simple = false;
+				break;
 			case select_pseudo_class:
+				/* With apply_pseudo=false the full path only ORs the pseudo flag
+					 * in, so the first-pass result is a known constant. */
+				has_pseudo_class = true;
 				break;
 			default:
+				simple = false;
 				break;
 			}
 		}
-		return true;
+		return simple ? (has_pseudo_class ? 3 : 1) : 2;
 	};
 
 	css::selector_index& sel_idx = stylesheet.get_selector_index();
 	std::vector<int> candidates;
-	uint64_t cand_start = sys_tic_ms(0);
+	uint64_t cand_start = sprof ? sys_tic_ms(0) : 0;
 	{
 		uint32_t epoch = sel_idx.begin_visit();
 		auto push_bucket = [&](const css::selector_index::key_t& key)
@@ -1039,42 +1353,66 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 		}
 		std::sort(candidates.begin(), candidates.end());
 	}
-	g_apply_cand_ms += sys_tic_ms(0) - cand_start;
+	if(sprof) g_apply_cand_ms += (uint32_t)(sys_tic_ms(0) - cand_start);
 	g_apply_calls++;
 
 	for(size_t ci = 0; ci < candidates.size(); ci++)
 	{
-		uint64_t match_start = sys_tic_ms(0);
+		uint64_t match_start = sprof ? sys_tic_ms(0) : 0;
 		const litehtml::css_selector::ptr& sel = stylesheet.selectors()[candidates[ci]];
 		if(!sel->is_media_valid())
 		{
 			continue;
 		}
-		if(!right_selector_maybe_matches(sel))
+		int rpf = right_selector_maybe_matches(sel);
+		if(rpf == 0)
 		{
 			continue;
 		}
-		int apply = select(*sel, false);
-
-		if(apply == select_no_match)
+		int apply;
+		/* EWEB_SELFAST_OFF=1 forces every candidate through the full select()
+			 * evaluation (the pre-constant-fold behaviour). */
+		static int s_sel_fast_off = -1;
+		if(s_sel_fast_off < 0) { s_sel_fast_off = (getenv("EWEB_SELFAST_OFF") != NULL) ? 1 : 0; }
+		if(!s_sel_fast_off && (rpf & 1) && !sel->m_left)
 		{
-			g_apply_match_ms += sys_tic_ms(0) - match_start;
-			continue;
+			/* Right side proven by the prefilter and no combinator to walk:
+				 * the first select() pass is a compile-time constant (rpf 1: plain
+				 * match; rpf 3: match + pseudo flag, exactly what select_element
+				 * returns for pseudo-classes when apply_pseudo=false). Only the
+				 * pseudo second pass below still runs. github/Primer candidates
+				 * are overwhelmingly this shape. */
+			apply = (rpf == 3) ? (select_match | select_match_pseudo_class) : select_match;
+			if(sprof) g_applyT_fast++;
+		}
+		else
+		{
+			apply = select(*sel, false);
+
+			if(apply == select_no_match)
+			{
+				if(sprof) g_apply_match_ms += (uint32_t)(sys_tic_ms(0) - match_start);
+				continue;
+			}
 		}
 		if(apply & select_match_pseudo_class)
 		{
 			apply = select(*sel, true);
 			if(apply == select_no_match)
 			{
-				g_apply_match_ms += sys_tic_ms(0) - match_start;
+				if(sprof) g_apply_match_ms += (uint32_t)(sys_tic_ms(0) - match_start);
 				continue;
 			}
 		}
-		g_apply_match_ms += sys_tic_ms(0) - match_start;
-		uint64_t add_start = sys_tic_ms(0);
+		if(sprof) g_apply_match_ms += (uint32_t)(sys_tic_ms(0) - match_start);
+		uint64_t add_start = sprof ? sys_tic_ms(0) : 0;
 
 		if(apply != select_no_match)
 		{
+			if(eweb_cardbg_enabled())
+			{
+				eweb_cardbg_dump(this, sel, sel->m_order);
+			}
 			used_selector* us = nullptr;
 			auto ensure_used_style = [&]() -> used_selector&
 			{
@@ -1120,7 +1458,7 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 				}
 			}
 		}
-		g_apply_add_ms += (uint32_t)(sys_tic_ms(0) - add_start);
+		if(sprof) g_apply_add_ms += (uint32_t)(sys_tic_ms(0) - add_start);
 	}
 
 	/* The children walk and the per-root phase dump live in the
@@ -1189,6 +1527,55 @@ bool litehtml::html_tag::css_clip_rect(position& out, int x, int y) const
 	return true;
 }
 
+/* clip-path:inset() resolves against the border box and, unlike legacy clip,
+ * applies to every element (not just positioned ones). inset(50%) yields a
+ * zero-area rect - the modern visually-hidden pattern. */
+bool litehtml::html_tag::css_clip_path_rect(position& out, int x, int y) const
+{
+	if(!m_has_css_clip_path)
+		return false;
+	position box = m_pos;
+	box.x += x;
+	box.y += y;
+	box += m_padding;
+	box += m_borders;
+	int top = m_css_clip_path.top.is_predefined() ? 0 : m_css_clip_path.top.calc_percent(box.height);
+	int right = m_css_clip_path.right.is_predefined() ? box.width : m_css_clip_path.right.calc_percent(box.width);
+	int bottom = m_css_clip_path.bottom.is_predefined() ? box.height : m_css_clip_path.bottom.calc_percent(box.height);
+	int left = m_css_clip_path.left.is_predefined() ? 0 : m_css_clip_path.left.calc_percent(box.width);
+	out = position(box.x + left, box.y + top,
+		(right > left) ? right - left : 0,
+		(bottom > top) ? bottom - top : 0);
+	return true;
+}
+
+/* The single paint-time clip source: the intersection of legacy clip:rect()
+ * and clip-path:inset() when both are present, either one alone otherwise.
+ * Folding both here keeps draw()/draw_children() - which gate the whole
+ * subtree on css_clip_hides_all / push_css_clip - correct for either syntax
+ * with a single push/pop pair. */
+bool litehtml::html_tag::css_effective_clip_rect(position& out, int x, int y) const
+{
+	position lr, pr;
+	bool hl = css_clip_rect(lr, x, y);
+	bool hp = css_clip_path_rect(pr, x, y);
+	if(!hl && !hp)
+		return false;
+	if(hl && hp)
+	{
+		int x1 = std::max(lr.x, pr.x);
+		int y1 = std::max(lr.y, pr.y);
+		int x2 = std::min(lr.x + lr.width, pr.x + pr.width);
+		int y2 = std::min(lr.y + lr.height, pr.y + pr.height);
+		out = position(x1, y1, (x2 > x1) ? x2 - x1 : 0, (y2 > y1) ? y2 - y1 : 0);
+	}
+	else
+	{
+		out = hl ? lr : pr;
+	}
+	return true;
+}
+
 /* An empty clip rectangle leaves no visible region at all, so the element
  * and everything inside it paint nothing. This is what the standard
  * "visually hidden" pattern relies on (clip:rect(1px,1px,1px,1px) on a 1px
@@ -1200,7 +1587,7 @@ bool litehtml::html_tag::css_clip_rect(position& out, int x, int y) const
 bool litehtml::html_tag::css_clip_hides_all(int x, int y) const
 {
 	position r;
-	if(!css_clip_rect(r, x, y))
+	if(!css_effective_clip_rect(r, x, y))
 		return false;
 	return r.width <= 0 || r.height <= 0;
 }
@@ -1208,7 +1595,7 @@ bool litehtml::html_tag::css_clip_hides_all(int x, int y) const
 bool litehtml::html_tag::push_css_clip(uint_ptr hdc, int x, int y)
 {
 	position r;
-	if(!css_clip_rect(r, x, y))
+	if(!css_effective_clip_rect(r, x, y))
 		return false;
 	border_radiuses radius;
 	get_document()->container()->set_clip(r, radius, true, true);
@@ -1277,9 +1664,75 @@ litehtml::uint_ptr litehtml::html_tag::get_font(font_metrics* fm)
 	return m_font;
 }
 
+/* Per CSS, only inherited properties fall back to the parent's computed
+ * value; a non-inherited property with no own declaration takes its initial
+ * value. The CSSOM bridge (getComputedStyle) needs this distinction, because
+ * get_style_property(name, true, ...) walks ancestors for ANY name and would
+ * otherwise leak e.g. an ancestor's padding into a child's computed style. */
+bool litehtml::css_property_inherited( const tchar_t* name )
+{
+	if(!name || !name[0])
+	{
+		return false;
+	}
+	/* Custom properties (--*) inherit by definition. */
+	if(name[0] == _t('-') && name[1] == _t('-'))
+	{
+		return true;
+	}
+	static const tchar_t* inherited_props[] = {
+		_t("azimuth"), _t("border-collapse"), _t("border-spacing"),
+		_t("caption-side"), _t("color"), _t("cursor"), _t("direction"),
+		_t("empty-cells"), _t("font"), _t("font-family"), _t("font-feature-settings"),
+		_t("font-kerning"), _t("font-language-override"), _t("font-optical-sizing"),
+		_t("font-palette"), _t("font-size"), _t("font-size-adjust"), _t("font-stretch"),
+		_t("font-style"), _t("font-synthesis"), _t("font-variant"),
+		_t("font-variant-alternates"), _t("font-variant-caps"),
+		_t("font-variant-east-asian"), _t("font-variant-emoji"),
+		_t("font-variant-ligatures"), _t("font-variant-numeric"),
+		_t("font-variant-position"), _t("font-variation-settings"),
+		_t("font-weight"), _t("forced-color-adjust"), _t("hyphenate-character"),
+		_t("hyphens"), _t("image-orientation"), _t("image-rendering"),
+		_t("letter-spacing"), _t("line-break"), _t("line-height"), _t("list-style"),
+		_t("list-style-image"), _t("list-style-position"), _t("list-style-type"),
+		_t("math-style"), _t("math-variant"),
+		_t("orphans"), _t("overflow-wrap"),
+		_t("pointer-events"), _t("quotes"), _t("ruby-align"), _t("ruby-merge"),
+		_t("ruby-position"), _t("speak"), _t("tab-size"), _t("text-align"),
+		_t("text-align-last"), _t("text-combine-upright"), _t("text-decoration-color"),
+		_t("text-decoration-skip"), _t("text-decoration-skip-ink"),
+		_t("text-emphasis"), _t("text-emphasis-color"), _t("text-emphasis-position"),
+		_t("text-emphasis-style"), _t("text-indent"), _t("text-justify"),
+		_t("text-orientation"), _t("text-rendering"), _t("text-shadow"),
+		_t("text-size-adjust"), _t("text-transform"), _t("text-underline-offset"),
+		_t("text-underline-position"), _t("text-wrap"), _t("visibility"),
+		_t("voice-family"), _t("volume"), _t("white-space"), _t("widows"),
+		_t("word-break"), _t("word-spacing"), _t("word-wrap"), _t("writing-mode"),
+		/* engine-internal pseudo properties that follow their parent */
+		_t("-litehtml-border-spacing-x"), _t("-litehtml-border-spacing-y"),
+		_t("list-style-image-baseurl"),
+		/* vendor aliases of inherited properties */
+		_t("-webkit-text-size-adjust"), _t("-moz-text-size-adjust"),
+		_t("-ms-text-size-adjust"), _t("-webkit-font-smoothing"),
+		_t("-moz-osx-font-smoothing"), _t("-webkit-tap-highlight-color"),
+		_t("-webkit-hyphenate-character"), _t("-webkit-line-break"),
+		_t("-webkit-text-fill-color"), _t("-webkit-text-stroke-color"),
+		_t("-webkit-box-direction"), _t("-webkit-box-orient"),
+		nullptr
+	};
+	for(int i = 0; inherited_props[i]; i++)
+	{
+		if(!t_strcasecmp(name, inherited_props[i]))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 const litehtml::tchar_t* litehtml::html_tag::get_style_property( const tchar_t* name, bool inherited, const tchar_t* def /*= 0*/ )
 {
-	uint64_t start_ms = sys_tic_ms(0);
+	uint64_t start_ms = (litehtml::style_prof_enabled() ? sys_tic_ms(0) : 0);
 	if(!name)
 	{
 		litehtml::profile_get_style_property(false, 0, start_ms);
@@ -1358,6 +1811,27 @@ const litehtml::tchar_t* litehtml::html_tag::get_style_property_own(const tchar_
 
 namespace litehtml {
 
+/* A custom property whose declared value is the `initial` keyword holds the
+ * spec's guaranteed-invalid value (the csstools light/dark toggle pattern:
+ * ":root{--csstools-color-scheme--light: initial}"). Referencing it must
+ * behave like an undefined property: take the var() fallback, or invalidate
+ * the reference. Resolve-time expansion can also leave the substituted
+ * residue ("initial #a4cefe"), so recognise the prefix form as well. */
+static bool custom_prop_is_guaranteed_invalid(const tstring& v)
+{
+	tstring t = v;
+	trim(t);
+	if(t.empty())
+	{
+		return false;
+	}
+	if(!t_strcasecmp(t.c_str(), _t("initial")))
+	{
+		return true;
+	}
+	return t.length() > 8 && !t_strncasecmp(t.c_str(), _t("initial "), 8);
+}
+
 static bool expand_var_refs(const tstring& in, const string_map& vars, tstring& out, int depth)
 {
 	if(depth > 8)
@@ -1401,29 +1875,47 @@ static bool expand_var_refs(const tstring& in, const string_map& vars, tstring& 
 		tstring name = in.substr(f + 4, (comma == tstring::npos ? j : comma) - (f + 4));
 		trim(name);
 		tstring sub;
+		bool have = false;
 		string_map::const_iterator it = vars.find(name);
-		if(it != vars.end())
+		if(it != vars.end() && !custom_prop_is_guaranteed_invalid(it->second))
 		{
-			sub = it->second;
-		} else if(comma != tstring::npos)
+			if(it->second.find(_t("var(")) != tstring::npos)
+			{
+				tstring subexp;
+				if(expand_var_refs(it->second, vars, subexp, depth + 1))
+				{
+					sub = subexp;
+					have = true;
+				}
+				/* else: the custom property's own value is invalid at
+				 * computed-value time (its var() reference resolved to the
+				 * guaranteed-invalid value); fall through to the fallback. */
+			} else
+			{
+				sub = it->second;
+				have = true;
+			}
+		}
+		if(!have)
 		{
+			if(comma == tstring::npos)
+			{
+				return false;	// undefined / invalid custom property, no fallback
+			}
 			/* Fallbacks keep their whitespace in the spec, but property values
 			 * in m_custom_props are stored trimmed, so trim here too to keep
 			 * both sources interchangeable ("var(--x, 88px)"). */
 			sub = in.substr(comma + 1, j - comma - 1);
 			trim(sub);
-		} else
-		{
-			return false;	// undefined custom property, no fallback
-		}
-		if(sub.find(_t("var(")) != tstring::npos)
-		{
-			tstring subexp;
-			if(!expand_var_refs(sub, vars, subexp, depth + 1))
+			if(sub.find(_t("var(")) != tstring::npos)
 			{
-				return false;
+				tstring subexp;
+				if(!expand_var_refs(sub, vars, subexp, depth + 1))
+				{
+					return false;
+				}
+				sub = subexp;
 			}
-			sub = subexp;
 		}
 		out += sub;
 		i = j + 1;
@@ -1477,6 +1969,23 @@ static bool eval_one_length(const tstring& tok, document* doc, int font_size, in
 	{
 		return false;
 	}
+	/* Unknown length unit (css-values-4 lh and friends): fromString leaves
+	 * units() == css_units_none, indistinguishable from a bare number, and
+	 * cvt_units then reads it as px. That silently folded MDN's
+	 * calc(.5lh - .5em) to -8px at cascade time, before the transform
+	 * parser (which understands lh) ever saw it. A none-unit token that
+	 * still carries alphabetic suffix is a unit we do not know: refuse to
+	 * fold it and let the calc survive to a consumer that can resolve it. */
+	if(len.units() == css_units_none)
+	{
+		for(size_t i = 0; i < a.length(); i++)
+		{
+			if(isalpha((unsigned char)a[i]))
+			{
+				return false;
+			}
+		}
+	}
 	out_px = doc->cvt_units(len, font_size);
 	return true;
 }
@@ -1504,6 +2013,38 @@ static bool parse_css_clip_rect(const tchar_t* raw, css_offsets& out)
 		else
 			edges[i]->fromString(toks[i].c_str());
 	}
+	return true;
+}
+
+/* clip-path:inset(<1-4 lengths> [round <radius>]). Only the inset rectangle is
+ * modelled; a round radius and the shape()/url() forms are ignored (treated as
+ * no clip). Token repetition follows the margin/padding shorthand rules. */
+static bool parse_css_clip_path_inset(const tchar_t* raw, css_offsets& out)
+{
+	if(!raw) return false;
+	tstring val = raw;
+	trim(val);
+	if(val.length() < 7 || t_strncasecmp(val.c_str(), _t("inset("), 6) || val[val.length() - 1] != _t(')'))
+		return false;
+	tstring args = val.substr(6, val.length() - 7);
+	size_t rp = args.find(_t("round"));
+	if(rp != tstring::npos) args = args.substr(0, rp);
+	string_vector toks;
+	split_string(args, toks, _t(" \t\r\n"));
+	if(toks.empty() || toks.size() > 4) return false;
+	css_length v[4];
+	for(size_t i = 0; i < toks.size(); i++)
+	{
+		trim(toks[i]);
+		if(toks[i].empty()) return false;
+		v[i].fromString(toks[i].c_str());
+	}
+	css_length e[4];
+	if(toks.size() == 1)      { e[0]=e[1]=e[2]=e[3]=v[0]; }
+	else if(toks.size() == 2) { e[0]=e[2]=v[0]; e[1]=e[3]=v[1]; }
+	else if(toks.size() == 3) { e[0]=v[0]; e[1]=e[3]=v[1]; e[2]=v[2]; }
+	else                      { e[0]=v[0]; e[1]=v[1]; e[2]=v[2]; e[3]=v[3]; }
+	out.top = e[0]; out.right = e[1]; out.bottom = e[2]; out.left = e[3];
 	return true;
 }
 
@@ -1566,14 +2107,63 @@ static bool eval_length_expr(const tstring& expr, document* doc, int font_size, 
 /* One multiplicative term of a calc(): factors joined by top-level '*'/'/'.
  * Exactly one factor may be a length (length*length is meaningless); the rest
  * must be plain numbers, which covers the idioms real sheets emit such as
- * "calc(var(--x) * 2)" and "calc(2 * var(--x))". */
+ * "calc(var(--x) * 2)" and "calc(2 * var(--x))". A leading parenthesized
+ * group ("(56px - 24px) / 2", gestalt TextField padding) evaluates as a
+ * nested additive expression followed by numeric factors only. */
+static bool eval_additive_px(const tstring& body, document* doc, int font_size, int& out_px);
 static bool eval_term_px(const tstring& in, document* doc, int font_size, int& out_px)
 {
 	tstring s = in;
 	trim(s);
-	if(s.empty() || s.find(_t('(')) != tstring::npos)
+	if(s.empty())
 	{
 		return false;
+	}
+	if(s.find(_t('(')) != tstring::npos)
+	{
+		if(s[0] != _t('('))
+		{
+			return false;	/* "2px + (…)": additive, not one term */
+		}
+		int depth = 0;
+		size_t m = 0;
+		for(; m < s.length(); m++)
+		{
+			if(s[m] == _t('(')) depth++;
+			else if(s[m] == _t(')'))
+			{
+				depth--;
+				if(depth == 0) break;
+			}
+		}
+		if(m >= s.length()) return false;	/* unbalanced */
+		int px = 0;
+		if(!eval_additive_px(s.substr(1, m - 1), doc, font_size, px)) return false;
+		double acc = px;
+		tstring rest = s.substr(m + 1);
+		trim(rest);
+		size_t p = 0;
+		while(p < rest.length())
+		{
+			tchar_t op = rest[p];
+			if(op != _t('*') && op != _t('/')) return false;
+			p++;
+			tstring f;
+			while(p < rest.length() && rest[p] != _t('*') && rest[p] != _t('/'))
+			{
+				f += rest[p];
+				p++;
+			}
+			trim(f);
+			const tchar_t* st = f.c_str();
+			tchar_t* end = 0;
+			double n = strtod((const char*)st, (char**)&end);
+			if(!end || *end != 0) return false;
+			if(op == _t('*')) acc *= n;
+			else { if(n == 0) return false; acc /= n; }
+		}
+		out_px = (int)(acc + (acc >= 0 ? 0.5 : -0.5));
+		return true;
 	}
 	/* split into (op, factor) pairs */
 	std::vector<tchar_t> ops;
@@ -1600,29 +2190,78 @@ static bool eval_term_px(const tstring& in, document* doc, int font_size, int& o
 	bool saw_len = false;
 	for(size_t k = 0; k < facs.size(); k++)
 	{
+		/* Classify plain numbers FIRST: css_length::fromString also accepts a
+		 * bare number ("1.5"), so the length-first order misread every numeric
+		 * factor as a second length and rejected "16px * 1.5" (gestalt
+		 * TextField padding) as length*length. */
+		const tchar_t* st = facs[k].c_str();
+		tchar_t* end = 0;
+		double n = strtod((const char*)st, (char**)&end);
+		if(end != 0 && *end == 0)
+		{
+			tchar_t op = (k == 0) ? _t('*') : ops[k - 1];
+			if(!have) { acc = n; have = true; }
+			else if(op == _t('*')) acc *= n;
+			else { if(n == 0) return false; acc /= n; }
+			continue;
+		}
 		int px = 0;
+		/* ops[i] is the separator that ENDED factor i, i.e. the operator
+		 * BETWEEN factor i and i+1: combining factor k uses ops[k-1]. The
+		 * old ops[k] read paired every last factor with the trailing '*'
+		 * placeholder, turning "56px / 2" into 56*2. */
+		tchar_t op = (k == 0) ? _t('*') : ops[k - 1];
 		if(eval_one_length(facs[k], doc, font_size, px))
 		{
 			if(saw_len) return false;		/* length * length */
 			saw_len = true;
 			if(!have) { acc = px; have = true; }
-			else if(ops[k] == _t('*')) acc *= px;
+			else if(op == _t('*')) acc *= px;
 			else return false;			/* dividing by a length is not a length */
 		}
 		else
 		{
-			/* plain number */
-			const tchar_t* st = facs[k].c_str();
-			tchar_t* end = 0;
-			double n = strtod((const char*)st, (char**)&end);
-			if(!end || *end != 0) return false;
-			if(!have) { acc = n; have = true; }
-			else if(ops[k] == _t('*')) acc *= n;
-			else acc /= n;
+			return false;
 		}
 	}
 	if(!have || !saw_len) return false;
 	out_px = (int)(acc + (acc >= 0 ? 0.5 : -0.5));
+	return true;
+}
+
+/* Additive scan of a calc() body over TOP-LEVEL '+'/'-' only (paren-depth
+ * aware): a term may itself be a parenthesized group such as
+ * "(56px - var*var - 2px) / 2" (gestalt TextField padding), which the old
+ * any-position split fed to eval_term_px as "(56px" and rejected. */
+static bool eval_additive_px(const tstring& body, document* doc, int font_size, int& out_px)
+{
+	int total = 0;
+	int sign = 1;
+	bool any = false;
+	bool fail = false;
+	tstring term;
+	int depth = 0;
+	for(size_t k = 0; k <= body.length(); k++)
+	{
+		tchar_t c = (k < body.length()) ? body[k] : 0;
+		if(c == _t('(')) { depth++; term += c; continue; }
+		if(c == _t(')')) { depth--; term += c; continue; }
+		if(((c == _t('+') || c == _t('-')) && k > 0 && depth == 0) || c == 0)
+		{
+			if(!term.empty())
+			{
+				int t = 0;
+				if(!eval_term_px(term, doc, font_size, t)) { fail = true; if(c == 0) break; }
+				else { total += sign * t; any = true; }
+				if(fail) break;
+			}
+			term.clear();
+			sign = (c == _t('-')) ? -1 : 1;
+		}
+		else term += c;
+	}
+	if(fail || !any) return false;
+	out_px = total;
 	return true;
 }
 
@@ -1718,25 +2357,38 @@ static bool eval_number_expr(const tstring& body, double& out)
 static void eval_calc_funcs(tstring& val, document* doc, int font_size)
 {
 	size_t from = 0;
-	for(int guard = 0; guard < 16; guard++)
+	size_t upto = tstring::npos;	/* exclusive bound: a failed calc excludes itself */
+	for(int guard = 0; guard < 64; guard++)
 	{
 		tstring fname;
-		/* innermost-first: reuse the clamp/min/max scanner by looking for a
-		 * calc( at or after 'from' with the greatest position. */
+		/* Innermost-first, for real this time: the LAST valid calc( occurrence
+		 * cannot contain another calc( (an inner one would start at a greater
+		 * position), so resolving right-to-left collapses one nesting layer
+		 * per pass. Wikipedia's search field sets
+		 * "padding-left:calc(8px + 8px + calc(var(--font-size-medium,1rem) + 4px))";
+		 * a leftmost-first scan took the OUTER calc, whose body still holds a
+		 * calc( token the additive evaluator rejects, and then skipped past the
+		 * inner one too - leaving the whole value unparsed (padding 0, the
+		 * start icon painted over the placeholder text). */
 		size_t f = tstring::npos;
 		{
 			size_t p = val.find(_t("calc("), from);
-			while(p != tstring::npos && p > 0)
+			size_t last = tstring::npos;
+			while(p != tstring::npos && (upto == tstring::npos || p < upto))
 			{
-				tchar_t prev = val[p - 1];
-				if((prev >= _t('a') && prev <= _t('z')) || (prev >= _t('A') && prev <= _t('Z')) || prev == _t('-'))
+				bool valid = true;
+				if(p > 0)
 				{
-					p = val.find(_t("calc("), p + 1);
-					continue;
+					tchar_t prev = val[p - 1];
+					if((prev >= _t('a') && prev <= _t('z')) || (prev >= _t('A') && prev <= _t('Z')) || prev == _t('-'))
+					{
+						valid = false;
+					}
 				}
-				break;
+				if(valid) last = p;
+				p = val.find(_t("calc("), p + 1);
 			}
-			f = p;
+			f = last;
 		}
 		if(f == tstring::npos)
 		{
@@ -1783,59 +2435,27 @@ static void eval_calc_funcs(tstring& val, document* doc, int font_size)
 			}
 			tstring repl = buf;
 			val.replace(f, (j - f) + 1, repl);
-			from = f + repl.length();
+			/* positions shifted and the resolved layer may sit INSIDE an
+			 * outer calc to the left: rescan from the top. */
+			from = 0;
+			upto = tstring::npos;
 			continue;
 		}
 		if(body.find(_t(',')) == tstring::npos)
 		{
 			/* additive over top-level '+'/'-' of multiplicative terms */
-			int total = 0;
-			int sign = 1;
-			bool any = false;
-			tstring term;
-			bool fail = false;
-			for(size_t k = 0; k <= body.length(); k++)
-			{
-				tchar_t c = (k < body.length()) ? body[k] : 0;
-				if((c == _t('+') || c == _t('-')) && k > 0)
-				{
-					int t = 0;
-					if(!term.empty())
-					{
-						if(!eval_term_px(term, doc, font_size, t)) { fail = true; break; }
-						total += sign * t;
-						any = true;
-					}
-					term.clear();
-					sign = (c == _t('-')) ? -1 : 1;
-				}
-				else if(c == 0)
-				{
-					if(!term.empty())
-					{
-						int t = 0;
-						if(!eval_term_px(term, doc, font_size, t)) { fail = true; }
-						else { total += sign * t; any = true; }
-					}
-					break;
-				}
-				else term += c;
-			}
-			if(!fail && any)
-			{
-				px = total;
-				ok = true;
-			}
+			ok = eval_additive_px(body, doc, font_size, px);
 		}
 		if(ok)
 		{
 			tstring repl = std::to_string(px) + _t("px");
 			val.replace(f, (j - f) + 1, repl);
-			from = f + repl.length();
+			from = 0;
+			upto = tstring::npos;
 		}
 		else
 		{
-			from = j + 1;	/* leave this calc() alone, scan past it */
+			upto = f;	/* leave this calc() alone, exclude it from the scan */
 		}
 	}
 }
@@ -1931,31 +2551,63 @@ static bool eval_math_funcs(tstring& val, document* doc, int font_size)
 	return true;
 }
 
+
 void litehtml::html_tag::resolve_custom_properties()
 {
-	m_custom_props.clear();
-	element::ptr p = parent();
-	if(p)
+	/* Fast path: an element with no own --* declarations inherits its
+	 * parent's custom-property map unchanged - share it via shared_ptr
+	 * instead of copying every entry. Pages that define their design tokens
+	 * on :root (github's primer ships hundreds of --color-* vars) otherwise
+	 * paid one full map copy per element per style update, which dominated
+	 * parse_styles in wall-clock profiles. EWEB_CPSHARE_OFF restores the
+	 * unconditional copy. */
+	static int s_cpshare_off = -1;
+	if (s_cpshare_off < 0)
 	{
-		/* Virtual accessor: works without RTTI and returns null for
-		 * non-html_tag parents (text nodes etc.). */
-		const string_map* pm = p->get_custom_props();
-		if(pm)
+		s_cpshare_off = (getenv("EWEB_CPSHARE_OFF") != NULL) ? 1 : 0;
+	}
+	bool has_own = false;
+	for(props_map::const_iterator it = m_style.properties().begin(); it != m_style.properties().end(); ++it)
+	{
+		if(it->first.length() > 2 && it->first[0] == _t('-') && it->first[1] == _t('-'))
 		{
-			m_custom_props = *pm;
+			has_own = true;
+			break;
 		}
+	}
+	element::ptr p = parent();
+	if(!s_cpshare_off && !has_own)
+	{
+		m_custom_props = p ? p->get_custom_props_shared() : std::shared_ptr<const string_map>();
+		if(cpshare_stats_enabled()) g_cpshare_shared++;
+		return;
+	}
+	/* Merge path: own --* declarations exist (or the share is disabled), so
+	 * build the inherited+own map. Virtual accessor: works without RTTI and
+	 * returns null for non-html_tag parents (text nodes etc.). */
+	std::shared_ptr<string_map> merged(new string_map);
+	const string_map* pm = p ? p->get_custom_props() : 0;
+	if(pm)
+	{
+		*merged = *pm;
 	}
 	for(props_map::const_iterator it = m_style.properties().begin(); it != m_style.properties().end(); ++it)
 	{
 		if(it->first.length() > 2 && it->first[0] == _t('-') && it->first[1] == _t('-'))
 		{
 			tstring v;
-			if(!expand_var_refs(it->second.m_value, m_custom_props, v, 0))
+			if(!expand_var_refs(it->second.m_value, *merged, v, 0))
 			{
 				v = it->second.m_value;
 			}
-			m_custom_props[it->first] = v;
+			(*merged)[it->first] = v;
 		}
+	}
+	m_custom_props = merged;
+	if(cpshare_stats_enabled())
+	{
+		g_cpshare_merged++;
+		g_cpshare_entries += merged->size();
 	}
 }
 
@@ -2044,7 +2696,12 @@ void litehtml::html_tag::expand_css_functions()
 		if(v.find(_t("var(")) != tstring::npos)
 		{
 			tstring exp;
-			if(!expand_var_refs(v, m_custom_props, exp, 0))
+			/* m_custom_props may be null (no own --* and empty parent chain);
+			 * a stack-local empty map is the fallback - a function-local static
+			 * is banned here (__cxa_guard clash in this -fno-rtti build). */
+			string_map empty_props;
+			const string_map& cprops = m_custom_props ? *m_custom_props : empty_props;
+			if(!expand_var_refs(v, cprops, exp, 0))
 			{
 				continue;	// invalid at computed-value time: drop it
 			}
@@ -2171,6 +2828,23 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		doc->cvt_units(m_css_clip.bottom, m_font_size);
 		doc->cvt_units(m_css_clip.left, m_font_size);
 	}
+	m_has_css_clip_path = parse_css_clip_path_inset(get_style_property_own(_t("clip-path")), m_css_clip_path);
+	if(!m_has_css_clip_path)
+	{
+		/* clip-path:rect() is the other shape github's screen-reader-only headings
+		 * use (clip-path:rect(0 0 0 0), space-separated). Its four edges follow the
+		 * legacy CSS2 clip rect offsets (right/bottom measured from the top-left),
+		 * which is exactly how css_clip_path_rect resolves m_css_clip_path against
+		 * the border box - so the clip:rect parser produces a correct clip-path. */
+		m_has_css_clip_path = parse_css_clip_rect(get_style_property_own(_t("clip-path")), m_css_clip_path);
+	}
+	if(m_has_css_clip_path)
+	{
+		doc->cvt_units(m_css_clip_path.top, m_font_size);
+		doc->cvt_units(m_css_clip_path.right, m_font_size);
+		doc->cvt_units(m_css_clip_path.bottom, m_font_size);
+		doc->cvt_units(m_css_clip_path.left, m_font_size);
+	}
 	const tchar_t* own_position = own_style_ref_ptr(own_refs.position);
 	const tchar_t* own_overflow = own_style_ref_ptr(own_refs.overflow);
 	const tchar_t* own_display = own_style_ref_ptr(own_refs.display);
@@ -2236,6 +2910,25 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	if(m_display == display_contents && m_el_position == element_position_absolute)
 	{
 		m_display = display_none;
+	}
+	/* css-overflow-3 §3.1: overflow only applies to block containers; on a
+	 * non-replaced inline box the used value is 'visible'. GitHub's issue
+	 * titles are h3{display:inline;overflow:hidden} - clipping an inline box
+	 * to its degenerate fragment rect erased the whole title text, and the
+	 * same pattern starved the metadata track's max-content probe.
+	 * Flex/grid ITEMS are blockified, so overflow stays meaningful for them:
+	 * w3.org's .avatar (no declared display, child of an inline-flex link,
+	 * overflow:hidden + border-radius:50%) must still clip its <img> to a
+	 * disc; resetting it left the square image corners poking out of the
+	 * round border ring. */
+	bool flex_or_grid_item = el_parent &&
+		(el_parent->get_display() == display_flex ||
+		 el_parent->get_display() == display_inline_flex ||
+		 el_parent->get_display() == display_grid ||
+		 el_parent->get_display() == display_inline_grid);
+	if(m_overflow > overflow_visible && m_display == display_inline && !is_replaced() && !flex_or_grid_item)
+	{
+		m_overflow = overflow_visible;
 	}
 	m_box_sizing	= (box_sizing)			value_index((own_box_sizing && t_strcasecmp(own_box_sizing, _t("inherit"))) ? own_box_sizing : _t("content-box"),	box_sizing_strings,			box_sizing_content_box);
 
@@ -2351,6 +3044,25 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	else
 	{
 		m_visibility = visibility_visible;
+	}
+
+	/* CSS 'pointer-events' (inherited): a none box is transparent to hit
+	 * testing - see eweb_hit_testable(). Only the none/everything-else
+	 * distinction matters for HTML content. */
+	{
+		const tchar_t* own_pe = get_style_property_own(_t("pointer-events"));
+		if(own_pe && t_strcasecmp(own_pe, _t("inherit")))
+		{
+			m_pointer_events_none = !t_strcasecmp(own_pe, _t("none"));
+		}
+		else if(el_parent)
+		{
+			m_pointer_events_none = !el_parent->eweb_hit_testable();
+		}
+		else
+		{
+			m_pointer_events_none = false;
+		}
 	}
 
 	/* CSS 'opacity' (non-inherited, 0..1). The visible transparency is the
@@ -2631,13 +3343,24 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 
 	if (m_float != float_none)
 	{
-		// reset display in to block for floating elements
-		if (m_display != display_none)
+		/* A float is blockified, not forced to display:block (CSS Display 3
+		 * 2.4): the block-level *outer* box is what changes, so a floated
+		 * table stays a table (wikipedia's float:right infobox used to be
+		 * flattened to a block box here - rows/cells rendered 0x0). */
+		switch (m_display)
 		{
-			m_display = display_block;
+		case display_inline:		m_display = display_block;	break;
+		case display_inline_block:	m_display = display_block;	break;
+		case display_inline_table:	m_display = display_table;	break;
+		case display_inline_flex:	m_display = display_flex;	break;
+		case display_inline_grid:	m_display = display_grid;	break;
+		default:											break;
 		}
 	}
-	else if (doc && (m_display == display_table ||
+	/* Tabular registration must not be an else-branch of the float check:
+	 * a floated table is still tabular and needs the anonymous-box fixup
+	 * pass, and fast-mode builds re-register on the chunked reparse. */
+	if (doc && (m_display == display_table ||
 		m_display == display_table_caption ||
 		m_display == display_table_cell ||
 		m_display == display_table_column ||
@@ -2900,22 +3623,22 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	}
 
 	const tchar_t* own_border_left_color = get_style_property_own(_t("border-left-color"));
-	m_css_borders.left.color = own_border_left_color ? web_color::from_string(own_border_left_color, doc->container()) : web_color();
+	m_css_borders.left.color = own_border_left_color ? resolve_color_value(own_border_left_color, web_color()) : web_color();
 	const tchar_t* own_border_left_style = get_style_property_own(_t("border-left-style"));
 	m_css_borders.left.style = own_border_left_style ? (border_style) value_index(own_border_left_style, border_style_strings, border_style_none) : border_style_none;
 
 	const tchar_t* own_border_right_color = get_style_property_own(_t("border-right-color"));
-    m_css_borders.right.color = own_border_right_color ? web_color::from_string(own_border_right_color, doc->container()) : web_color();
+    m_css_borders.right.color = own_border_right_color ? resolve_color_value(own_border_right_color, web_color()) : web_color();
 	const tchar_t* own_border_right_style = get_style_property_own(_t("border-right-style"));
 	m_css_borders.right.style = own_border_right_style ? (border_style) value_index(own_border_right_style, border_style_strings, border_style_none) : border_style_none;
 
 	const tchar_t* own_border_top_color = get_style_property_own(_t("border-top-color"));
-    m_css_borders.top.color = own_border_top_color ? web_color::from_string(own_border_top_color, doc->container()) : web_color();
+    m_css_borders.top.color = own_border_top_color ? resolve_color_value(own_border_top_color, web_color()) : web_color();
 	const tchar_t* own_border_top_style = get_style_property_own(_t("border-top-style"));
 	m_css_borders.top.style = own_border_top_style ? (border_style) value_index(own_border_top_style, border_style_strings, border_style_none) : border_style_none;
 
 	const tchar_t* own_border_bottom_color = get_style_property_own(_t("border-bottom-color"));
-    m_css_borders.bottom.color = own_border_bottom_color ? web_color::from_string(own_border_bottom_color, doc->container()) : web_color();
+    m_css_borders.bottom.color = own_border_bottom_color ? resolve_color_value(own_border_bottom_color, web_color()) : web_color();
 	const tchar_t* own_border_bottom_style = get_style_property_own(_t("border-bottom-style"));
 	m_css_borders.bottom.style = own_border_bottom_style ? (border_style) value_index(own_border_bottom_style, border_style_strings, border_style_none) : border_style_none;
 
@@ -3055,6 +3778,108 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 	{
 		m_line_height = m_font_metrics.height;
 		m_lh_predefined = true;
+	}
+
+	/* CSS text-3 letter-spacing: inherited, adds spacing between adjacent
+	 * glyphs. An own declaration is resolved against this element's font size
+	 * (em/rem); otherwise the parent's already-computed px inherits, matching
+	 * how a computed length inherits. 'normal'/unset stays 0 so the common
+	 * path is untouched. Text runs read it via letter_spacing(). */
+	{
+		const tchar_t* lsval = get_style_property_own(_t("letter-spacing"));
+		if(lsval)
+		{
+			m_letter_spacing = (t_strcasecmp(lsval, _t("normal")) == 0)
+				? 0 : doc->cvt_units(lsval, m_font_size);
+		}
+		else if(el_parent)
+		{
+			m_letter_spacing = el_parent->letter_spacing();
+		}
+		else
+		{
+			m_letter_spacing = 0;
+		}
+	}
+
+	/* css-values-4 lh inside transform: parse_transform_list() ran far above,
+	 * before this block computed m_line_height, so a translateY(calc(.5lh -
+	 * .5em)) rewrote its lh terms against a stale (zero/normal) line height.
+	 * Re-parse the authored list now that the computed line-height is known;
+	 * m_transform_str still holds it verbatim. */
+	if(m_transform_str.find(_t("lh")) != tstring::npos)
+	{
+		parse_transform_list(m_transform_str.c_str());
+	}
+
+	/* css-mult-3 multi-column: MDN splits its big property index lists with
+	 * `columns:18rem`. Without column support a thousand-item list stacks
+	 * into one 31k-px single column and pushes the rest of the article below
+	 * any reachable fold. Parse the shorthand (<column-width> ||
+	 * <column-count>, either order) plus the longhands. */
+	m_column_count = 0;
+	m_column_width = 0;
+	m_column_gap = m_font_size;	/* 'normal' gap is 1em (css-mult-3) */
+	{
+		const tchar_t* cg = get_style_property(_t("column-gap"), false, nullptr);
+		if(cg != nullptr)
+		{
+			css_length g;
+			g.fromString(cg, _t("normal"));
+			if(!g.is_predefined())
+			{
+				m_column_gap = get_document()->cvt_units(g, m_font_size);
+			}
+		}
+		const tchar_t* cw = get_style_property(_t("column-width"), false, nullptr);
+		if(cw != nullptr)
+		{
+			css_length w;
+			w.fromString(cw, _t("auto"));
+			if(!w.is_predefined())
+			{
+				m_column_width = get_document()->cvt_units(w, m_font_size);
+			}
+		}
+		const tchar_t* cc = get_style_property(_t("column-count"), false, nullptr);
+		if(cc != nullptr)
+		{
+			int cnt = t_atoi(cc);
+			if(cnt > 0) m_column_count = cnt;
+		}
+		const tchar_t* cs = get_style_property(_t("columns"), false, nullptr);
+		if(cs != nullptr)
+		{
+			tstring s = cs;
+			size_t i = 0;
+			while(i < s.length())
+			{
+				while(i < s.length() && (s[i] == _t(' ') || s[i] == _t('\t'))) i++;
+				size_t st = i;
+				while(i < s.length() && s[i] != _t(' ') && s[i] != _t('\t')) i++;
+				tstring tok = s.substr(st, i - st);
+				if(tok.empty()) break;
+				bool all_digit = true;
+				for(size_t k = 0; k < tok.length(); k++)
+				{
+					if(!isdigit((unsigned char)tok[k])) { all_digit = false; break; }
+				}
+				if(all_digit)
+				{
+					int cnt = t_atoi(tok.c_str());
+					if(cnt > 0) m_column_count = cnt;
+				}
+				else
+				{
+					css_length w;
+					w.fromString(tok.c_str(), _t("auto"));
+					if(!w.is_predefined())
+					{
+						m_column_width = get_document()->cvt_units(w, m_font_size);
+					}
+				}
+			}
+		}
 	}
 
 
@@ -3453,6 +4278,48 @@ static void split_selector_list(const litehtml::tstring& txt, std::vector<liteht
  * Returns true when any member of the list matches the element. */
 static bool match_selector_list(litehtml::html_tag* el, const litehtml::tstring& param, bool apply_pseudo)
 {
+	/* The pseudo-class argument is selector SOURCE TEXT; parsing it on every
+	 * evaluation (per element, per candidate, and per descendant under :has)
+	 * dominated the pseudo second pass on selector-heavy sheets. The text->
+	 * selector parse is deterministic and context-free here (the selector is
+	 * built with a null owner every time), so memoize per unique param text.
+	 * EWEB_SELMEMO_OFF=1 restores the parse-per-evaluation behaviour. */
+	static int s_memo_off = -1;
+	if(s_memo_off < 0)
+	{
+		s_memo_off = (getenv("EWEB_SELMEMO_OFF") != NULL) ? 1 : 0;
+	}
+	if(!s_memo_off)
+	{
+		static std::unordered_map<litehtml::tstring, std::vector<litehtml::css_selector::ptr> > s_memo;
+		auto it = s_memo.find(param);
+		if(it == s_memo.end())
+		{
+			std::vector<litehtml::css_selector::ptr> parsed;
+			std::vector<litehtml::tstring> parts;
+			split_selector_list(param, parts);
+			for(size_t i = 0; i < parts.size(); i++)
+			{
+				litehtml::tstring part = parts[i];
+				litehtml::trim(part);
+				if(part.empty()) continue;
+				/* Raw pointer per css_selector::ptr convention; the memo owns it
+				 * for the process lifetime (deliberate: parse-once cache). */
+				litehtml::css_selector::ptr sel = new litehtml::css_selector(nullptr);
+				if(!sel->parse(part)) { delete sel; continue; }
+				parsed.push_back(sel);
+			}
+			it = s_memo.emplace(param, std::move(parsed)).first;
+		}
+		for(size_t i = 0; i < it->second.size(); i++)
+		{
+			if(el->select(*it->second[i], apply_pseudo) != litehtml::select_no_match)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
 	std::vector<litehtml::tstring> parts;
 	split_selector_list(param, parts);
 	for(size_t i = 0; i < parts.size(); i++)
@@ -3468,6 +4335,86 @@ static bool match_selector_list(litehtml::html_tag* el, const litehtml::tstring&
 		}
 	}
 	return false;
+}
+
+/* Split a ":nth-child" argument into its <an+b> part and an optional
+ * "of <selector-list>" part (CSS Selectors Level 4). The 'of' keyword is a
+ * whitespace-delimited, case-insensitive token; the <an+b> grammar (digits,
+ * 'n', "odd", "even", '+', '-') never contains a standalone "of" token, so
+ * the first such token is unambiguously the split point. Returns true when an
+ * "of S" clause is present. */
+static bool split_nth_of(const litehtml::tstring& param, litehtml::tstring& anb, litehtml::tstring& of_sel)
+{
+	size_t n = param.size();
+	size_t i = 0;
+	while(i < n)
+	{
+		while(i < n && (param[i] == _t(' ') || param[i] == _t('\t'))) i++;
+		size_t start = i;
+		while(i < n && param[i] != _t(' ') && param[i] != _t('\t')) i++;
+		if(i - start == 2 &&
+		   (param[start] == _t('o') || param[start] == _t('O')) &&
+		   (param[start + 1] == _t('f') || param[start + 1] == _t('F')))
+		{
+			anb = param.substr(0, start);
+			of_sel = param.substr(i);
+			litehtml::trim(anb);
+			litehtml::trim(of_sel);
+			return !of_sel.empty();
+		}
+	}
+	anb = param;
+	of_sel.clear();
+	return false;
+}
+
+/* ":nth-child(An+B of S)" / ":nth-last-child(An+B of S)": per spec only the
+ * siblings that match the selector list S are counted, and an element that is
+ * not itself in S can never match. `last` counts from the end of that filtered
+ * list. litehtml used to fold the whole argument through parse_nth_child_params,
+ * which mangled "1 of .card--event" into a bare ":nth-child(1)" - so the rule
+ * matched EVERY first child and sprayed its declarations (w3.org's
+ * ".card--event"/".card--member" margin-block-start:2.5rem) onto unrelated
+ * elements such as the nav icon links, pushing them out of the header row. */
+static bool nth_child_of_selector_match(litehtml::html_tag* el,
+					const litehtml::element::ptr& el_parent,
+					int num, int off, bool last,
+					const litehtml::tstring& of_sel, bool apply_pseudo)
+{
+	if(!el_parent) return false;
+
+	std::vector<litehtml::element::ptr> matches;
+	bool self_in = false;
+	size_t n = el_parent->get_children_count();
+	for(size_t i = 0; i < n; i++)
+	{
+		litehtml::element::ptr child = el_parent->get_child((int)i);
+		if(!child) continue;
+		/* Skip text nodes and pseudo-elements: they are not element siblings
+		 * for :nth-* counting (mirrors html_tag::is_nth_child). */
+		if(child->get_display() == litehtml::display_inline_text) continue;
+		const litehtml::tchar_t* cn = child->get_tagName();
+		if(cn && cn[0] == _t(':')) continue;
+		if(!child->is_html_tag()) continue;
+		litehtml::html_tag* ct = static_cast<litehtml::html_tag*>(child);
+		if(!match_selector_list(ct, of_sel, apply_pseudo)) continue;
+		if(ct == el) self_in = true;
+		matches.push_back(child);
+	}
+	if(!self_in) return false;
+
+	int idx = 0;
+	for(size_t i = 0; i < matches.size(); i++)
+	{
+		if(matches[i] == el) { idx = (int)i + 1; break; }
+	}
+	if(last) idx = (int)matches.size() - idx + 1;
+
+	if(num != 0)
+	{
+		return (idx - off) >= 0 && (idx - off) % num == 0;
+	}
+	return idx == off;
 }
 
 /* :has() subset. The argument is a relative selector list anchored at `el`.
@@ -3584,6 +4531,48 @@ static bool is_checked_element(litehtml::html_tag* el)
 		return el->get_attr(_t("selected"), nullptr) != nullptr;
 	}
 	return false;
+}
+
+/* :placeholder-shown — an input of a placeholder-capable type, or a textarea,
+ * that carries a non-empty placeholder attribute and an empty value. Live
+ * typed values are not tracked (same convention as :checked); the DOM
+ * attributes decide at cascade time. */
+static bool is_placeholder_shown(litehtml::html_tag* el)
+{
+	const litehtml::tchar_t* tag = el->get_tagName();
+	if(!tag) return false;
+	bool is_textarea = !t_strcasecmp(tag, _t("textarea"));
+	if(!is_textarea && t_strcasecmp(tag, _t("input")))
+	{
+		return false;
+	}
+	const litehtml::tchar_t* ph = el->get_attr(_t("placeholder"), nullptr);
+	if(!ph || !ph[0]) return false;
+	if(!is_textarea)
+	{
+		/* Only the text-entry types render a placeholder; button-ish types,
+		 * checkbox/radio, range, color and file never show one. */
+		const litehtml::tchar_t* type = el->get_attr(_t("type"), nullptr);
+		if(type)
+		{
+			static const litehtml::tchar_t* shown_types[] = {
+				_t("text"), _t("search"), _t("url"), _t("tel"), _t("email"),
+				_t("password"), _t("number"), _t("date"), _t("month"),
+				_t("week"), _t("time"), _t("datetime-local"), nullptr };
+			bool ok = false;
+			for(int i = 0; shown_types[i]; i++)
+			{
+				if(!t_strcasecmp(type, shown_types[i]))
+				{
+					ok = true;
+					break;
+				}
+			}
+			if(!ok) return false;
+		}
+	}
+	const litehtml::tchar_t* val = el->get_attr(_t("value"), nullptr);
+	return !val || !val[0];
 }
 
 /* :dir(ltr|rtl) — nearest ancestor (or self) with an explicit dir attribute
@@ -3747,11 +4736,16 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 					  i->val == _t("-webkit-slider-runnable-track") ||
 					  i->val == _t("-moz-range-thumb") ||
 					  i->val == _t("-moz-range-track") ||
-					  i->val == _t("-moz-range-progress"))
+					  i->val == _t("-moz-range-progress") ||
+					  i->val == _t("placeholder") ||
+					  i->val == _t("-webkit-input-placeholder") ||
+					  i->val == _t("-moz-placeholder") ||
+					  i->val == _t("-ms-input-placeholder"))
 			{
 				/* Form-widget part pseudo-element: the rule paints a sub-part
-				 * of a replaced control (range slider thumb/track). Match it and
-				 * let the dispatch sites hand the block to the element; unknown
+				 * of a replaced control (range slider thumb/track, or the
+				 * text control's placeholder hint). Match it and let the
+				 * dispatch sites hand the block to the element; unknown
 				 * pseudo-elements still refuse to match. */
 				res |= select_match_with_widget;
 			} else
@@ -3762,25 +4756,30 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 		case select_pseudo_class:
 			if(apply_pseudo)
 			{
-				tstring selector_param;
-				tstring	selector_name;
-
-				tstring::size_type begin	= i->val.find_first_of(_t('('));
-				tstring::size_type end		= (begin == tstring::npos) ? tstring::npos : find_close_bracket(i->val, begin);
-				if(begin != tstring::npos && end != tstring::npos)
+				/* The name(param) split of a pseudo-class is a pure function of
+					 * the selector text - compute it once per selector, not once per
+					 * element evaluation (github: ~0.5M second-pass evaluations). */
+				if(i->pseudo_idx == -2)
 				{
-					selector_param = i->val.substr(begin + 1, end - begin - 1);
+					tstring	selector_name;
+					tstring::size_type begin	= i->val.find_first_of(_t('('));
+					tstring::size_type end		= (begin == tstring::npos) ? tstring::npos : find_close_bracket(i->val, begin);
+					if(begin != tstring::npos && end != tstring::npos)
+					{
+						i->pseudo_param = i->val.substr(begin + 1, end - begin - 1);
+					}
+					if(begin != tstring::npos)
+					{
+						selector_name = i->val.substr(0, begin);
+						litehtml::trim(selector_name);
+					} else
+					{
+						selector_name = i->val;
+					}
+					i->pseudo_idx = value_index(selector_name.c_str(), pseudo_class_strings);
 				}
-				if(begin != tstring::npos)
-				{
-					selector_name = i->val.substr(0, begin);
-					litehtml::trim(selector_name);
-				} else
-				{
-					selector_name = i->val;
-				}
-
-				int selector = value_index(selector_name.c_str(), pseudo_class_strings);
+				const tstring& selector_param = i->pseudo_param;
+				int selector = i->pseudo_idx;
 
 				/* Structural pseudo-classes need a parent; :root is the
 				 * opposite - it matches exactly the parentless element. :has()
@@ -3805,7 +4804,8 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 						   s == pseudo_class_read_write ||
 						   s == pseudo_class_empty ||
 						   s == pseudo_class_any_link ||
-						   s == pseudo_class_default;
+						   s == pseudo_class_default ||
+						   s == pseudo_class_placeholder_shown;
 				};
 				if(!el_parent && !parentless_ok(selector))
 				{
@@ -3857,11 +4857,30 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 					{
 						if(selector_param.empty()) return select_no_match;
 
+						/* Peel off an "of <selector-list>" clause (Selectors L4)
+						 * before the An+B parse: parse_nth_child_params has no
+						 * notion of it and would mangle the argument, turning
+						 * ":nth-child(1 of .card)" into a bare ":nth-child(1)". */
+						tstring anb_param = selector_param;
+						tstring of_sel;
+						bool has_of = split_nth_of(selector_param, anb_param, of_sel);
+
 						int num = 0;
 						int off = 0;
 
-						parse_nth_child_params(selector_param, num, off);
+						parse_nth_child_params(anb_param, num, off);
 						if(!num && !off) return select_no_match;
+
+						if(has_of)
+						{
+							bool last = (selector == pseudo_class_nth_last_child ||
+										 selector == pseudo_class_nth_last_of_type);
+							if(!nth_child_of_selector_match(this, el_parent, num, off, last, of_sel, apply_pseudo))
+							{
+								return select_no_match;
+							}
+							break;
+						}
 						switch(selector)
 						{
 						case pseudo_class_nth_child:
@@ -4146,11 +5165,24 @@ int litehtml::html_tag::select(const css_element_selector& selector, bool apply_
 						return select_no_match;
 					}
 					break;
+				case pseudo_class_placeholder_shown:
+					/* :placeholder-shown — gestalt-style fields hide their
+					 * float label and tint the native placeholder through
+					 * this state (Pinterest signup); without it the resting
+					 * field paints both the overlay label and the native
+					 * placeholder. */
+					if(!is_placeholder_shown(this))
+					{
+						return select_no_match;
+					}
+					break;
 				case pseudo_class_lang:
 					{
-						trim( selector_param );
+						/* selector_param aliases the per-selector cache; trim a copy. */
+						tstring lang_param = selector_param;
+						trim( lang_param );
 
-						if( !get_document()->match_lang( selector_param ) )
+						if( !get_document()->match_lang( lang_param ) )
 						{
 							return select_no_match;
 						}
@@ -4208,6 +5240,158 @@ litehtml::element::ptr litehtml::html_tag::find_ancestor(const css_selector& sel
 		el_parent = el_parent->parent();
 	}
 	return nullptr;
+}
+
+int litehtml::html_tag::content_box_max_height()
+{
+	if(m_css_max_height.is_predefined() || m_css_max_height.units() == css_units_none)
+	{
+		return -1;
+	}
+	int mh = 0;
+	if(m_css_max_height.units() == css_units_percentage)
+	{
+		/* percentage against an indefinite containing block == none */
+		element::ptr p = parent();
+		int ph = 0;
+		if(!p || !p->get_predefined_height(ph)) return -1;
+		mh = m_css_max_height.calc_percent(p->border_box_content_height(ph));
+	}
+	else
+	{
+		mh = get_document()->cvt_units(m_css_max_height, m_font_size, 0);
+	}
+	if(m_box_sizing == box_sizing_border_box)
+	{
+		mh -= m_padding.top + m_borders.top + m_padding.bottom + m_borders.bottom;
+	}
+	return mh < 0 ? 0 : mh;
+}
+
+/* CSS sizing-4 §4: the preferred aspect ratio (width / height) declared by
+ * `aspect-ratio`. parse_styles has already folded var()/calc() (apple ships
+ * "aspect-ratio:calc(var(--vp-w)/var(--vp-h))"), so the stored value is a bare
+ * number ("1.77778"), a slash ratio ("16 / 9"), or either with the optional
+ * `auto` keyword attached. Returns 0 when the box carries no usable ratio. */
+double litehtml::html_tag::aspect_ratio()
+{
+	const tchar_t* v = get_style_property(_t("aspect-ratio"), false, 0);
+	if(!v)
+	{
+		return 0.0;
+	}
+	tstring s = v;
+	trim(s);
+	/* drop the optional `auto` keyword ("auto", "auto 16 / 9", "16 / 9 auto");
+	 * a bare "auto" leaves nothing and means no preferred ratio */
+	size_t a = s.find(_t("auto"));
+	if(a != tstring::npos)
+	{
+		s.erase(a, 4);
+		trim(s);
+	}
+	if(s.empty())
+	{
+		return 0.0;
+	}
+	size_t slash = s.find(_t('/'));
+	if(slash != tstring::npos)
+	{
+		double num = t_strtod(s.c_str(), nullptr);
+		double den = t_strtod(s.c_str() + slash + 1, nullptr);
+		if(num <= 0.0 || den <= 0.0)
+		{
+			return 0.0;
+		}
+		return num / den;
+	}
+	double num = t_strtod(s.c_str(), nullptr);
+	return num > 0.0 ? num : 0.0;
+}
+
+/* -webkit-line-clamp: the multi-line truncation idiom (display:-webkit-box +
+ * -webkit-box-orient:vertical + -webkit-line-clamp:N + overflow:hidden) that
+ * card teasers use where text-overflow:ellipsis only covers a single line.
+ * Returns the clamp line count, or 0 when the idiom's gates are not all met so
+ * an unrelated overflow:hidden box is never truncated. */
+int litehtml::html_tag::line_clamp_lines()
+{
+	if(m_overflow == overflow_visible)
+	{
+		return 0;
+	}
+	const tchar_t* d = get_style_property(_t("display"), false, 0);
+	if(!d || t_strstr(d, _t("-webkit-box")) == nullptr)
+	{
+		return 0;
+	}
+	const tchar_t* v = get_style_property(_t("-webkit-line-clamp"), false, 0);
+	if(!v)
+	{
+		return 0;
+	}
+	int n = (int)t_strtod(v, nullptr);
+	return n > 0 ? n : 0;
+}
+
+void litehtml::html_tag::clamp_used_block_height()
+{
+	int block_height = 0;
+	int min_height = 0;
+	if (!m_css_min_height.is_predefined() && m_css_min_height.units() == css_units_percentage)
+	{
+		element::ptr el_parent = parent();
+		if (el_parent)
+		{
+			if (el_parent->get_predefined_height(block_height))
+			{
+				min_height = m_css_min_height.calc_percent(block_height);
+			}
+		}
+	}
+	else
+	{
+		min_height = (int)m_css_min_height.val();
+	}
+	if (min_height != 0 && m_box_sizing == box_sizing_border_box)
+	{
+		min_height -= m_padding.top + m_borders.top + m_padding.bottom + m_borders.bottom;
+		if (min_height < 0) min_height = 0;
+	}
+
+	if (m_display == display_list_item)
+	{
+		const tchar_t* list_image = get_style_property(_t("list-style-image"), true, 0);
+		if (list_image)
+		{
+			tstring url;
+			css::parse_css_url(list_image, url);
+
+			size sz;
+			const tchar_t* list_image_baseurl = get_style_property(_t("list-style-image-baseurl"), true, 0);
+			get_document()->container()->get_image_size(url.c_str(), list_image_baseurl, sz);
+			if (min_height < sz.height)
+			{
+				min_height = sz.height;
+			}
+		}
+
+	}
+
+	/* Cap BEFORE the min floor: on a min>max conflict the min wins
+	 * (css-sizing-3), so flooring last is what implements that. */
+	{
+		int max_height = content_box_max_height();
+		if (max_height >= 0 && m_pos.height > max_height)
+		{
+			m_pos.height = max_height;
+		}
+	}
+
+	if (min_height > m_pos.height)
+	{
+		m_pos.height = min_height;
+	}
 }
 
 int litehtml::html_tag::get_floats_height(element_float el_float) const
@@ -4707,7 +5891,7 @@ void litehtml::html_tag::parse_background()
 	const tchar_t* mask_composite = get_style_property_own(_t("mask-composite"));
 	if(!mask_composite) mask_composite = get_style_property_own(_t("-webkit-mask-composite"));
 
-	m_bg.m_color = bg_color ? web_color::from_string(bg_color, get_document()->container()) : web_color(0, 0, 0, 0);
+	m_bg.m_color = bg_color ? resolve_color_value(bg_color, web_color(0, 0, 0, 0)) : web_color(0, 0, 0, 0);
 	m_bg.m_box_shadow = (box_shadow && t_strcasecmp(box_shadow, _t("none"))) ? box_shadow : _t("");
 	m_bg.m_mask = (mask && t_strcasecmp(mask, _t("none"))) ? mask : _t("");
 	/* Modern sites commonly express the two-layer ring mask entirely through
@@ -4726,6 +5910,20 @@ void litehtml::html_tag::parse_background()
 	{
 		m_bg.m_mask += _t(" ");
 		m_bg.m_mask += mask_composite;
+	}
+	/* An image mask (mask-image: url(...), the icon-glyph idiom: a solid
+	 * background-color shaped by the mask's alpha) is a fetchable resource
+	 * exactly like background-image: queue it so the decoded bitmap is in the
+	 * container cache by paint time. parse_css_url rejects non-url() tokens
+	 * (mask-clip / mask-composite keywords appended above). */
+	if(!m_bg.m_mask.empty())
+	{
+		tstring mask_url;
+		css::parse_css_url(m_bg.m_mask, mask_url);
+		if(!mask_url.empty())
+		{
+			get_document()->container()->load_image(mask_url.c_str(), m_bg.m_baseurl.empty() ? 0 : m_bg.m_baseurl.c_str(), true);
+		}
 	}
 	m_bg.m_position.x.set_value(0, css_units_percentage);
 	m_bg.m_position.y.set_value(0, css_units_percentage);
@@ -5358,7 +6556,7 @@ void litehtml::html_tag::init_font()
 
 void litehtml::html_tag::init_font(const tchar_t* own_font_size, const tchar_t* own_name, const tchar_t* own_weight, const tchar_t* own_style, const tchar_t* own_decoration)
 {
-	uint64_t start_ms = sys_tic_ms(0);
+	uint64_t start_ms = (litehtml::style_prof_enabled() ? sys_tic_ms(0) : 0);
 	bool inherit_fast = false;
 	static const tchar_t* s_inherit = _t("inherit");
 
@@ -5549,7 +6747,45 @@ void litehtml::html_tag::parse_transform_list(const tchar_t* val)
 	 * regardless of whether this parse came from parse_styles, an animated
 	 * writeback (set_animated_transform), or a snap-back-to-CSS restore. */
 	m_transform_str = val ? val : _t("");
-	const tchar_t* p = val;
+	/* css-values-4 lh unit: MDN centres its external-link icon with
+	 * translateY(calc(.5lh - .5em)). The cascade-time calc folder has no
+	 * line-height to offer, so such a calc() reaches here untouched and the
+	 * translate parsed to zero. Rewrite every <num>lh to its px value from
+	 * THIS element's computed line-height, then fold the calc() the rewrite
+	 * made resolvable. m_transform_str keeps the authored form above. */
+	tstring work = val ? val : _t("");
+	if(work.find(_t("lh")) != tstring::npos)
+	{
+		int lh = line_height();
+		for(size_t i = 0; i + 1 < work.length(); )
+		{
+			if(work[i] == _t('l') && work[i + 1] == _t('h') &&
+			   (i + 2 >= work.length() ||
+			    !(isalnum((unsigned char)work[i + 2]) || work[i + 2] == _t('%'))))
+			{
+				size_t ns = i;
+				while(ns > 0 &&
+				      (isdigit((unsigned char)work[ns - 1]) || work[ns - 1] == _t('.') ||
+				       work[ns - 1] == _t('+') || work[ns - 1] == _t('-')))
+				{
+					ns--;
+				}
+				tstring num = work.substr(ns, i - ns);
+				if(!num.empty())
+				{
+					double v = strtod(num.c_str(), nullptr);
+					char buf[32];
+					snprintf(buf, sizeof(buf), "%.2fpx", v * lh);
+					work.replace(ns, i + 2 - ns, buf);
+					i = ns + tstring(buf).length();
+					continue;
+				}
+			}
+			i++;
+		}
+		eval_calc_funcs(work, get_document(), get_font_size());
+	}
+	const tchar_t* p = work.c_str();
 	while(p && *p)
 	{
 		while(*p == ' ' || *p == '\t') p++;
@@ -5724,6 +6960,123 @@ bool litehtml::html_tag::compute_transform_matrix(const position& box, float m[6
 	m[4] = es + box.x - (a * box.x + c * box.y);
 	m[5] = fs + box.y - (b * box.x + d * box.y);
 	return true;
+}
+
+bool litehtml::html_tag::eweb_self_xform(float m[6]) const
+{
+	if(m_transform.empty()) return false;
+	/* The matrix wants the BORDER box in document coordinates: the same box
+	 * the draw path transforms (draw_background adds only the draw offset,
+	 * which cancels for a document-space query). m_pos is the content box. */
+	position bb = get_placement();
+	bb.x -= m_padding.left + m_borders.left;
+	bb.y -= m_padding.top + m_borders.top;
+	bb.width  = m_pos.width  + m_padding.width()  + m_borders.width();
+	bb.height = m_pos.height + m_padding.height() + m_borders.height();
+	return compute_transform_matrix(bb, m);
+}
+
+bool litehtml::html_tag::eweb_transform_bounds(position& bb) const
+{
+	/* Compose own + ancestor transforms in document space (self applied
+	 * first, then each ancestor outwards) and take the axis-aligned bounds
+	 * of the transformed box: getBoundingClientRect semantics, while the
+	 * offset* properties keep the untransformed layout box. element::ptr is a
+	 * non-owning raw pointer; the chain stays alive through the tree. */
+	float acc[6] = {1, 0, 0, 1, 0, 0};
+	bool any = false;
+	const element* cur = this;
+	for(;;)
+	{
+		float m[6];
+		if(cur->eweb_self_xform(m))
+		{
+			/* acc = m . acc (m applied after the product so far) */
+			const float a2 = acc[0], b2 = acc[1], c2 = acc[2], d2 = acc[3], e2 = acc[4], f2 = acc[5];
+			acc[0] = m[0] * a2 + m[2] * b2;
+			acc[1] = m[1] * a2 + m[3] * b2;
+			acc[2] = m[0] * c2 + m[2] * d2;
+			acc[3] = m[1] * c2 + m[3] * d2;
+			acc[4] = m[0] * e2 + m[2] * f2 + m[4];
+			acc[5] = m[1] * e2 + m[3] * f2 + m[5];
+			any = true;
+		}
+		const element* up = cur->parent();
+		if(!up) break;
+		cur = up;
+	}
+	if(!any) return false;
+	const float px[4] = {(float)bb.x, (float)(bb.x + bb.width), (float)bb.x, (float)(bb.x + bb.width)};
+	const float py[4] = {(float)bb.y, (float)bb.y, (float)(bb.y + bb.height), (float)(bb.y + bb.height)};
+	float minx = 0, maxx = 0, miny = 0, maxy = 0;
+	for(int i = 0; i < 4; i++)
+	{
+		float X = acc[0] * px[i] + acc[2] * py[i] + acc[4];
+		float Y = acc[1] * px[i] + acc[3] * py[i] + acc[5];
+		if(i == 0){ minx = maxx = X; miny = maxy = Y; continue; }
+		if(X < minx) minx = X;
+		if(X > maxx) maxx = X;
+		if(Y < miny) miny = Y;
+		if(Y > maxy) maxy = Y;
+	}
+	int l = (int)lroundf(minx), t = (int)lroundf(miny);
+	bb.width  = (int)lroundf(maxx) - l;
+	bb.height = (int)lroundf(maxy) - t;
+	bb.x = l;
+	bb.y = t;
+	return true;
+}
+
+bool litehtml::html_tag::eweb_sticky_offset(int scroll_y, int view_h, int* dy) const
+{
+	/* position:sticky CSS Positioned Layout 3: the box lays out in flow, then
+	 * shifts just enough to keep its border box >= top inset from the
+	 * scrollport top (and <= bottom inset from its bottom), never leaving its
+	 * containing block (approximated by the parent's padding box). Only the
+	 * vertical axis - top/bottom insets - which is what real pages pin. */
+	if(dy) *dy = 0;
+	if(m_el_position != element_position_sticky || !dy) return false;
+	element::ptr par = parent();
+	if(!par || par->get_display() == display_none) return false;
+
+	position bb = get_placement();               /* content box, document coords */
+	bb.y -= m_padding.top + m_borders.top;       /* -> border box top */
+	int bb_h = m_pos.height + m_padding.height() + m_borders.height();
+
+	position pb = par->get_placement();
+	margins ppad = par->get_paddings();
+	int cb_bot = pb.y + par->height() + ppad.bottom; /* containing block padding box bottom */
+	int cb_top = pb.y - ppad.top;
+
+	/* Per-axis pin constraints (CSS Positioned Layout 3): a top inset pushes
+	 * the box DOWN to stay below the scrollport top; a bottom inset pulls it
+	 * UP to stay above the scrollport bottom. The containing box clamps both:
+	 * the border box may never leave it - once the cb's bottom edge scrolls
+	 * past, a top-sticky box is pushed out of view with it (shift goes
+	 * negative, back through its flow position). */
+	int lo = cb_top - bb.y;                      /* box top >= cb top */
+	int hi = cb_bot - (bb.y + bb_h);             /* box bottom <= cb bottom */
+	if(lo > hi) { if(hi < 0) hi = lo; else lo = hi; } /* degenerate cb */
+	int need_lo = lo, need_hi = hi;              /* unbounded unless inset given */
+	if(!m_css_offsets.top.is_predefined())
+	{
+		css_length top_inset = m_css_offsets.top; /* cvt_units takes it by ref */
+		int inset = get_document()->cvt_units(top_inset, m_font_size);
+		need_lo = scroll_y + inset - bb.y;        /* box top >= scrollport top+inset */
+	}
+	if(!m_css_offsets.bottom.is_predefined())
+	{
+		css_length bot_inset = m_css_offsets.bottom;
+		int inset = get_document()->cvt_units(bot_inset, m_font_size);
+		need_hi = (scroll_y + view_h - inset) - (bb.y + bb_h); /* box bottom <= */
+	}
+	int shift = 0;
+	if(shift < need_lo) shift = need_lo;
+	if(shift > need_hi) shift = need_hi;        /* top wins when contradictory */
+	if(shift < lo) shift = lo;
+	if(shift > hi) shift = hi;
+	*dy = shift;
+	return shift != 0;
 }
 
 void litehtml::html_tag::draw_background( uint_ptr hdc, int x, int y, const position* clip )
@@ -5941,23 +7294,29 @@ int litehtml::html_tag::place_element(const element::ptr &el, int max_width)
 
 	if(el_position == element_position_absolute || el_position == element_position_fixed)
 	{
+		/* Static position in inline flow = where the box would have sat had it
+		 * been static (CSS 2.1 10.6.4 / css-position-3): the current line's
+		 * inline cursor, i.e. right after the preceding inline content. The
+		 * old next-line-start placement (x=0, y jumped by line_height on a
+		 * non-empty line) dropped MDN's a.external::after icons onto the
+		 * FOLLOWING line's left margin instead of after the link text. An
+		 * empty current line degenerates to its left edge, and a trailing
+		 * block box keeps the after-block origin. */
 		int line_top = 0;
+		int line_left = 0;
 		if(!m_boxes.empty())
 		{
 			if(m_boxes.back()->get_type() == box_line)
 			{
 				line_top = m_boxes.back()->top();
-				if(!m_boxes.back()->is_empty())
-				{
-					line_top += line_height();
-				}
+				line_left = m_boxes.back()->left() + m_boxes.back()->width();
 			} else
 			{
 				line_top = m_boxes.back()->bottom();
 			}
 		}
 
-		el->render(0, line_top, max_width);
+		el->render(line_left, line_top, max_width);
 		el->m_pos.x	+= el->content_margins_left();
 		el->m_pos.y	+= el->content_margins_top();
 
@@ -6399,6 +7758,11 @@ bool litehtml::html_tag::is_line_height_normal() const
 float litehtml::html_tag::line_height_factor() const
 {
 	return m_lh_factor;
+}
+
+int litehtml::html_tag::letter_spacing() const
+{
+	return m_letter_spacing;
 }
 
 bool litehtml::html_tag::is_replaced() const
@@ -6960,6 +8324,23 @@ void litehtml::html_tag::draw_children( uint_ptr hdc, int x, int y, const positi
 			get_document()->container()->del_clip();
 		return;
 	}
+	/* A CSS transform applies to the element's WHOLE painted subtree, but
+	 * draw_background only wraps the box's own background/borders in the
+	 * matrix. Keep the matrix active across the content paint too, so the
+	 * element's text and descendants shift with it. This is what makes the
+	 * ubiquitous top:50%+translateY(-50%) (and translate(-50%,-50%)) centering
+	 * idiom actually centre the glyphs, not just the (usually transparent) box.
+	 * push/pop is stack-based, so a descendant with its own transform composes
+	 * over this one and restores it on the way out. */
+	position xf_pos = m_pos;
+	xf_pos.x += x;
+	xf_pos.y += y;
+	xf_pos += m_padding;
+	xf_pos += m_borders;
+	float xform[6];
+	bool have_xform = compute_transform_matrix(xf_pos, xform);
+	if(have_xform)
+		get_document()->container()->push_paint_transform(xform);
 	if (m_display == display_table || m_display == display_inline_table)
 	{
 		draw_children_table(hdc, x, y, clip, flag, zindex);
@@ -6968,6 +8349,8 @@ void litehtml::html_tag::draw_children( uint_ptr hdc, int x, int y, const positi
 	{
 		draw_children_box(hdc, x, y, clip, flag, zindex);
 	}
+	if(have_xform)
+		get_document()->container()->pop_paint_transform();
 	if(css_clipped)
 		get_document()->container()->del_clip();
 }
@@ -6977,6 +8360,8 @@ bool litehtml::html_tag::fetch_positioned()
 	bool ret = false;
 
 	m_positioned.clear();
+	m_has_pospart = false;
+	m_has_floater = false;
 
 	litehtml::element_position el_pos;
 
@@ -6986,6 +8371,7 @@ bool litehtml::html_tag::fetch_positioned()
 		if (el->is_stacking_participant())
 		{
 			add_positioned(el);
+			m_has_pospart = true;
 		}
 		if (!ret && (el_pos == element_position_absolute || el_pos == element_position_fixed))
 		{
@@ -6994,6 +8380,14 @@ bool litehtml::html_tag::fetch_positioned()
 		if(el->fetch_positioned())
 		{
 			ret = true;
+		}
+		if(el->has_pospart())
+		{
+			m_has_pospart = true;
+		}
+		if(el->get_float() != float_none || el->has_floater())
+		{
+			m_has_floater = true;
 		}
 	}
 	return ret;
@@ -7224,6 +8618,59 @@ void litehtml::html_tag::render_positioned(render_type rt)
 					}
 					cvt_y = true;
 				}
+
+				/* Static position (all-auto insets on an axis) inside a flex
+				 * container: per CSS the abs child is placed as if it were the
+				 * sole flex item, honouring justify-content (main axis) and
+				 * align-items (cross axis). The flex algorithm skips abs children
+				 * entirely, so without this they keep the in-flow origin and pile
+				 * up at the container's top-left (gestalt field trailing icons).
+				 * Expressed in the same padding-box convention as the explicit
+				 * inset paths above so the chain conversion below applies alike.
+				 * Scoped to cb==parent flex containers: a block cb keeps the old
+				 * in-flow static position to avoid regressing ordinary pages. */
+				if(cb == el->parent() &&
+				   (cb->get_display() == display_flex || cb->get_display() == display_inline_flex))
+				{
+					if(css_left.is_predefined() && css_right.is_predefined())
+					{
+						int pad_l = cb->padding_left();
+						int pad_r = cb->padding_right();
+						int content_w = cb_pw - pad_l - pad_r;
+						int iw = el->m_pos.width + el->content_margins_left() + el->content_margins_right();
+						const tchar_t* jc = cb->get_style_property(_t("justify-content"), false, _t("flex-start"));
+						int x = pad_l;
+						if(jc && (!t_strcmp(jc, _t("flex-end")) || !t_strcmp(jc, _t("end")) || !t_strcmp(jc, _t("right"))))
+						{
+							x = cb_pw - pad_r - iw;
+						}
+						else if(jc && (!t_strcmp(jc, _t("center")) || !t_strcmp(jc, _t("space-around")) || !t_strcmp(jc, _t("space-evenly"))))
+						{
+							x = pad_l + (content_w - iw) / 2;
+						}
+						el->m_pos.x = x + el->content_margins_left();
+						cvt_x = true;
+					}
+					if(css_top.is_predefined() && css_bottom.is_predefined())
+					{
+						int pad_t = cb->padding_top();
+						int pad_b = cb->padding_bottom();
+						int content_h = cb_ph - pad_t - pad_b;
+						int ih = el->m_pos.height + el->content_margins_top() + el->content_margins_bottom();
+						const tchar_t* ai = cb->get_style_property(_t("align-items"), false, _t("stretch"));
+						int y = pad_t;
+						if(ai && !t_strcmp(ai, _t("center")))
+						{
+							y = pad_t + (content_h - ih) / 2;
+						}
+						else if(ai && (!t_strcmp(ai, _t("flex-end")) || !t_strcmp(ai, _t("end"))))
+						{
+							y = cb_ph - pad_b - ih;
+						}
+						el->m_pos.y = y + el->content_margins_top();
+						cvt_y = true;
+					}
+				}
 			}
 
 			if(cvt_x || cvt_y)
@@ -7352,6 +8799,13 @@ void litehtml::html_tag::render_positioned(render_type rt)
 				el->m_pos = pos;
 			}
 
+			/* The m_pos restore above replays the pre-render CSS-geometry
+			 * snapshot and so discards whatever min/max-height clamps
+			 * render_box/render_flex applied inside el->render(); re-apply them
+			 * on the final box (CSS2.1 10.4). Also catches the need_render==false
+			 * pass, where the definite-size step's own write is unclamped. */
+			static_cast<html_tag*>(el)->clamp_used_block_height();
+
 			if(el_position == element_position_fixed)
 			{
 				position fixed_pos;
@@ -7375,6 +8829,72 @@ void litehtml::html_tag::render_positioned(render_type rt)
 void litehtml::html_tag::draw_stacking_context( uint_ptr hdc, int x, int y, const position* clip, bool with_positioned )
 {
 	if(!is_visible()) return;
+
+	/* m_positioned is stable-sorted by z-index at the end of every
+	 * render_positioned() call, and document::render() always runs
+	 * render_positioned right after fetch_positioned() rebuilds the list,
+	 * so by paint time each distinct z level is one adjacent run in
+	 * m_positioned. Scanning those runs directly replaces the std::map
+	 * round-trip (one red-black insert + allocation per participant per
+	 * z-level pass per frame). EWEB_ZSCAN_OFF restores the map. */
+	static int s_zscan_off = -1;
+	if (s_zscan_off < 0)
+	{
+		s_zscan_off = (getenv("EWEB_ZSCAN_OFF") != NULL) ? 1 : 0;
+	}
+	if (!s_zscan_off)
+	{
+		if(with_positioned)
+		{
+			if (zscan_stats_enabled())
+			{
+				g_zscan_calls++;
+				g_zscan_items += m_positioned.size();
+			}
+			int prev = 0;
+			bool started = false, saw_zero = false;
+			for (auto& el : m_positioned)
+			{
+				int z = el->get_zindex();
+				if (z >= 0) break;
+				if (!started || z != prev)
+				{
+					draw_children(hdc, x, y, clip, draw_positioned, z);
+					prev = z; started = true;
+				}
+			}
+			draw_children(hdc, x, y, clip, draw_block, 0);
+			draw_children(hdc, x, y, clip, draw_floats, 0);
+			draw_children(hdc, x, y, clip, draw_inlines, 0);
+			for (auto& el : m_positioned)
+			{
+				int z = el->get_zindex();
+				if (z < 0) continue;
+				saw_zero = (z == 0);
+				break;
+			}
+			if (saw_zero)
+			{
+				draw_children(hdc, x, y, clip, draw_positioned, 0);
+			}
+			prev = 0; started = false;
+			for (auto& el : m_positioned)
+			{
+				int z = el->get_zindex();
+				if (z <= 0) continue;
+				if (!started || z != prev)
+				{
+					draw_children(hdc, x, y, clip, draw_positioned, z);
+					prev = z; started = true;
+				}
+			}
+			return;
+		}
+		draw_children(hdc, x, y, clip, draw_block, 0);
+		draw_children(hdc, x, y, clip, draw_floats, 0);
+		draw_children(hdc, x, y, clip, draw_inlines, 0);
+		return;
+	}
 
 	std::map<int, bool> zindexes;
 	if(with_positioned)
@@ -7935,15 +9455,30 @@ litehtml::element::ptr litehtml::html_tag::get_child_by_point(int x, int y, int 
 					if(el->get_element_position() == element_position_fixed)
 					{
 						ret = el->get_element_by_point(client_x, client_y, client_x, client_y);
-						if(!ret && (*i)->is_point_inside(client_x, client_y))
+						if(!ret && (*i)->eweb_hit_testable() && (*i)->is_point_inside(client_x, client_y))
 						{
 							ret = (*i);
 						}
 						el = 0;
 					} else
 					{
-						ret = el->get_element_by_point(pos.x, pos.y, client_x, client_y);
-						if(!ret && (*i)->is_point_inside(pos.x, pos.y))
+						/* Sticky children paint shifted, so hit-test against the
+						 * shifted box too: undo the pin shift from the test point
+						 * (pos.x/pos.y hold the point relative to this parent's
+						 * m_pos, and x,y is that same point in this parent's local
+						 * space - parent document coords are x - pos.x). */
+						int hx = pos.x, hy = pos.y;
+						if(el->get_element_position() == element_position_sticky)
+						{
+							document* doc = get_document();
+							position wnd;
+							doc->container()->get_client_rect(wnd);
+							int sdy = 0;
+							el->eweb_sticky_offset(doc->get_hit_scroll_y(), wnd.height, &sdy);
+							hy -= sdy;
+						}
+						ret = el->get_element_by_point(hx, hy, client_x, client_y);
+						if(!ret && (*i)->eweb_hit_testable() && (*i)->is_point_inside(hx, hy))
 						{
 							ret = (*i);
 						}
@@ -7960,7 +9495,7 @@ litehtml::element::ptr litehtml::html_tag::get_child_by_point(int x, int y, int 
 			case draw_block:
 				if(!el->is_inline_box() && el->get_float() == float_none && !el->is_stacking_participant())
 				{
-					if(el->is_point_inside(pos.x, pos.y))
+					if(el->eweb_hit_testable() && el->is_point_inside(pos.x, pos.y))
 					{
 						ret = el;
 					}
@@ -7971,7 +9506,7 @@ litehtml::element::ptr litehtml::html_tag::get_child_by_point(int x, int y, int 
 				{
 					ret = el->get_element_by_point(pos.x, pos.y, client_x, client_y);
 
-					if(!ret && (*i)->is_point_inside(pos.x, pos.y))
+					if(!ret && (*i)->eweb_hit_testable() && (*i)->is_point_inside(pos.x, pos.y))
 					{
 						ret = (*i);
 					}
@@ -7986,7 +9521,7 @@ litehtml::element::ptr litehtml::html_tag::get_child_by_point(int x, int y, int 
 						ret = el->get_element_by_point(pos.x, pos.y, client_x, client_y);
 						el = 0;
 					}
-					if(!ret && (*i)->is_point_inside(pos.x, pos.y))
+					if(!ret && (*i)->eweb_hit_testable() && (*i)->is_point_inside(pos.x, pos.y))
 					{
 						ret = (*i);
 					}
@@ -8015,7 +9550,15 @@ litehtml::element::ptr litehtml::html_tag::get_child_by_point(int x, int y, int 
 					if(	el->get_float() == float_none &&
 						el->get_display() != display_inline_block)
 					{
-						element::ptr child = el->get_child_by_point(pos.x, pos.y, client_x, client_y, flag, zindex);
+						/* A static box can still be a STACKING CONTEXT (isolation,
+						 * opacity, transform, filter...): positioned descendants
+						 * bubble into ITS m_positioned, which only a full
+						 * get_element_by_point consults. A plain get_child_by_point
+						 * (draw_block) would skip those stacking participants and
+						 * make e.g. a sticky header unreachable. */
+						element::ptr child = (flag == draw_block)
+							? el->get_element_by_point(pos.x, pos.y, client_x, client_y)
+							: el->get_child_by_point(pos.x, pos.y, client_x, client_y, flag, zindex);
 						if(child)
 						{
 							ret = child;
@@ -8029,7 +9572,7 @@ litehtml::element::ptr litehtml::html_tag::get_child_by_point(int x, int y, int 
 	return ret;
 }
 
-litehtml::element::ptr litehtml::html_tag::get_element_by_point(int x, int y, int client_x, int client_y)
+litehtml::element::ptr litehtml::html_tag::eweb_gebp_inner(int x, int y, int client_x, int client_y)
 {
 	if(!is_visible()) return 0;
 
@@ -8081,15 +9624,105 @@ litehtml::element::ptr litehtml::html_tag::get_element_by_point(int x, int y, in
 
 	if(m_el_position == element_position_fixed)
 	{
-		if(is_point_inside(client_x, client_y))
+		if(eweb_hit_testable() && is_point_inside(client_x, client_y))
 		{
 			ret = this;
 		}
 	} else
 	{
-		if(is_point_inside(x, y))
+		if(eweb_hit_testable() && is_point_inside(x, y))
 		{
 			ret = this;
+		}
+	}
+
+	return ret;
+}
+
+/* EWEB_HITDBG helper: print the chain of boxes whose border box contains the
+ * point (px,py given in `e`'s parent coordinate space), with the stacking /
+ * positioning flags the hit walker keys off, so an unreachable subtree can be
+ * seen directly. Depth-capped; purely diagnostic. */
+static void eweb_dump_chain_to_point(litehtml::element* e, int px, int py, int depth)
+{
+	if(depth > 12) return;
+	litehtml::position ep = e->get_placement();
+	int lx = px - ep.x;
+	int ly = py - ep.y;
+	for(size_t k = 0; k < e->get_children_count(); k++)
+	{
+		litehtml::element::ptr c = e->get_child((int)k);
+		if(!c || !c->is_point_inside(lx, ly)) continue;
+		litehtml::position p = c->get_placement();
+		fprintf(stderr, "[hitdbg-chain] %*sd=%d tag=%s posn=%d z=%d part=%d stack=%d box=%d,%d %dx%d\n",
+			depth * 2, "", depth, c->get_tagName(), (int)c->get_element_position(), (int)c->get_zindex(),
+			(int)c->is_stacking_participant(), (int)c->is_stacking_context(), p.x, p.y, p.width, p.height);
+		if(c->get_display() != litehtml::display_inline_text && depth < 12)
+		{
+			eweb_dump_chain_to_point(c, lx, ly, depth + 1);
+		}
+	}
+}
+
+litehtml::element::ptr litehtml::html_tag::get_element_by_point(int x, int y, int client_x, int client_y)
+{
+	element::ptr ret = eweb_gebp_inner(x, y, client_x, client_y);
+
+	/* EWEB_HITDBG: when a query resolves to body/root (a "miss"), dump this
+	 * element's positioned layer with boxes so the missing or absorbing
+	 * positioned subtree (e.g. a sticky header) can be located. */
+	if(ret != 0 && (ret == this || ret->is_body()) && (m_parent == nullptr || is_body()) && getenv("EWEB_HITDBG") != nullptr)
+	{
+		fprintf(stderr, "[hitdbg-miss] x=%d y=%d cx=%d cy=%d self=%s target=%s npos=%d\n", x, y, client_x, client_y,
+			get_tagName(), ret->get_tagName(), (int)m_positioned.size());
+		for(elements_vector::iterator i = m_positioned.begin(); i != m_positioned.end(); i++)
+		{
+			litehtml::position p = (*i)->get_placement();
+			fprintf(stderr, "[hitdbg-miss]   pos tag=%s z=%d posn=%d box=%d,%d %dx%d inside=%d test=%d stack=%d\n",
+				(*i)->get_tagName(), (int)(*i)->get_zindex(), (int)(*i)->get_element_position(),
+				p.x, p.y, p.width, p.height,
+				(int)(*i)->is_point_inside(x, y), (int)(*i)->eweb_hit_testable(),
+				(int)(*i)->is_stacking_context());
+		}
+		static int chain_budget = 2;
+		if(chain_budget > 0 && getenv("EWEB_HITDUMP") != nullptr) { chain_budget--; eweb_dump_chain_to_point(this, x, y, 0); }
+		static int kid_budget = 1;
+		if(is_body() && kid_budget > 0 && getenv("EWEB_HITDUMP") != nullptr)
+		{
+			kid_budget--;
+			for(size_t k = 0; k < get_children_count(); k++)
+			{
+				element::ptr c = get_child((int)k);
+				if(!c) continue;
+				litehtml::position p = c->get_placement();
+				fprintf(stderr, "[hitdbg-kid] k=%zu tag=%s disp=%d vis=%d posn=%d z=%d part=%d box=%d,%d %dx%d inside=%d\n",
+					k, c->get_tagName(), (int)c->get_display(), (int)c->is_visible(), (int)c->get_element_position(),
+					(int)c->get_zindex(), (int)c->is_stacking_participant(), p.x, p.y, p.width, p.height,
+					(int)c->is_point_inside(x, y));
+				if(c->is_visible() && c->get_display() != litehtml::display_inline_text)
+				{
+					litehtml::html_tag* ht = static_cast<litehtml::html_tag*>((litehtml::element*)c);
+					fprintf(stderr, "[hitdbg-kid]     npos=%d nkids=%zu stack=%d\n",
+						(int)ht->m_positioned.size(), c->get_children_count(), (int)c->is_stacking_context());
+					for(size_t q = 0; q < ht->m_positioned.size() && q < 10; q++)
+					{
+						litehtml::element* pe = ht->m_positioned[q];
+						litehtml::position pp = pe->get_placement();
+						fprintf(stderr, "[hitdbg-kid]     pos tag=%s posn=%d z=%d box=%d,%d %dx%d\n",
+							pe->get_tagName(), (int)pe->get_element_position(), (int)pe->get_zindex(),
+							pp.x, pp.y, pp.width, pp.height);
+					}
+					for(size_t q = 0; q < c->get_children_count() && q < 10; q++)
+					{
+						litehtml::element::ptr gc = c->get_child((int)q);
+						if(!gc) continue;
+						litehtml::position gp = gc->get_placement();
+						fprintf(stderr, "[hitdbg-kid]     kid tag=%s vis=%d posn=%d box=%d,%d %dx%d\n",
+							gc->get_tagName(), (int)gc->is_visible(), (int)gc->get_element_position(),
+							gp.x, gp.y, gp.width, gp.height);
+					}
+				}
+			}
 		}
 	}
 
@@ -8141,6 +9774,69 @@ const litehtml::background* litehtml::html_tag::get_background(bool own_only)
 	return &m_bg;
 }
 
+/* css-mult-3 balanced multi-column flow over the block-level children of a
+ * column container (MDN's property index: `columns:18rem` over thousand-item
+ * lists). Two passes at the column width: measure every unit's outer height,
+ * balance the total into N column targets, then place units child-granular
+ * (break-inside:avoid is automatic at this granularity; line-level
+ * fragmentation of inline content is out of scope, so a container with
+ * inline children returns -1 and keeps the normal single-column flow). */
+int litehtml::html_tag::render_multicol(const std::vector<element::ptr>& kids, int content_width, bool second_pass)
+{
+	std::vector<element::ptr> units;
+	for(const auto& el : kids)
+	{
+		if(el->get_display() == display_none) continue;
+		if(el->is_white_space()) continue;
+		element_position p = el->get_element_position();
+		if(p == element_position_absolute || p == element_position_fixed) continue;
+		style_display d = el->get_display();
+		if(d == display_inline || d == display_inline_block || d == display_inline_text || el->is_inline_box())
+		{
+			return -1;
+		}
+		units.push_back(el);
+	}
+	if(units.empty()) return -1;
+	int gap = m_column_gap > 0 ? m_column_gap : 0;
+	int n = m_column_count > 0 ? m_column_count
+		: (m_column_width + gap > 0 ? (content_width + gap) / (m_column_width + gap) : 1);
+	if(n < 2) return -1;
+	if(n > 64) n = 64;
+	int cw = (content_width - (n - 1) * gap) / n;
+	if(cw < 8) return -1;
+	/* Measure pass: stack every unit at column width; the sum is what the
+	 * balanced columns must share. */
+	std::vector<int> hs(units.size(), 0);
+	int total = 0;
+	for(size_t i = 0; i < units.size(); i++)
+	{
+		units[i]->render(0, 0, cw, second_pass);
+		const position& r = units[i]->get_position();
+		hs[i] = r.height + units[i]->content_margins_top() + units[i]->content_margins_bottom();
+		if(hs[i] < 0) hs[i] = 0;
+		total += hs[i];
+	}
+	int target = (total + n - 1) / n;
+	std::vector<int> fill(n, 0);
+	int col = 0;
+	int height = 0;
+	for(size_t i = 0; i < units.size(); i++)
+	{
+		/* Break before this unit when the column already holds content and
+		 * would overshoot the balanced target; the last column absorbs the
+		 * remainder (unbalanced tail beats lost content). */
+		if(col < n - 1 && fill[col] > 0 && fill[col] + hs[i] > target)
+		{
+			col++;
+		}
+		units[i]->render(col * (cw + gap), fill[col], cw, second_pass);
+		fill[col] += hs[i];
+		if(fill[col] > height) height = fill[col];
+	}
+	return height;
+}
+
 int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass /*= false*/)
 {
 	int parent_width = max_width;
@@ -8162,13 +9858,85 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 		/* Flex items set m_pct_cb_width: per spec their percentage width /
 		 * max-width resolve against the flex container content box, while
 		 * render() hands them their resolved main size as parent_width. */
-		int w = (m_pct_cb_width > 0 && m_css_width.units() == css_units_percentage)
-			? get_document()->cvt_units(m_css_width, m_font_size, m_pct_cb_width)
-			: calc_width(parent_width);
+		int w;
+		if (m_css_width.units() == css_units_percentage && !is_body() && have_parent()
+			&& (m_pct_cb_width > 0 || parent_width > 0))
+		{
+			/* A percentage width resolves against the CONTAINING BLOCK's used
+			 * content width — the parent_width render() already handed down —
+			 * not against a recursive walk of the ancestors' specified widths.
+			 * calc_width() does that walk, so when an ancestor in the chain is
+			 * narrowed by max-width the walk keeps reporting the unclamped
+			 * ancestor width and every percentage descendant over-measures
+			 * (text laid out one line wide, sliding under the next panel —
+			 * Pinterest's "Collaborate with group boards" column). */
+			int pct_base = m_pct_cb_width > 0 ? m_pct_cb_width : parent_width;
+			w = get_document()->cvt_units(m_css_width, m_font_size, pct_base);
+		}
+		else
+		{
+			w = calc_width(parent_width);
+		}
 		
 		if (m_box_sizing == box_sizing_border_box)
 		{
 			w -= m_padding.width() + m_borders.width();
+		}
+		/* The max-width check below only narrows max_width: ret_width and
+		 * block_width would keep the unclamped w, and so would m_pos.width
+		 * (the percentage base every descendant resolves against) whenever
+		 * the box is inline or the clamp is skipped on the second pass.
+		 * Clamp the specified width itself — CSS 2.1 §10.4: width is
+		 * replaced by max-width when it computes larger. */
+		if (!m_css_max_width.is_predefined())
+		{
+			int mwbase = m_pct_cb_width > 0 ? m_pct_cb_width : parent_width;
+			/* Percentage max-width with no used base (measurement passes hand
+			 * parent_width=0) would resolve to 0 and clamp the specified width
+			 * to zero, collapsing shrink-to-fit boxes; skip there. */
+			if (!(m_css_max_width.units() == css_units_percentage && mwbase <= 0))
+			{
+			int mw = get_document()->cvt_units(m_css_max_width, m_font_size, mwbase);
+			if (m_box_sizing == box_sizing_border_box)
+			{
+				mw -= m_padding.left + m_borders.left + m_padding.right + m_borders.right;
+			}
+			if (mw >= 0 && w > mw) w = mw;
+			}
+		}
+		/* A flex item's used main size is the FLEXED value render() passed as
+		 * parent_width; its percentage / specified width only fed the flex base
+		 * size. Two directions must both land on that flexed size:
+		 *  - SHRINK: re-resolving a percentage width against m_pct_cb_width (the
+		 *    container) re-expanded an item the flex algorithm had shrunk, so a
+		 *    width:100%+max-width column kept its un-flexed 550 and overlapped
+		 *    the neighbour panel. Cap at the flexed main size (unchanged).
+		 *  - GROW: an item with a SPECIFIED width that flex-grow / flex-basis
+		 *    expanded past that width kept rendering at the specified width
+		 *    (calc_width ignores the flexed parent_width), so the grown space
+		 *    was left empty and the following items sat at their packed offsets
+		 *    with a gap. Expand the content width to the flexed main size minus
+		 *    the item's own margins (it.main is the outer margin-box main size).
+		 * Non-flex boxes keep overflowing freely (width:150%). */
+		if (m_pct_cb_width > 0)
+		{
+			if (w > parent_width)
+			{
+				w = parent_width;
+			}
+			else
+			{
+				/* GROW: expand the content width to the flexed main size. it.main
+				 * is the item's outer main size as the flex algorithm measured it
+				 * (content + margins; the base collection excludes padding/border,
+				 * a known imprecision), so give back margins AND padding/border to
+				 * keep the padded item's outer box inside its allotted slot rather
+				 * than overflowing onto the next one. */
+				int flexed = parent_width - (margin_left() + margin_right())
+					- (m_padding.left + m_borders.left + m_padding.right + m_borders.right);
+				if (flexed < 0) flexed = 0;
+				if (flexed > w) w = flexed;
+			}
 		}
 		ret_width = max_width = block_width = w;
 	}
@@ -8298,6 +10066,30 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 		}
 	}
 
+	/* css-mult-3: a column container flows its block-level children into
+	 * balanced column strips instead of the single-column block flow below.
+	 * render_multicol returns -1 for ineligible boxes (inline children),
+	 * which keep the normal flow untouched. */
+	if((m_column_count > 0 || m_column_width > 0) && max_width > 0)
+	{
+		int colh = render_multicol(layout_children, max_width, second_pass);
+		if(colh >= 0)
+		{
+			m_pos.width = max_width;
+			m_pos.height = colh;
+			int bh = 0;
+			if(get_predefined_height(bh))
+			{
+				m_pos.height = border_box_content_height(bh);
+			}
+			calc_auto_margins(parent_width);
+			m_pos.move_to(x, y);
+			m_pos.x += content_margins_left();
+			m_pos.y += content_margins_top();
+			return max_width;
+		}
+	}
+
 	white_space ws = get_white_space();
 	bool skip_spaces = false;
 	if (ws == white_space_normal ||
@@ -8400,56 +10192,42 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 	m_pos.x += content_margins_left();
 	m_pos.y += content_margins_top();
 
+	/* CSS sizing-4 §4: with an auto block size and a definite inline size, the
+	 * used block size transfers from the preferred aspect ratio (the
+	 * width:100% + aspect-ratio media/card pattern). Applied before the
+	 * predefined-height override is skipped and before clamp_used_block_height
+	 * so min/max-height still win over the transferred size. */
+	if (m_pos.width > 0 && !get_predefined_height(block_height))
+	{
+		double ar = aspect_ratio();
+		if (ar > 0.0)
+		{
+			m_pos.height = (int)(m_pos.width / ar + 0.5);
+		}
+	}
+
+	/* -webkit-line-clamp: cap an auto block size to N line boxes; the surplus
+	 * lines are then clipped by the idiom's overflow:hidden. Applied while the
+	 * height is still auto so an explicit height keeps precedence. */
+	if (!get_predefined_height(block_height))
+	{
+		int nl = line_clamp_lines();
+		if (nl > 0 && m_line_height > 0)
+		{
+			int cap = nl * m_line_height;
+			if (m_pos.height > cap)
+			{
+				m_pos.height = cap;
+			}
+		}
+	}
+
 	if (get_predefined_height(block_height))
 	{
 		m_pos.height = border_box_content_height(block_height);
 	}
 
-	int min_height = 0;
-	if (!m_css_min_height.is_predefined() && m_css_min_height.units() == css_units_percentage)
-	{
-		element::ptr el_parent = parent();
-		if (el_parent)
-		{
-			if (el_parent->get_predefined_height(block_height))
-			{
-				min_height = m_css_min_height.calc_percent(block_height);
-			}
-		}
-	}
-	else
-	{
-		min_height = (int)m_css_min_height.val();
-	}
-	if (min_height != 0 && m_box_sizing == box_sizing_border_box)
-	{
-		min_height -= m_padding.top + m_borders.top + m_padding.bottom + m_borders.bottom;
-		if (min_height < 0) min_height = 0;
-	}
-
-	if (m_display == display_list_item)
-	{
-		const tchar_t* list_image = get_style_property(_t("list-style-image"), true, 0);
-		if (list_image)
-		{
-			tstring url;
-			css::parse_css_url(list_image, url);
-
-			size sz;
-			const tchar_t* list_image_baseurl = get_style_property(_t("list-style-image-baseurl"), true, 0);
-			get_document()->container()->get_image_size(url.c_str(), list_image_baseurl, sz);
-			if (min_height < sz.height)
-			{
-				min_height = sz.height;
-			}
-		}
-
-	}
-
-	if (min_height > m_pos.height)
-	{
-		m_pos.height = min_height;
-	}
+	clamp_used_block_height();
 
 	int min_width = m_css_min_width.calc_percent(parent_width);
 
@@ -8887,8 +10665,12 @@ void litehtml::html_tag::draw_children_box(uint_ptr hdc, int x, int y, const pos
 		doc->container()->set_clip(pad_box, bdr_radius, true, true);
 	}
 
+	/* browser_wnd is read only by the draw_positioned phase (fixed
+	 * placement, sticky pin height) - fetching the client rect is a
+	 * container virtual call, so defer it to first use instead of paying
+	 * it in every block/floats/inlines pass over every node. */
 	position browser_wnd;
-	doc->container()->get_client_rect(browser_wnd);
+	bool browser_wnd_init = false;
 
 	element::ptr el = 0;
 	for (auto& item : m_children)
@@ -8901,16 +10683,40 @@ void litehtml::html_tag::draw_children_box(uint_ptr hdc, int x, int y, const pos
 			case draw_positioned:
 				if (el->is_stacking_participant() && el->get_zindex() == zindex)
 				{
+					if (!browser_wnd_init)
+					{
+						doc->container()->get_client_rect(browser_wnd);
+						browser_wnd_init = true;
+					}
 					if (el->get_element_position() == element_position_fixed)
 					{
-						el->draw(hdc, browser_wnd.x, browser_wnd.y, clip);
-						el->draw_stacking_context(hdc, browser_wnd.x, browser_wnd.y, clip, true);
+						/* browser_wnd is viewport-relative, but the draw target's
+						 * viewport rows start at the overscan origin: shift fixed
+						 * boxes down by it or they paint into the top overscan band
+						 * (clipped away from any viewport-sized capture). 0 when the
+						 * embedder draws without overscan. */
+						int fy = browser_wnd.y + doc->get_draw_vp_origin_y();
+						el->draw(hdc, browser_wnd.x, fy, clip);
+						el->draw_stacking_context(hdc, browser_wnd.x, fy, clip, true);
 						el = 0;
 					}
 					else
 					{
+						/* A sticky child paints at its in-flow position plus the
+						 * scroll-driven pin shift. The scroll comes from the value
+						 * document::draw captured at the root, so it is correct at
+						 * any tree depth. Shifting the draw offset moves the child
+						 * AND its whole subtree, matching the shifted layout
+						 * position Chrome reports. */
+						int sx = pos.x, sy = pos.y;
+						if (el->get_element_position() == element_position_sticky)
+						{
+							int sdy = 0;
+							el->eweb_sticky_offset(doc->get_draw_scroll_y(), browser_wnd.height, &sdy);
+							sy += sdy;
+						}
 						bool el_sc = el->is_stacking_context();
-						el->draw(hdc, pos.x, pos.y, clip);
+						el->draw(hdc, sx, sy, clip);
 						/* A z-index:auto positioned box is not a stacking context:
 						 * paint its own in-flow content here (with_positioned is
 						 * false) and let its z-indexed descendants be painted by
@@ -8920,7 +10726,7 @@ void litehtml::html_tag::draw_children_box(uint_ptr hdc, int x, int y, const pos
 						 * positioned descendants - nested position:relative wrappers
 						 * are extremely common and must not swallow their children.
 						 * A real stacking context is atomic, so consume it. */
-						el->draw_stacking_context(hdc, pos.x, pos.y, clip, el_sc);
+						el->draw_stacking_context(hdc, sx, sy, clip, el_sc);
 						if (el_sc)
 						{
 							el = 0;
@@ -8967,7 +10773,27 @@ void litehtml::html_tag::draw_children_box(uint_ptr hdc, int x, int y, const pos
 					 * context are still found at their own z level. */
 					if (!el->is_stacking_context())
 					{
-						el->draw_children(hdc, pos.x, pos.y, clip, flag, zindex);
+						/* Subtree prune: with no stacking participant below
+						 * (m_has_pospart, rebuilt by fetch_positioned together
+						 * with m_positioned), the descent cannot paint
+						 * anything - skipping it keeps a per-z-level pass from
+						 * re-walking participant-free subtrees (the bulk of a
+						 * long document). EWEB_POSPRUNE_OFF restores the
+						 * unconditional descent. */
+						static int s_posprune_off = -1;
+						if (s_posprune_off < 0)
+						{
+							s_posprune_off = (getenv("EWEB_POSPRUNE_OFF") != NULL) ? 1 : 0;
+						}
+						if (s_posprune_off || el->has_pospart())
+						{
+							if (posd_stats_enabled()) g_posd_taken++;
+							el->draw_children(hdc, pos.x, pos.y, clip, flag, zindex);
+						}
+						else
+						{
+							if (posd_stats_enabled()) g_posd_pruned++;
+						}
 					}
 				}
 				else
@@ -8976,7 +10802,28 @@ void litehtml::html_tag::draw_children_box(uint_ptr hdc, int x, int y, const pos
 						el->get_display() != display_inline_block &&
 						!el->is_stacking_participant())
 					{
-						el->draw_children(hdc, pos.x, pos.y, clip, flag, zindex);
+						/* Floats-phase prune: with no floated box below
+						 * (m_has_floater, rebuilt by fetch_positioned together
+						 * with m_has_pospart), the draw_floats descent cannot
+						 * paint anything - skipping it keeps that pass from
+						 * re-walking float-free subtrees every frame (nearly
+						 * the whole tree on flex-era pages). Block/inline
+						 * passes always descend. EWEB_FLOATPRUNE_OFF restores
+						 * the unconditional descent. */
+						static int s_floatprune_off = -1;
+						if (s_floatprune_off < 0)
+						{
+							s_floatprune_off = (getenv("EWEB_FLOATPRUNE_OFF") != NULL) ? 1 : 0;
+						}
+						if (flag == draw_floats && !s_floatprune_off && !el->has_floater())
+						{
+							if (floatprune_stats_enabled()) g_floatprune_pruned++;
+						}
+						else
+						{
+							if (flag == draw_floats && floatprune_stats_enabled()) g_floatprune_taken++;
+							el->draw_children(hdc, pos.x, pos.y, clip, flag, zindex);
+						}
 					}
 				}
 			}

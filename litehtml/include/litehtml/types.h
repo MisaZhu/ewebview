@@ -452,9 +452,9 @@ namespace litehtml
 		element_position_relative,
 		element_position_absolute,
 		element_position_fixed,
-		/* sticky lays out in flow like static/relative: this engine has no
-		 * scroll-driven pinning, and falling back to fixed would stack every
-		 * sticky element on top of the viewport. */
+		/* sticky lays out in flow like static/relative and paints through the
+		 * positioned phase; the scroll-driven pin shift is computed on demand
+		 * (eweb_sticky_offset) and applied at paint/rect/hit-test time. */
 		element_position_sticky,
 	};
 
@@ -534,7 +534,7 @@ namespace litehtml
  * html_tag::select(css_element_selector, bool) — unknown names fall through to
  * the m_pseudo_classes lookup, which is only for state-driven classes the
  * engine toggles at runtime (:hover/:active/:focus/:link). */
-#define pseudo_class_strings		_t("only-child;only-of-type;first-child;first-of-type;last-child;last-of-type;nth-child;nth-of-type;nth-last-child;nth-last-of-type;not;lang;root;where;is;has;focus-within;focus-visible;dir;checked;disabled;enabled;required;optional;read-only;read-write;empty;any-link;default")
+#define pseudo_class_strings		_t("only-child;only-of-type;first-child;first-of-type;last-child;last-of-type;nth-child;nth-of-type;nth-last-child;nth-last-of-type;not;lang;root;where;is;has;focus-within;focus-visible;dir;checked;disabled;enabled;required;optional;read-only;read-write;empty;any-link;default;placeholder-shown")
 
 	enum pseudo_class
 	{
@@ -567,6 +567,7 @@ namespace litehtml
 		pseudo_class_empty,
 		pseudo_class_any_link,
 		pseudo_class_default,
+		pseudo_class_placeholder_shown,
 	};
 
 #define content_property_string		_t("none;normal;open-quote;close-quote;no-open-quote;no-close-quote")

@@ -19,13 +19,16 @@ extern "C" {
 
 #include "js_web.h"
 #include "js_event.h"
+#include "js_dom.h"            /* js_dom_has_pending_timers / monotonic ms */
 #include "js_natives_priv.h"
+#include "Promise/native_Promise.h"   /* promise_new_deferred(): async fetch */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
 #include <time.h>
+#include <pthread.h>
 
 #define CLS_STORAGE   "Storage"
 #define CLS_LOCATION  "Location"
@@ -1530,9 +1533,15 @@ static var_t* nav_get_languages(vm_t* vm, var_t* env, void* data) {
 }
 
 static var_t* nav_get_bool(vm_t* vm, var_t* env, void* data) {
-    (void)env;
-    int which = (int)(intptr_t)data;
-    return var_new_bool(vm, which == 0);   /* 0 onLine -> true, 1 cookieEnabled -> true */
+    (void)env; (void)data;
+    /* Both navigator.onLine (which==0) and navigator.cookieEnabled (which==1)
+     * report true in a working embedder: the network stack is up and the cookie
+     * jar accepts reads/writes (document.cookie round-trips csrftoken). The old
+     * `which == 0` returned true for onLine but FALSE for cookieEnabled, so
+     * cookie-gated apps (pinterest.com renders an "enable cookies" wall when
+     * navigator.cookieEnabled is false) refused to boot even though cookies
+     * actually worked. */
+    return var_new_bool(vm, true);
 }
 
 /* navigator.userAgentData: the Chromium client-hints object. Analytics and
@@ -1777,15 +1786,22 @@ static void web_scroll_to(vm_t* vm, int x, int y) {
     if(st != NULL && st->cb.scroll_to != NULL) st->cb.scroll_to(web_ctx(vm), x, y);
 }
 
-/* 0 innerWidth, 1 innerHeight, 2 outerWidth, 3 outerHeight, 4 screenX,
- * 5 screenY, 6 scrollX, 7 scrollY, 8 devicePixelRatio, 9 length */
+/* Index into kWinProps (see the registration loop): 0 innerWidth, 1 innerHeight,
+ * 2 outerWidth, 3 outerHeight, 4 screenX, 5 screenY, 6 scrollX, 7 scrollY,
+ * 8 pageXOffset, 9 pageYOffset, 10 devicePixelRatio, 11 length.
+ * pageXOffset/pageYOffset are the legacy aliases of scrollX/scrollY. The switch
+ * MUST stay in lockstep with that list: it once assumed a 10-entry layout
+ * (devicePixelRatio at 8, length at 9), so adding pageXOffset/pageYOffset
+ * silently shifted devicePixelRatio onto the scroll branch - it read back the
+ * scrollY offset (0 at the top of the page). Responsive/retina code and any
+ * `devicePixelRatio >= 1` guard then saw 0 and took the wrong branch. */
 static var_t* win_metric_get(vm_t* vm, var_t* env, void* data) {
     (void)env;
     int which = (int)(intptr_t)data;
     switch(which) {
         case 4: case 5: return var_new_int(vm, 0);      /* no window-manager hook */
-        case 8: return var_new_float(vm, 1.0f);         /* 1 CSS px == 1 device px */
-        case 9: return var_new_int(vm, 0);              /* no frames, no workers */
+        case 10: return var_new_float(vm, 1.0f);        /* 1 CSS px == 1 device px */
+        case 11: return var_new_int(vm, 0);             /* no frames, no workers */
         default: break;
     }
     int w = 0, h = 0;
@@ -1803,7 +1819,8 @@ static var_t* win_metric_get(vm_t* vm, var_t* env, void* data) {
     }
     int sx = 0, sy = 0;
     web_scroll_pos(vm, &sx, &sy);
-    return var_new_int(vm, (which == 6) ? sx : sy);
+    /* 6 scrollX, 7 scrollY, 8 pageXOffset, 9 pageYOffset: even index -> X. */
+    return var_new_int(vm, (which == 6 || which == 8) ? sx : sy);
 }
 
 /* scrollTo()/scrollBy()/scroll() take either (x, y) or one options object -
@@ -1933,7 +1950,25 @@ static bool mq_cond_match(vm_t* vm, const char* c, int vw, int vh) {
     mq_trim(name);
     mq_trim(val);
 
-    int n = (int)strtod(val, NULL);   /* "640px" -> 640, strtod stops at 'p' */
+    /* "640px" -> 640 (strtod stops at the unit suffix); font-relative units
+     * resolve against the initial font size exactly like litehtml's stylesheet
+     * media queries do (media_range_value multiplies by the container default,
+     * 16px here), so "(min-width: 64em)" means 1024px and NOT 64. w3.org's
+     * navigation.js flips the mobile hamburger on matchMedia("(min-width:
+     * 64em)"); with em read as px it matched at every viewport width, pinning
+     * aria-expanded="true" + display:none on the trigger and leaving the
+     * horizontal nav unfolded on narrow viewports. */
+    char* unit = NULL;
+    double dv = strtod(val, &unit);
+    if(unit != NULL) {
+        while(*unit == ' ' || *unit == '\t') unit++;
+        if((unit[0] == 'e' || unit[0] == 'E') && (unit[1] == 'm' || unit[1] == 'M') && unit[2] == 0)
+            dv *= 16.0;   /* em  */
+        else if((unit[0] == 'r' || unit[0] == 'R') && (unit[1] == 'e' || unit[1] == 'E') &&
+                (unit[2] == 'm' || unit[2] == 'M') && unit[3] == 0)
+            dv *= 16.0;   /* rem */
+    }
+    int n = (int)dv;
     if(js_ascii_casecmp(name, "min-width") == 0)  return vw >= n;
     if(js_ascii_casecmp(name, "max-width") == 0)  return vw <= n;
     if(js_ascii_casecmp(name, "width") == 0)      return vw == n;
@@ -2237,6 +2272,23 @@ static var_t* web_promise(vm_t* vm, const char* which, var_t* value) {
     return p;
 }
 
+/* navigator.credentials (Web Credentials): the FedCM / credential probe calls
+ * `navigator.credentials.get(opts).then(noop, noop)`. Without the container the
+ * read of `.get` off undefined aborts the probe inside its try/catch and the
+ * page records a failed capability. A real browser with no stored credential
+ * resolves get() with null and store()/create()/preventSilentAccess() with
+ * undefined, so mirror that with already-settled promises. */
+static var_t* nav_cred_get(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* p = web_promise(vm, "resolve", var_new_null(vm));
+    return (p != NULL) ? p : var_new_null(vm);
+}
+static var_t* nav_cred_settle(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* p = web_promise(vm, "resolve", var_new(vm));
+    return (p != NULL) ? p : var_new(vm);
+}
+
 /* Invoke a zero-argument `on*` handler stored on `self` with `this` bound to
  * it. Same release contract js_event.c uses for listener calls. */
 static void web_fire_handler(vm_t* vm, var_t* self, const char* prop) {
@@ -2510,6 +2562,12 @@ static var_t* native_xhr_send(vm_t* vm, var_t* env, void* data) {
          * Content-Type / X-CSRFToken / Accept before the hook adds Cookie. */
         if(hdrs->len > 0)
             fprintf(stderr, "[httpdbg] reqhdrs:\n%s", hdrs->cstr);
+        /* The request body (first 1200 bytes): needed to diff the exact
+         * JSON.stringify output the server rejects (e.g. Pinterest's
+         * ApiCResource 400 "Expected ',' or '}' at position N"). */
+        if(bs != NULL && bs[0] != 0)
+            fprintf(stderr, "[httpdbg] reqbody[0..%d]=\n%.1200s\n",
+                    (int)strlen(bs), bs);
     }
     bool ok = (st->cb.http_request != NULL) &&
               st->cb.http_request(web_ctx(vm), method, url,
@@ -2560,6 +2618,26 @@ static var_t* native_xhr_send(vm_t* vm, var_t* env, void* data) {
 #define CLS_HEADERS  "Headers"
 #define RESP_TEXT    "@@text"
 #define RESP_HDR_OBJ "@@headers"
+
+/* Request/Blob/FormData hidden-member keys (definitions further below;
+ * native_fetch above them reads Request bodies off the instance). */
+#define CLS_REQUEST  "Request"
+#define CLS_BLOB     "Blob"
+#define CLS_FORMDATA "FormData"
+#define REQ_BODY     "@@reqbody"    /* hidden: request body text or null */
+#define BLOB_TEXT    "@@blobtext"    /* hidden: blob payload as string */
+#define FD_ENTRIES   "@@fdentries"   /* hidden: array of [name, value] */
+
+/* Forward decls: native_fetch uses the header-flattening and URLSearchParams
+ * pair-list helpers that are defined further down the file. */
+static void web_headers_into(vm_t* vm, var_t* h, mstr_t* hdrs);
+static bool web_has_hidden(var_t* v, const char* key);
+static bool web_hdr_block_has(const char* block, const char* name);
+static void usp_serialize_into(var_t* e, mstr_t* out);
+static void usp_add_entry(vm_t* vm, var_t* entries, const char* name, const char* value);
+static const char* usp_pair_at(var_t* pair, int idx);
+#define usp_pair_name(pair)  usp_pair_at((pair), 0)
+#define usp_pair_value(pair) usp_pair_at((pair), 1)
 
 static var_t* headers_new(vm_t* vm, const char* block) {
     var_t* h = new_obj(vm, CLS_HEADERS, 0);
@@ -2684,6 +2762,120 @@ static void hdr_obj_each(const char* key, void* value, void* user_data) {
     mstr_free(tmp);
 }
 
+/* ------------------------------------------------------------------ */
+/* Async fetch: off-thread HTTP via pthread worker                     */
+/*                                                                     */
+/* When cb.http_request_worker is set, native_fetch spawns a detached   */
+/* pthread that performs the blocking HTTP call off the VM thread and   */
+/* returns a pending Promise immediately. The engine loop calls          */
+/* js_web_fetch_poll() to drain completed jobs and settle promises on   */
+/* the VM thread (avoiding UAF: resolve/reject are var_ref'd and held   */
+/* in the job struct which is only freed after settlement).             */
+/* ------------------------------------------------------------------ */
+
+typedef struct fetch_job {
+    struct fetch_job* next;
+    /* Request parameters (owned, strdup'd) */
+    char*   method;
+    char*   url;
+    char*   headers;   /* may be NULL */
+    char*   body;      /* may be NULL */
+    void*   ctx;       /* embedder context for the callback */
+    bool  (*worker_fn)(void*, const char*, const char*, const char*,
+                       const char*, int*, char**, char**);
+    /* Result (filled by worker thread) */
+    volatile int done;   /* 0=pending, 1=complete */
+    bool    ok;
+    int     status;
+    char*   rbody;       /* mario_malloc'd or NULL */
+    char*   rhdrs;       /* mario_malloc'd or NULL */
+    /* Promise settlement handles (owned refs, VM-thread only) */
+    var_t*  resolve;
+    var_t*  reject;
+    vm_t*   vm;          /* borrowed: for response_new in poll */
+} fetch_job_t;
+
+static pthread_mutex_t g_fetch_mtx = PTHREAD_MUTEX_INITIALIZER;
+static fetch_job_t*    g_fetch_head = NULL;  /* jobs awaiting worker completion */
+static fetch_job_t*    g_fetch_done = NULL;  /* completed jobs awaiting poll */
+
+/* DIAG (EWEB_FETCHDBG): monotonic ms so worker-spawn / worker-done / settle
+ * timestamps can be compared against the engine's timestamped [js] logs to
+ * tell "HTTP finished late" from "poll starved by a long synchronous task". */
+static double fetch_dbg_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+#define FETCHDBG() (getenv("EWEB_FETCHDBG") != NULL)
+
+/* Set by the embedder (EWebJs) once the initial hydration render has committed
+ * (first react-query observer subscribe). js_web_fetch_poll defers settlement
+ * until then; see the first-commit gate in js_web_fetch_poll. */
+extern int g_eweb_first_commit;
+/* Set on the first async-fetch spawn. The embedder combines it with its
+ * commitRoot probe so the settlement gate opens at the first commit AFTER a
+ * suspended render actually issued its query (a commit before any fetch would
+ * be a pre-hydration partial render, and opening the gate there reproduces the
+ * settle-before-hydration mismatch). */
+int g_eweb_fetch_spawned = 0;
+
+/* Host policy: pinterest.com is set here (at fetch spawn or document-URL check)
+ * to mark hosts whose initial data fetch is on the critical path to the first
+ * hydration commit. For those hosts the settlement gate (defer-until-commit AND
+ * the post-commit 2 s grace) is skipped entirely - browser-like immediate
+ * settlement - because deferring deadlocks to the 60 s deadline and the grace
+ * window still misorders the fetch relative to hydration. github.com leaves this
+ * 0 and keeps the deferred path that fixes #519/#156. */
+static int s_pin_nogate = 0;
+
+static char* fetch_strdup(const char* s) {
+    if(s == NULL) return NULL;
+    size_t n = strlen(s) + 1;
+    char* p = (char*)mario_malloc(n);
+    if(p) memcpy(p, s, n);
+    return p;
+}
+
+static void fetch_job_free(fetch_job_t* j) {
+    if(j == NULL) return;
+    if(j->method)  mario_free(j->method);
+    if(j->url)     mario_free(j->url);
+    if(j->headers) mario_free(j->headers);
+    if(j->body)    mario_free(j->body);
+    if(j->rbody)   mario_free(j->rbody);
+    if(j->rhdrs)   mario_free(j->rhdrs);
+    /* resolve/reject are unref'd by the poll function before free */
+    mario_free(j);
+}
+
+/* Worker thread entry: performs the blocking HTTP call, then moves the job
+ * from g_fetch_head to g_fetch_done. Detached; no join needed. */
+static void* fetch_worker_main(void* arg) {
+    fetch_job_t* j = (fetch_job_t*)arg;
+    /* Perform the actual HTTP request off the VM thread. */
+    j->ok = j->worker_fn(j->ctx, j->method, j->url,
+                         j->headers, j->body,
+                         &j->status, &j->rbody, &j->rhdrs);
+    /* Mark done and move to the done list. */
+    if(FETCHDBG())
+        fprintf(stderr, "[fetchdbg] %.1f WORKER-DONE url=%s ok=%d status=%d\n",
+                fetch_dbg_ms(), j->url ? j->url : "-", (int)j->ok, (int)j->status);
+    pthread_mutex_lock(&g_fetch_mtx);
+    /* Unlink from head list */
+    fetch_job_t** pp = &g_fetch_head;
+    while(*pp != NULL) {
+        if(*pp == j) { *pp = j->next; break; }
+        pp = &(*pp)->next;
+    }
+    /* Prepend to done list */
+    j->next = g_fetch_done;
+    g_fetch_done = j;
+    j->done = 1;
+    pthread_mutex_unlock(&g_fetch_mtx);
+    return NULL;
+}
+
 static var_t* native_fetch(vm_t* vm, var_t* env, void* data) {
     (void)data;
     js_web_state* st = web_state(vm);
@@ -2701,6 +2893,22 @@ static var_t* native_fetch(vm_t* vm, var_t* env, void* data) {
     mstr_t* body = mstr_new("");
     mstr_t* hdrs = mstr_new("");
     const char* bs = NULL;
+    int fd_body = 0;
+
+    /* A Request instance carries method/headers/body of its own; the init
+     * object below overrides each of them. */
+    var_t* req = (a0 != NULL && a0->type == V_OBJECT && get_obj(a0, REQ_BODY) != NULL) ? a0 : NULL;
+    if(req != NULL) {
+        var_t* m = get_obj(req, "method");
+        if(m != NULL && m->type == V_STRING && var_get_str(m) != NULL && var_get_str(m)[0] != 0)
+            snprintf(method, sizeof(method), "%s", var_get_str(m));
+        web_headers_into(vm, get_obj(req, "headers"), hdrs);
+        var_t* rb = get_obj(req, REQ_BODY);
+        if(rb != NULL && var_get_str(rb) != NULL && var_get_str(rb)[0] != 0) {
+            mstr_append(body, var_get_str(rb));
+            bs = body->cstr;
+        }
+    }
 
     var_t* init = js_arg(env, 1);
     if(init != NULL && init->type == V_OBJECT) {
@@ -2710,41 +2918,33 @@ static var_t* native_fetch(vm_t* vm, var_t* env, void* data) {
             if(ms != NULL && ms[0] != 0) snprintf(method, sizeof(method), "%s", ms);
         }
         var_t* b = get_obj(init, "body");
-        if(b != NULL && b->type != V_UNDEF && b->type != V_NULL) bs = js_cstr(b, body);
-        /* headers: a plain {Name: value} object, or a "N: v\r\n" string. */
+        if(b != NULL && b->type != V_UNDEF && b->type != V_NULL) {
+            mstr_reset(body);
+            bs = NULL;
+            if(web_has_hidden(b, FD_ENTRIES)) {
+                usp_serialize_into(get_obj(b, FD_ENTRIES), body);
+                fd_body = 1;
+                bs = body->cstr;
+            }
+            else if(web_has_hidden(b, BLOB_TEXT)) {
+                var_t* t = get_obj(b, BLOB_TEXT);
+                if(t != NULL && var_get_str(t) != NULL) mstr_append(body, var_get_str(t));
+                bs = body->cstr;
+            }
+            else bs = js_cstr(b, body);
+        }
+        /* headers: a plain {Name: value} object, a "N: v\r\n" string, an
+         * [[n,v],...] array or a Headers instance. init replaces whatever
+         * the Request carried (duplicating header lines would confuse the
+         * server). */
         var_t* h = get_obj(init, "headers");
         if(h != NULL) {
-            if(h->type == V_STRING) {
-                const char* hs = var_get_str(h);
-                if(hs != NULL) mstr_append(hdrs, hs);
-            }
-            else if(h->is_array) {
-                /* [[name, value], ...] */
-                int n = (int)var_array_size(h);
-                for(int i = 0; i < n; ++i) {
-                    node_t* nd = var_array_get(h, i);
-                    if(nd == NULL || nd->var == NULL || !nd->var->is_array) continue;
-                    node_t* kn = var_array_get(nd->var, 0);
-                    node_t* vn = var_array_get(nd->var, 1);
-                    if(kn == NULL || kn->var == NULL) continue;
-                    mstr_t* tmp = mstr_new("");
-                    mstr_append(hdrs, js_cstr(kn->var, tmp));
-                    mstr_append(hdrs, ": ");
-                    mstr_reset(tmp);
-                    if(vn != NULL && vn->var != NULL) mstr_append(hdrs, js_cstr(vn->var, tmp));
-                    mstr_append(hdrs, "\r\n");
-                    mstr_free(tmp);
-                }
-            }
-            else {
-                /* {Name: value, ...}: node_t has no sibling link, so the walk
-                 * goes through the children hash map. */
-                hdr_obj_ctx hc;
-                hc.out = hdrs;
-                hash_map_iterate(&h->children, hdr_obj_each, &hc);
-            }
+            mstr_reset(hdrs);
+            web_headers_into(vm, h, hdrs);
         }
     }
+    if(fd_body && !web_hdr_block_has(hdrs->cstr, "Content-Type"))
+        mstr_append(hdrs, "Content-Type: application/x-www-form-urlencoded\r\n");
 
     int status = 0;
     char* out_body = NULL;
@@ -2754,6 +2954,86 @@ static var_t* native_fetch(vm_t* vm, var_t* env, void* data) {
         fprintf(stderr, "[httpdbg] fetch hdrs(len=%d):\n%s", (int)hdrs->len,
                 (hdrs->len > 0) ? hdrs->cstr : "(empty)\n");
     }
+
+    /* ---- Async path: spawn a worker thread, return pending Promise ---- */
+    if(st->cb.http_request_worker != NULL) {
+        var_t* resolve_fn = NULL;
+        var_t* reject_fn = NULL;
+        var_t* promise = promise_new_deferred(vm, &resolve_fn, &reject_fn);
+        if(promise != NULL && resolve_fn != NULL && reject_fn != NULL) {
+            fetch_job_t* j = (fetch_job_t*)mario_malloc(sizeof(fetch_job_t));
+            if(j != NULL) {
+                memset(j, 0, sizeof(*j));
+                j->method  = fetch_strdup(method);
+                j->url     = fetch_strdup(url);
+                j->headers = (hdrs->len > 0) ? fetch_strdup(hdrs->cstr) : NULL;
+                j->body    = fetch_strdup(bs);
+                j->ctx     = web_ctx(vm);
+                j->worker_fn = st->cb.http_request_worker;
+                j->resolve = resolve_fn;  /* owned ref from promise_new_deferred */
+                j->reject  = reject_fn;   /* owned ref */
+                j->vm      = vm;
+                j->done    = 0;
+                /* Link into global list and spawn worker. */
+                pthread_mutex_lock(&g_fetch_mtx);
+                j->next = g_fetch_head;
+                g_fetch_head = j;
+                pthread_mutex_unlock(&g_fetch_mtx);
+                g_eweb_fetch_spawned = 1;
+                /* Host policy (earliest open): pinterest.com puts the initial data
+                 * fetch on the critical path to the first hydration commit, so open
+                 * the settlement gate at the first fetch spawn for that host instead
+                 * of waiting for a commit that depends on the fetch. Complements the
+                 * document-URL check in js_web_fetch_poll. */
+                if(strstr(url, "pinterest.com") != NULL) {
+                    g_eweb_first_commit = 1;
+                    s_pin_nogate = 1;
+                }
+
+                pthread_t tid;
+                pthread_attr_t attr;
+                pthread_attr_init(&attr);
+                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                /* BearSSL TLS + response buffering recurse deeper than the
+                 * default 512 KB pthread stack on some bundles; a stack-guard
+                 * fault here surfaces as EXC_BAD_ACCESS(code=2) in memmove. */
+                pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+                if(FETCHDBG())
+                    fprintf(stderr, "[fetchdbg] %.1f SPAWN url=%s\n",
+                            fetch_dbg_ms(), j->url ? j->url : "-");
+                int rc = pthread_create(&tid, &attr, fetch_worker_main, j);
+                pthread_attr_destroy(&attr);
+                if(rc != 0) {
+                    /* Spawn failed: unlink, settle synchronously as fallback. */
+                    pthread_mutex_lock(&g_fetch_mtx);
+                    fetch_job_t** pp = &g_fetch_head;
+                    while(*pp) { if(*pp == j) { *pp = j->next; break; } pp = &(*pp)->next; }
+                    pthread_mutex_unlock(&g_fetch_mtx);
+                    /* Perform sync request as fallback */
+                    j->ok = st->cb.http_request_worker(j->ctx, j->method, j->url,
+                                                       j->headers, j->body,
+                                                       &j->status, &j->rbody, &j->rhdrs);
+                    j->done = 1;
+                    /* Put on done list so poll settles it next tick */
+                    pthread_mutex_lock(&g_fetch_mtx);
+                    j->next = g_fetch_done;
+                    g_fetch_done = j;
+                    pthread_mutex_unlock(&g_fetch_mtx);
+                }
+                mstr_free(hdrs);
+                mstr_free(body);
+                mstr_free(us);
+                return promise;  /* pending; poll will settle it */
+            }
+            /* malloc failed: release refs, fall through to sync */
+            var_unref(resolve_fn);
+            var_unref(reject_fn);
+            var_unref(promise);
+        }
+        /* promise creation failed: fall through to sync path */
+    }
+
+    /* ---- Sync path (fallback or no worker callback) ---- */
     bool ok = (st->cb.http_request != NULL) &&
               st->cb.http_request(web_ctx(vm), method, url,
                                   (hdrs->len > 0) ? hdrs->cstr : NULL, bs,
@@ -2782,6 +3062,576 @@ static var_t* native_fetch(vm_t* vm, var_t* env, void* data) {
     var_t* p = web_promise(vm, "resolve", result);
     if(p != NULL) return p;
     return result;
+}
+
+/* ------------------------------------------------------------------ */
+/* js_web_fetch_poll: drain completed async-fetch jobs on the VM thread */
+/* ------------------------------------------------------------------ */
+
+int js_web_fetch_poll(vm_t* vm) {
+    if(vm == NULL) return 0;
+
+    /* First-commit gate. Settling a fetch BEFORE the initial hydration render has
+     * committed flips the react-query cache mid-render: client output diverges
+     * from SSR (#519) or a setState lands in a live workInProgress and corrupts
+     * the fiber tree (#156). A browser cannot hit this because its hydration is
+     * an atomic ~ms pass; ours spans tens of seconds of wall time. The QADD
+     * probe (observer subscribe, i.e. the first commit's passive flush) sets
+     * g_eweb_first_commit, so defer settlement until then. A 60 s deadline
+     * force-drains so a page that never commits can't stall the network. */
+    {
+        static uint64_t s_defer_since = 0;
+        static uint64_t s_gate_open_at = 0;
+        int have_done;
+        /* A/B switch: settle fetches immediately (browser-like) instead of waiting for
+         * the first hydration commit. Used to test whether the deferred settlement is
+         * what lets React clear suspendedLanes / commit the fallback before the
+         * suspense wakeable resolves (making ping+retry no-ops). */
+        static int s_nogate = -1;
+        if(s_nogate < 0) s_nogate = (getenv("EWEB_FETCH_NOGATE") != NULL) ? 1 : 0;
+        if(s_nogate) g_eweb_first_commit = 1;
+        /* Host policy: some SPAs put the initial data fetch on the critical path to
+         * the first hydration commit - pinterest.com's landing page suspends the
+         * whole tree on /_/graphql/, so deferring settlement until a commit that can
+         * only happen after that fetch deadlocks to the 60 s deadline, by which time
+         * hydration has wedged and the page renders blank. For those hosts the
+         * deferred path is strictly worse than the (browser-like) immediate path, so
+         * open the gate at once; github.com keeps the deferred path that fixes
+         * #519/#156. */
+        static int s_host_nogate = -1;
+        if(s_host_nogate < 0) {
+            char* u = web_current_url(vm);
+            if(u != NULL) {
+                if(u[0] != '\0')
+                    s_host_nogate = (strstr(u, "pinterest.com") != NULL) ? 1 : 0;
+                mario_free(u);
+            }
+        }
+        if(s_host_nogate == 1) { g_eweb_first_commit = 1; s_pin_nogate = 1; }
+        pthread_mutex_lock(&g_fetch_mtx);
+        have_done = (g_fetch_done != NULL);
+        pthread_mutex_unlock(&g_fetch_mtx);
+        uint64_t now = (uint64_t)js_dom_monotonic_ms();
+        if(have_done && !g_eweb_first_commit) {
+            if(s_defer_since == 0) s_defer_since = now;
+            if(now - s_defer_since < 60000) return 0;   /* wait for first commit */
+        }
+        s_defer_since = 0;
+        /* Post-commit grace period: the gate opens at commitRoot entry, but the
+         * suspended boundary's passive effects (observer subscribe, wakeable
+         * attach) flush after the commit returns. Settling inside that window
+         * flips the query cache mid-flush and yields hydration mismatch #519,
+         * so hold settlement a moment longer - still seconds earlier than the
+         * old 60 s deadline. */
+        if(g_eweb_first_commit && have_done && !s_pin_nogate) {
+            if(s_gate_open_at == 0) s_gate_open_at = now;
+            if(now - s_gate_open_at < 2000) return 0;
+        }
+    }
+
+    /* Snapshot the done list under the mutex. */
+    pthread_mutex_lock(&g_fetch_mtx);
+    fetch_job_t* batch = g_fetch_done;
+    g_fetch_done = NULL;
+    pthread_mutex_unlock(&g_fetch_mtx);
+
+    int settled = 0;
+    while(batch != NULL) {
+        fetch_job_t* j = batch;
+        batch = j->next;
+        j->next = NULL;
+
+        /* Error-state isolation (same pattern as js_fire_timer): clear any
+         * residual propagating_err so one failed settlement does not poison
+         * the next. */
+        if(vm->propagating_err != NULL) vm_report_uncaught(vm);
+
+        if(j->ok) {
+            /* Build the Response object on the VM thread. */
+            var_t* resp = response_new(vm, j->status, j->url,
+                                       (j->rbody != NULL) ? j->rbody : "",
+                                       (j->rhdrs != NULL) ? j->rhdrs : "");
+            /* Settle: call resolve(response) */
+            var_t* args = var_new_array(vm);
+            var_array_add(args, resp);
+            var_t* ret = call_m_func(vm, NULL, j->resolve, args);
+            var_unref(args);
+            if(ret != NULL) var_unref(ret);
+        } else {
+            /* Network failure: call reject(TypeError) */
+            var_t* reason = var_new_str(vm, "TypeError: network request failed");
+            var_t* args = var_new_array(vm);
+            var_array_add(args, reason);
+            var_t* ret = call_m_func(vm, NULL, j->reject, args);
+            var_unref(args);
+            if(ret != NULL) var_unref(ret);
+        }
+
+        if(vm->propagating_err != NULL) vm_report_uncaught(vm);
+
+        if(FETCHDBG())
+            fprintf(stderr, "[fetchdbg] %.1f SETTLE url=%s ok=%d\n",
+                    fetch_dbg_ms(), j->url ? j->url : "-", (int)j->ok);
+
+        /* Release owned refs and free the job. */
+        var_unref(j->resolve);
+        var_unref(j->reject);
+        fetch_job_free(j);
+        settled++;
+    }
+    return settled;
+}
+
+/* ------------------------------------------------------------------ */
+/* Request / Blob / FormData                                          */
+/*                                                                    */
+/* github's fetch-utilities wrapper builds `new Request(url, init)`   */
+/* before calling fetch() and react-query's queryFn dies on the       */
+/* missing global with a TypeError it swallows - the tree-commit-info */
+/* Deferred queries then never reach the network. These are the       */
+/* minimum-faithful shapes: Request carries url/method/headers/body   */
+/* (fetch() reads them back off the instance), Blob is a string       */
+/* wrapper, FormData a name/value list that fetch serialises as       */
+/* application/x-www-form-urlencoded.                                 */
+/* ------------------------------------------------------------------ */
+static bool web_has_hidden(var_t* v, const char* key) {
+    return (v != NULL && v->type == V_OBJECT && get_obj(v, key) != NULL);
+}
+static void web_hide(node_t* n) {
+    if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+}
+
+/* Flatten any headers init form (string block, [[k,v],...], Headers
+ * instance, plain {k: v}) into the "\r\n"-joined request block. */
+static void web_headers_into(vm_t* vm, var_t* h, mstr_t* hdrs) {
+    (void)vm;
+    if(h == NULL) return;
+    if(h->type == V_STRING) {
+        const char* hs = var_get_str(h);
+        if(hs != NULL) mstr_append(hdrs, hs);
+        return;
+    }
+    if(h->type != V_OBJECT) return;
+    var_t* blk = get_obj(h, XHR_RESP_HDRS);   /* Headers instance */
+    if(blk != NULL && blk->type == V_STRING) {
+        const char* hs = var_get_str(blk);
+        if(hs != NULL) mstr_append(hdrs, hs);
+        return;
+    }
+    if(h->is_array) {
+        int n = (int)var_array_size(h);
+        for(int i = 0; i < n; ++i) {
+            node_t* nd = var_array_get(h, i);
+            if(nd == NULL || nd->var == NULL || !nd->var->is_array) continue;
+            node_t* kn = var_array_get(nd->var, 0);
+            node_t* vn = var_array_get(nd->var, 1);
+            if(kn == NULL || kn->var == NULL) continue;
+            mstr_t* tmp = mstr_new("");
+            mstr_append(hdrs, js_cstr(kn->var, tmp));
+            mstr_append(hdrs, ": ");
+            mstr_reset(tmp);
+            if(vn != NULL && vn->var != NULL) mstr_append(hdrs, js_cstr(vn->var, tmp));
+            mstr_append(hdrs, "\r\n");
+            mstr_free(tmp);
+        }
+        return;
+    }
+    hdr_obj_ctx hc;
+    hc.out = hdrs;
+    hash_map_iterate(&h->children, hdr_obj_each, &hc);
+}
+
+/* true when the header block already carries `name` (case-insensitive). */
+static bool web_hdr_block_has(const char* block, const char* name) {
+    if(block == NULL || name == NULL) return false;
+    size_t nl = strlen(name);
+    const char* p = block;
+    while(p != NULL && *p != 0) {
+        const char* eol = strstr(p, "\r\n");
+        size_t llen = (eol != NULL) ? (size_t)(eol - p) : strlen(p);
+        if(llen > nl + 1 && p[nl] == ':' && strncasecmp(p, name, nl) == 0) return true;
+        p = (eol != NULL) ? eol + 2 : NULL;
+    }
+    return false;
+}
+
+static var_t* native_request_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    var_t* input = js_arg(env, 0);
+    var_t* init  = js_arg(env, 1);
+
+    const char* url = "";
+    const char* method = "GET";
+    var_t* src_headers = NULL;
+    var_t* src_body = NULL;
+    const char* credentials = "same-origin";
+    const char* mode = "cors";
+    const char* cache = "default";
+    const char* redirect = "follow";
+    var_t* signal = NULL;   /* AbortSignal passthrough: request.signal must stay
+                             * the caller's live signal (react-router attaches an
+                             * "abort" listener to it inside callLoader). */
+    if(input != NULL && input->type == V_OBJECT) {
+        var_t* u = get_obj(input, "url");
+        if(u != NULL && var_get_str(u) != NULL) url = var_get_str(u);
+        var_t* m = get_obj(input, "method");
+        if(m != NULL && var_get_str(m) != NULL) method = var_get_str(m);
+        src_headers = get_obj(input, "headers");
+        src_body = get_obj(input, REQ_BODY);
+        var_t* c = get_obj(input, "credentials");
+        if(c != NULL && var_get_str(c) != NULL) credentials = var_get_str(c);
+        var_t* sg = get_obj(input, "signal");
+        if(sg != NULL && sg->type == V_OBJECT) signal = sg;
+    }
+    else if(input != NULL && input->type == V_STRING) {
+        url = var_get_str(input);
+    }
+    if(init != NULL && init->type == V_OBJECT) {
+        var_t* m = get_obj(init, "method");
+        if(m != NULL && var_get_str(m) != NULL) method = var_get_str(m);
+        var_t* h = get_obj(init, "headers");
+        if(h != NULL) src_headers = h;
+        var_t* b = get_obj(init, "body");
+        if(b != NULL && b->type != V_UNDEF && b->type != V_NULL) src_body = b;
+        var_t* c = get_obj(init, "credentials");
+        if(c != NULL && var_get_str(c) != NULL) credentials = var_get_str(c);
+        var_t* mo = get_obj(init, "mode");
+        if(mo != NULL && var_get_str(mo) != NULL) mode = var_get_str(mo);
+        var_t* ca = get_obj(init, "cache");
+        if(ca != NULL && var_get_str(ca) != NULL) cache = var_get_str(ca);
+        var_t* rd = get_obj(init, "redirect");
+        if(rd != NULL && var_get_str(rd) != NULL) redirect = var_get_str(rd);
+        var_t* sg = get_obj(init, "signal");
+        if(sg != NULL && sg->type == V_OBJECT) signal = sg;
+    }
+
+    web_set_str(vm, self, "url", (url != NULL) ? url : "");
+    web_set_str(vm, self, "method", (method != NULL) ? method : "GET");
+    web_set_str(vm, self, "credentials", credentials);
+    web_set_str(vm, self, "mode", mode);
+    web_set_str(vm, self, "cache", cache);
+    web_set_str(vm, self, "redirect", redirect);
+    web_set_str(vm, self, "referrer", "");
+    web_set_str(vm, self, "integrity", "");
+    web_set_str(vm, self, "destination", "");
+    var_add(self, "signal", (signal != NULL) ? signal : var_new_null(vm));
+    var_add(self, "bodyUsed", var_new_bool(vm, false));
+
+    /* headers: always expose a Headers instance. */
+    mstr_t* hb = mstr_new("");
+    web_headers_into(vm, src_headers, hb);
+    var_add(self, "headers", headers_new(vm, hb->cstr));
+    mstr_free(hb);
+
+    /* body: FormData/Blob/Request collapse to their text form. */
+    mstr_t* bb = mstr_new("");
+    if(src_body != NULL) {
+        if(web_has_hidden(src_body, FD_ENTRIES)) {
+            var_t* e = get_obj(src_body, FD_ENTRIES);
+            usp_serialize_into(e, bb);
+        }
+        else if(web_has_hidden(src_body, BLOB_TEXT)) {
+            var_t* t = get_obj(src_body, BLOB_TEXT);
+            if(t != NULL && var_get_str(t) != NULL) mstr_append(bb, var_get_str(t));
+        }
+        else if(src_body->type == V_STRING) {
+            mstr_append(bb, var_get_str(src_body));
+        }
+        else {
+            mstr_t* tmp = mstr_new("");
+            mstr_append(bb, js_cstr(src_body, tmp));
+            mstr_free(tmp);
+        }
+    }
+    web_hide(var_add(self, REQ_BODY, var_new_str(vm, bb->cstr)));
+    mstr_free(bb);
+    return NULL;
+}
+
+static var_t* native_request_clone(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return var_new_null(vm);
+    var_t* r = new_obj(vm, CLS_REQUEST, 0);
+    if(r == NULL) return var_new_null(vm);
+    const char* keys[] = { "url", "method", "credentials", "mode", "cache",
+                           "redirect", "referrer", "integrity", "destination" };
+    for(int i = 0; i < (int)(sizeof(keys) / sizeof(keys[0])); ++i) {
+        var_t* v = get_obj(self, keys[i]);
+        web_set_str(vm, r, keys[i], (v != NULL && var_get_str(v) != NULL) ? var_get_str(v) : "");
+    }
+    var_t* h = get_obj(self, "headers");
+    var_add(r, "headers", (h != NULL) ? h : headers_new(vm, ""));
+    var_t* b = get_obj(self, REQ_BODY);
+    web_hide(var_add(r, REQ_BODY, var_new_str(vm, (b != NULL && var_get_str(b) != NULL) ? var_get_str(b) : "")));
+    var_add(r, "bodyUsed", var_new_bool(vm, false));
+    var_t* sg = get_obj(self, "signal");
+    var_add(r, "signal", (sg != NULL && sg->type == V_OBJECT) ? sg : var_new_null(vm));
+    return r;
+}
+
+static var_t* native_request_text(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* b = (self != NULL) ? get_obj(self, REQ_BODY) : NULL;
+    var_t* s = var_new_str(vm, (b != NULL && var_get_str(b) != NULL) ? var_get_str(b) : "");
+    var_t* p = web_promise(vm, "resolve", s);
+    return (p != NULL) ? p : s;
+}
+
+static var_t* native_request_json(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* b = (self != NULL) ? get_obj(self, REQ_BODY) : NULL;
+    var_t* t = var_new_str(vm, (b != NULL && var_get_str(b) != NULL) ? var_get_str(b) : "");
+    var_t* json_cls = var_find_own_member_var(vm->root, "JSON");
+    var_t* parse = web_static_func(vm, "JSON", "parse");
+    var_t* parsed = NULL;
+    if(json_cls != NULL && parse != NULL) {
+        var_t* args = var_new_array(vm);
+        var_array_add(args, t);
+        parsed = call_m_func(vm, json_cls, parse, args);
+        var_unref(args);
+    }
+    if(parsed == NULL || parsed->type == V_UNDEF) {
+        var_t* reason = var_new_str(vm, "SyntaxError: unexpected token in JSON");
+        var_t* p = web_promise(vm, "reject", reason);
+        return (p != NULL) ? p : reason;
+    }
+    var_t* p = web_promise(vm, "resolve", parsed);
+    return (p != NULL) ? p : parsed;
+}
+
+static var_t* native_blob_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    mstr_t* txt = mstr_new("");
+    var_t* parts = js_arg(env, 0);
+    if(parts != NULL && parts->type == V_OBJECT && parts->is_array) {
+        int n = (int)var_array_size(parts);
+        for(int i = 0; i < n; ++i) {
+            node_t* nd = var_array_get(parts, i);
+            if(nd == NULL || nd->var == NULL) continue;
+            if(web_has_hidden(nd->var, BLOB_TEXT)) {
+                var_t* t = get_obj(nd->var, BLOB_TEXT);
+                if(t != NULL && var_get_str(t) != NULL) mstr_append(txt, var_get_str(t));
+            }
+            else if(nd->var->type == V_STRING) {
+                mstr_append(txt, var_get_str(nd->var));
+            }
+            else {
+                mstr_t* tmp = mstr_new("");
+                mstr_append(txt, js_cstr(nd->var, tmp));
+                mstr_free(tmp);
+            }
+        }
+    }
+    else if(parts != NULL && parts->type == V_STRING) {
+        mstr_append(txt, var_get_str(parts));
+    }
+    const char* type = "";
+    var_t* opts = js_arg(env, 1);
+    if(opts != NULL && opts->type == V_OBJECT) {
+        var_t* t = get_obj(opts, "type");
+        if(t != NULL && var_get_str(t) != NULL) type = var_get_str(t);
+    }
+    web_hide(var_add(self, BLOB_TEXT, var_new_str(vm, txt->cstr)));
+    web_set_int(vm, self, "size", (int)txt->len);
+    web_set_str(vm, self, "type", type);
+    mstr_free(txt);
+    return NULL;
+}
+
+static var_t* native_blob_text(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* t = (self != NULL) ? get_obj(self, BLOB_TEXT) : NULL;
+    var_t* s = var_new_str(vm, (t != NULL && var_get_str(t) != NULL) ? var_get_str(t) : "");
+    var_t* p = web_promise(vm, "resolve", s);
+    return (p != NULL) ? p : s;
+}
+
+static var_t* native_blob_slice(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* t = (self != NULL) ? get_obj(self, BLOB_TEXT) : NULL;
+    const char* s = (t != NULL) ? var_get_str(t) : NULL;
+    int len = (s != NULL) ? (int)strlen(s) : 0;
+    int beg = 0, end = len;
+    var_t* a0 = js_arg(env, 0);
+    var_t* a1 = js_arg(env, 1);
+    if(a0 != NULL && (a0->type == V_INT || a0->type == V_FLOAT || a0->type == V_FLOAT64))
+        beg = var_get_int(a0);
+    if(a1 != NULL && (a1->type == V_INT || a1->type == V_FLOAT || a1->type == V_FLOAT64))
+        end = var_get_int(a1);
+    if(beg < 0) beg = len + beg;
+    if(end < 0) end = len + end;
+    if(beg < 0) beg = 0;
+    if(end > len) end = len;
+    var_t* r = new_obj(vm, CLS_BLOB, 0);
+    if(r == NULL) return var_new_null(vm);
+    char* sub = js_strndup((s != NULL) ? s + beg : "", (uint32_t)(end > beg ? end - beg : 0));
+    web_hide(var_add(r, BLOB_TEXT, var_new_str(vm, sub)));
+    web_set_int(vm, r, "size", (int)strlen(sub));
+    web_set_str(vm, r, "type", "");
+    mario_free(sub);
+    return r;
+}
+
+static var_t* fd_entries_var(vm_t* vm, var_t* self) {
+    var_t* e = (self != NULL) ? get_obj(self, FD_ENTRIES) : NULL;
+    if(e == NULL && self != NULL) {
+        e = var_new_array(vm);
+        web_hide(var_add(self, FD_ENTRIES, e));
+    }
+    return e;
+}
+
+static var_t* native_fd_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    fd_entries_var(vm, self);
+    return NULL;
+}
+
+static var_t* native_fd_append(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* e = fd_entries_var(vm, self);
+    mstr_t* a = mstr_new("");
+    mstr_t* b = mstr_new("");
+    var_t* n = js_arg(env, 0);
+    var_t* v = js_arg(env, 1);
+    const char* ns = (n != NULL) ? js_cstr(n, a) : "";
+    const char* vs = (v != NULL) ? js_cstr(v, b) : "";
+    usp_add_entry(vm, e, ns, vs);
+    mstr_free(a);
+    mstr_free(b);
+    return var_new_null(vm);
+}
+
+static var_t* native_fd_set(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* e = fd_entries_var(vm, self);
+    mstr_t* a = mstr_new("");
+    mstr_t* b = mstr_new("");
+    var_t* n = js_arg(env, 0);
+    var_t* v = js_arg(env, 1);
+    const char* ns = (n != NULL) ? js_cstr(n, a) : "";
+    const char* vs = (v != NULL) ? js_cstr(v, b) : "";
+    /* drop every existing pair with this name, then append the new one */
+    int cnt = (int)var_array_size(e);
+    for(int i = cnt - 1; i >= 0; --i) {
+        node_t* pn = var_array_get(e, i);
+        if(pn != NULL && pn->var != NULL &&
+           strcmp(usp_pair_name(pn->var), ns) == 0)
+            var_array_del(e, i);
+    }
+    usp_add_entry(vm, e, ns, vs);
+    mstr_free(a);
+    mstr_free(b);
+    return var_new_null(vm);
+}
+
+static var_t* native_fd_get(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* e = (self != NULL) ? get_obj(self, FD_ENTRIES) : NULL;
+    mstr_t* a = mstr_new("");
+    var_t* n = js_arg(env, 0);
+    const char* ns = (n != NULL) ? js_cstr(n, a) : "";
+    var_t* r = NULL;
+    int cnt = (e != NULL) ? (int)var_array_size(e) : 0;
+    for(int i = 0; i < cnt && r == NULL; ++i) {
+        node_t* pn = var_array_get(e, i);
+        if(pn != NULL && pn->var != NULL &&
+           strcmp(usp_pair_name(pn->var), ns) == 0)
+            r = var_new_str(vm, usp_pair_value(pn->var));
+    }
+    mstr_free(a);
+    return (r != NULL) ? r : var_new_null(vm);
+}
+
+static var_t* native_fd_getall(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* e = (self != NULL) ? get_obj(self, FD_ENTRIES) : NULL;
+    mstr_t* a = mstr_new("");
+    var_t* n = js_arg(env, 0);
+    const char* ns = (n != NULL) ? js_cstr(n, a) : "";
+    var_t* out = var_new_array(vm);
+    int cnt = (e != NULL) ? (int)var_array_size(e) : 0;
+    for(int i = 0; i < cnt; ++i) {
+        node_t* pn = var_array_get(e, i);
+        if(pn != NULL && pn->var != NULL &&
+           strcmp(usp_pair_name(pn->var), ns) == 0)
+            var_array_add(out, var_new_str(vm, usp_pair_value(pn->var)));
+    }
+    mstr_free(a);
+    return out;
+}
+
+static var_t* native_fd_has(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* e = (self != NULL) ? get_obj(self, FD_ENTRIES) : NULL;
+    mstr_t* a = mstr_new("");
+    var_t* n = js_arg(env, 0);
+    const char* ns = (n != NULL) ? js_cstr(n, a) : "";
+    bool has = false;
+    int cnt = (e != NULL) ? (int)var_array_size(e) : 0;
+    for(int i = 0; i < cnt && !has; ++i) {
+        node_t* pn = var_array_get(e, i);
+        if(pn != NULL && pn->var != NULL &&
+           strcmp(usp_pair_name(pn->var), ns) == 0)
+            has = true;
+    }
+    mstr_free(a);
+    return var_new_bool(vm, has);
+}
+
+static var_t* native_fd_delete(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* e = (self != NULL) ? get_obj(self, FD_ENTRIES) : NULL;
+    mstr_t* a = mstr_new("");
+    var_t* n = js_arg(env, 0);
+    const char* ns = (n != NULL) ? js_cstr(n, a) : "";
+    int cnt = (e != NULL) ? (int)var_array_size(e) : 0;
+    for(int i = cnt - 1; i >= 0; --i) {
+        node_t* pn = var_array_get(e, i);
+        if(pn != NULL && pn->var != NULL &&
+           strcmp(usp_pair_name(pn->var), ns) == 0)
+            var_array_del(e, i);
+    }
+    mstr_free(a);
+    return var_new_null(vm);
+}
+
+static var_t* native_fd_foreach(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* e = (self != NULL) ? get_obj(self, FD_ENTRIES) : NULL;
+    var_t* cb = js_arg(env, 0);
+    if(cb == NULL || !cb->is_func) return var_new_null(vm);
+    int cnt = (e != NULL) ? (int)var_array_size(e) : 0;
+    for(int i = 0; i < cnt; ++i) {
+        node_t* pn = var_array_get(e, i);
+        if(pn == NULL || pn->var == NULL) continue;
+        var_t* args = var_new_array(vm);
+        var_array_add(args, var_new_str(vm, usp_pair_value(pn->var)));
+        var_array_add(args, var_new_str(vm, usp_pair_name(pn->var)));
+        var_array_add(args, self);
+        var_t* r = call_m_func(vm, NULL, cb, args);
+        var_unref(args);
+        if(r != NULL) var_unref(r);
+    }
+    return var_new_null(vm);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3678,10 +4528,19 @@ static void web_register_url(vm_t* vm, var_t* bridge) {
         vm_reg_native(vm, cls, "entries()",           native_usp_entries,  bridge);
         vm_reg_native(vm, cls, "toString()",          native_usp_toString, bridge);
         js_acc_cls(vm, cls, "size", native_usp_get_size, NULL, bridge);
-        /* for..of over the params object itself (not just entries()). */
-        var_t* proto = var_find_member_var(cls, "prototype");
-        if(proto != NULL)
-            vm_reg_static(vm, proto, "@@S:iterator()", native_usp_symbol_iterator, bridge);
+        /* for..of over the params object itself (not just entries()). Must be a
+         * NORMAL prototype method: vm_reg_native(vm, cls, ...) already targets
+         * var_get_prototype(cls), i.e. URLSearchParams.prototype. The old code
+         * passed the prototype object itself as the "class", so vm_reg_native
+         * re-resolved var_get_prototype(proto) == Object.prototype and, worse,
+         * vm_reg_static flagged it is_static - which the Object.prototype
+         * pollution fix deliberately hides from instance member lookup. Net
+         * effect: instances had no @@S:iterator and github's query builders
+         * (`for (const [k,v] of new URLSearchParams(...))`) threw "object is not
+         * iterable", rejecting every Deferred route query (tree-commit-info,
+         * latest-commit, branch-and-tag-count, sidebarAbout) so the commit
+         * column and sidebar sections stayed skeleton. */
+        vm_reg_native(vm, cls, "@@S:iterator()", native_usp_symbol_iterator, bridge);
     }
 
     cls = vm_new_class(vm, CLS_URL);
@@ -4102,7 +4961,8 @@ static void web_mirror_globals(vm_t* vm, var_t* window) {
         "Event", "CustomEvent", "MouseEvent", "KeyboardEvent",
         "Element", "Document", "Storage", "Location", "History",
         "Navigator", "Screen", "Performance", "XMLHttpRequest",
-        "Response", "Headers", "URL", "URLSearchParams", "CSS"
+        "Response", "Headers", "URL", "URLSearchParams", "CSS",
+        "Request", "Blob", "FormData"
     };
     /* A/B knob (MARIO_NOQMT): withhold the native queueMicrotask so polyfills
      * (core-js) install their own - on rokid.com the engine-backed microtask
@@ -4363,6 +5223,23 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
     var_t* navigator = new_obj(vm, CLS_NAVIGATOR, 0);
     web_publish(vm, window, "navigator", navigator);
     if(navigator != NULL) var_add(bridge, "@@navigator", navigator);
+    /* navigator.credentials (CredentialsContainer): FedCM / Password Credential
+     * Management API surface used by capability probes. get() resolves(null) and
+     * the mutators resolve(undefined) - no credential store in this engine.
+     * Enabled by default for browser parity. */
+    {
+        var_t* ccls = vm_new_class(vm, "CredentialsContainer");
+        if(ccls != NULL) {
+            vm_reg_native(vm, ccls, "get(o)",                nav_cred_get,    bridge);
+            vm_reg_native(vm, ccls, "store(c)",              nav_cred_settle, bridge);
+            vm_reg_native(vm, ccls, "create(o)",             nav_cred_settle, bridge);
+            vm_reg_native(vm, ccls, "preventSilentAccess()", nav_cred_settle, bridge);
+        }
+        if(navigator != NULL) {
+            var_t* cred = new_obj(vm, "CredentialsContainer", 0);
+            if(cred != NULL) var_add(navigator, "credentials", cred);
+        }
+    }
 
     /* ---- screen ---- */
     cls = vm_new_class(vm, CLS_SCREEN);
@@ -4490,6 +5367,32 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
     if(cls != NULL) {
         vm_reg_native(vm, cls, "get(k)", native_headers_get, bridge);
         vm_reg_native(vm, cls, "has(k)", native_headers_has, bridge);
+    }
+
+    /* ---- Request / Blob / FormData (fetch request-construction side) ---- */
+    cls = vm_new_class(vm, CLS_REQUEST);
+    if(cls != NULL) {
+        vm_reg_native(vm, cls, "constructor(i, init)", native_request_ctor,  bridge);
+        vm_reg_native(vm, cls, "clone()",              native_request_clone, bridge);
+        vm_reg_native(vm, cls, "text()",               native_request_text,  bridge);
+        vm_reg_native(vm, cls, "json()",               native_request_json,  bridge);
+    }
+    cls = vm_new_class(vm, CLS_BLOB);
+    if(cls != NULL) {
+        vm_reg_native(vm, cls, "constructor(p, o)", native_blob_ctor,  bridge);
+        vm_reg_native(vm, cls, "text()",            native_blob_text,  bridge);
+        vm_reg_native(vm, cls, "slice(a, b)",       native_blob_slice, bridge);
+    }
+    cls = vm_new_class(vm, CLS_FORMDATA);
+    if(cls != NULL) {
+        vm_reg_native(vm, cls, "constructor(f)",   native_fd_ctor,    bridge);
+        vm_reg_native(vm, cls, "append(n, v)",     native_fd_append,  bridge);
+        vm_reg_native(vm, cls, "set(n, v)",        native_fd_set,     bridge);
+        vm_reg_native(vm, cls, "get(n)",           native_fd_get,     bridge);
+        vm_reg_native(vm, cls, "getAll(n)",        native_fd_getall,  bridge);
+        vm_reg_native(vm, cls, "has(n)",           native_fd_has,     bridge);
+        vm_reg_native(vm, cls, "delete(n)",        native_fd_delete,  bridge);
+        vm_reg_native(vm, cls, "forEach(cb, t)",   native_fd_foreach, bridge);
     }
 
     /* ---- URL / URLSearchParams ---- */

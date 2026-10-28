@@ -78,7 +78,25 @@ typedef ptrdiff_t  PVG_FT_PtrDist;
 #include <stdlib.h>
 #include <limits.h>
 
+/* Under ASan the interposed libc longjmp runs __asan_handle_no_return ->
+ * PlatformUnpoisonStacks, whose internal AddrIsInMem CHECK can fail on
+ * macOS/arm64 when the stack is deep at the call site, killing the process
+ * even with halt_on_error=0. The longjmp itself is the lawful band-overflow
+ * restart back to the live setjmp in gray_convert_glyph_inner (same thread,
+ * same stack), so that sanitizer runtime CHECK is an artifact, not an engine
+ * bug. Prod builds keep the upstream 8KB pool byte-identically; ASan builds
+ * get a pool large enough that cell overflow (and thus the longjmp) does not
+ * happen in practice. 256KB => ~1024px bands, ~8000 cells per band. */
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define PVG_FT_POOL_SIZE_ASAN  262144
+#endif
+#endif
+#ifdef PVG_FT_POOL_SIZE_ASAN
+#define PVG_FT_MINIMUM_POOL_SIZE  PVG_FT_POOL_SIZE_ASAN
+#else
 #define PVG_FT_MINIMUM_POOL_SIZE 8192
+#endif
 
 #define RAS_ARG   PWorker  worker
 #define RAS_ARG_  PWorker  worker,

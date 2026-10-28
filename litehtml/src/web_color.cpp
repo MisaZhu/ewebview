@@ -5,6 +5,7 @@
 #include <math.h>
 
 namespace litehtml {
+bool style_prof_enabled();
 void profile_color_parse(uint64_t start_ms);
 
 namespace {
@@ -340,7 +341,7 @@ static bool parse_color_mix(const litehtml::tchar_t* str, litehtml::document_con
 
 litehtml::web_color litehtml::web_color::from_string(const tchar_t* str, litehtml::document_container* callback)
 {
-	uint64_t start_ms = sys_tic_ms(0);
+	uint64_t start_ms = litehtml::style_prof_enabled() ? sys_tic_ms(0) : 0;
 	if(!str || !str[0])
 	{
 		litehtml::profile_color_parse(start_ms);

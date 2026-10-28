@@ -17,6 +17,7 @@ void reset_parse_style_profile();
 void dump_parse_style_profile();
 void reset_dom_internal_profile();
 void dump_dom_internal_profile();
+bool style_prof_enabled();
 void profile_apply_stylesheet(uint32_t selector_count, uint64_t start_ms);
 void profile_select(uint64_t start_ms);
 void profile_select_element(uint64_t start_ms);
@@ -197,12 +198,53 @@ void litehtml::reset_dom_internal_profile()
 	memset(&g_dom_internal_profile, 0, sizeof(g_dom_internal_profile));
 }
 
+static void dump_dom_internal_profile_atexit()
+{
+	if(!litehtml::style_prof_enabled()) return;
+	dom_internal_profile_t& p = g_dom_internal_profile;
+	fprintf(stderr,
+		"[styleprof] apply n=%u sel=%u ms=%u | select n=%u ms=%u | selem n=%u ms=%u | getprop n=%u hit=%u psteps=%u ms=%u | font n=%u ih=%u ms=%u | text n=%u tf=%u mm=%u ms=%u | getfont n=%u hit=%u miss=%u ms=%u | cvt n=%u ms=%u | color n=%u ms=%u\n",
+		p.apply_stylesheet_calls, p.apply_stylesheet_selectors, p.apply_stylesheet_ms,
+		p.select_calls, p.select_ms,
+		p.select_element_calls, p.select_element_ms,
+		p.get_style_calls, p.get_style_cache_hits, p.get_style_parent_steps, p.get_style_ms,
+		p.init_font_calls, p.init_font_inherit_hits, p.init_font_ms,
+		p.text_parse_calls, p.text_transform_ms, p.text_measure_ms, p.text_parse_ms,
+		p.get_font_calls, p.get_font_cache_hits, p.get_font_cache_misses, p.get_font_ms,
+		p.cvt_units_calls, p.cvt_units_ms,
+		p.color_parse_calls, p.color_parse_ms);
+}
+
 void litehtml::dump_dom_internal_profile()
 {
+	static bool s_atexit_armed = false;
+	if(!s_atexit_armed && style_prof_enabled())
+	{
+		s_atexit_armed = true;
+		atexit(dump_dom_internal_profile_atexit);
+	}
+}
+
+/* EWEB_STYLE_PROF=1 gate for the style-phase clock instrumentation. The
+ * counters below are reset-only (dump_* print nothing), so default-off
+ * changes no observable behaviour; it also lets the apply_stylesheet /
+ * select hot paths skip several mach_absolute_time reads per candidate
+ * selector (those clock reads sampled at ~38% of apply_stylesheet in a
+ * github style-burst window, Oct 22). */
+int litehtml::g_style_prof_flag = -1;
+
+bool litehtml::style_prof_enabled()
+{
+	if(g_style_prof_flag < 0)
+	{
+		g_style_prof_flag = (getenv("EWEB_STYLE_PROF") != NULL) ? 1 : 0;
+	}
+	return g_style_prof_flag == 1;
 }
 
 void litehtml::profile_apply_stylesheet(uint32_t selector_count, uint64_t start_ms)
 {
+	if(!style_prof_enabled()) return;
 	g_dom_internal_profile.apply_stylesheet_calls++;
 	g_dom_internal_profile.apply_stylesheet_selectors += selector_count;
 	add_dom_internal_time(g_dom_internal_profile.apply_stylesheet_ms, start_ms);
@@ -210,18 +252,21 @@ void litehtml::profile_apply_stylesheet(uint32_t selector_count, uint64_t start_
 
 void litehtml::profile_select(uint64_t start_ms)
 {
+	if(!style_prof_enabled()) return;
 	g_dom_internal_profile.select_calls++;
 	add_dom_internal_time(g_dom_internal_profile.select_ms, start_ms);
 }
 
 void litehtml::profile_select_element(uint64_t start_ms)
 {
+	if(!style_prof_enabled()) return;
 	g_dom_internal_profile.select_element_calls++;
 	add_dom_internal_time(g_dom_internal_profile.select_element_ms, start_ms);
 }
 
 void litehtml::profile_get_style_property(bool cache_hit, uint32_t parent_steps, uint64_t start_ms)
 {
+	if(!style_prof_enabled()) return;
 	g_dom_internal_profile.get_style_calls++;
 	if(cache_hit)
 	{
@@ -233,6 +278,7 @@ void litehtml::profile_get_style_property(bool cache_hit, uint32_t parent_steps,
 
 void litehtml::profile_init_font(bool inherit_fast, uint64_t start_ms)
 {
+	if(!style_prof_enabled()) return;
 	g_dom_internal_profile.init_font_calls++;
 	if(inherit_fast)
 	{
@@ -243,6 +289,7 @@ void litehtml::profile_init_font(bool inherit_fast, uint64_t start_ms)
 
 void litehtml::profile_text_parse(uint32_t transform_ms, uint32_t measure_ms, uint64_t start_ms)
 {
+	if(!style_prof_enabled()) return;
 	g_dom_internal_profile.text_parse_calls++;
 	g_dom_internal_profile.text_transform_ms += transform_ms;
 	g_dom_internal_profile.text_measure_ms += measure_ms;
@@ -251,6 +298,7 @@ void litehtml::profile_text_parse(uint32_t transform_ms, uint32_t measure_ms, ui
 
 void litehtml::profile_get_font(bool cache_hit, uint64_t start_ms)
 {
+	if(!style_prof_enabled()) return;
 	g_dom_internal_profile.get_font_calls++;
 	if(cache_hit)
 	{
@@ -265,12 +313,14 @@ void litehtml::profile_get_font(bool cache_hit, uint64_t start_ms)
 
 void litehtml::profile_cvt_units(uint64_t start_ms)
 {
+	if(!style_prof_enabled()) return;
 	g_dom_internal_profile.cvt_units_calls++;
 	add_dom_internal_time(g_dom_internal_profile.cvt_units_ms, start_ms);
 }
 
 void litehtml::profile_color_parse(uint64_t start_ms)
 {
+	if(!style_prof_enabled()) return;
 	g_dom_internal_profile.color_parse_calls++;
 	add_dom_internal_time(g_dom_internal_profile.color_parse_ms, start_ms);
 }
@@ -364,6 +414,10 @@ litehtml::document::ptr litehtml::document::createFromUTF8(const char* str, lite
 		}
 		// Sort css selectors using CSS rules.
 		doc->m_styles.sort_selectors();
+		/* The one-shot sweep has consumed every queued sheet: from here on
+		 * m_css is dead, so add_stylesheet must parse a runtime-injected <style>
+		 * straight into m_styles (see add_stylesheet). */
+		doc->m_css_swept = true;
 
 		if (!doc->m_media_lists.empty())
 		{
@@ -386,6 +440,10 @@ litehtml::document::ptr litehtml::document::createFromUTF8(const char* str, lite
 		// We have to check the tabular elements for missing table elements
 		// and create the anonymous boxes in visual table layout
 		doc->fix_tables_layout();
+		/* The sweep above just covered every registered element; clear the
+		 * deferred-fixup flag add_tabular set so the first render does not
+		 * redundantly re-run the (idempotent but O(n)) pass. */
+		doc->m_tabular_dirty = false;
 
 		// Fanaly initialize elements
 		doc->m_root->init();
@@ -539,7 +597,7 @@ litehtml::uint_ptr litehtml::document::add_font( const tchar_t* name, int size, 
 
 litehtml::uint_ptr litehtml::document::get_font( const tchar_t* name, int size, const tchar_t* weight, const tchar_t* style, const tchar_t* decoration, font_metrics* fm )
 {
-	uint64_t start_ms = sys_tic_ms(0);
+	uint64_t start_ms = (style_prof_fast() ? sys_tic_ms(0) : 0);
 	if( !name || (name && !t_strcasecmp(name, _t("inherit"))) )
 	{
 		name = m_container->get_default_font_name();
@@ -641,6 +699,18 @@ int litehtml::document::render( int max_width, render_type rt )
 	}
 	if(m_root)
 	{
+		/* Tabular elements registered after create_document's one-shot
+		 * fix_tables_layout() (fast-mode builds register nothing until the
+		 * chunked reparse; JS restyles can flip display to table) still lack
+		 * their anonymous row/row-group boxes. Consume the deferred fixup
+		 * here rather than inside parse_styles: fix_table_children inserts
+		 * into m_children, which the recursive style walk is iterating. */
+		if(m_tabular_dirty)
+		{
+			m_tabular_dirty = false;
+			fix_tables_layout();
+			m_tables_dirty = true;
+		}
 		/* A post-creation style update can flip a cell's computed display; the
 		 * grid captured in init() would keep the stale column set, so rebuild
 		 * the tabular grids before this layout pass measures them. */
@@ -671,6 +741,13 @@ int litehtml::document::render( int max_width, render_type rt )
 
 void litehtml::document::draw( uint_ptr hdc, int x, int y, const position* clip )
 {
+	/* Capture the scroll offset (the embedder enters with x/y = vp_origin -
+	 * scroll, vp_origin being the frame row the viewport starts at - nonzero
+	 * when the frame carries overscan rows) so scroll-driven effects computed
+	 * during the paint walk - position:sticky pinning - see the true document
+	 * scroll regardless of tree depth. */
+	m_draw_scroll_x = -x;
+	m_draw_scroll_y = m_draw_vp_origin_y - y;
 	if(m_root)
 	{
 		m_root->draw(hdc, x, y, clip);
@@ -680,7 +757,7 @@ void litehtml::document::draw( uint_ptr hdc, int x, int y, const position* clip 
 
 int litehtml::document::cvt_units( const tchar_t* str, int fontSize, bool* is_percent/*= 0*/ ) const
 {
-	uint64_t start_ms = sys_tic_ms(0);
+	uint64_t start_ms = (style_prof_fast() ? sys_tic_ms(0) : 0);
 	if(!str)	return 0;
 	
 	css_length val;
@@ -696,7 +773,7 @@ int litehtml::document::cvt_units( const tchar_t* str, int fontSize, bool* is_pe
 
 int litehtml::document::cvt_units( css_length& val, int fontSize, int size ) const
 {
-	uint64_t start_ms = sys_tic_ms(0);
+	uint64_t start_ms = (style_prof_fast() ? sys_tic_ms(0) : 0);
 	if(val.is_predefined())
 	{
 		profile_cvt_units(start_ms);
@@ -857,8 +934,58 @@ void litehtml::document::add_stylesheet( const tchar_t* str, const tchar_t* base
 		/* Master css changed: any chunked update in flight is stale (its epoch
 		 * stamps would skip elements against the old stylesheet set). */
 		abort_style_step();
+		/* Before the creation-time sweep, queue into m_css so create_document
+		 * parses every sheet in source order. After it, m_css is never consumed
+		 * again, so a sheet JS adds at runtime (gestalt's per-field
+		 * `#label-x > div { color: transparent }` injected via
+		 * createElement('style') + appendChild) must parse straight into
+		 * m_styles or its rules are silently dropped and the label stays opaque.
+		 * The engine layer raises the restyle flag so existing elements re-match. */
+		if(m_css_swept)
+		{
+			add_stylesheet_now(str, baseurl, media);
+			return;
+		}
 		m_css.push_back(css_text(str, baseurl, media));
 	}
+}
+
+bool litehtml::document::uses_attribute_selector( const tchar_t* name ) const
+{
+	if(!name || !name[0])
+	{
+		return false;
+	}
+	/* Link sheets land in the context master set on async containers, so a
+	 * name only a fetched sheet tests must be visible here too. */
+	tstring n(name);
+	return m_styles.uses_attribute(n) || master_styles().uses_attribute(n);
+}
+
+void litehtml::document::add_stylesheet_now( const tchar_t* str, const tchar_t* baseurl, const tchar_t* media )
+{
+	if(!str || !str[0])
+	{
+		return;
+	}
+	/* A sheet arriving after the creation-time m_css sweep must be parsed
+	 * straight into m_styles (and re-sorted) or its selectors never enter the
+	 * cascade; abort any chunked walk so its epoch stamps do not skip elements
+	 * against the pre-addition selector set. */
+	abort_style_step();
+	/* media_query_list::ptr is a RAW pointer, so it must be initialised: an
+	 * absent media= attribute otherwise passes an uninitialised garbage pointer
+	 * to parse_stylesheet, whose `if(media && doc) add_media_list(media)` then
+	 * files a dangling list that update_media_lists later dereferences (SIGSEGV
+	 * in apply_media_features). create_document's sweep assigns both branches;
+	 * mirror that here. */
+	media_query_list::ptr m = nullptr;
+	if(media && media[0])
+	{
+		m = media_query_list::create_from_string(media, this);
+	}
+	m_styles.parse_stylesheet(str, baseurl ? baseurl : _t(""), this, m);
+	m_styles.sort_selectors();
 }
 
 bool litehtml::document::on_mouse_over( int x, int y, int client_x, int client_y, position::vector& redraw_boxes )
@@ -999,7 +1126,8 @@ void style_detached_subtree_walk(litehtml::element* el,
                                  const litehtml::css& master,
                                  const litehtml::css& doc_css,
                                  int depth,
-                                 int& budget)
+                                 int& budget,
+                                 bool& exhausted)
 {
 	/* The walk is entered from a live root (the node handed to
 	 * appendChild/insertBefore) but recurses through every descendant, and a
@@ -1016,6 +1144,7 @@ void style_detached_subtree_walk(litehtml::element* el,
 	 * below the limit stay unstyled here and pick up styles on a later pass. */
 	if(depth > 32)
 	{
+		exhausted = true;
 		return;
 	}
 	/* Hard work budget: a single style_detached_subtree call must not monopolize
@@ -1025,6 +1154,7 @@ void style_detached_subtree_walk(litehtml::element* el,
 	 * past the budget stay unstyled here and are picked up by a later pass. */
 	if(budget <= 0)
 	{
+		exhausted = true;
 		return;
 	}
 	--budget;
@@ -1097,6 +1227,16 @@ void style_detached_subtree_walk(litehtml::element* el,
 			t->apply_stylesheet_own(doc_css);
 		}
 	}
+	/* Cascade only fills m_style with RAW declarations: var()/calc() expand and
+	 * the custom-property map resolves in parse_styles, and both need the live
+	 * ancestor chain (a subtree built detached had none, so its earlier parse
+	 * DROPPED every unresolvable var() out of m_style for good). Parse each
+	 * cascaded node here, top-down, so the fresh chain reaches every node the
+	 * budget covers; the embedder schedules a full restyle for the rest. */
+	if(el->is_html_tag())
+	{
+		static_cast<litehtml::html_tag*>(el)->parse_styles(false);
+	}
 	int count = el->get_children_count();
 	/* Sanity cap: a smashed m_children (heap written through a dangling handle)
 	 * reads back as an astronomical count and the loop below would spin on
@@ -1107,19 +1247,25 @@ void style_detached_subtree_walk(litehtml::element* el,
 	}
 	for(int i = 0; i < count; i++)
 	{
-		style_detached_subtree_walk(el->get_child(i), master, doc_css, depth + 1, budget);
+		style_detached_subtree_walk(el->get_child(i), master, doc_css, depth + 1, budget, exhausted);
 	}
 }
 } // namespace
 
-void litehtml::document::style_detached_subtree(element* el)
+bool litehtml::document::style_detached_subtree(element* el)
 {
 	if(!el || !m_context)
 	{
-		return;
+		return false;
 	}
 	int budget = 400;
-	style_detached_subtree_walk(el, m_context->master_css(), m_styles, 0, budget);
+	bool exhausted = false;
+	style_detached_subtree_walk(el, m_context->master_css(), m_styles, 0, budget, exhausted);
+	/* True when the budget or the depth cap cut the walk short: nodes past the
+	 * cut keep whatever stale cascade they carried (a detached-built subtree
+	 * lost every var() its starved parse could not expand), and only a full
+	 * chunked restyle re-resolves them against the live ancestor chain. */
+	return exhausted;
 }
 
 litehtml::element::ptr litehtml::document::create_element(const tchar_t* tag_name, const string_map& attributes)
@@ -1875,7 +2021,17 @@ void litehtml::document::fix_table_children(element::ptr& el_ptr, style_display 
 
 	while (cur_iter != el_ptr->m_children.end())
 	{
-		if ((*cur_iter)->get_display() != disp)
+		if ((*cur_iter)->get_display() == display_none)
+		{
+			/* A display:none child generates no box at all (CSS 2.1 §17.2.1),
+			 * so it must NOT be wrapped in an anonymous table-cell. Doing that
+			 * injects a ghost column into the grid (github's display:none
+			 * small-screen name cell leaked its text as a stray column and
+			 * shifted the visible cells right into the sidebar). Leave it in
+			 * place; the table grid skips it naturally. */
+			cur_iter++;
+		}
+		else if ((*cur_iter)->get_display() != disp)
 		{
 			if (!(*cur_iter)->is_white_space() || ((*cur_iter)->is_white_space() && !tmp.empty()))
 			{
@@ -1962,6 +2118,29 @@ void litehtml::document::fix_table_parent(element::ptr& el_ptr, style_display di
 				}
 			}
 
+			/* Snapshot the run to move and the sibling that follows it BEFORE
+			 * mutating anything: appendChild() unlinks each element from
+			 * parent->m_children (removeChild erases it), which invalidates
+			 * every iterator into that vector. Capturing the successor as a
+			 * value lets us re-insert the anonymous wrapper by position via
+			 * insertBefore (a value-based lookup) instead of dereferencing a
+			 * dangling iterator. */
+			elements_vector move_set(first, last + 1);
+			/* element::ptr is a RAW pointer (typedef element*), so it must be
+			 * explicitly null-initialised: a default-init raw ptr holds an
+			 * indeterminate value, and the "moved run reaches the end" case
+			 * below never assigns it, which would then feed a garbage ref to
+			 * insertBefore. */
+			element::ptr successor = nullptr;
+			{
+				elements_vector::iterator after = last;
+				after++;
+				if (after != parent->m_children.end())
+				{
+					successor = *after;
+				}
+			}
+
 			// extract elements with the same display and wrap them with anonymous object
 			element::ptr annon_tag = litehtml_alloc<html_tag>("html_tag(table-parent)", this);
 			if(!annon_tag)
@@ -1973,14 +2152,23 @@ void litehtml::document::fix_table_parent(element::ptr& el_ptr, style_display di
 			annon_tag->add_style(st);
 			annon_tag->parent(parent);
 			annon_tag->parse_styles();
-			std::for_each(first, last + 1,
+			std::for_each(move_set.begin(), move_set.end(),
 				[&annon_tag](element::ptr& el)
 				{
 					annon_tag->appendChild(el);
 				}
 			);
-			first = parent->m_children.erase(first, last + 1);
-			parent->m_children.insert(first, annon_tag);
+			/* appendChild already removed the moved elements from parent, so
+			 * only the wrapper has to be spliced back in - by value, never by
+			 * the now-stale first/last iterators. */
+			if (successor)
+			{
+				parent->insertBefore(annon_tag, successor);
+			}
+			else
+			{
+				parent->appendChild(annon_tag);
+			}
 		}
 	}
 }

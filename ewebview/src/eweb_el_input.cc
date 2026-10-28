@@ -41,9 +41,11 @@ eweb_el_input::eweb_el_input(
     /* element::ptr is a RAW pointer, so these range-slider part slots must be
      * explicitly nulled: part_color()/part_dim() test `if(!p)` and would else
      * read construction-time garbage, intermittently dereferencing a bogus
-     * address and crashing every <input type=range>. */
+     * address and crashing every <input type=range>. Same for the
+     * ::placeholder part slot tested by placeholder_color(). */
     m_part_thumb(nullptr),
-    m_part_track(nullptr)
+    m_part_track(nullptr),
+    m_part_placeholder(nullptr)
 {
     m_display = litehtml::display_inline_block;
 }
@@ -715,6 +717,34 @@ uint32_t eweb_el_input::make_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
     return ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
 }
 
+/* Chrome's date/time controls ignore the placeholder attribute entirely:
+ * their empty state is the native datetime-edit segments ("mm/dd/yyyy"),
+ * which inherit the control colour and vanish under color:transparent.
+ * Pinterest's birthday field carries a JS-set placeholder string, and painting
+ * it made the field show "Enter your birthday (mm/dd/yyyy, …)" where Chrome
+ * shows an empty box. Map date-like types to their static segment hint. */
+static bool input_is_date_like(eweb_el_input* e)
+{
+    const litehtml::tchar_t* pty = e->get_attr(_t("type"));
+    return pty &&
+           (!t_strcasecmp(pty, _t("date")) ||
+            !t_strcasecmp(pty, _t("time")) ||
+            !t_strcasecmp(pty, _t("month")) ||
+            !t_strcasecmp(pty, _t("week")) ||
+            !t_strcasecmp(pty, _t("datetime-local")));
+}
+
+static std::string date_segment_hint(eweb_el_input* e)
+{
+    const litehtml::tchar_t* pty = e->get_attr(_t("type"));
+    if (!pty) return std::string();
+    if (!t_strcasecmp(pty, _t("time"))) return "--:-- --";
+    if (!t_strcasecmp(pty, _t("month"))) return "mm/yyyy";
+    if (!t_strcasecmp(pty, _t("week"))) return "ww/yyyy";
+    if (!t_strcasecmp(pty, _t("datetime-local"))) return "mm/dd/yyyy hh:mm AM";
+    return "mm/dd/yyyy";
+}
+
 std::string eweb_el_input::label(bool* is_placeholder)
 {
     if (is_placeholder) {
@@ -726,6 +756,12 @@ std::string eweb_el_input::label(bool* is_placeholder)
         const litehtml::tchar_t* v = get_attr(_t("value"));
         if (v && v[0]) {
             return std::string(v);
+        }
+        if (m_inputType == EWEB_INPUT_TEXT && input_is_date_like(this)) {
+            if (is_placeholder) {
+                *is_placeholder = true;
+            }
+            return date_segment_hint(this);
         }
         const litehtml::tchar_t* p = get_attr(_t("placeholder"));
         if (p && p[0]) {
@@ -1043,43 +1079,74 @@ litehtml::element_position eweb_el_input::get_element_position(litehtml::css_off
 
 void eweb_el_input::add_widget_part_style(const litehtml::tstring& part, const litehtml::style& st)
 {
-    /* Only replaced controls with painted parts (the range slider) keep these;
-     * accumulating on every control would grow the map with rules like
-     * input::placeholder that draw() never reads. */
-    if (m_inputType != EWEB_INPUT_RANGE) {
-        return;
+    /* Vendor aliases of ::placeholder paint the same native hint; normalise
+     * them so a page written against ::-webkit-input-placeholder (common in
+     * CSS-in-JS resets) still lands in the "placeholder" slot draw() reads. */
+    litehtml::tstring norm = part;
+    if (norm == litehtml::tstring(_t("-webkit-input-placeholder")) ||
+        norm == litehtml::tstring(_t("-moz-placeholder")) ||
+        norm == litehtml::tstring(_t("-ms-input-placeholder"))) {
+        norm = litehtml::tstring(_t("placeholder"));
     }
-    m_widget_styles[std::string(part.c_str())] = st;
+    /* Range sliders keep every part block. Text-like controls keep only
+     * ::placeholder so draw() can honour the page's placeholder colour
+     * (Pinterest hides the native hint with ::placeholder{color:transparent}
+     * while a gestalt overlay div paints the visible resting text); every
+     * other part stays range-only, or the map would grow with blocks
+     * draw() never reads. */
+    if (m_inputType != EWEB_INPUT_RANGE) {
+        bool is_textish = (m_inputType == EWEB_INPUT_TEXT ||
+                           m_inputType == EWEB_INPUT_TEXTAREA);
+        if (!is_textish || norm != litehtml::tstring(_t("placeholder"))) {
+            return;
+        }
+    }
+    m_widget_styles[std::string(norm.c_str())] = st;
 }
 
 void eweb_el_input::resolve_widget_parts()
 {
-    if (m_inputType != EWEB_INPUT_RANGE || m_widget_styles.empty()) {
+    if (m_widget_styles.empty()) {
         return;
     }
-    static const char* const kThumb[] = { "-webkit-slider-thumb", "-moz-range-thumb" };
-    static const char* const kTrack[] = { "-webkit-slider-runnable-track", "-moz-range-track" };
-    for (int which = 0; which < 2; which++) {
-        litehtml::element::ptr* slot = which ? &m_part_track : &m_part_thumb;
-        const char* const* names = which ? kTrack : kThumb;
-        if (*slot) {
-            continue;  /* built on an earlier parse; styles accumulate below */
-        }
-        for (int i = 0; i < 2; i++) {
-            auto it = m_widget_styles.find(names[i]);
-            if (it == m_widget_styles.end()) {
-                continue;
+    if (m_inputType == EWEB_INPUT_RANGE) {
+        static const char* const kThumb[] = { "-webkit-slider-thumb", "-moz-range-thumb" };
+        static const char* const kTrack[] = { "-webkit-slider-runnable-track", "-moz-range-track" };
+        for (int which = 0; which < 2; which++) {
+            litehtml::element::ptr* slot = which ? &m_part_track : &m_part_thumb;
+            const char* const* names = which ? kTrack : kThumb;
+            if (*slot) {
+                continue;  /* built on an earlier parse; styles accumulate below */
             }
-            /* Childless html_tag, parented to this control so custom-property
-             * inheritance and var() resolution follow the real tree - the same
-             * trick the ::before/::after elements use. Never appended to
-             * m_children, so layout/draw never see it. */
+            for (int i = 0; i < 2; i++) {
+                auto it = m_widget_styles.find(names[i]);
+                if (it == m_widget_styles.end()) {
+                    continue;
+                }
+                /* Childless html_tag, parented to this control so custom-property
+                 * inheritance and var() resolution follow the real tree - the same
+                 * trick the ::before/::after elements use. Never appended to
+                 * m_children, so layout/draw never see it. */
+                litehtml::element::ptr el = new litehtml::html_tag(get_document());
+                el->parent(this);
+                el->add_style(it->second);
+                el->parse_styles(false);
+                *slot = el;
+                break;
+            }
+        }
+    }
+    if ((m_inputType == EWEB_INPUT_TEXT || m_inputType == EWEB_INPUT_TEXTAREA) &&
+        !m_part_placeholder) {
+        auto it = m_widget_styles.find("placeholder");
+        if (it != m_widget_styles.end()) {
+            /* Same childless-tag trick as the slider parts: parented to this
+             * control so var()/inheritance resolve against the real tree. */
             litehtml::element::ptr el = new litehtml::html_tag(get_document());
             el->parent(this);
             el->add_style(it->second);
             el->parse_styles(false);
-            *slot = el;
-            break;
+            m_part_placeholder = el;
         }
     }
 }
@@ -1101,6 +1168,21 @@ bool eweb_el_input::part_color(bool thumb, litehtml::web_color& c) const
     }
     c = litehtml::web_color::from_string(v, get_document()->container());
     return c.alpha != 0;
+}
+
+bool eweb_el_input::placeholder_color(litehtml::web_color& c) const
+{
+    if (!m_part_placeholder) {
+        return false;
+    }
+    const litehtml::tchar_t* v = m_part_placeholder->get_style_property(_t("color"), false);
+    if (!v || !v[0] || !litehtml::web_color::is_color(v)) {
+        return false;
+    }
+    c = litehtml::web_color::from_string(v, get_document()->container());
+    /* Unlike part_color(), alpha 0 is meaningful here: a transparent
+     * ::placeholder colour hides the hint (Pinterest signup). */
+    return true;
 }
 
 int eweb_el_input::part_dim(bool thumb, const char* prop, int defval) const
@@ -1227,7 +1309,21 @@ void eweb_el_input::draw_page_box(litehtml::uint_ptr hdc, int x, int y, const li
 static uint32_t widget_fg_argb(eweb_el_input* el)
 {
     litehtml::web_color fgc = el->get_color(_t("color"), true, litehtml::web_color(0, 0, 0, 255));
-    return ((uint32_t)(fgc.alpha ? fgc.alpha : 255) << 24) |
+    uint32_t a = fgc.alpha;
+    if (!a) {
+        /* alpha 0 is both an authored transparent colour and the engine's
+         * unset default (m_color starts at (0,0,0,0)); the UA sheet also
+         * dresses every control in 'color: initial', which from_string()
+         * cannot resolve and likewise yields alpha 0. Only syntax that can
+         * actually express transparency hides the glyphs. */
+        const litehtml::tchar_t* cv = el->get_style_property_own(_t("color"));
+        bool authored = cv && cv[0] &&
+                        (!t_strcasecmp(cv, _t("transparent")) ||
+                         !t_strncasecmp(cv, _t("rgb"), 3) ||
+                         cv[0] == _t('#'));
+        a = authored ? 0 : 255;
+    }
+    return (a << 24) |
            ((uint32_t)fgc.red << 16) | ((uint32_t)fgc.green << 8) | fgc.blue;
 }
 
@@ -1302,8 +1398,12 @@ void eweb_el_input::draw(litehtml::uint_ptr hdc, int x, int y, const litehtml::p
             t = displayText();
             placeholder = t.empty();
             if (placeholder) {
-                const litehtml::tchar_t* p = get_attr(_t("placeholder"));
-                if (p && p[0]) t = std::string(p);
+                if (input_is_date_like(this)) {
+                    t = date_segment_hint(this);
+                } else {
+                    const litehtml::tchar_t* p = get_attr(_t("placeholder"));
+                    if (p && p[0]) t = std::string(p);
+                }
             }
             ensureCaretVisible(tb.width);
         } else {
@@ -1311,10 +1411,47 @@ void eweb_el_input::draw(litehtml::uint_ptr hdc, int x, int y, const litehtml::p
         }
         uint32_t fg = widget_fg_argb(this);
         uint32_t tcol = fg;
+        /* The container's draw_text clamps alpha 0 to opaque black (defence
+         * for unset colours), so a fully transparent hint/value colour has
+         * to skip the glyph draw here instead. */
+        bool hide_text = ((fg >> 24) == 0);
         if (placeholder) {
-            tcol = ((((fg >> 16) & 0xFF) / 2 + 64) << 16) |
-                   ((((fg >> 8) & 0xFF) / 2 + 64) << 8) |
-                   (((fg & 0xFF) / 2 + 64)) | (fg & 0xFF000000);
+            /* date/time inputs expose no ::placeholder in Chrome: their empty
+             * state is the native datetime-edit, which inherits the control
+             * colour and is hidden by `color:transparent` / ::-webkit-datetime-
+             * edit{visibility:hidden}. Forcing the UA gray hint here would paint
+             * the hint opaque over a transparent control (Pinterest's birthday
+             * field), so date-like types keep honouring the control colour. */
+            const litehtml::tchar_t* pty = get_attr(_t("type"));
+            bool date_like = (m_inputType == EWEB_INPUT_TEXT && pty &&
+                              (!t_strcasecmp(pty, _t("date")) ||
+                               !t_strcasecmp(pty, _t("time")) ||
+                               !t_strcasecmp(pty, _t("month")) ||
+                               !t_strcasecmp(pty, _t("week")) ||
+                               !t_strcasecmp(pty, _t("datetime-local"))));
+            if (date_like) {
+                /* hide_text already mirrors the control colour alpha; tcol
+                 * stays the control colour. */
+            } else {
+            /* The hint colour is UA gray derived from the control colour,
+             * independent of its alpha (Chrome keeps the gray hint under
+             * input{color:transparent}); only a ::placeholder rule with an
+             * explicit colour overrides it, alpha 0 included. */
+            litehtml::web_color pc;
+            if (placeholder_color(pc)) {
+                if (pc.alpha == 0) {
+                    hide_text = true;
+                } else {
+                    hide_text = false;
+                    tcol = make_color(pc.red, pc.green, pc.blue, pc.alpha);
+                }
+            } else {
+                hide_text = false;
+                tcol = ((((fg >> 16) & 0xFF) / 2 + 64) << 16) |
+                       ((((fg >> 8) & 0xFF) / 2 + 64) << 8) |
+                       (((fg & 0xFF) / 2 + 64)) | 0xFF000000;
+            }
+            }
         }
         /* number fields keep the right edge clear for the spinner arrows */
         const litehtml::tchar_t* tyattr = get_attr(_t("type"));
@@ -1336,13 +1473,15 @@ void eweb_el_input::draw(litehtml::uint_ptr hdc, int x, int y, const litehtml::p
                     gfx->fill_rect(gfx->ud, s, sx, tb.y, ex - sx, tb.height, 0x663390FF);
                 }
             }
-            draw_scrolled_text(s, tb, t, tcol, m_textScrollX);
+            if (!hide_text) {
+                draw_scrolled_text(s, tb, t, tcol, m_textScrollX);
+            }
             /* Caret: a 1px vertical bar at the caret offset while focused. */
             if (m_focused && gfx->fill_rect) {
                 int cx = tb.x + 4 - m_textScrollX + offsetToX(m_caret);
                 gfx->fill_rect(gfx->ud, s, cx, tb.y + 2, 1, tb.height - 4, 0xFF000000);
             }
-        } else {
+        } else if (!hide_text) {
             draw_text_box(s, tb, t, tcol, false);
         }
         if (is_number && gfx->fill_rect) {
@@ -1733,6 +1872,26 @@ int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
         }
         if (!m_css_height.is_predefined()) {
             m_pos.height += m_padding.height() + m_borders.height();
+        }
+    }
+
+    /* CSS min-height floors the field (gestalt TextField
+     * .md_input_height_1d{min-height:36px}): the branches above only honour
+     * max-height, so a field with no explicit height collapsed to the
+     * intrinsic 24px line and its absolutely-positioned helper/escapes
+     * overlapped the next row. m_pos is the border box here, so a content-box
+     * min-height (which names the content edge) carries the chrome in its
+     * floor; border-box declarations compare against m_pos directly. */
+    if (!m_css_min_height.is_predefined() &&
+        m_css_min_height.units() != litehtml::css_units_percentage) {
+        int min_box = (int)m_css_min_height.val();
+        if (m_box_sizing == litehtml::box_sizing_content_box) {
+            /* m_pos is the border box here; a content-box min-height names
+             * the content edge, so the floor carries the chrome. */
+            min_box += m_padding.height() + m_borders.height();
+        }
+        if (m_pos.height < min_box) {
+            m_pos.height = min_box;
         }
     }
 

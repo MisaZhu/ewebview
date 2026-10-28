@@ -102,6 +102,7 @@ typedef struct {
     mstr_t*               write_buf;   /* document.write accumulator */
     js_timer_t            timers[JS_TIMER_MAX];
     int                   timer_next_id;  /* monotonic id source */
+    long                  timer_drops;    /* callbacks lost to table overflow */
     uint64_t              timer_last_now; /* embedder clock at the previous poll */
     bool                  timer_synced;   /* false until the first poll seeds it */
     js_el_cache_t*        el_cache;       /* growable, never evicted (see above) */
@@ -109,6 +110,46 @@ typedef struct {
     int                   el_cache_cap;
     bool                  dom_loaded;     /* false until DOMContentLoaded fires */
     bool                  parsing_complete; /* true while deferred/module scripts run */
+    /* True while an ASYNC event-loop callback runs (timer / MessageChannel /
+     * promise reaction / event handler - jsVmEnter(appScript=false)). A real
+     * browser only ever runs those AFTER the parser finished, so they observe
+     * readyState=="interactive", never "loading". This engine parses the whole
+     * document before running any script, yet reports "loading" during the SYNC
+     * script phase so Next.js's inline flight bootstrap defers its stream-close
+     * to DOMContentLoaded (see native_document_get_readyState). pinterest.com's
+     * app scripts are async CLASSIC webpack chunks (no type=module), so nothing
+     * ever flips parsing_complete and its MessageChannel-scheduled React render
+     * saw "loading": the dehydrated-Suspense client-render gate
+     * (c4: "$?"===data && readyState!=="loading") then deferred the boundary to
+     * the idle lane and the CSR shell never filled. This flag gives the async
+     * callbacks the post-parse value while sync bodies keep "loading". */
+    bool                  in_async_cb;
+    /* While true, customElements.define() records the registration but queues
+     * its bulk connectedCallback upgrade instead of running it inline (see
+     * js_dom_set_defer_upgrades). github.com's react-app connectedCallback
+     * awaits a code-view registration that only a LATER document-order script
+     * performs; upgrading inline (mid script_4) forced the synchronous await
+     * spin / re-entrant script pump that corrupts the suspended webpack
+     * factory frames. Deferring the reaction to after the post-swap script
+     * queue lets the registration exist first, so the await settles normally. */
+    bool                  defer_upgrades;
+    /* Custom-element insertion reactions. customElements.define() runs a
+     * one-shot bulk upgrade over the elements that exist AT DEFINE TIME. But
+     * github's React fill commit (post deferred-data) appends <relative-time>
+     * and other catalyst elements LONG AFTER their define() ran with
+     * matched=0, so those instances never get a connectedCallback and render
+     * as permanent grey skeletons (relative-time never formats its datetime).
+     * A real browser fires an upgrade reaction on insertion; we approximate it
+     * by recording the tag name of every registered custom element that gets
+     * inserted (see ce_mark_dirty in mo_notify_childlist), then re-running the
+     * idempotent ce_upgrade_all for just those names once the JS that inserted
+     * them settles (js_dom_upgrade_dirty, called from the engine tick after
+     * timers/fetch fire). Bounded: only names actually inserted are re-scanned,
+     * and ce_upgrade_all skips elements already carrying @@ceupg. */
+#define CE_DIRTY_MAX  48
+#define CE_DIRTY_NAME 48
+    char                  ce_dirty[CE_DIRTY_MAX][CE_DIRTY_NAME];
+    int                   ce_dirty_n;
 } js_dom_state;
 
 /* ------------------------------------------------------------------ */
@@ -404,6 +445,25 @@ static var_t* wrap_element(vm_t* vm, js_element_t el) {
     if(obj == NULL) return var_new_null(vm);
     obj->value = el;
     obj->free_func = el_free;
+    /* Tag nodes are reparented onto HTMLElement.prototype so the real DOM
+     * prototype chain holds: HTMLElement.prototype inherits Element.prototype
+     * (linked in js_register_dom_natives), which inherits Node/EventTarget. A
+     * <div> is therefore `instanceof HTMLElement`, `instanceof Element` AND
+     * `instanceof Node`, exactly as in a browser, and the native Element methods
+     * still resolve up the chain. Wrapping every element as plain "Element" made
+     * `el instanceof HTMLElement` false, breaking the guard sites React and
+     * countless libraries use (e.g. Pinterest's shell-loader teardown
+     * `e instanceof HTMLElement && body.removeChild(e)`). Done by reparenting
+     * rather than new_obj("HTMLElement") so the upgrade-aware HTMLElement @@ctor
+     * (native_htmlel_ctor / s_ce_pending_el) is never triggered from here.
+     * Non-tag nodes (text/comment) keep the bare Element wrapper as before. */
+    if(st != NULL && st->cb.el_is_tag != NULL && st->cb.el_is_tag(st->ctx, el)) {
+        var_t* hcls = var_find_own_member_var(vm->root, "HTMLElement");
+        if(hcls != NULL) {
+            var_t* hproto = var_get_prototype(hcls);
+            if(hproto != NULL) var_set_prototype(obj, hproto);
+        }
+    }
     if(st != NULL) {
         if(st->el_cache_len == st->el_cache_cap) {
             int ncap = (st->el_cache_cap > 0) ? st->el_cache_cap * 2 : 64;
@@ -450,6 +510,12 @@ static var_t* native_el_set_textContent(vm_t* vm, var_t* env, void* data) {
     return NULL;
 }
 
+/* Forward decls: the custom-element insertion-reaction helpers live further
+ * down (with the MutationObserver hooks) but innerHTML assignment - which
+ * bypasses mo_notify_childlist - also needs them. */
+static void ce_mark_dirty(vm_t* vm, js_dom_state* st, js_element_t added);
+static void ce_mark_subtree_dirty(vm_t* vm, js_dom_state* st, js_element_t el, int depth);
+
 static var_t* native_el_get_innerHTML(vm_t* vm, var_t* env, void* data) {
     js_dom_state* st = state_any(vm, data);
     js_element_t el = handle_from_this(this_from_env(env));
@@ -466,6 +532,13 @@ static var_t* native_el_set_innerHTML(vm_t* vm, var_t* env, void* data) {
     const char* s = (n != NULL) ? var_get_str(n->var) : "";
     if(st != NULL && el != NULL && st->cb.el_set_html != NULL) {
         st->cb.el_set_html(st->ctx, el, s ? s : "");
+        /* The port parses and attaches the fragment internally, so custom
+         * elements created by innerHTML never pass through mo_notify_childlist
+         * and would miss their insertion upgrade reaction. Walk the freshly
+         * set subtree and mark any registered custom element for the drain.
+         * Skipped entirely when no custom element is defined yet. */
+        if(var_find_member_var(vm->root, "@@customelements") != NULL)
+            ce_mark_subtree_dirty(vm, st, el, 0);
     }
     return NULL;
 }
@@ -473,9 +546,27 @@ static var_t* native_el_set_innerHTML(vm_t* vm, var_t* env, void* data) {
 /* Element.id is served by the attribute-property table below (kAttrProps),
  * which also gives it a setter. */
 
+/* Env-gated (EWEB_HYDDBG) DOM-walk trace: prints each firstChild/nextSibling/
+ * tagName touch so a hydration desync can be located by replaying the walk
+ * against the SSR markup. el_get_tag returns an owned string; free after use. */
+static void hydw_log(const char* op, js_dom_state* st, js_element_t el) {
+    static int on = -1;
+    if(on < 0) on = (getenv("EWEB_HYDDBG") != NULL);
+    if(!on) return;
+    if(st == NULL || el == NULL) { fprintf(stderr, "[HYDW] %s <null>\n", op); return; }
+    if(st->cb.el_is_tag != NULL && !st->cb.el_is_tag(st->ctx, el)) {
+        fprintf(stderr, "[HYDW] %s #text\n", op); return;
+    }
+    if(st->cb.el_get_tag == NULL) { fprintf(stderr, "[HYDW] %s <?>\n", op); return; }
+    char* tag = st->cb.el_get_tag(st->ctx, el);
+    fprintf(stderr, "[HYDW] %s <%s>\n", op, tag ? tag : "?");
+    free(tag);
+}
+
 static var_t* native_el_get_tagName(vm_t* vm, var_t* env, void* data) {
     js_dom_state* st = state_any(vm, data);
     js_element_t el = handle_from_this(this_from_env(env));
+    hydw_log("tn", st, el);
     if(st == NULL || el == NULL || st->cb.el_get_tag == NULL)
         return var_new_str(vm, "");
     /* HTML parsers fold tag names to lower case internally (litehtml's
@@ -515,11 +606,23 @@ static var_t* native_el_get_nodeType(vm_t* vm, var_t* env, void* data) {
     js_element_t el = handle_from_this(this_from_env(env));
     if(st == NULL || el == NULL)
         return var_new_int(vm, 1);
+    int t;
     if(st->cb.el_is_comment != NULL && st->cb.el_is_comment(st->ctx, el))
-        return var_new_int(vm, 8); /* COMMENT_NODE */
-    if(st->cb.el_is_tag != NULL && !st->cb.el_is_tag(st->ctx, el))
-        return var_new_int(vm, 3); /* TEXT_NODE */
-    return var_new_int(vm, 1);     /* ELEMENT_NODE */
+        t = 8; /* COMMENT_NODE */
+    else if(st->cb.el_is_tag != NULL && !st->cb.el_is_tag(st->ctx, el))
+        t = 3; /* TEXT_NODE */
+    else
+        t = 1; /* ELEMENT_NODE */
+    {   /* HYDDBG: nodeType reads with the node identity */
+        static int on = -1;
+        if(on < 0) on = (getenv("EWEB_HYDDBG") != NULL);
+        if(on) {
+            char* g = (st->cb.el_get_tag != NULL) ? st->cb.el_get_tag(st->ctx, el) : NULL;
+            fprintf(stderr, "[HYD] nt <%s> = %d\n", g ? (g[0] ? g : "#text") : "?", t);
+            free(g);
+        }
+    }
+    return var_new_int(vm, t);
 }
 
 /* MutationObserver delivery hook (defined with the observer natives below):
@@ -548,7 +651,16 @@ static var_t* native_el_get_nodeValue(vm_t* vm, var_t* env, void* data) {
         return var_new_null(vm); /* elements: nodeValue is null */
     if(st->cb.el_get_text == NULL)
         return var_new_str(vm, "");
-    return adopt_cstr(vm, st->cb.el_get_text(st->ctx, el));
+    {
+        const char* txt = st->cb.el_get_text(st->ctx, el);
+        static int hyd_dbg = -1;
+        if(hyd_dbg < 0) hyd_dbg = (getenv("EWEB_HYDDBG") != NULL);
+        if(hyd_dbg) {
+            static int ctr = 0;
+            fprintf(stderr, "[HYD] nv#%d <%s>\n", ctr++, txt ? txt : "");
+        }
+        return adopt_cstr(vm, txt);
+    }
 }
 
 static var_t* native_el_set_nodeValue(vm_t* vm, var_t* env, void* data) {
@@ -561,8 +673,9 @@ static var_t* native_el_set_nodeValue(vm_t* vm, var_t* env, void* data) {
     var_t* args = get_func_args(env);
     node_t* n = var_array_get(args, 0);
     const char* s = (n != NULL) ? var_get_str(n->var) : "";
-    if(st->cb.el_set_text != NULL)
+    if(st->cb.el_set_text != NULL) {
         st->cb.el_set_text(st->ctx, el, s ? s : "");
+    }
     mo_notify_charattr(vm, el, 1, NULL);   /* MutationObserver: characterData */
     return NULL;
 }
@@ -575,7 +688,18 @@ static var_t* native_el_getAttribute(vm_t* vm, var_t* env, void* data) {
     const char* name = (n != NULL) ? var_get_str(n->var) : NULL;
     if(st == NULL || el == NULL || name == NULL || st->cb.el_get_attr == NULL)
         return var_new_null(vm);
-    return adopt_cstr(vm, st->cb.el_get_attr(st->ctx, el, name));
+    char* v = st->cb.el_get_attr(st->ctx, el, name);
+    {   /* HYDDBG: attribute reads - React's hydration diff probes props here */
+        static int on = -1;
+        if(on < 0) on = (getenv("EWEB_HYDDBG") != NULL);
+        if(on) {
+            char* t = (st->cb.el_get_tag != NULL) ? st->cb.el_get_tag(st->ctx, el) : NULL;
+            fprintf(stderr, "[HYD] ga <%s> %s=%s\n", t ? (t[0] ? t : "#text") : "?",
+                    name, v ? v : "(null)");
+            free(t);
+        }
+    }
+    return adopt_cstr(vm, v);
 }
 
 static var_t* native_el_setAttribute(vm_t* vm, var_t* env, void* data) {
@@ -586,6 +710,17 @@ static var_t* native_el_setAttribute(vm_t* vm, var_t* env, void* data) {
     node_t* vn = var_array_get(args, 1);
     const char* name = (nn != NULL) ? var_get_str(nn->var) : NULL;
     const char* value = (vn != NULL) ? var_get_str(vn->var) : "";
+    /* EWEB_IMGDBG: trace whether the carousel cover-image <img> is ever
+     * created by React (setAttribute data-test-id / a pinimg src). */
+    {
+        static int s_coverdbg = -1;
+        if(s_coverdbg < 0) { const char* e = getenv("EWEB_IMGDBG"); s_coverdbg = (e && e[0] == '1') ? 1 : 0; }
+        if(s_coverdbg && name != NULL && value != NULL) {
+            if((strcmp(name, "data-test-id") == 0 && strstr(value, "cover") != NULL) ||
+               (strcmp(name, "src") == 0 && (strstr(value, "1200x") != NULL || strstr(value, "control1") != NULL)))
+                fprintf(stderr, "[IMGDBG] coverimg setAttr %s=%.80s\n", name, value);
+        }
+    }
     if(st != NULL && el != NULL && name != NULL && st->cb.el_set_attr != NULL) {
         st->cb.el_set_attr(st->ctx, el, name, value ? value : "");
         mo_notify_charattr(vm, el, 0, name);   /* MutationObserver: attributes */
@@ -632,19 +767,160 @@ static void js_date_free(void* p) { (void)p; }
 
 static int64_t js_date_ms_of(var_t* this_v) {
     if(this_v == NULL) return 0;
+    /* @@t is the fresher store: mario's native Date setters (setDate/setMonth/
+     * setFullYear/setHours/... - none of which js_patch_date overrides) write ONLY
+     * @@t through date_store_ms, while js_dom's own ctor/setTime mirror both
+     * stores. Reading @@t first keeps every getter (getTime/valueOf/getFullYear/
+     * ...) consistent no matter which setter family ran last; before this, a
+     * native-setter mutation left ->value stale and the js_dom getters read the
+     * pre-mutation stamp (github relative-time's roundToSingleUnit month/ year
+     * correction collapsed to 0 that way, formatting 3-day-old dates as
+     * "in 0 seconds" and 8-year-old ones as "2 weeks ago"). */
+    var_t* t = var_find_member_var(this_v, "@@t");
+    if(t != NULL && t->type == V_INT64)
+        return var_get_int64(t);
     return (int64_t)(intptr_t)this_v->value;
 }
 
+/* Parse an ISO-8601 / RFC-3339 date string ("2026-09-05T19:14:39.000+08:00",
+ * "2026-09-05", "...Z") into epoch ms. github's committedDate/createdAt arrive as
+ * strings, and var_get_float() on a string yields 0 (epoch), which rendered every
+ * row as "Thu Jan 01 1970". Date-only forms are UTC midnight per spec; a trailing
+ * Z forces UTC; an explicit +/-HH:MM shifts; otherwise the fields are local time.
+ * Returns false when the text is not a recognisable date. */
+static bool js_date_parse_iso(const char* s, int64_t* out) {
+    if(s == NULL || s[0] == 0 || out == NULL) return false;
+    int y = 1970, mo = 1, d = 1, h = 0, mi = 0, se = 0, fms = 0;
+    if(sscanf(s, "%d-%d-%d", &y, &mo, &d) < 1) return false;
+    const char* t = strchr(s, 'T');
+    if(t == NULL) t = strchr(s, ' ');
+    bool has_time = (t != NULL);
+    bool utc = false;
+    int tz_sign = 0, tz_h = 0, tz_m = 0;
+    if(has_time) {
+        t++;
+        sscanf(t, "%d:%d:%d", &h, &mi, &se);
+        const char* dot = strchr(t, '.');
+        if(dot != NULL) fms = (int)(atof(dot) * 1000.0 + 0.5);
+        if(strchr(t, 'Z') != NULL || strchr(t, 'z') != NULL) utc = true;
+        else {
+            const char* sg = NULL;
+            for(const char* q = t + strlen(t) - 1; q > t; q--) {
+                if(*q == '+' || *q == '-') { sg = q; break; }
+            }
+            if(sg != NULL) {
+                tz_sign = (*sg == '+') ? 1 : -1;
+                sscanf(sg + 1, "%d:%d", &tz_h, &tz_m);
+            }
+        }
+    }
+    struct tm tmv;
+    memset(&tmv, 0, sizeof(tmv));
+    tmv.tm_year = y - 1900; tmv.tm_mon = mo - 1; tmv.tm_mday = d;
+    tmv.tm_hour = h; tmv.tm_min = mi; tmv.tm_sec = se;
+    int64_t ms;
+    if(has_time && !utc && tz_sign == 0) {
+        ms = (int64_t)mktime(&tmv) * 1000 + fms;      /* local wall time */
+    } else {
+        ms = (int64_t)timegm(&tmv) * 1000 + fms;      /* UTC (date-only or Z) */
+        if(tz_sign != 0)
+            ms -= (int64_t)tz_sign * ((int64_t)tz_h * 3600 + tz_m * 60) * 1000;
+    }
+    *out = ms;
+    return true;
+}
+
+/* js_patch_date overrides Date's constructor/getTime/getHours/... but NOT
+ * toString/toISOString/toLocaleDateString/toJSON/toDateString/toTimeString:
+ * those still resolve to mario's native_Date.c implementations, which read the
+ * time from a hidden "@@t" member (not from obj->value). Without mirroring the
+ * stamp there, every formatted date renders "Invalid Date". Keep the two stores
+ * in sync: obj->value is authoritative for js_dom's own methods, "@@t" feeds
+ * mario's un-overridden ones. */
+static void js_date_stamp_mario(vm_t* vm, var_t* obj, int64_t ms) {
+    if(vm == NULL || obj == NULL || obj->type != V_OBJECT) return;
+    node_t* sn = var_find_own_member(obj, "@@t");
+    if(sn != NULL && sn->var != NULL) {
+        var_set_int64(sn->var, ms);
+    } else {
+        sn = var_add(obj, "@@t", var_new_int64(vm, ms));
+        if(sn != NULL) { sn->be_unenumerable = 1; sn->invisable = 1; }
+    }
+}
+
+/* Mirrors native_Date.c's DATE_INVALID sentinel (that header is not visible
+ * here); every js_dom Date entry point must map it to NaN / "Invalid Date"
+ * exactly like the native side does. */
+#define JS_DATE_INVALID  INT64_MIN
+
+/* ToNumber result guarded against NaN: the C cast (int64_t)NAN is undefined
+ * behaviour (and differs between arm64/x86), so route NaN to the invalid
+ * sentinel instead. */
+static int64_t js_date_to_ms(vm_t* vm, var_t* arg) {
+    double dv = vm_to_number(vm, arg);
+    if(isnan(dv)) return JS_DATE_INVALID;
+    return (int64_t)dv;
+}
+
 static var_t* js_date_ctor(vm_t* vm, var_t* env, void* data) {
-    (void)vm; (void)data;
+    (void)data;
     var_t* obj = this_from_env(env);
     if(obj == NULL) return NULL;
-    var_t* arg = get_obj(env, "value");
-    int64_t ms = (arg != NULL && arg->type != V_UNDEF)
-               ? (int64_t)var_get_float(arg)   /* new Date(ms): best the 32-bit model allows */
-               : js_now_ms();                  /* new Date(): precise wall clock */
+    uint32_t argc = get_func_args_num(env);
+    int64_t ms;
+    if(argc >= 2) {
+        /* new Date(y, m[, d, h, mi, s, ms]): composed in LOCAL time per spec.
+         * Before this the ctor only honoured a single `value` argument, so the
+         * multi-arg form fell into the numeric path and stamped the YEAR as the
+         * epoch-ms (getTime()===2026), making getFullYear()/Intl/toLocale* all
+         * read 1970 - the text mismatch behind rokid.com's React #418. */
+        int64_t v[7];
+        for(int i = 0; i < 7; i++)
+            v[i] = (i < (int)argc) ? (int64_t)vm_to_number(vm, get_func_arg(env, i)) : 0;
+        int64_t y = v[0];
+        if(y >= 0 && y <= 99) y += 1900;   /* JS two-digit year mapping */
+        struct tm tm;
+        memset(&tm, 0, sizeof(tm));
+        tm.tm_year = (int)(y - 1900);
+        tm.tm_mon  = (int)v[1];            /* 0-based month */
+        tm.tm_mday = (argc > 2) ? (int)v[2] : 1;
+        tm.tm_hour = (int)v[3];
+        tm.tm_min  = (int)v[4];
+        tm.tm_sec  = (int)v[5];
+        tm.tm_isdst = -1;                  /* let mktime resolve DST */
+        time_t t = mktime(&tm);
+        ms = (int64_t)t * 1000 + v[6];
+    } else if(argc == 1) {
+        var_t* arg = get_func_arg(env, 0);
+        if(arg != NULL && arg->type == V_STRING) {
+            if(!js_date_parse_iso(var_get_str(arg), &ms)) {
+                const char* sv = var_get_str(arg);
+                if(sv == NULL || *sv == 0)
+                    ms = JS_DATE_INVALID;   /* Date.parse("") = NaN -> Invalid Date;
+                                             * vm_to_number("") would wrongly give 0. */
+                else
+                    ms = js_date_to_ms(vm, arg);   /* numeric-looking string; NaN-safe */
+            }
+        } else if(arg != NULL && arg->type != V_UNDEF) {
+            /* Covers numbers AND objects. An object must go through ToPrimitive
+             * (vm_to_number) per `new Date(obj)` semantics; var_get_float() would
+             * read obj->value as a raw float, which is both wrong (an object's
+             * ->value is internal data, not a number) and unsafe - crash#1's
+             * var_get_float fault was exactly such a dangling ->value deref.
+             * vm_to_number also keeps full double precision where var_get_float's
+             * 32-bit float truncated large epoch-ms values. */
+            ms = js_date_to_ms(vm, arg);
+        } else {
+            /* One actual argument that IS undefined: ToNumber(undefined) = NaN =
+             * Invalid Date (only the ZERO-arg form means "now"). */
+            ms = JS_DATE_INVALID;
+        }
+    } else {
+        ms = js_now_ms();                   /* new Date(): precise wall clock */
+    }
     obj->value = (void*)(intptr_t)ms;
     obj->free_func = js_date_free;
+    js_date_stamp_mario(vm, obj, ms);
     return NULL;   /* new_obj keeps `this` when the ctor returns a non-object */
 }
 
@@ -652,7 +928,10 @@ static var_t* js_date_get_time(vm_t* vm, var_t* env, void* data) {
     (void)data;
     /* A wall-clock stamp needs more than float32 mantissa (it is ~1.7e12 ms,
      * i.e. beyond 2^24), so the canonical double type keeps it exact. */
-    return var_new_float64(vm, (double)js_date_ms_of(this_from_env(env)));
+    int64_t ms = js_date_ms_of(this_from_env(env));
+    if(ms == JS_DATE_INVALID)
+        return var_new_float64(vm, NAN);
+    return var_new_float64(vm, (double)ms);
 }
 
 /* Date.now(): the static counterpart of new Date().getTime(), and the cheap
@@ -665,6 +944,8 @@ static var_t* js_date_now(vm_t* vm, var_t* env, void* data) {
 /* field: 0=hours 1=minutes 2=seconds 3=fullYear 4=month(0-based) 5=date 6=day */
 static var_t* js_date_field(vm_t* vm, var_t* env, int field) {
     int64_t ms = js_date_ms_of(this_from_env(env));
+    if(ms == JS_DATE_INVALID)
+        return var_new_float64(vm, NAN);
     time_t sec = (time_t)(ms / 1000);
     struct tm t;
     memset(&t, 0, sizeof(t));
@@ -694,17 +975,147 @@ static var_t* js_date_set_time(vm_t* vm, var_t* env, void* data) {
     var_t* obj = this_from_env(env);
     if(obj == NULL) return NULL;
     var_t* arg = get_obj(env, "ms");
-    int64_t ms = (arg != NULL && arg->type != V_UNDEF) ? (int64_t)var_get_float(arg) : 0;
+    int64_t ms;
+    if(arg != NULL && arg->type == V_STRING) {
+        if(!js_date_parse_iso(var_get_str(arg), &ms))
+            ms = js_date_to_ms(vm, arg);
+    } else {
+        ms = (arg != NULL && arg->type != V_UNDEF) ? js_date_to_ms(vm, arg) : JS_DATE_INVALID;
+    }
     obj->value = (void*)(intptr_t)ms;
     obj->free_func = js_date_free;
+    js_date_stamp_mario(vm, obj, ms);
+    if(ms == JS_DATE_INVALID)
+        return var_new_float64(vm, NAN);
     return var_new_float64(vm, (double)ms);
 }
+
+/* toLocaleDateString/toLocaleString/toLocaleTimeString: mario's native_Date.c
+ * maps these to its full toString format, but github's file list calls
+ * toLocaleDateString("en-US", {month:"short",day:"numeric",year:"numeric"}) and
+ * expects "Sep 5, 2026". Honour the common en-US option subset here. */
+static const char* kMoShort[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+static const char* kMoLong[] = {"January","February","March","April","May","June","July","August","September","October","November","December"};
+
+static const char* js_date_opt_str(var_t* opts, const char* key) {
+    if(opts == NULL || opts->type != V_OBJECT) return NULL;
+    node_t* n = var_find_own_member(opts, key);
+    if(n == NULL || n->var == NULL || n->var->type != V_STRING) return NULL;
+    return var_get_str(n->var);
+}
+
+/* which: 0=date only, 1=date+time, 2=time only */
+static var_t* js_date_to_locale(vm_t* vm, var_t* env, int which) {
+    int64_t ms = js_date_ms_of(this_from_env(env));
+    if(ms == JS_DATE_INVALID)
+        return var_new_str(vm, "Invalid Date");
+    time_t sec = (time_t)(ms / 1000);
+    struct tm t;
+    memset(&t, 0, sizeof(t));
+    localtime_r(&sec, &t);
+    var_t* opts = get_obj(env, "options");
+    /* `toLocaleDateString("zh-CN")` passes the LOCALE as arg0 and leaves options
+     * undefined; get_obj still hands back the undefined var (non-NULL), so the
+     * old `opts == NULL` test skipped the default fill and every field stayed
+     * NULL -> an EMPTY string (a React #418 text mismatch on rokid.com). Treat
+     * any non-object as "no options". */
+    int had_opts = (opts != NULL && opts->type == V_OBJECT);
+    const char* mo = js_date_opt_str(opts, "month");
+    const char* dy = js_date_opt_str(opts, "day");
+    const char* yr = js_date_opt_str(opts, "year");
+    const char* hr = js_date_opt_str(opts, "hour");
+    const char* mi = js_date_opt_str(opts, "minute");
+    const char* sd = js_date_opt_str(opts, "second");
+    bool want_date = (which == 0 || which == 1);
+    bool want_time = (which == 1 || which == 2);
+    if(!had_opts) {   /* default en-US: M/D/YYYY, h:mm:ss AM/PM */
+        mo = "numeric"; dy = "numeric"; yr = "numeric";
+        hr = "numeric"; mi = "2-digit"; sd = "2-digit";
+        want_date = true; want_time = true;
+    }
+    /* zh layout: option-driven fields glue with 年/月/日; the no-option default
+     * is the slash form. Time is a 24-hour clock. */
+    var_t* locv = get_obj(env, "locale");
+    const char* loc = (locv != NULL && locv->type == V_STRING) ? var_get_str(locv) : "";
+    if(loc != NULL && loc[0] == 'z' && loc[1] == 'h') {
+        char buf[96]; buf[0] = 0;
+        if(want_date) {
+            if(had_opts && (mo != NULL || dy != NULL || yr != NULL)) {
+                if(yr != NULL) snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%d年", t.tm_year + 1900);
+                if(mo != NULL) snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%d月", t.tm_mon + 1);
+                if(dy != NULL) snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%d日", t.tm_mday);
+            } else {
+                snprintf(buf, sizeof(buf), "%04d/%02d/%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+            }
+        }
+        if(want_time) {
+            char tp[40];
+            if(hr != NULL && mi != NULL && sd != NULL)
+                snprintf(tp, sizeof(tp), "%s%02d:%02d:%02d", buf[0] ? " " : "", t.tm_hour, t.tm_min, t.tm_sec);
+            else if(hr != NULL && mi != NULL)
+                snprintf(tp, sizeof(tp), "%s%02d:%02d", buf[0] ? " " : "", t.tm_hour, t.tm_min);
+            else if(hr != NULL)
+                snprintf(tp, sizeof(tp), "%s%02d", buf[0] ? " " : "", t.tm_hour);
+            else tp[0] = 0;
+            strcat(buf, tp);
+        }
+        return var_new_str(vm, buf);
+    }
+    char buf[96]; buf[0] = 0;
+    if(want_date) {
+        char part[48]; part[0] = 0;
+        if(mo != NULL) {
+            if(strcmp(mo, "short") == 0) snprintf(part, sizeof(part), "%s", kMoShort[t.tm_mon % 12]);
+            else if(strcmp(mo, "long") == 0) snprintf(part, sizeof(part), "%s", kMoLong[t.tm_mon % 12]);
+            else snprintf(part, sizeof(part), "%d", t.tm_mon + 1);
+        }
+        if(dy != NULL) {
+            char d2[8];
+            if(strcmp(dy, "2-digit") == 0) snprintf(d2, sizeof(d2), "%02d", t.tm_mday);
+            else snprintf(d2, sizeof(d2), "%d", t.tm_mday);
+            if(part[0]) { strcat(part, " "); strcat(part, d2); } else snprintf(part, sizeof(part), "%s", d2);
+        }
+        if(yr != NULL) {
+            char y2[8];
+            if(strcmp(yr, "2-digit") == 0) snprintf(y2, sizeof(y2), "%02d", (t.tm_year + 1900) % 100);
+            else snprintf(y2, sizeof(y2), "%d", t.tm_year + 1900);
+            if(part[0]) { strcat(part, ", "); strcat(part, y2); } else snprintf(part, sizeof(part), "%s", y2);
+        }
+        strcat(buf, part);
+    }
+    if(want_time) {
+        char tp[40];
+        int h = t.tm_hour;
+        const char* ap = "";
+        if(hr != NULL) {   /* en-US defaults to 12-hour clock */
+            ap = (h >= 12) ? " PM" : " AM";
+            h = h % 12; if(h == 0) h = 12;
+        }
+        if(hr != NULL && mi != NULL && sd != NULL)
+            snprintf(tp, sizeof(tp), "%s%d:%02d:%02d%s", (buf[0] ? ", " : ""), h, t.tm_min, t.tm_sec, ap);
+        else if(hr != NULL && mi != NULL)
+            snprintf(tp, sizeof(tp), "%s%d:%02d%s", (buf[0] ? ", " : ""), h, t.tm_min, ap);
+        else if(hr != NULL)
+            snprintf(tp, sizeof(tp), "%s%d%s", (buf[0] ? ", " : ""), h, ap);
+        else if(mi != NULL)
+            snprintf(tp, sizeof(tp), "%s%02d", (buf[0] ? ", " : ""), t.tm_min);
+        else tp[0] = 0;
+        strcat(buf, tp);
+    }
+    return var_new_str(vm, buf);
+}
+
+static var_t* js_date_to_locale_date(vm_t* vm, var_t* env, void* data) { (void)data; return js_date_to_locale(vm, env, 0); }
+static var_t* js_date_to_locale_both(vm_t* vm, var_t* env, void* data) { (void)data; return js_date_to_locale(vm, env, 1); }
+static var_t* js_date_to_locale_time(vm_t* vm, var_t* env, void* data) { (void)data; return js_date_to_locale(vm, env, 2); }
 
 /* "Wed, 21 Oct 2015 07:28:00 GMT" - toGMTString is the legacy alias of
  * toUTCString; both appear in cookie and analytics code. */
 static var_t* js_date_to_gmt_string(vm_t* vm, var_t* env, void* data) {
     (void)data;
     int64_t ms = js_date_ms_of(this_from_env(env));
+    if(ms == JS_DATE_INVALID)
+        return var_new_str(vm, "Invalid Date");
     time_t sec = (time_t)(ms / 1000);
     struct tm t;
     memset(&t, 0, sizeof(t));
@@ -739,7 +1150,7 @@ static var_t* js_date_tz_offset(vm_t* vm, var_t* env, void* data) {
 static void js_patch_date(vm_t* vm) {
     var_t* cls = var_find_own_member_var(vm->root, CLS_DATE);
     if(cls == NULL) return;
-    vm_reg_native(vm, cls, "constructor(value)", js_date_ctor, NULL);
+    vm_reg_native(vm, cls, "constructor(a,b,c,d,e,f,g)", js_date_ctor, NULL);
     vm_reg_native(vm, cls, "getTime()",    js_date_get_time, NULL);
     vm_reg_native(vm, cls, "valueOf()",    js_date_get_time, NULL);
     vm_reg_native(vm, cls, "getHours()",   js_date_getHours, NULL);
@@ -753,6 +1164,9 @@ static void js_patch_date(vm_t* vm) {
     vm_reg_native(vm, cls, "toGMTString()",     js_date_to_gmt_string, NULL);
     vm_reg_native(vm, cls, "toUTCString()",     js_date_to_gmt_string, NULL);
     vm_reg_native(vm, cls, "getTimezoneOffset()", js_date_tz_offset, NULL);
+    vm_reg_native(vm, cls, "toLocaleDateString(locale, options)", js_date_to_locale_date, NULL);
+    vm_reg_native(vm, cls, "toLocaleString(locale, options)", js_date_to_locale_both, NULL);
+    vm_reg_native(vm, cls, "toLocaleTimeString(locale, options)", js_date_to_locale_time, NULL);
     /* Statics live on the class var itself, not its prototype. */
     vm_reg_static(vm, cls, "now()", js_date_now, NULL);
 }
@@ -818,6 +1232,15 @@ static int js_add_timer(vm_t* vm, js_dom_state* st, var_t* cb, uint32_t ms, bool
     if(slot < 0) {                                /* table full: report failure */
         if(getenv("MARIO_TIMERDBG") != NULL)
             fprintf(stderr, "[timerdbg] ADD_FAIL table full cb=%p\n", (void*)cb);
+        /* Overflow here silently DROPS the callback (see JS_TIMER_MAX comment),
+         * which can strand an event loop (e.g. React's scheduler MessageChannel
+         * message never fires and an idle render never reaches its fiber). Keep
+         * an always-on, rate-limited warning so a drop is never invisible; the
+         * cumulative count is echoed by the MARIO_MTDRAIN poll diagnostic. */
+        st->timer_drops++;
+        if(st->timer_drops <= 5 || (st->timer_drops % 256) == 0)
+            fprintf(stderr, "[jsdom] timer table full (%d slots): DROPPED %ld callback(s) so far\n",
+                JS_TIMER_MAX, (long)st->timer_drops);
         return 0;
     }
     st->timer_next_id++;
@@ -1100,10 +1523,22 @@ static int js_fire_timer(vm_t* vm, js_dom_state* st, int idx) {
         var_add(dl, "@@idle_start", var_new_int64(vm, js_now_ms()));
         var_array_add(args, dl);
     }
-    extern int mario_scopedbg_arm;
-    mario_scopedbg_arm = 1;
+    /* Each timer/microtask callback is an independent JOB: per the HTML/ES event
+     * loop a task runs to completion and an error that escapes it is reported to
+     * the global handler and then CLEARED - it must never leak into the next job.
+     * mario propagates an uncaught throw via vm->propagating_err + vm->abort_run,
+     * and call_m_func -> vm_run aborts immediately when abort_run is already set.
+     * Without this isolation an uncaught throw in one microtask (e.g. a page
+     * helper doing `for(t of e) t.getAttribute(...)`) left abort_run set, so the
+     * NEXT job - a webpack lazy-chunk registration reaction `import(x).then(d)` -
+     * bailed before d's body ran, its factories never merged into require.m, and
+     * the page stayed a grey skeleton. Report+clear before (defensive: a leftover
+     * from any entry point) and after (this job's own escape). */
+    if(vm->propagating_err != NULL)
+        vm_report_uncaught(vm);
     var_t* r = call_m_func(vm, NULL, cb, args);
-    mario_scopedbg_arm = 0;
+    if(vm->propagating_err != NULL)
+        vm_report_uncaught(vm);
     if(r != NULL) var_unref(r);
     var_unref(args);
     return 1;
@@ -1172,8 +1607,26 @@ int js_dom_poll_timers(vm_t* vm, uint64_t now_ms) {
         uint64_t nm = js_dom_monotonic_ms();
         if(capped || nm - s_last >= 500) {
             s_last = nm;
-            fprintf(stderr, "[mtdrain] poll=%ld this(micro=%d macro=%d capped=%d) act(micro=%d macro=%d) cum(micro=%ld macro=%ld capHit=%ld)\n",
-                c_poll, n_micro, n_macro, capped ? 1 : 0, act_micro, act_macro, c_micro, c_macro, c_cap);
+            fprintf(stderr, "[mtdrain] poll=%ld this(micro=%d macro=%d capped=%d) act(micro=%d macro=%d) cum(micro=%ld macro=%ld capHit=%ld) drops=%ld\n",
+                c_poll, n_micro, n_macro, capped ? 1 : 0, act_micro, act_macro, c_micro, c_macro, c_cap, (long)st->timer_drops);
+            /* Stuck-timer detail: any ACTIVE slot already due (remaining<=0)
+             * that the phase-2 scan should have fired this poll. Distinguishes
+             * a corrupted remaining_ms (never due) from a corrupted cb (fires
+             * as a no-op) from a slot the scan itself skips. */
+            for(int i = 0; i < JS_TIMER_MAX; ++i) {
+                if(st->timers[i].active &&
+                   (st->timers[i].remaining_ms <= 0 ||
+                    (!st->timers[i].repeat && st->timers[i].period_ms <= 1 &&
+                     st->timers[i].remaining_ms > 1000))) {
+                    var_t* tcb = st->timers[i].cb;
+                    fprintf(stderr, "[mtstuck] slot=%d id=%d micro=%d repeat=%d rem=%lld per=%u cb=%p isfunc=%d\n",
+                        i, st->timers[i].id, st->timers[i].microtask ? 1 : 0,
+                        st->timers[i].repeat ? 1 : 0,
+                        (long long)st->timers[i].remaining_ms,
+                        (unsigned)st->timers[i].period_ms,
+                        (void*)tcb, (tcb != NULL && tcb->is_func) ? 1 : 0);
+                }
+            }
         }
     }
     js_reanchor_timers(vm, st);   /* drop fired one-shots from the GC anchor */
@@ -1189,6 +1642,23 @@ int js_dom_has_pending_timers(vm_t* vm) {
     if(vm == NULL || st == NULL) return 0;
     for(int i = 0; i < JS_TIMER_MAX; ++i)
         if(st->timers[i].active) return 1;
+    return 0;
+}
+
+/* Non-zero when a ONE-SHOT timer is armed to fire on essentially the next poll
+ * - a 0-ms macrotask such as React's MessageChannel scheduler continuation,
+ * which js_add_timer stores with remaining_ms 1 (ms<1 -> period 1). The engine
+ * uses this to DEFER a repaint: painting between back-to-back scheduler chunks
+ * costs a full repaint of a large DOM after every ~5 ms slice, whereas a browser
+ * runs the message-task chain and paints only once it drains. Repeating timers
+ * (setInterval) and long-delayed one-shots (setTimeout(N), a deferred fetch)
+ * keep remaining_ms >> 1 and never suppress the paint. */
+int js_dom_has_imminent_timers(vm_t* vm) {
+    js_dom_state* st = state_from_vm(vm);
+    if(vm == NULL || st == NULL) return 0;
+    for(int i = 0; i < JS_TIMER_MAX; ++i)
+        if(st->timers[i].active && !st->timers[i].repeat &&
+           st->timers[i].remaining_ms <= 1) return 1;
     return 0;
 }
 
@@ -1425,6 +1895,18 @@ static var_t* native_document_createElement(vm_t* vm, var_t* env, void* data) {
         mstr_t* low = mstr_new("");
         for(const char* p = tag; *p != 0; ++p) mstr_add(low, js_ascii_lower(*p));
         el = st->cb.create_element(st->ctx, low->cstr);
+        /* EWEB_IMGDBG: count createElement('img') so a React-rendered <img>
+         * (cover-image, which sets src via property not setAttribute) is
+         * visible even when no setAttribute/src=string probe fires. */
+        {
+            static int s_imgcedbg = -1;
+            if(s_imgcedbg < 0) { const char* e = getenv("EWEB_IMGDBG"); s_imgcedbg = (e && e[0] == '1') ? 1 : 0; }
+            if(s_imgcedbg && strcmp(low->cstr, "img") == 0) {
+                static int s_imgce = 0;
+                s_imgce++;
+                fprintf(stderr, "[IMGDBG] createElement img #%d el=%p\n", s_imgce, (void*)el);
+            }
+        }
         mstr_free(low);
     }
     mstr_free(s);
@@ -2134,6 +2616,10 @@ static const attr_prop_t kAttrProps[] = {
     {"action",      "action"},
     {"method",      "method"},
     {"lang",        "lang"},
+    /* apple.com.cn's locale router iterates querySelectorAll('[hreflang]') and
+     * calls el.hreflang.split('-'); without the reflection the GET yields a
+     * non-string and the split throws, aborting hydration of the main tree. */
+    {"hreflang",    "hreflang"},
     /* `content` is NOT here: HTMLTemplateElement.content is a DocumentFragment,
      * not the reflected attribute, so it gets a dedicated branching accessor
      * (native_el_get_content) registered after this loop. Every other element
@@ -2183,6 +2669,14 @@ static var_t* attr_prop_set(vm_t* vm, var_t* env, void* data) {
     if(st == NULL || el == NULL || st->cb.el_set_attr == NULL) return NULL;
     mstr_t* s = mstr_new("");
     const char* v = js_arg_cstr(env, 0, s);
+    /* EWEB_IMGDBG: the React cover-image <img> sets src via the reflected
+     * property (el.src=), which lands here - NOT in native_el_setAttribute. */
+    {
+        static int s_propsrcdbg = -1;
+        if(s_propsrcdbg < 0) { const char* e = getenv("EWEB_IMGDBG"); s_propsrcdbg = (e && e[0] == '1') ? 1 : 0; }
+        if(s_propsrcdbg && v != NULL && (strstr(v, "1200x") != NULL || strstr(v, "control1") != NULL))
+            fprintf(stderr, "[IMGDBG] coverimg prop-src %s=%.80s el=%p\n", kAttrProps[idx].attr, v, (void*)el);
+    }
     st->cb.el_set_attr(st->ctx, el, kAttrProps[idx].attr, v);
     mstr_free(s);
     return NULL;
@@ -2228,6 +2722,76 @@ static var_t* native_el_set_content(vm_t* vm, var_t* env, void* data) {
     st->cb.el_set_attr(st->ctx, el, "content", v);
     mstr_free(s);
     return NULL;
+}
+
+/* ---- Shadow DOM (degenerate, light-DOM backed) ----------------------------
+ * The headless renderer models no separate shadow tree, but real pages wrap and
+ * call these unconditionally: github's catalyst patches
+ * `Element.prototype.attachShadow = function(e){ let o = n.call(this,e); ... }`
+ * at module load and invokes `this.attachShadow({mode})` from connectedCallback.
+ * With the natives absent, `n` (the saved original) was undefined and the wrapper
+ * threw "can not find function 'call'", aborting the upgrade of every element that
+ * opens a shadow root. Browsers return a ShadowRoot that is rendered in place, so
+ * the closest faithful behaviour here is a DocumentFragment wrapper bound to the
+ * SAME element handle (wrap_fragment): content appended to the returned root is
+ * laid out and painted as light-DOM children, and `shadowRoot` reads it back. */
+#define SHADOW_ROOT_KEY "@@shadowroot"
+
+static var_t* native_el_noop_null(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)env; (void)data;
+    return NULL;
+}
+static var_t* native_el_noop_true(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    return var_new_bool(vm, true);
+}
+
+/* Return (and memoise) the element's shadow root wrapper. The memo lives in a
+ * hidden own member so repeat attachShadow() calls and the shadowRoot getter
+ * agree; the member holds the only persistent ref, and every hand-out takes a
+ * fresh ref so the caller's release never frees the memoised wrapper. */
+static var_t* el_shadow_root(vm_t* vm, var_t* self, bool create) {
+    if(self == NULL) return var_new_null(vm);
+    var_t* root = var_find_own_member_var(self, SHADOW_ROOT_KEY);
+    if(root != NULL) { var_ref(root); return root; }
+    if(!create) return var_new_null(vm);
+    js_element_t el = handle_from_this(self);
+    if(el == NULL) return var_new_null(vm);
+    root = wrap_fragment(vm, el);
+    if(root == NULL || root->type != V_OBJECT) return var_new_null(vm);
+    var_add(self, SHADOW_ROOT_KEY, root);   /* member takes the persistent ref */
+    var_ref(root);                          /* + the ref we hand to the caller */
+    return root;
+}
+
+static var_t* native_el_attachShadow(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    return el_shadow_root(vm, this_from_env(env), true);
+}
+
+static var_t* native_el_get_shadowRoot(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    return el_shadow_root(vm, this_from_env(env), false);
+}
+
+/* ElementInternals: catalyst reads `internals.shadowRoot` right after
+ * attachInternals(); the remaining members are no-ops so feature-detects pass. */
+static var_t* native_el_attachInternals(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = this_from_env(env);
+    var_t* oi = var_new_obj(vm, var_get_prototype(vm->builtin_vars.var_Object), NULL, NULL);
+    if(oi == NULL) return var_new_null(vm);
+    var_add(oi, "shadowRoot", el_shadow_root(vm, self, false));
+    var_add(oi, "form", var_new_null(vm));
+    var_add(oi, "validity", var_new_obj(vm, var_get_prototype(vm->builtin_vars.var_Object), NULL, NULL));
+    var_add(oi, "validationMessage", var_new_str(vm, ""));
+    var_add(oi, "willValidate", var_new_bool(vm, false));
+    var_add(oi, "labels", var_new_array(vm));
+    var_add(oi, "setFormValue(v, s)", var_new_native_func(vm, native_el_noop_null, NULL));
+    var_add(oi, "setValidity(f, m, a)", var_new_native_func(vm, native_el_noop_null, NULL));
+    var_add(oi, "checkValidity()", var_new_native_func(vm, native_el_noop_true, NULL));
+    var_add(oi, "reportValidity()", var_new_native_func(vm, native_el_noop_true, NULL));
+    return oi;   /* refs==0: the members above each hold their own ref */
 }
 
 static var_t* bool_prop_get(vm_t* vm, var_t* env, void* data) {
@@ -2420,13 +2984,15 @@ static var_t* edge_child(vm_t* vm, var_t* env, void* data, bool first, bool tags
     return wrap_or_null(vm, (n > 0) ? nth_child(st, el, n - 1, tags_only) : NULL);
 }
 
-static var_t* native_el_get_firstChild(vm_t* vm, var_t* env, void* data)        { return edge_child(vm, env, data, true,  false); }
+static var_t* native_el_get_firstChild(vm_t* vm, var_t* env, void* data)        { var_t* r = edge_child(vm, env, data, true, false); js_dom_state* s0 = state_any(vm, data); js_element_t c0 = handle_from_this(this_from_env(env)); (void)c0; hydw_log("fc->", s0, (r && r->type == V_OBJECT) ? (js_element_t)r->value : NULL); return r; }
 static var_t* native_el_get_lastChild(vm_t* vm, var_t* env, void* data)         { return edge_child(vm, env, data, false, false); }
 static var_t* native_el_get_firstElementChild(vm_t* vm, var_t* env, void* data) { return edge_child(vm, env, data, true,  true); }
 static var_t* native_el_get_lastElementChild(vm_t* vm, var_t* env, void* data)  { return edge_child(vm, env, data, false, true); }
 
 static var_t* native_el_get_nextSibling(vm_t* vm, var_t* env, void* data) {
-    return wrap_or_null(vm, sibling_of(state_any(vm, data), this_handle(env), 1, false));
+    var_t* r = wrap_or_null(vm, sibling_of(state_any(vm, data), this_handle(env), 1, false));
+    hydw_log("ns->", state_any(vm, data), (r && r->type == V_OBJECT) ? (js_element_t)r->value : NULL);
+    return r;
 }
 static var_t* native_el_get_previousSibling(vm_t* vm, var_t* env, void* data) {
     return wrap_or_null(vm, sibling_of(state_any(vm, data), this_handle(env), -1, false));
@@ -2460,7 +3026,21 @@ static var_t* native_el_appendChild(vm_t* vm, var_t* env, void* data) {
     js_element_t ch = element_arg(vm, child);
     if(st == NULL || el == NULL || ch == NULL || st->cb.el_append_child == NULL)
         return var_new_null(vm);
-    if(!st->cb.el_append_child(st->ctx, el, ch)) return var_new_null(vm);
+    int appok = st->cb.el_append_child(st->ctx, el, ch);
+    /* EWEB_IMGDBG: does the cover-image <img src=1200x/control1> actually get
+     * appended into a laid-out parent, and does the append succeed? */
+    {
+        static int s_appdbg = -1;
+        if(s_appdbg < 0) { const char* e = getenv("EWEB_IMGDBG"); s_appdbg = (e && e[0] == '1') ? 1 : 0; }
+        if(s_appdbg && st->cb.el_get_attr != NULL) {
+            char* cs = st->cb.el_get_attr(st->ctx, ch, "src");
+            if(cs != NULL && (strstr(cs, "1200x") != NULL || strstr(cs, "control1") != NULL))
+                fprintf(stderr, "[IMGDBG] coverimg append ok=%d child_el=%p parent_el=%p src=%.50s\n",
+                    appok, (void*)ch, (void*)el, cs);
+            if(cs != NULL) mario_free(cs);
+        }
+    }
+    if(!appok) return var_new_null(vm);
     mo_notify_childlist(vm, st, el, ch, NULL);
     return (child != NULL) ? child : var_new_null(vm);
 }
@@ -2486,7 +3066,20 @@ static var_t* native_el_append(vm_t* vm, var_t* env, void* data) {
             mstr_free(tmp);
         }
         if(ch == NULL) continue;
-        st->cb.el_append_child(st->ctx, el, ch);
+        int apok = st->cb.el_append_child(st->ctx, el, ch);
+        /* EWEB_IMGDBG: cover-image mount via the variadic append() path, which
+         * bypasses native_el_appendChild (and thus its probe). */
+        {
+            static int s_app2dbg = -1;
+            if(s_app2dbg < 0) { const char* e = getenv("EWEB_IMGDBG"); s_app2dbg = (e && e[0] == '1') ? 1 : 0; }
+            if(s_app2dbg && st->cb.el_get_attr != NULL) {
+                char* cs = st->cb.el_get_attr(st->ctx, ch, "src");
+                if(cs != NULL && (strstr(cs, "1200x") != NULL || strstr(cs, "control1") != NULL))
+                    fprintf(stderr, "[IMGDBG] coverimg append() ok=%d child_el=%p parent_el=%p src=%.50s\n",
+                        apok, (void*)ch, (void*)el, cs);
+                if(cs != NULL) mario_free(cs);
+            }
+        }
         mo_notify_childlist(vm, st, el, ch, NULL);
     }
     return var_new_null(vm);
@@ -2529,9 +3122,43 @@ static var_t* native_el_insertBefore(vm_t* vm, var_t* env, void* data) {
     js_element_t ref = element_arg(vm, js_arg(env, 1));   /* NULL => append */
     if(st == NULL || el == NULL || ch == NULL || st->cb.el_insert_before == NULL)
         return var_new_null(vm);
-    if(!st->cb.el_insert_before(st->ctx, el, ch, ref)) return var_new_null(vm);
+    int ibok = st->cb.el_insert_before(st->ctx, el, ch, ref);
+    /* EWEB_IMGDBG: same cover-image trace on the insertBefore mount path. */
+    {
+        static int s_ibdbg = -1;
+        if(s_ibdbg < 0) { const char* e = getenv("EWEB_IMGDBG"); s_ibdbg = (e && e[0] == '1') ? 1 : 0; }
+        if(s_ibdbg && st->cb.el_get_attr != NULL) {
+            char* cs = st->cb.el_get_attr(st->ctx, ch, "src");
+            if(cs != NULL && (strstr(cs, "1200x") != NULL || strstr(cs, "control1") != NULL))
+                fprintf(stderr, "[IMGDBG] coverimg insertBefore ok=%d child_el=%p parent_el=%p src=%.50s\n",
+                    ibok, (void*)ch, (void*)el, cs);
+            if(cs != NULL) mario_free(cs);
+        }
+    }
+    if(!ibok) return var_new_null(vm);
     mo_notify_childlist(vm, st, el, ch, NULL);
     return (child != NULL) ? child : var_new_null(vm);
+}
+
+/* Env-gated (EWEB_MUTSTK) JS call-stack dump for unlink operations whose
+ * parent is <body>: names the page-JS call chain that removed a top-level
+ * node (e.g. rokid's bootstrap removing <main> before hydration). Frames
+ * carry function-start pcs; map them onto scripts via the embedder's
+ * pc_range table ("js: script N pc_range"). Read-only diagnostic. */
+static void mutstk_dump(vm_t* vm, js_dom_state* st, const char* op,
+                        js_element_t parent, js_element_t child) {
+    static int on = -1;
+    if(on < 0) on = (getenv("EWEB_MUTSTK") != NULL);
+    if(!on || st == NULL || parent == NULL || st->cb.el_get_tag == NULL) return;
+    char* pt = st->cb.el_get_tag(st->ctx, parent);
+    if(pt == NULL || strcmp(pt, "body") != 0) { mario_free(pt); return; }
+    char* ct = (child != NULL) ? st->cb.el_get_tag(st->ctx, child) : NULL;
+    char* s = mario_format_stack(vm, NULL);
+    fprintf(stderr, "[MUTSTK] %s parent=<%s> child=<%s>%s\n", op, pt,
+            ct ? ct : "?", s ? s : "");
+    mario_free(s);
+    mario_free(ct);
+    mario_free(pt);
 }
 
 static var_t* native_el_removeChild(vm_t* vm, var_t* env, void* data) {
@@ -2541,6 +3168,7 @@ static var_t* native_el_removeChild(vm_t* vm, var_t* env, void* data) {
     js_element_t ch = element_arg(vm, child);
     if(st == NULL || el == NULL || ch == NULL || st->cb.el_remove_child == NULL)
         return var_new_null(vm);
+    mutstk_dump(vm, st, "removeChild", el, ch);
     if(!st->cb.el_remove_child(st->ctx, el, ch)) return var_new_null(vm);
     mo_notify_childlist(vm, st, el, NULL, ch);
     return (child != NULL) ? child : var_new_null(vm);
@@ -2580,8 +3208,97 @@ static var_t* native_el_remove(vm_t* vm, var_t* env, void* data) {
     if(st == NULL || el == NULL || st->cb.el_parent == NULL || st->cb.el_remove_child == NULL)
         return NULL;
     js_element_t p = st->cb.el_parent(st->ctx, el);
-    if(p != NULL) st->cb.el_remove_child(st->ctx, p, el);
+    if(p != NULL) {
+        mutstk_dump(vm, st, "remove", p, el);
+        st->cb.el_remove_child(st->ctx, p, el);
+    }
     return NULL;
+}
+
+/* Coerce one replaceWith/before/after/replaceChildren argument to a node:
+ * element wrappers pass through, strings become text nodes (DOM spec),
+ * anything else is skipped. Returns NULL to skip. */
+static js_element_t childnode_arg(vm_t* vm, js_dom_state* st, var_t* a) {
+    js_element_t ch = element_arg(vm, a);
+    if(ch == NULL && a != NULL && a->type == V_STRING &&
+       st->cb.create_text_node != NULL) {
+        mstr_t* tmp = mstr_new("");
+        ch = st->cb.create_text_node(st->ctx, js_cstr(a, tmp));
+        mstr_free(tmp);
+    }
+    return ch;
+}
+
+/* ChildNode.replaceWith(...nodes): swap `this` out of its parent for the given
+ * nodes. React Router's link/scroll restoration and several polyfills call it
+ * during commit; without it the bundle threw ("can not find function
+ * 'replaceWith'") and the whole render aborted into the route error boundary.
+ * Insert every node immediately before `this` (a constant ref keeps argument
+ * order), then unlink `this`. Detached nodes no-op per spec. */
+static var_t* native_el_replaceWith(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL || st->cb.el_parent == NULL ||
+       st->cb.el_insert_before == NULL || st->cb.el_remove_child == NULL)
+        return NULL;
+    js_element_t p = st->cb.el_parent(st->ctx, el);
+    if(p == NULL) return NULL;
+    uint32_t n = get_func_args_num(env);
+    for(uint32_t i = 0; i < n; i++) {
+        js_element_t ch = childnode_arg(vm, st, js_arg(env, (int)i));
+        if(ch == NULL || ch == el) continue;
+        st->cb.el_insert_before(st->ctx, p, ch, el);
+        mo_notify_childlist(vm, st, p, ch, NULL);
+    }
+    st->cb.el_remove_child(st->ctx, p, el);
+    mo_notify_childlist(vm, st, p, NULL, el);
+    return NULL;
+}
+
+/* ChildNode.before/after(...nodes): insert siblings adjacent to `this` in its
+ * parent. `ref` is a constant anchor (this for before, this->nextSibling for
+ * after) so successive inserts preserve argument order. */
+static var_t* el_insert_siblings(vm_t* vm, var_t* env, void* data, int after) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL || st->cb.el_parent == NULL ||
+       st->cb.el_insert_before == NULL || st->cb.el_append_child == NULL)
+        return NULL;
+    js_element_t p = st->cb.el_parent(st->ctx, el);
+    if(p == NULL) return NULL;
+    js_element_t ref = after ? sibling_of(st, el, 1, false) : el;
+    uint32_t n = get_func_args_num(env);
+    for(uint32_t i = 0; i < n; i++) {
+        js_element_t ch = childnode_arg(vm, st, js_arg(env, (int)i));
+        if(ch == NULL) continue;
+        if(ref == NULL) st->cb.el_append_child(st->ctx, p, ch);
+        else            st->cb.el_insert_before(st->ctx, p, ch, ref);
+        mo_notify_childlist(vm, st, p, ch, NULL);
+    }
+    return NULL;
+}
+static var_t* native_el_before(vm_t* vm, var_t* env, void* data) {
+    return el_insert_siblings(vm, env, data, 0);
+}
+static var_t* native_el_after(vm_t* vm, var_t* env, void* data) {
+    return el_insert_siblings(vm, env, data, 1);
+}
+
+/* ParentNode.replaceChildren(...nodes): drop every child, then append the
+ * arguments (empty call = clear). Used by sheet/portal teardown polyfills. */
+static var_t* native_el_replaceChildren(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL || st->cb.el_remove_child == NULL)
+        return NULL;
+    while(st->cb.el_child_count != NULL && st->cb.el_child != NULL &&
+          st->cb.el_child_count(st->ctx, el) > 0) {
+        js_element_t c = st->cb.el_child(st->ctx, el, 0);
+        if(c == NULL) break;
+        if(!st->cb.el_remove_child(st->ctx, el, c)) break;
+        mo_notify_childlist(vm, st, el, NULL, c);
+    }
+    return native_el_append(vm, env, data);
 }
 
 static var_t* native_el_contains(vm_t* vm, var_t* env, void* data) {
@@ -2598,6 +3315,166 @@ static var_t* native_el_contains(vm_t* vm, var_t* env, void* data) {
         p = st->cb.el_parent(st->ctx, p);
     }
     return var_new_bool(vm, false);
+}
+
+/* HTMLMediaElement stubs. rokid's IntersectionObserver-driven video autoplay
+ * component runs `e.src||(e.src=a,e.load()), e.play().catch(()=>{})` and
+ * `e.pause()`; without these the call misses ("can not find function
+ * 'load'") and aborts the component's effect. There is no media pipeline, so
+ * load()/pause() are no-ops and play() reports instant success. */
+/* Defined further below (customElements section); reused as the no-Promise
+ * fallback thenable for play(). */
+static var_t* ce_then(vm_t* vm, var_t* env, void* data);
+static var_t* ce_catch(vm_t* vm, var_t* env, void* data);
+
+static var_t* native_el_media_noop(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)env; (void)data;
+    return NULL;
+}
+
+/* Resolved-promise for play(). Prefer the real Promise.resolve(undefined) so
+ * any chain (.catch/.then/await) behaves normally; fall back to the
+ * immediately-settled thenable trick ce_then uses (same shape as
+ * customElements.whenDefined's) when no Promise global is installed. */
+static var_t* native_el_media_play(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* cls = var_find_member_var(vm->root, "Promise");
+    var_t* res = (cls != NULL) ? var_find_member_var(cls, "resolve") : NULL;
+    if(res != NULL && res->is_func) {
+        var_t* args = var_new_array(vm);
+        var_array_add(args, var_new_null(vm));
+        var_t* p = call_m_func(vm, cls, res, args);
+        var_unref(args);
+        if(p != NULL) return p;
+    }
+    var_t* t = var_new_obj_no_proto(vm, NULL, NULL);
+    vm_reg_static(vm, t, "then(fn)", ce_then, NULL);
+    vm_reg_static(vm, t, "catch(fn)", ce_catch, NULL);
+    return t;
+}
+
+/* Case-insensitive ASCII attribute-name compare (HTML attribute names are
+ * ASCII and case-insensitive). Avoids strcasecmp's locale/include dependency. */
+static int js_attr_name_cmp(const char* a, const char* b) {
+    while(*a != 0 && *b != 0) {
+        char ca = js_ascii_lower(*a), cb = js_ascii_lower(*b);
+        if(ca != cb) return (int)(unsigned char)ca - (int)(unsigned char)cb;
+        a++; b++;
+    }
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+/* Compare two el_attr_snapshot buffers ("name\x1fvalue\x1e...") as attribute
+ * SETS per DOM isEqualNode (order-independent, with multiplicity). Both buffers
+ * are mutable and tokenized in place; a matched B pair is consumed by emptying
+ * its name (a real attribute name is never empty, so it cannot match twice).
+ * Returns true when every A pair has a distinct B match and no B pair is left. */
+static bool attr_snapshots_equal(char* a, char* b) {
+    if(a == NULL || b == NULL) return (a == b);
+    char* p = a;
+    while(*p != 0) {
+        char* sep = strchr(p, '\x1f');
+        char* end = strchr(p, '\x1e');
+        if(sep == NULL || end == NULL || sep > end) break;
+        *sep = 0; *end = 0;
+        const char* an = p;
+        const char* av = sep + 1;
+        bool matched = false;
+        char* q = b;
+        while(*q != 0) {
+            char* s2 = strchr(q, '\x1f');
+            char* e2 = strchr(q, '\x1e');
+            if(s2 == NULL || e2 == NULL || s2 > e2) break;
+            *s2 = 0; *e2 = 0;
+            if(q[0] != 0 && js_attr_name_cmp(q, an) == 0 && strcmp(s2 + 1, av) == 0) {
+                q[0] = '\0';       /* consume this B pair */
+                matched = true;
+                break;
+            }
+            q = e2 + 1;
+        }
+        if(!matched) return false;
+        p = end + 1;
+    }
+    /* Any unconsumed B attribute means the counts/sets differ. */
+    char* q = b;
+    while(*q != 0) {
+        char* s2 = strchr(q, '\x1f');
+        char* e2 = strchr(q, '\x1e');
+        if(s2 == NULL || e2 == NULL || s2 > e2) break;
+        *s2 = 0; *e2 = 0;
+        if(q[0] != 0) return false;
+        q = e2 + 1;
+    }
+    return true;
+}
+
+/* Recursive structural equality of two node handles (DOM Node.isEqualNode).
+ * Bounded depth so a corrupt tree cannot blow the stack. Uses the same cb
+ * discriminators as native_el_get_nodeType/nodeValue/tagName. */
+static bool el_node_equal(js_dom_state* st, js_element_t a, js_element_t b, int depth) {
+    if(a == b) return true;
+    if(a == NULL || b == NULL) return false;
+    if(depth > 1024) return false;
+    bool a_com = (st->cb.el_is_comment != NULL) && st->cb.el_is_comment(st->ctx, a);
+    bool b_com = (st->cb.el_is_comment != NULL) && st->cb.el_is_comment(st->ctx, b);
+    if(a_com != b_com) return false;
+    bool a_tag = (st->cb.el_is_tag == NULL) ? true : st->cb.el_is_tag(st->ctx, a);
+    bool b_tag = (st->cb.el_is_tag == NULL) ? true : st->cb.el_is_tag(st->ctx, b);
+    if(a_tag != b_tag) return false;
+    if(!a_tag) {
+        /* Text / comment node: compare data. */
+        if(st->cb.el_get_text == NULL) return true;
+        char* ta = st->cb.el_get_text(st->ctx, a);
+        char* tb = st->cb.el_get_text(st->ctx, b);
+        bool eq = (ta == NULL || tb == NULL) ? (ta == tb) : (strcmp(ta, tb) == 0);
+        mario_free(ta);
+        mario_free(tb);
+        return eq;
+    }
+    /* Element: tag name (case-insensitive; embedders fold case differently). */
+    if(st->cb.el_get_tag != NULL) {
+        char* na = st->cb.el_get_tag(st->ctx, a);
+        char* nb = st->cb.el_get_tag(st->ctx, b);
+        bool eq = (na == NULL || nb == NULL) ? (na == nb) : (js_attr_name_cmp(na, nb) == 0);
+        mario_free(na);
+        mario_free(nb);
+        if(!eq) return false;
+    }
+    /* Attributes (set equality). */
+    if(st->cb.el_attr_snapshot != NULL) {
+        char* sa = st->cb.el_attr_snapshot(st->ctx, a);
+        char* sb = st->cb.el_attr_snapshot(st->ctx, b);
+        bool eq = attr_snapshots_equal(sa, sb);
+        mario_free(sa);
+        mario_free(sb);
+        if(!eq) return false;
+    }
+    /* Children: same count, pairwise equal in document order. */
+    if(st->cb.el_child_count != NULL && st->cb.el_child != NULL) {
+        int na = st->cb.el_child_count(st->ctx, a);
+        int nb = st->cb.el_child_count(st->ctx, b);
+        if(na != nb) return false;
+        for(int i = 0; i < na; ++i) {
+            js_element_t ka = st->cb.el_child(st->ctx, a, i);
+            js_element_t kb = st->cb.el_child(st->ctx, b, i);
+            if(!el_node_equal(st, ka, kb, depth + 1)) return false;
+        }
+    }
+    return true;
+}
+
+/* Node.isEqualNode(other): deep structural equality. Apple's global-header
+ * virtual-DOM hydrator (see native_el_get_localName) and React reconciliation
+ * call it to match server-rendered nodes against freshly built client nodes;
+ * without it every comparison throws ("can not find function 'isEqualNode'")
+ * and the hydrator aborts. A non-node / null argument compares false. */
+static var_t* native_el_isEqualNode(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    js_element_t other = element_arg(vm, js_arg(env, 0));
+    if(st == NULL || el == NULL || other == NULL) return var_new_bool(vm, false);
+    return var_new_bool(vm, el_node_equal(st, el, other, 0));
 }
 
 /* ------------------------------------------------------------------ */
@@ -2684,10 +3561,18 @@ static var_t* native_el_matches(vm_t* vm, var_t* env, void* data) {
     js_element_t el = this_handle(env);
     mstr_t* s = mstr_new("");
     const char* sel = js_arg_cstr(env, 0, s);
-    js_element_t root = NULL;
-    if(st != NULL && el != NULL && st->cb.el_parent != NULL)
-        root = st->cb.el_parent(st->ctx, el);   /* NULL root => whole document */
-    bool m = matches_selector(vm, st, el, root, sel);
+    bool m;
+    if(st != NULL && el != NULL && sel != NULL && sel[0] != 0 &&
+       st->cb.el_matches != NULL) {
+        /* Single-element callback: one select() on the element itself instead
+         * of a full subtree query per matches() call. */
+        m = st->cb.el_matches(st->ctx, el, sel);
+    } else {
+        js_element_t root = NULL;
+        if(st != NULL && el != NULL && st->cb.el_parent != NULL)
+            root = st->cb.el_parent(st->ctx, el);   /* NULL root => whole document */
+        m = matches_selector(vm, st, el, root, sel);
+    }
     mstr_free(s);
     return var_new_bool(vm, m);
 }
@@ -2740,10 +3625,55 @@ static bool el_rect(js_dom_state* st, js_element_t el, int* x, int* y, int* w, i
     return true;
 }
 
+/* Current page scroll offset (0,0 when the embedder provides no hook). */
+static void dom_scroll_off(js_dom_state* st, int* sx, int* sy) {
+    int x = 0, y = 0;
+    if(st != NULL && st->cb.get_scroll != NULL) st->cb.get_scroll(st->ctx, &x, &y);
+    if(sx != NULL) *sx = x;
+    if(sy != NULL) *sy = y;
+}
+
+/* position:fixed boxes are pinned to the viewport by layout, so their document
+ * coordinates ARE already viewport coordinates: the scroll shift must not be
+ * applied to them or a fixed header would drift off-screen as the page scrolls. */
+static bool el_is_fixed(js_dom_state* st, js_element_t el) {
+    if(st == NULL || el == NULL || st->cb.el_get_style == NULL) return false;
+    char* p = st->cb.el_get_style(st->ctx, el, "position");
+    if(p == NULL) return false;
+    bool fixed = (strcmp(p, "fixed") == 0);
+    mario_free(p);
+    return fixed;
+}
+
+/* el_rect shifted into viewport coordinates (what getBoundingClientRect and
+ * IntersectionObserver report). The document box is first rewritten into its
+ * CSS-transformed bounds (gBCR semantics; the offset* properties keep the
+ * untransformed layout box el_rect reports), then shifted; fixed elements are
+ * left untouched by the shift. */
+static bool el_viewport_rect(js_dom_state* st, js_element_t el,
+                             int* x, int* y, int* w, int* h) {
+    int lx = 0, ly = 0, lw = 0, lh = 0;
+    if(!el_rect(st, el, &lx, &ly, &lw, &lh)) return false;
+    if(st->cb.el_transform_rect != NULL)
+        st->cb.el_transform_rect(st->ctx, el, &lx, &ly, &lw, &lh);
+    if(!el_is_fixed(st, el)) {
+        int sx = 0, sy = 0;
+        dom_scroll_off(st, &sx, &sy);
+        lx -= sx;
+        ly -= sy;
+    }
+    if(x != NULL) *x = lx;
+    if(y != NULL) *y = ly;
+    if(w != NULL) *w = lw;
+    if(h != NULL) *h = lh;
+    return true;
+}
+
 static var_t* native_el_getBoundingClientRect(vm_t* vm, var_t* env, void* data) {
     js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
     int x = 0, y = 0, w = 0, h = 0;
-    el_rect(st, this_handle(env), &x, &y, &w, &h);
+    el_viewport_rect(st, el, &x, &y, &w, &h);
     /* A plain object (not a class instance): DOMRect fields are read-only
      * numbers and pages only ever read them. */
     var_t* r = var_new_obj_no_proto(vm, NULL, NULL);
@@ -2765,16 +3695,60 @@ static var_t* native_el_getBoundingClientRect(vm_t* vm, var_t* env, void* data) 
 static var_t* geom_get(vm_t* vm, var_t* env, void* data) {
     int which = (int)(intptr_t)data;
     js_dom_state* st = state_from_vm(vm);
+    js_element_t el = this_handle(env);
     int x = 0, y = 0, w = 0, h = 0;
-    el_rect(st, this_handle(env), &x, &y, &w, &h);
+    el_rect(st, el, &x, &y, &w, &h);
     switch(which) {
         case 0:  return var_new_int(vm, w);
         case 1:  return var_new_int(vm, h);
-        case 2:  return var_new_int(vm, x);
-        case 3:  return var_new_int(vm, y);
-        case 4:  return var_new_int(vm, w);
-        case 5:  return var_new_int(vm, h);
-        case 6:  return var_new_int(vm, w);
+        case 2: case 3: {
+            /* offsetLeft/Top are relative to the OFFSET PARENT's border box
+             * (nearest positioned ancestor, else body), not the document: a
+             * child of an absolutely positioned card must read its offset
+             * inside the card. The embedder reports document coordinates, so
+             * the offsetParent origin is subtracted here. */
+            if(st != NULL && st->cb.el_offset_parent_origin != NULL) {
+                int ox = 0, oy = 0;
+                st->cb.el_offset_parent_origin(st->ctx, el, &ox, &oy);
+                x -= ox;
+                y -= oy;
+            }
+            return var_new_int(vm, which == 2 ? x : y);
+        }
+        case 4: case 5: {
+            /* clientWidth/Height of the scrolling element (html/body) is the
+             * VIEWPORT, not the (usually much taller) document box: pages test
+             * scrollHeight>clientHeight to decide whether scrolling is even
+             * possible, so reporting the document height here hides the scroll. */
+            if(st != NULL && st->cb.get_viewport != NULL &&
+               (el == doc_node(st, 0) || el == doc_node(st, 2))) {
+                int vw = 0, vh = 0;
+                st->cb.get_viewport(st->ctx, &vw, &vh);
+                return var_new_int(vm, (which == 4) ? vw : vh);
+            }
+            /* client* is the padding box, el_rect the border box: ask the
+             * embedder for the former when it can report it. */
+            if(st != NULL && st->cb.el_get_client_size != NULL) {
+                int cw = 0, ch = 0;
+                st->cb.el_get_client_size(st->ctx, el, &cw, &ch);
+                return var_new_int(vm, (which == 4) ? cw : ch);
+            }
+            return var_new_int(vm, (which == 4) ? w : h);
+        }
+        case 6: case 7: {
+            /* scrollWidth/Height of the scrolling element (html/body) is the
+             * DOCUMENT content size, not the viewport box el_get_rect reports
+             * for it: pages compare scrollHeight against clientHeight/scrollY
+             * to drive lazy loading and end-of-page detection, so reporting
+             * the viewport here makes them read "cannot scroll / at bottom". */
+            if(st != NULL && st->cb.get_document_size != NULL &&
+               (el == doc_node(st, 0) || el == doc_node(st, 2))) {
+                int dw = 0, dh = 0;
+                st->cb.get_document_size(st->ctx, &dw, &dh);
+                return var_new_int(vm, (which == 6) ? dw : dh);
+            }
+            return var_new_int(vm, (which == 6) ? w : h);
+        }
         default: return var_new_int(vm, h);
     }
 }
@@ -2877,6 +3851,17 @@ static var_t* native_document_get_activeElement(vm_t* vm, var_t* env, void* data
     return doc_node_get(vm, data, 2);
 }
 
+/* document.elementFromPoint(x,y): the topmost element under a viewport point.
+ * The embedder's hit walker already resolves paint order and scroll, so this
+ * is a thin pass-through; null when the point is outside the page. */
+static var_t* native_document_elementFromPoint(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    if(st == NULL || st->cb.el_from_point == NULL) return var_new_null(vm);
+    js_element_t el = st->cb.el_from_point(st->ctx, js_arg_int(env, 0), js_arg_int(env, 1));
+    if(el == NULL) return var_new_null(vm);
+    return wrap_or_null(vm, el);
+}
+
 /* document.currentScript: the <script> element whose body is executing right
  * now, null outside a script run. Security SDKs (baxia) insert their loader
  * with currentScript.parentNode.insertBefore(...) and never install their
@@ -2919,7 +3904,7 @@ static var_t* native_document_get_readyState(vm_t* vm, var_t* env, void* data) {
      * throw. The embedder flips parsing_complete around those scripts. */
     js_dom_state* st = state_any(vm, data);
     if(st != NULL && !st->dom_loaded) {
-        if(st->parsing_complete)
+        if(st->parsing_complete || st->in_async_cb)
             return var_new_str(vm, "interactive");
         return var_new_str(vm, "loading");
     }
@@ -2940,6 +3925,15 @@ void js_dom_mark_dom_loaded(vm_t* vm) {
 void js_dom_set_parsing_complete(vm_t* vm, bool complete) {
     js_dom_state* st = state_from_vm(vm);
     if(st != NULL) st->parsing_complete = complete;
+}
+
+/* Mark whether an ASYNC event-loop callback is running so readyState reports
+ * "interactive" for it (see in_async_cb / the getter). The embedder brackets
+ * every jsVmEnter(appScript=false) run - timer poll, MessageChannel drain,
+ * fetch settle, event dispatch - with true, and clears it on exit. */
+void js_dom_set_async_cb(vm_t* vm, bool async) {
+    js_dom_state* st = state_from_vm(vm);
+    if(st != NULL) st->in_async_cb = async;
 }
 
 static var_t* native_document_get_empty_str(vm_t* vm, var_t* env, void* data) {
@@ -3064,9 +4058,19 @@ static var_t* native_mo_dispatch(vm_t* vm, var_t* env, void* data) {
     ob_hide(var_add(observer, OB_PEND, var_new_array(vm)));
     var_t* dead = var_find_own_member_var(observer, OB_DEAD);
     int is_dead = (dead != NULL && var_get_int(dead) != 0);
-    if(getenv("MARIO_MODBG") != NULL)
-        fprintf(stderr, "[modbg] dispatch observer=%p records=%u dead=%d\n",
-            (void*)observer, (unsigned)var_array_size(records), is_dead);
+    if(getenv("MARIO_MODBG") != NULL) {
+        fprintf(stderr, "[modbg] dispatch observer=%p records=%p records=%u dead=%d rectype=%d\n",
+            (void*)observer, (void*)records, (unsigned)var_array_size(records), is_dead,
+            (int)records->type);
+        for(uint32_t ri = 0; ri < var_array_size(records) && ri < 4; ++ri) {
+            var_t* rc = var_array_get_var(records, (int32_t)ri);
+            var_t* an = (rc != NULL) ? var_find_member_var(rc, "addedNodes") : NULL;
+            fprintf(stderr, "[modbg]   rec#%u rc=%p rtype=%d addedNodes=%p antype=%d anisarr=%d\n",
+                (unsigned)ri, (void*)rc, (rc != NULL) ? (int)rc->type : -1,
+                (void*)an, (an != NULL) ? (int)an->type : -1,
+                (an != NULL) ? (int)an->is_array : -1);
+        }
+    }
     if(!is_dead) {
         var_t* cb = var_find_own_member_var(observer, OB_CB);
         if(cb != NULL && cb->is_func) {
@@ -3083,6 +4087,7 @@ static var_t* native_mo_dispatch(vm_t* vm, var_t* env, void* data) {
      * unanchor to here (it kept the observer rooted so d->observer stayed
      * valid); drop it from the registry now that we are done with it. */
     if(is_dead) mo_unanchor(vm, observer);
+    var_unref(records);   /* release mo_schedule's arm-time ownership ref */
     return NULL;
 }
 
@@ -3090,10 +4095,25 @@ static var_t* native_mo_dispatch(vm_t* vm, var_t* env, void* data) {
 static void mo_schedule(vm_t* vm, var_t* observer, var_t* record) {
     var_t* pend = ob_arr(vm, observer, OB_PEND);
     if(pend != NULL && record != NULL) var_array_add(pend, record);
+    /* Hold an extra ownership ref on the coalescing buffer until the dispatch
+     * trampoline consumes it. The buffer is otherwise owned only by the
+     * observer's hidden @@obpend slot; a var_add() that re-seats that slot (the
+     * dispatch's swap-in of a fresh buffer) or a refcount drop elsewhere freed
+     * it while records were still pending, so the callback received a recycled
+     * var (type 0) and `for (const r of records)` threw "object is not
+     * iterable", stranding catalyst/react-partial element upgrades. Taken once
+     * per armed dispatch cycle (not per record) so exactly one ref is held per
+     * trampoline; the matching release is in native_mo_dispatch after the
+     * callback ran (and on the arm-failure path below). */
+    if(getenv("MARIO_MODBG") != NULL)
+        fprintf(stderr, "[modbg] schedule observer=%p pend=%p ptype=%d psize=%u rec=%p\n",
+            (void*)observer, (void*)pend, (pend != NULL) ? (int)pend->type : -1,
+            (pend != NULL) ? (unsigned)var_array_size(pend) : 0u, (void*)record);
     var_t* tid = var_find_own_member_var(observer, OB_TIMER);
     if(tid != NULL && var_get_int(tid) != 0) return;   /* already armed: coalesce */
+    if(pend != NULL) var_ref(pend);   /* keep the buffer alive until dispatch */
     mo_disp_t* d = (mo_disp_t*)mario_malloc(sizeof(mo_disp_t));
-    if(d == NULL) return;
+    if(d == NULL) { if(pend != NULL) var_unref(pend); return; }
     d->observer = observer;
     var_t* tr = var_new_native_func(vm, native_mo_dispatch, d);
     /* MutationObserver callbacks are microtasks per the DOM spec: they run at the
@@ -3103,7 +4123,7 @@ static void mo_schedule(vm_t* vm, var_t* observer, var_t* record) {
     int id = js_dom_add_microtask(vm, tr);
     if(getenv("MARIO_MODBG") != NULL)
         fprintf(stderr, "[modbg] schedule observer=%p timer=%d\n", (void*)observer, id);
-    if(id == 0) { mario_free(d); var_unref(tr); return; }  /* table full: retried next write */
+    if(id == 0) { mario_free(d); var_unref(tr); if(pend != NULL) var_unref(pend); return; }  /* table full: retried next write */
     var_add(observer, OB_TIMER, var_new_int(vm, id));
     /* tr is owned solely by the timer table's @@timers anchor (var_new_* starts
      * at refs==0): do NOT unref it here or it is freed before it fires (the
@@ -3130,12 +4150,24 @@ static void mo_notify_charattr(vm_t* vm, js_element_t el, int is_cd, const char*
         for(uint32_t j = 0; j < tn; ++j) {
             node_t* tnd = var_array_get(tg, (int32_t)j);
             if(tnd == NULL || tnd->var == NULL) continue;
-            if(handle_from_this(tnd->var) != el) continue;
             node_t* ond = (op != NULL) ? var_array_get(op, (int32_t)j) : NULL;
             var_t* opts = (ond != NULL) ? ond->var : NULL;
             const char* key = is_cd ? "characterData" : "attributes";
             var_t* flag = (opts != NULL) ? var_find_member_var(opts, key) : NULL;
             if(flag == NULL || !var_get_bool(flag)) continue;
+            js_element_t target = handle_from_this(tnd->var);
+            if(target == NULL) {
+                /* Document-object observer (new_obj, not wrap_element): matches
+                 * any node's attribute / characterData change when subtree:true,
+                 * since Document is the root ancestor of every node. Mirrors the
+                 * mo_notify_childlist document-target handling. */
+                var_t* docv = var_find_member_var(vm->root, "document");
+                if(docv == NULL || docv != tnd->var) continue;
+                var_t* dsub = (opts != NULL) ? var_find_member_var(opts, "subtree") : NULL;
+                if(dsub == NULL || !var_get_bool(dsub)) continue;
+            } else if(target != el) {
+                continue;
+            }
             var_t* rec = var_new_obj_no_proto(vm, NULL, NULL);
             var_add(rec, "type", var_new_str(vm, is_cd ? "characterData" : "attributes"));
             var_add(rec, "target", tnd->var);
@@ -3162,9 +4194,65 @@ static void mo_notify_charattr(vm_t* vm, js_element_t el, int is_cd, const char*
  * code that wait for a node to appear (React's root attach, relay data-island
  * injection, core-js feature probes) park forever on a promise that only a
  * childList record would settle. */
+/* Record `added`'s tag for a later upgrade pass iff it names a REGISTERED
+ * custom element that is not already queued. Placed at the very top of
+ * mo_notify_childlist (which every insertion native funnels through) so it runs
+ * even when no MutationObserver is registered - the common case, where
+ * mo_notify_childlist otherwise returns early. Cheap: two hash lookups and, for
+ * the overwhelmingly common non-custom-element child, an immediate miss. */
+static void ce_mark_dirty(vm_t* vm, js_dom_state* st, js_element_t added) {
+    /* Kill-switch for A/B attribution of hydration-time faults (cached; one
+     * predictable branch per insertion when off). */
+    static int s_cedirty_off = -1;
+    if(s_cedirty_off < 0) s_cedirty_off = (getenv("EWEB_CEDIRTY_OFF") != NULL);
+    if(s_cedirty_off) return;
+    if(st == NULL || added == NULL || st->cb.el_get_tag == NULL) return;
+    var_t* reg = var_find_member_var(vm->root, "@@customelements");
+    if(reg == NULL) return;   /* no custom elements defined yet */
+    char* tag = st->cb.el_get_tag(st->ctx, added);
+    if(tag == NULL) return;
+    char buf[CE_DIRTY_NAME];
+    int k = 0;
+    for(char* p = tag; *p != 0 && k < CE_DIRTY_NAME - 1; ++p)
+        buf[k++] = (*p >= 'A' && *p <= 'Z') ? (char)(*p - 'A' + 'a') : *p;
+    buf[k] = 0;
+    /* el_get_tag strdup's via mario_malloc (see jsElGetTag); we only need the
+     * lowercased copy in buf, and this runs on every insertion, so release it
+     * here or each appendChild leaks a string. */
+    mario_free(tag);
+    if(k == 0) return;
+    if(var_find_own_member(reg, buf) == NULL) return;   /* not a custom element */
+    for(int i = 0; i < st->ce_dirty_n; ++i)
+        if(strcmp(st->ce_dirty[i], buf) == 0) return;   /* already queued */
+    if(st->ce_dirty_n >= CE_DIRTY_MAX) return;
+    strcpy(st->ce_dirty[st->ce_dirty_n++], buf);
+}
+
+/* Walk a freshly attached subtree (innerHTML / fragment parse) and mark every
+ * registered custom element for the insertion-upgrade drain. The port attaches
+ * parsed fragments without going through mo_notify_childlist, so without this
+ * walk an innerHTML-created <relative-time> would never run connectedCallback.
+ * Depth- and child-bounded so a pathological fragment cannot stall the tick;
+ * ce_mark_dirty itself is a cheap double hash lookup plus a strdup/free. */
+static void ce_mark_subtree_dirty(vm_t* vm, js_dom_state* st, js_element_t el, int depth) {
+    if(el == NULL || depth > 24) return;
+    if(st->cb.el_child_count == NULL || st->cb.el_child == NULL) return;
+    int n = st->cb.el_child_count(st->ctx, el);
+    if(n < 0 || n > 4096) return;
+    for(int i = 0; i < n; ++i) {
+        js_element_t ch = st->cb.el_child(st->ctx, el, i);
+        if(ch == NULL) continue;
+        ce_mark_dirty(vm, st, ch);
+        ce_mark_subtree_dirty(vm, st, ch, depth + 1);
+    }
+}
+
 static void mo_notify_childlist(vm_t* vm, js_dom_state* st, js_element_t parent,
                                 js_element_t added, js_element_t removed) {
     if(vm == NULL || parent == NULL) return;
+    /* Custom-element insertion reaction (before the no-observer early return
+     * below): a late-inserted registered element needs an upgrade pass. */
+    if(added != NULL) ce_mark_dirty(vm, st, added);
     var_t* reg = var_find_own_member_var(vm->root, OB_REG);
     if(reg == NULL) return;   /* no observers: the overwhelmingly common case */
     uint32_t sz = var_array_size(reg);
@@ -3187,8 +4275,25 @@ static void mo_notify_childlist(vm_t* vm, js_dom_state* st, js_element_t parent,
             var_t* flag = (opts != NULL) ? var_find_member_var(opts, "childList") : NULL;
             if(flag == NULL || !var_get_bool(flag)) continue;
             js_element_t target = handle_from_this(tnd->var);
-            if(target == NULL) continue;
-            if(target != parent) {
+            bool doc_target = false;
+            if(target == NULL) {
+                /* The observer may target the Document OBJECT rather than an
+                 * element wrapper. Document is created with new_obj() (not
+                 * wrap_element()), so handle_from_this() rejects it and the old
+                 * `target == NULL -> continue` silently dropped every document
+                 * observer. Document is the root ancestor of every element, so
+                 * with subtree:true it must match a childList mutation anywhere
+                 * in the tree. React's streaming-reveal helper observes
+                 * `document` exactly this way to learn when a streamed node
+                 * (e.g. #__PWS_INITIAL_PROPS__) appears; without this the
+                 * observer never fired and hydration stalled. */
+                var_t* docv = var_find_member_var(vm->root, "document");
+                if(docv == NULL || docv != tnd->var) continue;
+                var_t* dsub = (opts != NULL) ? var_find_member_var(opts, "subtree") : NULL;
+                if(dsub == NULL || !var_get_bool(dsub)) continue;
+                doc_target = true;
+            }
+            if(!doc_target && target != parent) {
                 var_t* sub = (opts != NULL) ? var_find_member_var(opts, "subtree") : NULL;
                 if(sub == NULL || !var_get_bool(sub)) continue;
                 if(st == NULL || st->cb.el_parent == NULL) continue;
@@ -3398,7 +4503,7 @@ static var_t* native_ro_dispatch(vm_t* vm, var_t* env, void* data) {
     }
 
     int x = 0, y = 0, w = 0, h = 0;
-    el_rect(state_from_vm(vm), handle_from_this(target), &x, &y, &w, &h);
+    el_viewport_rect(state_from_vm(vm), handle_from_this(target), &x, &y, &w, &h);
     if(getenv("MARIO_RODBG") != NULL)
         fprintf(stderr, "[rodbg] dispatch observer=%p target=%p rect=%d,%d %dx%d\n",
             (void*)observer, (void*)target, x, y, w, h);
@@ -3852,9 +4957,62 @@ static var_t* ce_registry(vm_t* vm) {
  * so the native Element methods (getAttribute, appendChild, ...) stay reachable
  * after the move - this relies on HTMLElement.prototype being linked to
  * Element.prototype (see js_register_dom_natives). */
+/* A `class X extends HTMLElement` whose extends-link was dropped at class-creation
+ * time (the bundle's HTMLElement binding had no prototype yet, so var_set_father
+ * left X.prototype chained straight to the Object terminus) yields an instance
+ * chain with NO Element.prototype: connectedCallback then throws "can not find
+ * function 'hasAttribute'/'addEventListener'" on the live element and React's
+ * error boundary blanks the code-view. Repair by re-linking the class prototype
+ * to HTMLElement.prototype. Guarded narrowly so a legitimate chain is never
+ * clobbered: only when the chain truly lacks Element.prototype AND the class
+ * prototype points DIRECTLY at a prototype-less terminus (no intermediate
+ * prototype holding class methods would be dropped) AND that terminus is not
+ * itself re-linked (avoids a cycle through the shared Object prototype). */
+static void ce_repair_proto_chain(vm_t* vm, var_t* ctor) {
+    if(ctor == NULL || !ctor->is_class) return;
+    var_t* elc = var_find_own_member_var(vm->root, "Element");
+    var_t* el_proto_g = (elc != NULL) ? var_get_prototype(elc) : NULL;
+    if(el_proto_g == NULL) return;
+    var_t* ctor_proto = var_get_prototype(ctor);
+    if(ctor_proto == NULL || ctor_proto == el_proto_g) return;
+    bool reaches = false;
+    int hops = 0;
+    for(var_t* p = ctor_proto; p != NULL && hops++ < 64; p = var_get_prototype(p))
+        if(p == el_proto_g) { reaches = true; break; }
+    if(reaches) return;
+    var_t* hec = var_find_own_member_var(vm->root, "HTMLElement");
+    var_t* he_proto_g = (hec != NULL) ? var_get_prototype(hec) : NULL;
+    var_t* link = (he_proto_g != NULL) ? he_proto_g : el_proto_g;
+    var_t* opc = var_find_own_member_var(vm->root, "Object");
+    var_t* obj_proto_g = (opc != NULL) ? var_get_prototype(opc) : NULL;
+    /* Locate the chain terminus T (proto==NULL) and its predecessor P, then
+     * splice the DOM prototypes in: below a per-class terminus (keeps any
+     * mixin methods it holds) or, when the terminus IS the shared Object
+     * prototype (must never be re-linked: the DOM chain ends there and
+     * re-linking it would close a cycle), at the last class prototype P. */
+    var_t* T = NULL;
+    var_t* P = NULL;
+    int h2 = 0;
+    for(var_t* p = ctor_proto; p != NULL && h2++ < 64; p = var_get_prototype(p)) {
+        var_t* nx = var_get_prototype(p);
+        if(nx == NULL) { T = p; break; }
+        P = p;
+    }
+    if(T == NULL || T == link) return;
+    var_t* splice_at = (T == obj_proto_g) ? P : T;
+    if(splice_at == NULL || splice_at == link) return;
+    if(getenv("MARIO_CEDBG") != NULL) {
+        node_t* cnn = var_find_own_member(ctor, "name");
+        fprintf(stderr, "[cedbg] repair proto chain ctor=%s ctor_proto=%p T=%p splice_at=%p now->%p\n",
+                (cnn != NULL && cnn->var != NULL) ? var_get_str(cnn) : "?",
+                (void*)ctor_proto, (void*)T, (void*)splice_at, (void*)link);
+    }
+    var_set_prototype(splice_at, link);
+}
+
 static void ce_reparent(vm_t* vm, var_t* el, var_t* ctor) {
-    (void)vm;
     if(el == NULL || ctor == NULL) return;
+    ce_repair_proto_chain(vm, ctor);
     var_t* ctor_proto = var_get_prototype(ctor);
     var_t* el_proto = var_get_prototype(el);
     if(ctor_proto == NULL || el_proto == NULL || ctor_proto == el_proto) return;
@@ -3862,7 +5020,27 @@ static void ce_reparent(vm_t* vm, var_t* el, var_t* ctor) {
     int hops = 0;
     for(var_t* p = ctor_proto; p != NULL && hops++ < 64; p = var_get_prototype(p))
         if(p == el_proto) { reaches = true; break; }
-    if(reaches)
+    /* Real-DOM semantics: reparent whenever the class prototype chain reaches the
+     * GLOBAL Element.prototype, even if the element's current proto is something
+     * else entirely. github's catalyst path leaves el.proto pointing at the class
+     * VAR (own key "prototype") rather than X.prototype, so the old el_proto test
+     * never matched and connectedCallback ran on a chain without Element methods
+     * ("can not find function 'hasAttribute'"). */
+    var_t* elc_g = var_find_own_member_var(vm->root, "Element");
+    var_t* el_proto_g = (elc_g != NULL) ? var_get_prototype(elc_g) : NULL;
+    bool reaches_g = false;
+    if(el_proto_g != NULL && !reaches) {
+        hops = 0;
+        for(var_t* p = ctor_proto; p != NULL && hops++ < 64; p = var_get_prototype(p))
+            if(p == el_proto_g) { reaches_g = true; break; }
+    }
+    if(getenv("MARIO_CEDBG") != NULL) {
+        node_t* cnn = var_find_own_member(ctor, "name");
+        fprintf(stderr, "[cedbg] reparent ctor=%s ctor_proto=%p el_proto=%p reaches=%d reaches_g=%d hops=%d\n",
+                (cnn != NULL && cnn->var != NULL) ? var_get_str(cnn) : "?",
+                (void*)ctor_proto, (void*)el_proto, (int)reaches, (int)reaches_g, hops);
+    }
+    if(reaches || reaches_g)
         var_set_prototype(el, ctor_proto);
 }
 
@@ -3892,6 +5070,9 @@ static void ce_init_instance(vm_t* vm, var_t* el, var_t* ctor) {
     /* Upgrade the wrapper's [[Prototype]] to the element class prototype first so
      * the constructor / @fields / lifecycle callbacks resolve instance members. */
     ce_reparent(vm, el, ctor);
+    if(getenv("MARIO_CEDBG") != NULL)
+        fprintf(stderr, "[cedbg] after-reparent#1 el=%p proto=%p\n",
+                (void*)el, (void*)var_get_prototype(el));
     /* @fields initializers (ES2022 class fields), superclass-first. Advance
      * only in the body: a `c = NULL` loop-increment truncates the walk to the
      * leaf class and drops inherited field initializers (catalyst's
@@ -3911,19 +5092,6 @@ static void ce_init_instance(vm_t* vm, var_t* el, var_t* ctor) {
                     (fe != NULL && fe->var != NULL && fe->var->is_array) ? var_array_size(fe->var) : 0);
         }
         fprintf(stderr, "\n");
-    }
-    { /* unconditional file mirror: stderr ordering proved unreliable here */
-        FILE* dbg = fopen("/tmp/ceinit.txt", "a");
-        if(dbg != NULL) {
-            fprintf(dbg, "ce_init ctor=%p chain=%d", (void*)ctor, cn);
-            for(int i = 0; i < cn; i++) {
-                node_t* fe = var_find_own_member(chain[i], "@fields");
-                fprintf(dbg, " [i%d fields=%u]", i,
-                        (fe != NULL && fe->var != NULL && fe->var->is_array) ? var_array_size(fe->var) : 0);
-            }
-            fprintf(dbg, "\n");
-            fclose(dbg);
-        }
     }
     for(int i = cn - 1; i >= 0; i--) {
         node_t* fe = var_find_own_member(chain[i], "@fields");
@@ -3964,8 +5132,21 @@ static void ce_init_instance(vm_t* vm, var_t* el, var_t* ctor) {
     else if(proto != NULL)
         ctor_fn = var_find_member_var(proto, "constructor");
     if(ctor_fn != NULL && ctor_fn->is_func) {
-        if(getenv("MARIO_CEDBG") != NULL)
-            fprintf(stderr, "[cedbg] ce_init_instance calling ctor_fn=%p\n", (void*)ctor_fn);
+        /* Real DOM hands the element its class prototype chain BEFORE the
+         * constructor body runs (github elements do super() then
+         * this.addEventListener(...) in the constructor); without this the
+         * constructor throws "can not find function 'addEventListener'". */
+        ce_reparent(vm, el, ctor);
+        if(getenv("MARIO_CEDBG") != NULL) {
+            var_t* ael = var_find_member_var(el, "addEventListener");
+            fprintf(stderr, "[cedbg] pre-ctor el=%p is_class=%d is_func=%d ctor_proto=%p chain:",
+                    (void*)el, (int)ctor->is_class, (int)ctor->is_func,
+                    (void*)var_get_prototype(ctor));
+            int hh = 0;
+            for(var_t* p = var_get_prototype(el); p != NULL && hh < 5; p = var_get_prototype(p))
+                fprintf(stderr, " %p", (void*)p);
+            fprintf(stderr, " | addEventListener=%d\n", (ael != NULL && ael->is_func) ? 1 : 0);
+        }
         s_ce_pending_el = el;
         var_ref(el);
         var_t* ret = call_m_func(vm, el, ctor_fn, NULL);
@@ -3973,8 +5154,14 @@ static void ce_init_instance(vm_t* vm, var_t* el, var_t* ctor) {
         s_ce_pending_el = NULL;
         if(ret != NULL) var_unref(ret);
         if(vm->propagating_err != NULL) {
-            if(getenv("MARIO_CEDBG") != NULL)
-                fprintf(stderr, "[cedbg] ce_init_instance ctor FAILED\n");
+            if(getenv("MARIO_CEDBG") != NULL) {
+                mstr_t* cem = mstr_new("");
+                var_to_str(vm->propagating_err, cem);
+                fprintf(stderr, "[cedbg] ce_init_instance ctor FAILED: %.300s\n", cem->cstr);
+                mstr_free(cem);
+                const char* ctl = mario_last_throw_loc();
+                if(ctl != NULL) fprintf(stderr, "[cedbg] ctor throw loc:%.300s", ctl);
+            }
             var_unref(vm->propagating_err);
             vm->propagating_err = NULL;
             vm->abort_run = false;
@@ -3984,14 +5171,32 @@ static void ce_init_instance(vm_t* vm, var_t* el, var_t* ctor) {
     } else if(getenv("MARIO_CEDBG") != NULL) {
         fprintf(stderr, "[cedbg] ce_init_instance NO ctor_fn (proto=%p)\n", (void*)proto);
     }
+    /* The derived constructor's `super()` (the HTMLElement ctor path) hands back
+     * this same live wrapper, and mario's [[Construct]] then re-asserts the
+     * wrapper's ORIGINAL [[Prototype]] on it - undoing the ce_reparent above. The
+     * base class's ES2022 private methods (`this.#i()` in the react-app /
+     * react-partial connectedCallback) live on the class prototype chain, so once
+     * the proto is knocked back to the plain Element wrapper they no longer
+     * resolve and connectedCallback throws "can not find function '#i'" (React
+     * never hydrates). Re-apply the reparent AFTER construction so the lifecycle
+     * callbacks see the class prototype. */
+    ce_reparent(vm, el, ctor);
+    if(getenv("MARIO_CEDBG") != NULL)
+        fprintf(stderr, "[cedbg] after-reparent#2 el=%p proto=%p\n",
+                (void*)el, (void*)var_get_prototype(el));
 }
 
 static void ce_upgrade_all(vm_t* vm, js_dom_state* st, const char* name, var_t* ctor) {
     var_t* proto = var_find_member_var(ctor, "prototype");
     var_t* cb = (proto != NULL) ? var_find_member_var(proto, "connectedCallback") : NULL;
+    if(getenv("MARIO_CEDBG") != NULL)
+        fprintf(stderr, "[cedbg] upgrade_all name=%s proto=%p cb=%p\n",
+                name ? name : "?", (void*)proto, (void*)cb);
     if(cb == NULL || !cb->is_func) return;
     var_t* els = query_elements(vm, st, NULL, name);
     uint32_t n = var_array_size(els);
+    if(getenv("MARIO_CEDBG") != NULL)
+        fprintf(stderr, "[cedbg] upgrade_all name=%s matched=%u\n", name ? name : "?", (unsigned)n);
     vm->gc.gc_defer++;   /* els and its wrappers stay off the root set */
     for(uint32_t i = 0; i < n; ++i) {
         var_t* el = var_array_get_var(els, i);
@@ -4011,6 +5216,22 @@ static void ce_upgrade_all(vm_t* vm, js_dom_state* st, const char* name, var_t* 
                     tg ? tg : "?", an ? an : "(null)", pn2 ? pn2 : "(null)",
                     var_find_own_member(el, "nameAttribute") != NULL,
                     var_array_size(q), var_array_size(q2));
+            /* Walk el's live prototype chain and report where (if anywhere) the
+             * private method '#i' lives, plus whether a full member lookup from
+             * el resolves it. This distinguishes "reparent didn't reach S.proto"
+             * from "#i is not stored on the prototype at all". */
+            {
+                fprintf(stderr, "[cedbg] CHAIN el=%p find#i=%d",
+                        (void*)el, var_find_member_var(el, "#i") != NULL);
+                int lvl = 0;
+                for(var_t* p = el; p != NULL && lvl < 8; p = var_get_prototype(p), ++lvl) {
+                    node_t* mi = var_find_own_member(p, "#i");
+                    node_t* cc = var_find_own_member(p, "connectedCallback");
+                    fprintf(stderr, " [%d]%p(#i=%d,cc=%d)", lvl, (void*)p,
+                            mi != NULL, cc != NULL);
+                }
+                fprintf(stderr, "\n");
+            }
         }
         /* Pass element as first arg: GitHub's catalyst pattern declares
          * connectedCallback(el, prev) where `el` is the element (not `this`).
@@ -4042,6 +5263,150 @@ static void ce_upgrade_all(vm_t* vm, js_dom_state* st, const char* name, var_t* 
     vm->gc.gc_defer--;
 }
 
+/* Upgrade every registered custom element whose instances were inserted since
+ * the last drain (see ce_mark_dirty / js_dom_state.ce_dirty). Called by the
+ * engine tick after timers/fetch settle, which is when React's post-deferred-
+ * data fill commit has appended its <relative-time> etc. Snapshot-and-clear
+ * first so a connectedCallback that itself inserts custom elements simply
+ * re-marks them for a later tick (bounded, no recursion here). Errors escaping
+ * a lifecycle callback are swallowed per name, exactly like native_ce_define,
+ * so one broken element cannot abort the page's JS. Returns non-zero if any
+ * name was processed (caller marks content dirty to repaint the new text). */
+int js_dom_upgrade_dirty(vm_t* vm) {
+    js_dom_state* st = state_from_vm(vm);
+    if(st == NULL || st->ce_dirty_n == 0) return 0;
+    /* Honour the same defer window as define(): while the post-swap script
+     * queue is still running (defer_upgrades), a connectedCallback that awaits
+     * a registration a LATER document-order script performs would force the
+     * synchronous await spin / re-entrant script pump that corrupts suspended
+     * webpack factory frames. Hold the dirty names (do NOT clear) until the
+     * queue drains, exactly like the deferred define-time upgrades. */
+    if(st->defer_upgrades) return 0;
+    int n = st->ce_dirty_n;
+    char names[CE_DIRTY_MAX][CE_DIRTY_NAME];
+    /* Bounded copy: a corrupted (non NUL-terminated) ce_dirty entry made the
+     * strcpy run off into unmapped memory, and because ce_dirty_n is only
+     * cleared AFTER the copy, the SEGV checkpoint recovery re-entered with the
+     * same dirty list and faulted forever (engine thread pinned at 100% CPU in
+     * _platform_strcpy, timers never polled again - pinterest's shell state).
+     * Truncate instead; a garbage name simply finds no ctor below. */
+    for(int i = 0; i < n; ++i) {
+        strncpy(names[i], st->ce_dirty[i], CE_DIRTY_NAME - 1);
+        names[i][CE_DIRTY_NAME - 1] = 0;
+    }
+    st->ce_dirty_n = 0;
+    var_t* reg = ce_registry(vm);
+    if(reg == NULL) return n;
+    if(getenv("MARIO_CEDBG") != NULL)
+        fprintf(stderr, "[cedbg] upgrade_dirty names=%d\n", n);
+    for(int i = 0; i < n; ++i) {
+        var_t* ctor = var_find_own_member_var(reg, names[i]);
+        if(ctor != NULL)
+            ce_upgrade_all(vm, st, names[i], ctor);
+        if(vm->propagating_err != NULL) {
+            if(getenv("MARIO_CEDBG") != NULL) {
+                mstr_t* em = mstr_new("");
+                var_to_str(vm->propagating_err, em);
+                fprintf(stderr, "[cedbg] upgrade_dirty '%s' SUPPRESSING: %s\n", names[i], em->cstr);
+                mstr_free(em);
+            }
+            var_unref(vm->propagating_err);
+            vm->propagating_err = NULL;
+            vm->abort_run = false;
+        }
+    }
+    return n;
+}
+
+void js_dom_clear_dirty_ce(vm_t* vm) {
+    js_dom_state* st = state_from_vm(vm);
+    if(st == NULL) return;
+    st->ce_dirty_n = 0;
+}
+
+/* Deferred bulk upgrades (see js_dom_state.defer_upgrades). Pairs of
+ * [name, ctor] park in a hidden root array so the ctor vars survive GC until
+ * the post-swap script queue finishes and js_dom_drain_deferred_upgrades runs
+ * them in registration order. */
+#define DOM_DEFER_UP_KEY "@@defer_up"
+
+static var_t* ce_deferred_list(vm_t* vm) {
+    if(vm == NULL || vm->root == NULL) return NULL;
+    var_t* bridge = var_find_own_member_var(vm->root, DOM_BRIDGE_KEY);
+    if(bridge == NULL) return NULL;
+    var_t* list = var_find_own_member_var(bridge, DOM_DEFER_UP_KEY);
+    if(list == NULL) {
+        list = var_new_array(vm);
+        node_t* n = var_add(bridge, DOM_DEFER_UP_KEY, list);
+        if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+    }
+    return list;
+}
+
+static void ce_defer_upgrade(vm_t* vm, const char* name, var_t* ctor) {
+    var_t* list = ce_deferred_list(vm);
+    if(list == NULL) return;
+    var_t* pair = var_new_array(vm);
+    var_array_add(pair, var_new_str(vm, name));
+    var_array_add(pair, ctor);
+    var_array_add(list, pair);
+    /* The list node now owns the only reference to `pair` (var_array_add takes
+     * it); an extra var_unref here dropped it to 0 and freed the pair, so the
+     * drain later read a recycled var, never matched name/ctor, and silently
+     * skipped every deferred connectedCallback upgrade (github's react-app
+     * never rendered its embedded payload -> permanent grey skeletons). */
+}
+
+void js_dom_set_defer_upgrades(vm_t* vm, bool on) {
+    js_dom_state* st = state_from_vm(vm);
+    if(st != NULL) st->defer_upgrades = on;
+}
+
+void js_dom_drain_deferred_upgrades(vm_t* vm) {
+    js_dom_state* st = state_from_vm(vm);
+    if(st == NULL) return;
+    st->defer_upgrades = false;
+    var_t* list = ce_deferred_list(vm);
+    if(getenv("MARIO_CEDBG") != NULL)
+        fprintf(stderr, "[cedbg] drain list=%p size=%u\n", (void*)list,
+                (list != NULL) ? (unsigned)var_array_size(list) : 0u);
+    if(list == NULL) return;
+    /* Snapshot every queued pair with an ownership ref BEFORE running any
+     * connectedCallback: var_array_del does not compact indices, so the old
+     * read-index-0-then-del-then-read-index-0 loop re-read a recycled slot
+     * (nm type 0) and silently skipped nearly every deferred upgrade - which
+     * is why github's react-app never rendered its embedded payload and the
+     * page stayed a grey skeleton. Process the snapshot, then drop the slots
+     * by descending index (each key still exists at its own del) and release
+     * the snapshot refs. Bounded rounds in case a callback re-queues. */
+    int rounds = 0;
+    while(rounds++ < 16) {
+        uint32_t n = var_array_size(list);
+        if(n == 0) break;
+        if(n > 128) n = 128;
+        var_t* snap[128];
+        for(uint32_t i = 0; i < n; ++i) {
+            snap[i] = var_array_get_var(list, (int32_t)i);
+            if(snap[i] != NULL) var_ref(snap[i]);
+        }
+        for(uint32_t i = 0; i < n; ++i) {
+            var_t* pair = snap[i];
+            if(pair == NULL) continue;
+            var_t* nm = var_array_get_var(pair, 0);
+            var_t* ctor = var_array_get_var(pair, 1);
+            if(getenv("MARIO_CEDBG") != NULL)
+                fprintf(stderr, "[cedbg] drain iter pair=%p nm=%p nmtype=%d ctor=%p\n",
+                    (void*)pair, (void*)nm, (nm != NULL) ? (int)nm->type : -1, (void*)ctor);
+            if(nm != NULL && nm->type == V_STRING && ctor != NULL)
+                ce_upgrade_all(vm, st, var_get_str(nm), ctor);
+        }
+        for(uint32_t i = n; i-- > 0; )
+            var_array_del(list, (int32_t)i);
+        for(uint32_t i = 0; i < n; ++i)
+            if(snap[i] != NULL) var_unref(snap[i]);
+    }
+}
+
 /* define(name, ctor): record once (the real registry throws on a redefinition,
  * silently ignoring it here is closer than aborting the bundle) and upgrade. */
 static var_t* native_ce_define(vm_t* vm, var_t* env, void* data) {
@@ -4059,10 +5424,13 @@ static var_t* native_ce_define(vm_t* vm, var_t* env, void* data) {
             if(st != NULL) {
                 if(getenv("MARIO_CEDBG") != NULL) {
                     var_t* dbg_els = query_elements(vm, st, NULL, name);
-                    fprintf(stderr, "[cedbg] upgrade '%s' found %u elements\n",
-                            name, var_array_size(dbg_els));
+                    fprintf(stderr, "[cedbg] upgrade '%s' found %u elements defer=%d\n",
+                            name, var_array_size(dbg_els), (int)st->defer_upgrades);
                 }
-                ce_upgrade_all(vm, st, name, ctor);
+                if(st->defer_upgrades)
+                    ce_defer_upgrade(vm, name, ctor);
+                else
+                    ce_upgrade_all(vm, st, name, ctor);
             }
         }
     }
@@ -4171,6 +5539,14 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
      * still recover it via state_from_vm(). */
     js_dom_state* st = (js_dom_state*)mario_malloc(sizeof(js_dom_state));
     if(st == NULL) return false;
+    /* Zero the WHOLE state first: timer_drops / defer_upgrades / ce_dirty_n
+     * were left uninitialized once, and a garbage ce_dirty_n made
+     * js_dom_upgrade_dirty walk its fixed 48-entry stack/heap tables hundreds
+     * of entries deep (ASan: stack-buffer-overflow writes into names[][] plus
+     * a heap-buffer-overflow read past the state block). That stack scribble
+     * is a corruption source for the teardown crash family. memset also
+     * future-proofs any field added without a matching init line below. */
+    memset(st, 0, sizeof(js_dom_state));
     st->ctx = ctx;
     st->cb = *cb;
     st->write_buf = NULL;
@@ -4183,6 +5559,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     st->el_cache_cap   = 0;
     st->dom_loaded     = false;
     st->parsing_complete = false;
+    st->in_async_cb    = false;
 
     var_t* bridge = var_new_obj_no_proto(vm, st, dom_state_free);
     if(bridge == NULL) {
@@ -4212,6 +5589,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     vm_reg_native(vm, doc_cls, "createTextNode(text)", native_document_createTextNode, bridge);
     vm_reg_native(vm, doc_cls, "createComment(text)", native_document_createComment, bridge);
     vm_reg_native(vm, doc_cls, "createElementNS(ns,tag)", native_document_createElementNS, bridge);
+    vm_reg_native(vm, doc_cls, "elementFromPoint(x,y)", native_document_elementFromPoint, bridge);
     /* title / body as accessor properties so `document.title` and
      * `document.body.innerHTML` resolve like a real browser. */
     reg_accessor(vm, doc_cls, "title", native_document_get_title, native_document_set_title, bridge);
@@ -4233,6 +5611,8 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     reg_accessor(vm, doc_cls, "childElementCount", native_document_get_childElementCount, NULL, bridge);
     reg_accessor(vm, doc_cls, "URL", native_document_get_url, NULL, bridge);
     reg_accessor(vm, doc_cls, "documentURI", native_document_get_url, NULL, bridge);
+    /* Node.baseURI: with no <base> support the document URL is the base. */
+    reg_accessor(vm, doc_cls, "baseURI", native_document_get_url, NULL, bridge);
     reg_accessor(vm, doc_cls, "readyState", native_document_get_readyState, NULL, bridge);
     reg_accessor(vm, doc_cls, "domain", native_document_get_empty_str, NULL, bridge);
     reg_accessor(vm, doc_cls, "referrer", native_document_get_empty_str, NULL, bridge);
@@ -4281,8 +5661,15 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     {
         var_t* hctor = var_new_native_func(vm, native_htmlel_ctor, NULL);
         if(hctor != NULL) {
-            node_t* cn = var_add(htmlel_cls, "@@ctor", hctor);
-            if(cn != NULL) var_unref(hctor);
+            /* var_new_native_func returns an UNOWNED var (refs==0, like var_new);
+             * var_add's @@ctor node adopts the sole reference (refs 0->1). Do NOT
+             * var_unref here: the old unconditional unref dropped it to 0 and freed
+             * the ctor out from under the @@ctor node, dangling its ->var. That block
+             * was then recycled into an unrelated live var, and the teardown
+             * node_free(@@ctor) stole a reference from it (a cross-object refcount
+             * underflow). Mirrors the `owned` guard idiom at the @fields install
+             * above - only release a var the caller actually owned. */
+            var_add(htmlel_cls, "@@ctor", hctor);
         }
     }
     /* HTMLCanvasElement: the canvas bridge hangs getContext()/width/height on
@@ -4337,6 +5724,8 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     reg_accessor(vm, el_cls, "nodeName", native_el_get_tagName, NULL, bridge);
     reg_accessor(vm, el_cls, "localName", native_el_get_localName, NULL, bridge);
     reg_accessor(vm, el_cls, "nodeType", native_el_get_nodeType, NULL, bridge);
+    /* Node.baseURI on every element (document URL; no <base> support). */
+    reg_accessor(vm, el_cls, "baseURI", native_document_get_url, NULL, bridge);
     reg_accessor(vm, el_cls, "className", native_el_get_className, native_el_set_className, bridge);
     reg_accessor(vm, el_cls, "classList", native_el_get_classList, NULL, bridge);
     reg_accessor(vm, el_cls, "style", native_el_get_style, NULL, bridge);
@@ -4365,6 +5754,13 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
      * reflected attribute), so it is registered here rather than in kAttrProps. */
     reg_accessor(vm, el_cls, "content", native_el_get_content, native_el_set_content, bridge);
 
+    /* Shadow DOM surface (degenerate light-DOM root): catalyst patches and calls
+     * attachShadow/attachInternals unconditionally, so they must exist and return
+     * a usable root/internals or connectedCallback throws (see the natives). */
+    vm_reg_native(vm, el_cls, "attachShadow(init)", native_el_attachShadow, bridge);
+    vm_reg_native(vm, el_cls, "attachInternals()", native_el_attachInternals, bridge);
+    reg_accessor(vm, el_cls, "shadowRoot", native_el_get_shadowRoot, NULL, bridge);
+
     /* Tree walking. */
     reg_accessor(vm, el_cls, "children", native_el_get_children, NULL, bridge);
     reg_accessor(vm, el_cls, "childNodes", native_el_get_childNodes, NULL, bridge);
@@ -4392,7 +5788,19 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     vm_reg_native(vm, el_cls, "replaceChild(node, old)", native_el_replaceChild, bridge);
     vm_reg_native(vm, el_cls, "cloneNode(deep)", native_el_cloneNode, bridge);
     vm_reg_native(vm, el_cls, "remove()", native_el_remove, bridge);
+    vm_reg_native(vm, el_cls, "replaceWith(node)", native_el_replaceWith, bridge);
+    vm_reg_native(vm, el_cls, "before(node)", native_el_before, bridge);
+    vm_reg_native(vm, el_cls, "after(node)", native_el_after, bridge);
+    vm_reg_native(vm, el_cls, "replaceChildren(node)", native_el_replaceChildren, bridge);
     vm_reg_native(vm, el_cls, "contains(node)", native_el_contains, bridge);
+    vm_reg_native(vm, el_cls, "isEqualNode(node)", native_el_isEqualNode, bridge);
+
+    /* HTMLMediaElement surface (<video>/<audio>): no media pipeline exists,
+     * but autoplay guards call load()/play()/pause() and a miss aborts the
+     * calling effect ("can not find function 'load'", rokid's video hero). */
+    vm_reg_native(vm, el_cls, "load()", native_el_media_noop, bridge);
+    vm_reg_native(vm, el_cls, "play()", native_el_media_play, bridge);
+    vm_reg_native(vm, el_cls, "pause()", native_el_media_noop, bridge);
 
     /* Real DOM hangs the mutation + tree-walking surface off Node.prototype, so
      * EVERY node kind (Document, DocumentFragment, Element, ...) inherits it.
@@ -4416,10 +5824,23 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
             reg_accessor(vm, nc, "parentElement", native_el_get_parentNode, NULL, bridge);
             reg_accessor(vm, nc, "ownerDocument", native_el_get_ownerDocument, NULL, bridge);
             reg_accessor(vm, nc, "namespaceURI", native_el_get_namespaceURI, NULL, bridge);
-            reg_accessor(vm, nc, "childNodes", native_el_get_childNodes, NULL, bridge);
-            reg_accessor(vm, nc, "children", native_el_get_children, NULL, bridge);
-            reg_accessor(vm, nc, "firstChild", native_el_get_firstChild, NULL, bridge);
-            reg_accessor(vm, nc, "lastChild", native_el_get_lastChild, NULL, bridge);
+            /* doc_cls keeps its OWN child-traversal accessors (registered
+             * above): the Document singleton carries no element handle, so
+             * the generic handle-based walk always yields null/empty for it,
+             * while native_document_get_firstChild/childNodes expose the
+             * documentElement. Re-registering the generic ones here shadowed
+             * the document-specific natives (reg_accessor overwrites), and
+             * React's hydrateRoot(document) - which seeds its hydration
+             * cursor from document.firstChild - then saw an empty container,
+             * never descended into <html>, and recovered with #418-per-host
+             * + #423 (rokid: SSR main deleted, client main appended after the
+             * footer, whole layout inverted). */
+            if(nc != doc_cls) {
+                reg_accessor(vm, nc, "childNodes", native_el_get_childNodes, NULL, bridge);
+                reg_accessor(vm, nc, "children", native_el_get_children, NULL, bridge);
+                reg_accessor(vm, nc, "firstChild", native_el_get_firstChild, NULL, bridge);
+                reg_accessor(vm, nc, "lastChild", native_el_get_lastChild, NULL, bridge);
+            }
             vm_reg_native(vm, nc, "appendChild(node)", native_el_appendChild, bridge);
             vm_reg_native(vm, nc, "append(node)", native_el_append, bridge);
             vm_reg_native(vm, nc, "prepend(node)", native_el_prepend, bridge);
@@ -4428,7 +5849,20 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
             vm_reg_native(vm, nc, "replaceChild(node, old)", native_el_replaceChild, bridge);
             vm_reg_native(vm, nc, "cloneNode(deep)", native_el_cloneNode, bridge);
             vm_reg_native(vm, nc, "remove()", native_el_remove, bridge);
+            vm_reg_native(vm, nc, "replaceWith(node)", native_el_replaceWith, bridge);
+            vm_reg_native(vm, nc, "before(node)", native_el_before, bridge);
+            vm_reg_native(vm, nc, "after(node)", native_el_after, bridge);
+            vm_reg_native(vm, nc, "replaceChildren(node)", native_el_replaceChildren, bridge);
             vm_reg_native(vm, nc, "contains(node)", native_el_contains, bridge);
+            vm_reg_native(vm, nc, "isEqualNode(node)", native_el_isEqualNode, bridge);
+            /* Media stubs on the HTMLElement mirror too: a <video> obtained via
+             * createElement may be wrapped against htmlel_cls rather than
+             * el_cls. Skipped for doc/frag/node - they are never media. */
+            if(nc == htmlel_cls) {
+                vm_reg_native(vm, nc, "load()", native_el_media_noop, bridge);
+                vm_reg_native(vm, nc, "play()", native_el_media_play, bridge);
+                vm_reg_native(vm, nc, "pause()", native_el_media_noop, bridge);
+            }
             /* Query surface: DocumentFragment/HTMLElement support querySelector
              * in the real DOM. A template's `.content` fragment
              * (native_el_get_content) is queried right after cloning

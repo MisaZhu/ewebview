@@ -12,6 +12,9 @@ namespace litehtml
 
 		virtual void	get_text(tstring& text) override;
 		virtual void	set_data(const tchar_t* data) override;
+		/* DOM CharacterData.data assignment: REPLACE the comment text (set_data
+		 * appends, which is what the parser needs while streaming chunks). */
+		virtual void	set_data_replace(const tchar_t* data) override;
 		virtual bool	is_comment() const override;
 	};
 }

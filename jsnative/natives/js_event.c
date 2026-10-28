@@ -33,6 +33,7 @@ extern "C" {
 #include "js_natives_priv.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 
 #define CLS_EVENT        "Event"
@@ -41,6 +42,9 @@ extern "C" {
 #define CLS_KEYEVENT     "KeyboardEvent"
 #define CLS_ELEMENT      "Element"
 #define CLS_DOCUMENT     "Document"
+#define CLS_FRAGMENT     "DocumentFragment"
+#define CLS_NODE         "Node"
+#define CLS_HTMLEL       "HTMLElement"
 
 #define EVENT_BRIDGE_KEY "@@event_bridge"
 /* Hidden array on the bridge var mirroring every live listener callback and
@@ -48,8 +52,15 @@ extern "C" {
 #define EVENT_ANCHOR_KEY "@@listeners"
 
 /* Upper bound on simultaneously registered listeners. Fixed table: no
- * allocation on the (hot) input path, and 64 is generous for a page. */
-#define JS_LISTENER_MAX 64
+ * allocation on the (hot) input path. 64 was badly undersized for a modern
+ * SPA: Pinterest alone attempts 600+ concurrent listeners (React synthetic
+ * events on document/window plus per-node onclick/onload), and once the table
+ * saturated ev_add_listener silently dropped every later registration -
+ * including the <link onload> that Rspack's miniCss chunk loader parks the
+ * CSS-chunk promise on, which wedged n.e(gestalt=78180) forever and left the
+ * bottom signup form unmounted. 2048 covers realistic pages with headroom; a
+ * saturated table is now reported under EWEB_MODPATCH_DBG instead of silent. */
+#define JS_LISTENER_MAX 2048
 /* Inline `on*="src"` handlers are compiled on demand; the cache keeps the
  * common case (the same attribute firing repeatedly) off the compiler. */
 #define JS_INLINE_CACHE 16
@@ -149,6 +160,13 @@ typedef struct {
     vm_t*         vm;
     var_t*        document;   /* borrowed: rooted by the DOM bridge */
     var_t*        window;     /* borrowed: rooted by the DOM bridge */
+    /* Borrowed (rooted by vm->root): the native Event/CustomEvent/MouseEvent/
+     * KeyboardEvent class vars, pinned at registration. createEvent()/ev_new()
+     * build instances from these instead of new_obj()'s global-name lookup, so a
+     * page that overrides the global binding (e.g. a CustomEvent polyfill whose
+     * shim calls document.createEvent) cannot hijack the factory into infinite
+     * recursion. Index order matches kEventClasses[] below. */
+    var_t*        ev_cls[4];
     js_listener_t listeners[JS_LISTENER_MAX];
     js_inline_t   inline_cache[JS_INLINE_CACHE];
     int           inline_next;   /* round-robin eviction cursor */
@@ -157,6 +175,8 @@ typedef struct {
 static void event_state_free(void* p) {
     js_event_state* st = (js_event_state*)p;
     if(st == NULL) return;
+    for(int i = 0; i < 4; ++i)
+        if(st->ev_cls[i] != NULL) var_unref(st->ev_cls[i]);   /* release the pinned class refs */
     for(int i = 0; i < JS_LISTENER_MAX; ++i)
         if(st->listeners[i].type != NULL) mario_free(st->listeners[i].type);
     for(int i = 0; i < JS_INLINE_CACHE; ++i)
@@ -198,9 +218,18 @@ static void ev_reanchor(vm_t* vm, js_event_state* st) {
 
 static js_element_t element_of(vm_t* vm, var_t* v) {
     if(v == NULL || v->type != V_OBJECT || v->is_func || v->is_array) return NULL;
-    var_t* cls = var_find_own_member_var(vm->root, CLS_ELEMENT);
-    if(cls != NULL && !var_instanceof(v, cls)) return NULL;
-    return (js_element_t)v->value;
+    /* Every node-kind wrapper (Element, HTMLElement, Node, DocumentFragment /
+     * ShadowRoot) carries the same bridge handle in v->value. Real DOM makes
+     * them ALL EventTargets, and catalyst's patched attachShadow hands the
+     * ShadowRoot to code that calls addEventListener on it, so they must
+     * classify as event targets - not just instanceof-Element. */
+    static const char* kNodeCls[] = { CLS_ELEMENT, CLS_FRAGMENT, CLS_NODE, CLS_HTMLEL };
+    for(int i = 0; i < (int)(sizeof(kNodeCls)/sizeof(kNodeCls[0])); ++i) {
+        var_t* cls = var_find_own_member_var(vm->root, kNodeCls[i]);
+        if(cls != NULL && var_instanceof(v, cls))
+            return (js_element_t)v->value;
+    }
+    return NULL;
 }
 
 /* Identify a JS object as one of the three EventTarget flavours. Returns -1
@@ -291,8 +320,20 @@ static bool ev_add_listener(vm_t* vm, js_event_state* st, int kind, js_element_t
         r->once      = once;
         r->from_prop = from_prop;
         r->active    = true;
+        if(getenv("EWEB_MODPATCH_DBG") != NULL) {
+            static int s_peak = 0;
+            int act = 0;
+            for(int j = 0; j < JS_LISTENER_MAX; ++j) if(st->listeners[j].active) act++;
+            if(act > s_peak) { s_peak = act; fprintf(stderr, "[evpeak] active=%d\n", act); }
+        }
         ev_reanchor(vm, st);
         return true;
+    }
+    if(getenv("EWEB_MODPATCH_DBG") != NULL) {
+        int act = 0;
+        for(int i = 0; i < JS_LISTENER_MAX; ++i) if(st->listeners[i].active) act++;
+        fprintf(stderr, "[evfull] DROP type=%s kind=%d from_prop=%d active=%d/%d\n",
+                type, kind, from_prop ? 1 : 0, act, JS_LISTENER_MAX);
     }
     mario_free(tcopy);
     return false;   /* table full */
@@ -462,9 +503,40 @@ static const char* ev_pick_class(const js_event_init_t* in) {
     return CLS_EVENT;
 }
 
+/* Public in mario.c but not declared in mario.h: build an instance from an
+ * explicit class var, bypassing new_obj()'s by-name global lookup. */
+extern var_t* new_obj_with_ctor(vm_t* vm, var_t* ctor_var, const char* name,
+                                int arg_num, bool plain_call);
+
+/* Resolve the pinned native class var for a legacy interface name. */
+static var_t* ev_saved_cls(js_event_state* st, const char* cls) {
+    if(st == NULL || cls == NULL) return NULL;
+    int idx = -1;
+    if(strcmp(cls, CLS_EVENT) == 0)            idx = 0;
+    else if(strcmp(cls, CLS_CUSTOMEVENT) == 0) idx = 1;
+    else if(strcmp(cls, CLS_MOUSEEVENT) == 0)  idx = 2;
+    else if(strcmp(cls, CLS_KEYEVENT) == 0)    idx = 3;
+    if(idx < 0) return NULL;
+    return st->ev_cls[idx];
+}
+
+/* new_obj(vm, cls, 0) equivalent that pins the class binding: a page may replace
+ * the global (window.CustomEvent = polyfill) and, because new_obj resolves the
+ * class by name through the scope chain, the factory would run that override as
+ * the constructor. When the override itself calls document.createEvent (the
+ * standard CustomEvent shim does), the result is unbounded self-recursion that
+ * only stops at the call-depth guard, aborting the whole script. Falling back to
+ * new_obj keeps behaviour if the class was never registered. */
+static var_t* ev_new_pinned(vm_t* vm, const char* cls) {
+    var_t* ctor = ev_saved_cls(ev_state(vm), cls);
+    if(ctor != NULL)
+        return new_obj_with_ctor(vm, ctor, cls, 0, false);
+    return new_obj(vm, cls, 0);
+}
+
 static var_t* ev_new(vm_t* vm, const js_event_init_t* in) {
     const char* cls = ev_pick_class(in);
-    var_t* ev = new_obj(vm, cls, 0);
+    var_t* ev = ev_new_pinned(vm, cls);
     if(ev == NULL) return NULL;
     ev_fill_common(vm, ev, in->type, in->bubbles, in->cancelable, in->trusted);
     if(in->custom_detail != NULL)
@@ -613,6 +685,53 @@ static var_t* native_event_ctor(vm_t* vm, var_t* env, void* data)      { (void)d
 static var_t* native_custom_ctor(vm_t* vm, var_t* env, void* data)     { (void)data; return ev_ctor(vm, env, 1); }
 static var_t* native_mouse_ctor(vm_t* vm, var_t* env, void* data)      { (void)data; return ev_ctor(vm, env, 2); }
 static var_t* native_key_ctor(vm_t* vm, var_t* env, void* data)        { (void)data; return ev_ctor(vm, env, 3); }
+
+/* ------------------------------------------------------------------ */
+/* Document.createEvent(interface)                                     */
+/* ------------------------------------------------------------------ */
+
+/* Legacy DOM factory: `document.createEvent("MouseEvent")` and friends still
+ * power capability probes (`try{document.createEvent("TouchEvent")}catch(_)`),
+ * which only need the call to SUCCEED. Map the legacy interface name onto the
+ * matching mario event class and hand back an UNINITIALISED instance (fields
+ * filled below to the spec's uninitialised defaults). TouchEvent has no mario
+ * class, so it - like any unrecognised name - degrades to a generic Event
+ * rather than throwing, which is what keeps the probe's `e=!0` path alive the
+ * same way Chrome/Safari returning a real event does. */
+static var_t* native_document_createEvent(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    mstr_t* s = mstr_new("");
+    const char* iface = js_arg_cstr(env, 0, s);
+    const char* cls = CLS_EVENT;
+    if(js_ascii_casecmp(iface, "CustomEvent") == 0 ||
+       js_ascii_casecmp(iface, "CustomEvents") == 0)
+        cls = CLS_CUSTOMEVENT;
+    else if(js_ascii_casecmp(iface, "MouseEvent") == 0 ||
+            js_ascii_casecmp(iface, "MouseEvents") == 0 ||
+            js_ascii_casecmp(iface, "UIEvent") == 0 ||
+            js_ascii_casecmp(iface, "UIEvents") == 0)
+        cls = CLS_MOUSEEVENT;
+    else if(js_ascii_casecmp(iface, "KeyboardEvent") == 0 ||
+            js_ascii_casecmp(iface, "KeyboardEvents") == 0 ||
+            js_ascii_casecmp(iface, "KeyEvents") == 0)
+        cls = CLS_KEYEVENT;
+    var_t* ev = ev_new_pinned(vm, cls);
+    if(ev != NULL) {
+        /* new_obj() allocates WITHOUT running the constructor, so the instance
+         * would carry no members at all (type read as undefined). A real
+         * createEvent hands back a fully-formed but UNINITIALISED event
+         * (type "", bubbles/cancelable false, zeroed flavour fields), so fill
+         * the same groups the constructor would. */
+        js_event_init_t in;
+        js_event_init(&in, "");
+        ev_fill_common(vm, ev, "", false, false, false);
+        if(strcmp(cls, CLS_MOUSEEVENT) == 0) ev_fill_mouse(vm, ev, &in);
+        if(strcmp(cls, CLS_KEYEVENT) == 0)   ev_fill_key(vm, ev, &in);
+        if(strcmp(cls, CLS_CUSTOMEVENT) == 0) ev_set(vm, ev, "detail", var_new_null(vm));
+    }
+    mstr_free(s);
+    return (ev != NULL) ? ev : var_new_null(vm);
+}
 
 /* ------------------------------------------------------------------ */
 /* EventTarget methods                                                */
@@ -1081,6 +1200,19 @@ void js_event_fire_dom_content_loaded(vm_t* vm) {
      * observe the post-load lifecycle state exactly as a real browser does. */
     extern void js_dom_mark_dom_loaded(vm_t* vm);
     js_dom_mark_dom_loaded(vm);
+    /* A real browser fires "readystatechange" on every document.readyState
+     * transition (loading -> interactive -> complete), just before
+     * DOMContentLoaded. Sites gate deferred work on it: github's redeployed
+     * element-registry lazy-loads each <react-partial> behind
+     *   ready = () => promise ||= new Promise(res =>
+     *     "loading" !== document.readyState ? res()
+     *       : document.addEventListener("readystatechange", () => res(), {once:true}))
+     * so when the registry runs while readyState is still "loading" it parks on
+     * readystatechange; without this dispatch the promise never resolves, the
+     * react-partial chunks never load, and React's hydrateRoot is never called
+     * (whole page stays on the SSR skeleton). Fire it now that readyState reads
+     * "complete", matching the browser ordering. */
+    ev_fire_global(vm, JS_EVENT_ON_DOCUMENT, "readystatechange", true);
     ev_fire_global(vm, JS_EVENT_ON_DOCUMENT, "DOMContentLoaded", true);
 }
 
@@ -1180,6 +1312,12 @@ bool js_register_event_natives(vm_t* vm) {
     var_t* ev_cls[4];
     for(int c = 0; c < 4; ++c) {
         ev_cls[c] = vm_new_class(vm, kEventClasses[c]);
+        st->ev_cls[c] = ev_cls[c];   /* pin for ev_new_pinned (survives global override) */
+        /* Hold a reference: a page may reassign the global (window.CustomEvent =
+         * polyfill), dropping vm->root's only ref and freeing the native class var
+         * out from under the borrowed pointer. The extra ref keeps it alive until
+         * event_state_free() releases it. */
+        if(ev_cls[c] != NULL) var_ref(ev_cls[c]);
         if(ev_cls[c] == NULL) continue;
         vm_reg_native(vm, ev_cls[c], "preventDefault()", native_ev_preventDefault, bridge);
         vm_reg_native(vm, ev_cls[c], "stopPropagation()", native_ev_stopPropagation, bridge);
@@ -1210,16 +1348,36 @@ bool js_register_event_natives(vm_t* vm) {
      * directly. */
     var_t* doc_cls = var_find_own_member_var(vm->root, CLS_DOCUMENT);
     var_t* el_cls  = var_find_own_member_var(vm->root, CLS_ELEMENT);
+    var_t* node_classes[3] = {
+        var_find_own_member_var(vm->root, CLS_FRAGMENT),
+        var_find_own_member_var(vm->root, CLS_NODE),
+        var_find_own_member_var(vm->root, CLS_HTMLEL),
+    };
 
     if(doc_cls != NULL) {
         vm_reg_native(vm, doc_cls, "addEventListener(t, f, o)",    native_addEventListener, bridge);
         vm_reg_native(vm, doc_cls, "removeEventListener(t, f, o)", native_removeEventListener, bridge);
         vm_reg_native(vm, doc_cls, "dispatchEvent(e)",             native_dispatchEvent, bridge);
+        /* document.createEvent(type): legacy DOM Level 2 factory still used by
+         * feature-detection probes (e.g. `document.createEvent("TouchEvent")`).
+         * Enabled by default for browser parity. */
+        vm_reg_native(vm, doc_cls, "createEvent(type)",            native_document_createEvent, bridge);
     }
     if(el_cls != NULL) {
         vm_reg_native(vm, el_cls, "addEventListener(t, f, o)",    native_addEventListener, bridge);
         vm_reg_native(vm, el_cls, "removeEventListener(t, f, o)", native_removeEventListener, bridge);
         vm_reg_native(vm, el_cls, "dispatchEvent(e)",             native_dispatchEvent, bridge);
+    }
+    /* DocumentFragment (ShadowRoot) / Node / HTMLElement are EventTargets in the
+     * real DOM; mario's classes are flat so they do not inherit el_cls's methods.
+     * Without these, `shadowRoot.addEventListener` (catalyst's shadow-DOM patch)
+     * misses and aborts every custom-element upgrade. */
+    for(int ci = 0; ci < 3; ++ci) {
+        var_t* nc = node_classes[ci];
+        if(nc == NULL || nc == el_cls) continue;
+        vm_reg_native(vm, nc, "addEventListener(t, f, o)",    native_addEventListener, bridge);
+        vm_reg_native(vm, nc, "removeEventListener(t, f, o)", native_removeEventListener, bridge);
+        vm_reg_native(vm, nc, "dispatchEvent(e)",             native_dispatchEvent, bridge);
     }
     if(st->window != NULL) {
         vm_reg_native_on(vm, st->window, "addEventListener(t, f, o)",    native_addEventListener, bridge);

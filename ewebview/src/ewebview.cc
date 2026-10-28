@@ -314,13 +314,18 @@ static std::string preprocess_noscript_picture(const std::string& html)
         }
     }
 
-    /* --- Pass 2: lower <picture>/<source srcSet> to plain <img> ------- */
-    /* For each <picture>...</picture>:
-     * - collect best srcSet URL from <source> tags
-     * - if a valid URL exists, emit <picture ...><img src=url width height></picture>
-     * - if no valid URL (all placeholders), drop the entire <picture> block
-     * The <source> tags are removed (litehtml doesn't understand them); the
-     * <picture> tag stays so descendant/child selectors keep matching. */
+    /* --- Pass 2: drop all-placeholder <picture> blocks ---------------- */
+    /* litehtml renders <picture>/<source srcSet> NATIVELY at paint time
+     * (el_image::resolve_effective_src re-reads the <source> children and
+     * picks the media-matching srcSet candidate). The SSR markup is therefore
+     * kept VERBATIM. This pass used to lower each <picture> to a plain
+     * <img src=resolved>, deleting the <source> children from the DOM; React's
+     * hydration then walked a <picture> whose first child was <img> while its
+     * virtual DOM expected <source> - a node-type mismatch that throws #418 and
+     * forces a whole-root client re-render (#423). Only a picture whose sources
+     * are ALL placeholders ("#") AND whose <img> carries no usable src is
+     * discarded, so the <noscript> fallback unwrapped beside it (Pass 1) stays
+     * the sole image. */
     std::string stage2;
     stage2.reserve(stage1.size());
     {
@@ -342,54 +347,26 @@ static std::string preprocess_noscript_picture(const std::string& html)
             size_t pic_end = pic_close + 10;
             std::string pic_orig = stage1.substr(pic_open, pic_end - pic_open);
             std::string pic_low  = lower.substr(pic_open, pic_end - pic_open);
-            /* the <picture ...> start tag, kept verbatim around the lowered img */
-            std::string pic_start_tag;
+
+            /* Does any <source> carry a real (non-placeholder) srcSet URL? */
+            bool has_real_source = false;
             {
-                size_t gt = pic_low.find('>');
-                if(gt != std::string::npos) pic_start_tag = pic_orig.substr(0, gt + 1);
-                else pic_start_tag = "<picture>";
-            }
-
-            /* Collect best srcSet URL from <source> tags. */
-            std::string best_url, best_width, best_height;
-            std::string fallback_url, fallback_width, fallback_height;
-            size_t sp = 0;
-            while(sp < pic_low.size()) {
-                size_t src_open = pic_low.find("<source", sp);
-                if(src_open == std::string::npos) break;
-                size_t src_end = pic_low.find('>', src_open);
-                if(src_end == std::string::npos) break;
-                std::string stag_low = pic_low.substr(src_open, src_end - src_open + 1);
-                std::string stag_orig = pic_orig.substr(src_open, src_end - src_open + 1);
-                std::string srcset = tag_attr_value(stag_low, stag_orig, "srcset");
-                std::string url = first_srcset_url(srcset);
-                std::string w = tag_attr_value(stag_low, stag_orig, "width");
-                std::string h = tag_attr_value(stag_low, stag_orig, "height");
-                if(!url.empty()) {
-                    fallback_url = url;
-                    fallback_width = w;
-                    fallback_height = h;
-                    std::string media = tag_attr_value(stag_low, stag_orig, "media");
-                    if(media.empty()) {
-                        best_url = url;
-                        best_width = w;
-                        best_height = h;
-                    }
+                size_t sp = 0;
+                while(sp < pic_low.size()) {
+                    size_t src_open = pic_low.find("<source", sp);
+                    if(src_open == std::string::npos) break;
+                    size_t src_end = pic_low.find('>', src_open);
+                    if(src_end == std::string::npos) break;
+                    std::string stag_low  = pic_low.substr(src_open, src_end - src_open + 1);
+                    std::string stag_orig = pic_orig.substr(src_open, src_end - src_open + 1);
+                    std::string url = first_srcset_url(tag_attr_value(stag_low, stag_orig, "srcset"));
+                    if(!url.empty() && url != "#") { has_real_source = true; break; }
+                    sp = src_end + 1;
                 }
-                sp = src_end + 1;
             }
-            if(best_url.empty()) {
-                best_url = fallback_url;
-                best_width = fallback_width;
-                best_height = fallback_height;
-            }
-
-            if(best_url.empty()) {
-                /* No <source> carried a URL. A <picture> wrapping just an <img src>
-                 * is valid HTML - keep that <img> verbatim (the wrapper alone is
-                 * dropped). Only a picture whose sources are ALL placeholders and
-                 * whose <img> has no src is discarded so the no-JS fallback
-                 * picture next to it remains the sole image. */
+            /* Does the wrapped <img> carry a usable src of its own? */
+            bool img_has_src = false;
+            {
                 size_t img_pos = pic_low.find("<img");
                 if(img_pos != std::string::npos) {
                     size_t img_gt = pic_low.find('>', img_pos);
@@ -397,54 +374,19 @@ static std::string preprocess_noscript_picture(const std::string& html)
                         std::string img_low  = pic_low.substr(img_pos, img_gt - img_pos + 1);
                         std::string img_orig = pic_orig.substr(img_pos, img_gt - img_pos + 1);
                         std::string src = tag_attr_value(img_low, img_orig, "src");
-                        if(!src.empty() && src != "#") {
-                            stage2 += pic_start_tag;
-                            stage2 += img_orig;
-                            stage2 += "</picture>";
-                        }
+                        if(!src.empty() && src != "#") img_has_src = true;
                     }
                 }
+            }
+            if(!has_real_source && !img_has_src) {
+                /* All-placeholder picture with no usable <img src>: drop it so
+                 * the unwrapped <noscript> fallback remains the only image. */
                 pos = pic_end;
                 continue;
             }
-
-            /* Emit a plain <img> with the resolved URL + dimensions.
-             * Preserve the original <img>'s remaining attributes (alt, class,
-             * aria-hidden, etc.) but inject src/width/height. */
-            size_t img_pos = pic_low.find("<img");
-            std::string extra_attrs;
-            if(img_pos != std::string::npos) {
-                size_t img_gt = pic_low.find('>', img_pos);
-                if(img_gt != std::string::npos) {
-                    /* Original img tag attributes (skip "<img" prefix). */
-                    std::string img_orig = pic_orig.substr(img_pos, img_gt - img_pos + 1);
-                    std::string img_low  = pic_low.substr(img_pos, img_gt - img_pos + 1);
-                    /* Collect attrs excluding src/width/height (we inject those). */
-                    /* Just take everything after "<img" up to "/>" or ">" */
-                    size_t a = 4; /* past "<img" */
-                    /* Strip trailing "/>" or ">" */
-                    std::string attr_text = img_orig.substr(a);
-                    if(!attr_text.empty() && attr_text.back() == '>') attr_text.pop_back();
-                    if(!attr_text.empty() && attr_text.back() == '/') attr_text.pop_back();
-                    extra_attrs = attr_text;
-                }
-            }
-            stage2 += pic_start_tag;
-            stage2 += "<img src=\"";
-            stage2 += best_url;
-            stage2 += "\"";
-            if(!best_width.empty()) {
-                stage2 += " width=\"";
-                stage2 += best_width;
-                stage2 += "\"";
-            }
-            if(!best_height.empty()) {
-                stage2 += " height=\"";
-                stage2 += best_height;
-                stage2 += "\"";
-            }
-            if(!extra_attrs.empty()) stage2 += extra_attrs;
-            stage2 += "/></picture>";
+            /* Otherwise keep the SSR <picture> block byte-for-byte: <source>
+             * children survive for hydration, el_image resolves the src. */
+            stage2 += pic_orig;
             pos = pic_end;
         }
     }
@@ -944,14 +886,16 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
                                    std::vector<std::string>* script_srcs,
                                    std::vector<std::string>* script_ids,
                                    std::vector<bool>* script_deferred,
+                                   std::vector<char>* script_async,
                                    std::vector<std::pair<std::string,std::string>>* import_map,
                                    bool* has_inline_handlers,
                                    bool* has_module_scripts)
 {
     if(has_inline_handlers != nullptr) *has_inline_handlers = false;
     if(has_module_scripts != nullptr) *has_module_scripts = false;
-    /* EWEB_RUN_MODULES opts in to executing type="module" scripts: "1" runs
-     * them all, any other value runs only modules whose src contains it (so a
+    /* EWEB_RUN_MODULES gates type="module" execution: unset/"1" runs them all
+     * (the default since github.com ships its whole app as modules), "0" strips
+     * them, and any other value runs only modules whose src contains it (so a
      * single bundle can be exercised while the rest stay skipped). */
     static const char* run_modules_env = ::getenv("EWEB_RUN_MODULES");
     const bool run_modules_all = (run_modules_env != nullptr && run_modules_env[0] == '1');
@@ -1023,12 +967,11 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
         std::string src_val = script_attr_value(open_tag, open_tag_orig, "src");
         bool external = !src_val.empty();
         /* A type= that is present and not a JS mime means "do not execute".
-         * type="module" is executable in principle (the mario VM parses the
-         * ES2015+ syntax these bundles use and implements import/export), but
-         * apple.com's homepage bundles still abort midway (missing stdlib
-         * pieces) after mutating the DOM, which loses the stylesheet links and
-         * paints an unstyled page. So modules stay skipped unless the operator
-         * opts in with EWEB_RUN_MODULES=1 while those VM gaps are closed. */
+         * type="module" is executable (the mario VM parses the ES2015+ syntax
+         * these bundles use and implements import/export) and runs by default:
+         * module-only apps (github.com) never execute otherwise. Pages whose
+         * module bundles abort midway after mutating the DOM (the old
+         * apple.com failure) can still opt out with EWEB_RUN_MODULES=0. */
         bool non_js = false;
         std::string type_val = script_attr_value(open_tag, open_tag_orig, "type");
         for(char& ch : type_val) ch = (char)::tolower((unsigned char)ch);
@@ -1036,10 +979,19 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
             bool js_mime = (type_val.find("javascript") != std::string::npos ||
                             type_val == "text/ecmascript" ||
                             type_val == "application/ecmascript");
+            /* type="module" runs by default: github.com's entire app ships as
+             * module scripts, and with them stripped the page sits on its SSR
+             * skeleton forever (no JS ever executes). EWEB_RUN_MODULES=0 opts
+             * out (strip all modules); any other non-"1" value keeps the
+             * legacy substring filter on src. */
             bool module_ok = false;
-            if(type_val == "module" && run_modules_env != nullptr) {
-                module_ok = run_modules_all ||
-                            (src_val.find(run_modules_env) != std::string::npos);
+            if(type_val == "module") {
+                if(run_modules_env == nullptr || run_modules_all)
+                    module_ok = true;
+                else if(run_modules_env[0] == '0' && run_modules_env[1] == '\0')
+                    module_ok = false;
+                else
+                    module_ok = (src_val.find(run_modules_env) != std::string::npos);
             }
             non_js = !(js_mime || module_ok);
         }
@@ -1073,6 +1025,28 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
                     dp = nx;
                 }
             }
+            /* Word-boundary check for the async attribute. An async external
+             * script holds NO document-order slot in a real browser: it runs
+             * whenever its fetch lands and never blocks a later inline script.
+             * Record it so the caller can order async externals after the
+             * inline/sync scripts. React streaming SSR depends on exactly that
+             * ordering - the end-of-body inline $RC(...) reveal scripts must
+             * run before the async bundle that calls hydrateRoot, otherwise the
+             * dehydrated Suspense boundaries are still pending at hydration and
+             * only get revealed late, which flips a clean initial-pass recovery
+             * into a stalled late-boundary hydration (React #418). */
+            bool is_async = false;
+            {
+                size_t ap = 0;
+                while((ap = open_tag.find("async", ap)) != std::string::npos) {
+                    bool lb = (ap == 0 || ::isspace((unsigned char)open_tag[ap - 1]));
+                    size_t nx = ap + 5;
+                    bool rb = (nx >= open_tag.size() || open_tag[nx] == '=' ||
+                               open_tag[nx] == '>' || ::isspace((unsigned char)open_tag[nx]));
+                    if(lb && rb) { is_async = true; break; }
+                    ap = nx;
+                }
+            }
             if(external) {
                 /* External <script src>: reserve an ordered slot with an empty
                  * body (filled when the EWEB_TASK_SCRIPT fetch lands) and record
@@ -1083,6 +1057,7 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
                 if(script_ids != nullptr)
                     script_ids->push_back(script_attr_value(open_tag, open_tag_orig, "id"));
                 if(script_deferred != nullptr) script_deferred->push_back(deferred);
+                if(script_async != nullptr) script_async->push_back(is_async ? 1 : 0);
             } else {
                 /* Skip blank/whitespace-only bodies to avoid empty vm_load calls. */
                 bool blank = true;
@@ -1095,6 +1070,10 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
                     if(script_ids != nullptr)
                         script_ids->push_back(script_attr_value(open_tag, open_tag_orig, "id"));
                     if(script_deferred != nullptr) script_deferred->push_back(deferred);
+                    /* An inline script is never async-deferred: it runs at its
+                     * document position, so it stays in the first ordering group
+                     * that async externals are moved behind. */
+                    if(script_async != nullptr) script_async->push_back(0);
                 }
             }
         }
@@ -1106,7 +1085,16 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
          * during hydration. Keep such tags in the output HTML so litehtml
          * parses them into the DOM tree; only executable script bodies (the
          * !non_js path above) are extracted into the run queue. */
-        if(non_js) {
+        /* Executable script elements are kept in the output HTML BY DEFAULT: a
+         * real browser leaves every <script> node in the DOM (with its text
+         * child) and React hydration walks the container's childNodes in order,
+         * desyncing (#418) when the inline streaming reveal scripts Chrome keeps
+         * are absent here. Execution still runs solely from the extracted queue,
+         * so keeping the node is DOM-parity only - no double execution.
+         * EWEB_KEEP_SCRIPTS=0 opts out (legacy stripping). */
+        static const char* keep_env = ::getenv("EWEB_KEEP_SCRIPTS");
+        const bool keep_executable = (keep_env == nullptr || keep_env[0] != '0');
+        if(non_js || keep_executable) {
             out.append(html, script_open, (script_close + 9) - script_open);
         }
 
@@ -1115,6 +1103,106 @@ static std::string extract_scripts(const std::string& html, std::vector<std::str
     }
 
     return removed > 0 ? out : html;
+}
+
+/* Stable-partition the parallel script vectors so every async external script
+ * (asyncFlag[i] != 0) moves after all inline/sync/defer scripts, each group
+ * keeping its relative document order. This mirrors a real browser, where an
+ * `async` <script src> holds no document-order slot: it executes when its fetch
+ * lands and never runs ahead of a later inline script. React streaming SSR
+ * relies on that - the end-of-body inline $RC(...) reveals must run before the
+ * async bundle's hydrateRoot. The body/src/id/deferred vectors are permuted by
+ * the same index map so they stay index-aligned; m_jsScriptDone and
+ * m_jsScriptEls are (re)assigned by the caller AFTER this, so they inherit the
+ * new order automatically. Bails out unless every vector is exactly n long. */
+static void ewebOrderAsyncScriptsLast(std::vector<std::string>& scripts,
+                                      std::vector<std::string>& srcs,
+                                      std::vector<std::string>& ids,
+                                      std::vector<bool>& deferred,
+                                      std::vector<char>& asyncFlag)
+{
+    size_t n = scripts.size();
+    if(n < 2) return;
+    if(srcs.size() != n || ids.size() != n || deferred.size() != n || asyncFlag.size() != n)
+        return;
+    bool any_async = false;
+    for(size_t i = 0; i < n; ++i) if(asyncFlag[i]) { any_async = true; break; }
+    if(!any_async) return;
+    std::vector<size_t> order;
+    order.reserve(n);
+    for(size_t i = 0; i < n; ++i) if(!asyncFlag[i]) order.push_back(i);
+    for(size_t i = 0; i < n; ++i) if(asyncFlag[i])  order.push_back(i);
+    bool changed = false;
+    for(size_t k = 0; k < n; ++k) if(order[k] != k) { changed = true; break; }
+    if(!changed) return;
+    std::vector<std::string> nscripts(n), nsrcs(n), nids(n);
+    std::vector<bool> ndeferred(n);
+    std::vector<char> nasync(n);
+    for(size_t k = 0; k < n; ++k) {
+        size_t s = order[k];
+        nscripts[k]  = scripts[s];
+        nsrcs[k]     = srcs[s];
+        nids[k]      = ids[s];
+        ndeferred[k] = deferred[s];
+        nasync[k]    = asyncFlag[s];
+    }
+    scripts.swap(nscripts);
+    srcs.swap(nsrcs);
+    ids.swap(nids);
+    deferred.swap(ndeferred);
+    asyncFlag.swap(nasync);
+}
+
+/* Narrower sibling of ewebOrderAsyncScriptsLast (EWEB_CLIENT_LAST): move ONLY
+ * the async bundle that carries the hydration entry (src contains "_client",
+ * e.g. pinterest's pjs/_client-*.mjs) to the very end of the queue, after the
+ * trailing inline $RC reveals, while every other async chunk keeps its
+ * document-order slot. The good natural-timing runs show exactly this shape:
+ * provider chunks land early (their registrations settle the app's data
+ * thenables) and the hydrateRoot entry runs after the reveals (#418-free);
+ * moving ALL async last instead starves the providers and the post-hydration
+ * transition suspends forever. Sites without a matching src are untouched. */
+static void ewebOrderClientBundleLast(std::vector<std::string>& scripts,
+                                      std::vector<std::string>& srcs,
+                                      std::vector<std::string>& ids,
+                                      std::vector<bool>& deferred,
+                                      std::vector<char>& asyncFlag)
+{
+    size_t n = scripts.size();
+    if(n < 2) return;
+    if(srcs.size() != n || ids.size() != n || deferred.size() != n || asyncFlag.size() != n)
+        return;
+    std::vector<size_t> order;
+    order.reserve(n);
+    bool any = false;
+    for(size_t i = 0; i < n; ++i)
+        if(!(asyncFlag[i] && srcs[i].find("_client") != std::string::npos))
+            order.push_back(i);
+    for(size_t i = 0; i < n; ++i)
+        if(asyncFlag[i] && srcs[i].find("_client") != std::string::npos) {
+            order.push_back(i);
+            any = true;
+        }
+    if(!any) return;
+    bool changed = false;
+    for(size_t k = 0; k < n; ++k) if(order[k] != k) { changed = true; break; }
+    if(!changed) return;
+    std::vector<std::string> nscripts(n), nsrcs(n), nids(n);
+    std::vector<bool> ndeferred(n);
+    std::vector<char> nasync(n);
+    for(size_t k = 0; k < n; ++k) {
+        size_t s = order[k];
+        nscripts[k]  = scripts[s];
+        nsrcs[k]     = srcs[s];
+        nids[k]      = ids[s];
+        ndeferred[k] = deferred[s];
+        nasync[k]    = asyncFlag[s];
+    }
+    scripts.swap(nscripts);
+    srcs.swap(nsrcs);
+    ids.swap(nids);
+    deferred.swap(ndeferred);
+    asyncFlag.swap(nasync);
 }
 
 /* Detect an inline event-handler attribute (`onclick=`, `onload=`, ...) so a
@@ -1224,6 +1312,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_contentDirtySince(0)
     , m_animActive(false)
     , m_jsVm(nullptr)
+    , m_jsPrefetch(nullptr)
     , m_jsHasInlineHandlers(false)
     , m_jsEnabled(true)
     , m_jsReparseCount(0)
@@ -1233,6 +1322,9 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_jsScriptWaitSince(0)
     , m_jsPostSwapRun(false)
     , m_jsPostSwapAt(0)
+    , m_postSwapSkelLatch(false)
+    , m_jsInitialScriptCount(0)
+    , m_jsLoadFired(false)
     , m_jsBuildHasModules(false)
     , m_jsPageHasModules(false)
     , m_moduleNoticeDecided(false)
@@ -1294,6 +1386,10 @@ EWebEngine::~EWebEngine()
     engineStop();
     if(!engineWasStarted)
         engineTeardown();
+
+    /* Reap the module prefetch workers (they only touch the port net
+     * callbacks and the cookie jar, never the documents). */
+    jsPrefetchStop();
 
     /* Reap the download worker pool. The workers only touch the mutex-guarded
      * task/result queues and the port's fetch/decode callbacks - never the
@@ -1485,6 +1581,132 @@ void EWebEngine::postScrollClamp()
     postUiEvent(ev);
 }
 
+/* EWEB_DOCID diagnostic: count elements under e (inclusive). */
+static int ewebCountEls(litehtml::element* e)
+{
+    if(e == nullptr) return 0;
+    int n = 1;
+    const char* tn = e->get_tagName();
+    if(tn != nullptr && tn[0] != 0 && strcmp(tn, "::") != 0) {
+        litehtml::html_tag* tag = static_cast<litehtml::html_tag*>(e);
+        for(auto& ch : tag->children())
+            n += ewebCountEls((litehtml::element*)ch);
+    }
+    return n;
+}
+
+/* EWEB_DOCID diagnostic: print the first few boxes whose right edge exceeds
+ * the viewport width (horizontal overflow contributors), walking in document
+ * order. Bounded output; read-only. */
+static int ewebDumpWideEls(litehtml::element* e, int vw, int* budget)
+{
+    if(e == nullptr || *budget <= 0) return 0;
+    const litehtml::position& p = e->get_position();
+    if(p.x + p.width > vw + 4) {
+        const char* cls = e->get_attr("class");
+        fprintf(stderr, "[WIDE] tag=%s cls=%s box=%d,%d %dx%d right=%d\n",
+                e->get_tagName(), (cls != nullptr) ? cls : "",
+                p.x, p.y, p.width, p.height, p.x + p.width);
+        (*budget)--;
+    }
+    const char* tn = e->get_tagName();
+    if(tn != nullptr && tn[0] != 0 && strcmp(tn, "::") != 0) {
+        litehtml::html_tag* tag = static_cast<litehtml::html_tag*>(e);
+        for(auto& ch : tag->children())
+            ewebDumpWideEls((litehtml::element*)ch, vw, budget);
+    }
+    return 0;
+}
+
+/* EWEB_DOCID diagnostic: print elements whose overflow != visible (the boxes
+ * that gate calc_document_size recursion and clip painted children), walking
+ * in document order with a bounded output. */
+static int ewebDumpOverflowEls(litehtml::element* e, int depth, int* budget)
+{
+    if(e == nullptr || *budget <= 0 || depth > 48) return 0;
+    if(e->get_overflow() != litehtml::overflow_visible) {
+        const litehtml::position& p = e->get_position();
+        const char* cls = e->get_attr("class");
+        fprintf(stderr, "[OVC] d=%d ov=%d tag=%s cls=%s box=%d,%d %dx%d\n",
+                depth, (int)e->get_overflow(), e->get_tagName(),
+                (cls != nullptr) ? cls : "", p.x, p.y, p.width, p.height);
+        (*budget)--;
+    }
+    const char* tn = e->get_tagName();
+    if(tn != nullptr && tn[0] != 0 && strcmp(tn, "::") != 0) {
+        litehtml::html_tag* tag = static_cast<litehtml::html_tag*>(e);
+        for(auto& ch : tag->children())
+            ewebDumpOverflowEls((litehtml::element*)ch, depth + 1, budget);
+    }
+    return 0;
+}
+
+/* EWEB_RDDUMP: one-shot ancestor-chain layout dump for the README zero-height
+ * investigation. Finds the first element whose class contains "markdown-body"
+ * and walks UP the parent chain printing tag/class/display/position/overflow/
+ * placement/css-height so the collapsing or clipping layer is visible. Pure
+ * read (no DOM mutation), gated by the EWEB_RDDUMP env. */
+static litehtml::element* rdFindMarkdown(litehtml::element* e)
+{
+    if(e == nullptr) return nullptr;
+    const char* cls = e->get_attr("class", "");
+    if(cls != nullptr && strstr(cls, "markdown-body") != nullptr) return e;
+    for(size_t i = 0; i < e->get_children_count(); i++) {
+        litehtml::element* c = e->get_child((int)i);
+        litehtml::element* r = rdFindMarkdown(c);
+        if(r != nullptr) return r;
+    }
+    return nullptr;
+}
+
+static void rdDumpChildren(litehtml::element* e, int depth)
+{
+    if(e == nullptr || depth > 6) return;
+    for(size_t i = 0; i < e->get_children_count(); i++) {
+        litehtml::element* c = e->get_child((int)i);
+        if(c == nullptr || c->is_comment()) continue;
+        litehtml::position pb = c->get_placement();
+        if(pb.width > 1200) {
+            fprintf(stderr, "[rdwide%d] tag=%s cls=%.36s disp=%s box=%d,%d %dx%d\n",
+                    depth, c->get_tagName(), c->get_attr("class", ""),
+                    c->get_style_property("display", false, "?"),
+                    pb.x, pb.y, pb.width, pb.height);
+        }
+        rdDumpChildren(c, depth + 1);
+    }
+}
+
+static void rdDumpChain(litehtml::element* e)
+{
+    for(litehtml::element* p = e; p != nullptr; p = p->parent()) {
+        litehtml::position pb = p->get_placement();
+        litehtml::css_length ch = p->get_css_height();
+        litehtml::css_length cwd = p->get_css_width();
+        const char* hspec = ch.is_predefined() ? "auto"
+                            : (ch.units() == litehtml::css_units_percentage) ? "pct" : "px";
+        const char* wspec = cwd.is_predefined() ? "auto"
+                            : (cwd.units() == litehtml::css_units_percentage) ? "pct" : "px";
+        fprintf(stderr, "[rddump] tag=%s cls=%.40s disp=%s pos=%s ov=%d box=%d,%d %dx%d h=%s(%g) w=%s(%g) fb=%s fg=%s fs=%s fd=%s ff=%s fw=%s mw=%s Mw=%s ai=%s\n",
+                p->get_tagName(), p->get_attr("class", ""),
+                p->get_style_property("display", false, "?"),
+                p->get_style_property("position", false, "?"),
+                (int)p->get_overflow(),
+                pb.x, pb.y, pb.width, pb.height,
+                hspec, (double)(ch.is_predefined() ? 0 : ch.val()),
+                wspec, (double)(cwd.is_predefined() ? 0 : cwd.val()),
+                p->get_style_property("flex-basis", false, "?"),
+                p->get_style_property("flex-grow", false, "?"),
+                p->get_style_property("flex-shrink", false, "?"),
+                p->get_style_property("flex-direction", false, "?"),
+                p->get_style_property("flex-flow", false, "?"),
+                p->get_style_property("flex-wrap", false, "?"),
+                p->get_style_property("min-width", false, "?"),
+                p->get_style_property("max-width", false, "?"),
+                p->get_style_property("align-items", false, "?"));
+        if(!p->have_parent()) break;
+    }
+}
+
 void EWebEngine::engineLoop()
 {
     /* The engine thread body. Each iteration:
@@ -1575,7 +1797,28 @@ void EWebEngine::engineLoop()
          * generation check, so polling never has to be skipped here - and
          * MUST not be skipped on a stale flag, or the visible page's timers
          * would freeze after a STOP on an idle page. */
-        if(jsPollTimers() > 0)
+        bool jsRanThisTick = false;
+        if(jsPollTimers() > 0) {
+            markContentDirty();
+            jsRanThisTick = true;
+        }
+
+        /* 7b. Async fetch settlement: drain completed worker-thread HTTP jobs
+         * and settle their promises on the VM thread. A settlement may trigger
+         * React state updates that dirty the DOM, so mark content. */
+        if(jsFetchPoll() > 0) {
+            markContentDirty();
+            jsRanThisTick = true;
+        }
+
+        /* 7c. Custom-element insertion reactions. React's post-deferred-data
+         * fill commit (driven by the timers/fetch above) appends <relative-time>
+         * and other catalyst elements long after customElements.define() ran its
+         * one-shot upgrade with matched=0, so they never get a connectedCallback
+         * and render as permanent grey skeletons. Upgrade any registered custom
+         * element inserted during the JS that just ran; mark content dirty so
+         * the freshly-formatted text repaints. */
+        if(jsRanThisTick && jsDrainCeUpgrades() > 0)
             markContentDirty();
 
         /* 8. images whose load was deferred during the build (set by
@@ -1627,10 +1870,49 @@ void EWebEngine::engineLoop()
 
         /* 9. render the viewport if the page changed or the scroll offset
          * moved away from what the cache holds. engineRenderFrame is a no-op
-         * while a previous frame still awaits adoption (back-pressure). */
-        if(m_doc && (!m_cacheValid || m_contentDirty ||
-                     m_engineScrollX != m_cacheScrollX ||
-                     m_engineScrollY != m_cacheScrollY)) {
+         * while a previous frame still awaits adoption (back-pressure).
+         *
+         * Defer the repaint while a one-shot ~0-ms JS macrotask is imminent
+         * (jsHasImminentTimers): React's scheduler re-queues a MessageChannel
+         * continuation after every work slice, and a browser runs that message-
+         * task chain back-to-back, painting only once it drains. Repainting
+         * between slices costs a full repaint of a large DOM each time
+         * (github.com ~4.5 s), which stretched hydration to ~14 s and let
+         * deferred route data resolve before React could suspend into its
+         * dehydrated Suspense boundary - the mismatch then had no boundary to
+         * recover into. The first frame (!m_cacheValid) always paints so a
+         * capture hook never sees an empty surface.
+         *
+         * A SCROLL change is exempt from the imminent-timers defer: the cache
+         * is viewport-local, so a frame rasterized at the old offset shows the
+         * wrong slice of the page no matter how much JS is still running. Pages
+         * with a persistent timer loop (Pinterest polls forever) would otherwise
+         * never repaint after a scroll and pin the viewport to the top. Only
+         * CONTENT churn is deferred until the macrotask chain drains. */
+        /* EWEB_RDDUMP: one-shot ancestor-chain layout dump (diagnostic). */
+        static bool rdDumped = false;
+        if(!rdDumped && getenv("EWEB_RDDUMP") != nullptr && m_doc &&
+           (ticMs() - m_swapAtMs) > 8000) {
+            rdDumped = true;
+            litehtml::element* art = rdFindMarkdown(m_doc->root());
+            if(art != nullptr) {
+                rdDumpChain(art);
+                fprintf(stderr, "[rddump] --- wrapper children ---\n");
+                rdDumpChildren(art->parent(), 0);
+            } else fprintf(stderr, "[rddump] markdown-body NOT FOUND\n");
+        }
+
+        bool scrollMoved = m_doc && (m_engineScrollX != m_cacheScrollX ||
+                                     m_engineScrollY != m_cacheScrollY);
+        /* Cap the imminent-timers defer: content that has stayed dirty past
+         * kRepaintDeferMaxMs without a paint is flushed anyway, so a page with
+         * a perpetual ~0-ms macrotask chain cannot starve the surface of
+         * content the DOM already committed. */
+        bool deferPaint = jsHasImminentTimers() &&
+                          (m_contentDirtySince == 0 ||
+                           (ticMs() - m_contentDirtySince) < kRepaintDeferMaxMs);
+        if(m_doc && (!m_cacheValid || scrollMoved ||
+                     (m_contentDirty && !deferPaint))) {
             engineRenderFrame(true);
         }
 
@@ -1760,6 +2042,12 @@ bool EWebEngine::engineHandleCommand(const EWebCmd& cmd)
     case ECMD_STOP:
         /* Interrupt the in-flight build/fetches and discard the half-built
          * page, keeping whatever is already on screen. */
+        {
+            static int imgdbgA = -1;
+            if(imgdbgA < 0) { const char* e = getenv("EWEB_IMGDBG"); imgdbgA = (e && e[0] == '1') ? 1 : 0; }
+            if(imgdbgA)
+                fprintf(stderr, "[IMGDBG] STOP cmd t=%u\n", (uint32_t)ticMs());
+        }
         engineAbortBuild();
         engineDropPendingWork();
         return true;
@@ -1991,6 +2279,12 @@ void EWebEngine::engineNavigate(const std::string& url)
      * The visible page (m_doc) is deliberately NOT freed here - it stays on
      * screen under the build overlay until BUILD_SWAP_DOC replaces it and
      * defers its deletion to a later loop iteration. */
+    {
+        static int imgdbg9 = -1;
+        if(imgdbg9 < 0) { const char* e = getenv("EWEB_IMGDBG"); imgdbg9 = (e && e[0] == '1') ? 1 : 0; }
+        if(imgdbg9)
+            fprintf(stderr, "[IMGDBG] NAVIGATE -> %.80s t=%u\n", url.c_str(), (uint32_t)ticMs());
+    }
     engineDropPendingWork();
     cleanupBuildResources();
 
@@ -2041,6 +2335,17 @@ void EWebEngine::engineAbortBuild()
 
 void EWebEngine::engineDropPendingWork()
 {
+    {
+        static int imgdbg8 = -1;
+        if(imgdbg8 < 0) { const char* e = getenv("EWEB_IMGDBG"); imgdbg8 = (e && e[0] == '1') ? 1 : 0; }
+        if(imgdbg8) {
+            pthread_mutex_lock(&m_resultMutex);
+            int qsz = (int)m_resultQueue.size();
+            pthread_mutex_unlock(&m_resultMutex);
+            fprintf(stderr, "[IMGDBG] DROP pending-work q=%d phase=%d t=%u\n",
+                qsz, (int)m_buildPhase, (uint32_t)ticMs());
+        }
+    }
     /* ENGINE-THREAD ONLY. Discard the downloads queued or already fetched for
      * the page being terminated:
      *   - empty the not-yet-started task queue, releasing a dropped
@@ -2107,9 +2412,11 @@ void EWebEngine::engineEnsureFramePool()
      * m_freeFrames for engineRenderFrame to draw into, and drop any spare
      * whose size no longer matches the client (a stale buffer the embedder
      * returned after a resize). Guarded by m_uiMutex because the UI thread
-     * returns buffers to m_freeFrames there (releaseFrame). */
+     * returns buffers to m_freeFrames there (releaseFrame).
+     * The buffer is kFrameOverscan logical px TALLER on each side so the
+     * embedder can shift-blit during scroll without exposing a gap. */
     int w = m_clientWidth > 0 ? m_clientWidth : 1;
-    int h = m_clientHeight > 0 ? m_clientHeight : 1;
+    int h = (m_clientHeight > 0 ? m_clientHeight : 1) + 2 * kFrameOverscan;
     pthread_mutex_lock(&m_uiMutex);
     for(size_t i = 0; i < m_freeFrames.size(); ) {
         eweb_surface_t* b = m_freeFrames[i];
@@ -2171,8 +2478,9 @@ void EWebEngine::engineRenderFrame(bool full)
     pthread_mutex_lock(&m_uiMutex);
     bool pending = (m_pendingFrame != nullptr);
     pthread_mutex_unlock(&m_uiMutex);
-    if(pending)
+    if(pending) {
         return;   /* UI has not adopted the last frame yet */
+    }
 
     /* Committing a frame must never paint a tree whose layout is still pending.
      * The paint walk dereferences every stacking context's m_positioned - a
@@ -2708,6 +3016,8 @@ litehtml::element* EWebEngine::hitElementAt(int cx, int cy)
     if(doc == nullptr) return nullptr;
     litehtml::element::ptr root = doc->root();
     if(root == nullptr) return nullptr;
+    /* Note the scroll so position:sticky boxes hit-test where they are pinned. */
+    doc->set_hit_scroll(m_engineScrollX, m_engineScrollY);
     litehtml::element::ptr t =
         root->get_element_by_point(cx + m_engineScrollX, cy + m_engineScrollY, cx, cy);
     return t;
@@ -2974,10 +3284,10 @@ bool EWebEngine::selectPopupRect(litehtml::position& out, int& rowH, int& visibl
 
     litehtml::position pl = ((litehtml::element*)w)->get_placement();
     int px = pl.x - m_engineScrollX;
-    int py = pl.y - m_engineScrollY + pl.height;   /* just below the control */
+    int py = pl.y - m_engineScrollY + pl.height + kFrameOverscan;   /* just below the control, in cache coords (overscan-adjusted) */
     int h = visibleRows * rowH + 2;
     /* Flip above the control when it would overflow the viewport bottom. */
-    if(py + h > m_clientHeight) py = pl.y - m_engineScrollY - h;
+    if(py + h > m_clientHeight + kFrameOverscan) py = pl.y - m_engineScrollY - h + kFrameOverscan;
     if(py < 0) py = 0;
     out.x = px; out.y = py; out.width = pl.width; out.height = h;
     return true;
@@ -3026,6 +3336,8 @@ void EWebEngine::cleanupBuildResources()
     m_jsScriptWaitSince = 0;
     m_jsPostSwapRun = false;
     m_jsPostSwapAt = 0;
+    m_postSwapSkelLatch = false;
+    m_jsLoadFired = false;
     m_jsProgressiveActive = false;
     m_jsLastFlushAt = 0;
     m_jsFlushCostMs = 0;
@@ -3419,7 +3731,16 @@ bool EWebEngine::addTask(const EWebTask& task)
 
     if(spawn) {
         pthread_t tid;
-        if(pthread_create(&tid, NULL, _ew_task_thread, this) != 0) {
+        /* Task bodies can recurse (module compile / layout off the engine
+         * thread); the default 512 KB pthread stack overflows into the guard
+         * page on deep github hydration work (EXC_BAD_ACCESS code=2 in
+         * memmove). Give workers the same headroom class as the engine. */
+        pthread_attr_t tattr;
+        pthread_attr_init(&tattr);
+        pthread_attr_setstacksize(&tattr, 8 * 1024 * 1024);
+        int task_rc = pthread_create(&tid, &tattr, _ew_task_thread, this);
+        pthread_attr_destroy(&tattr);
+        if(task_rc != 0) {
             pthread_mutex_lock(&m_taskMutex);
             m_taskThreads--;
             /* The queued task stays; wake whoever can still take it. */
@@ -3595,6 +3916,11 @@ bool EWebEngine::loadImageTask(const std::string& url)
     }
     EWEB_LOG("[ewebview] image result ready: url=%s hash=%08x ok=%d size=%d\n",
         url.c_str(), debug_hash_text(url), result.ok ? 1 : 0, sz);
+    static int imgdbg = -1;
+    if(imgdbg < 0) { const char* e = getenv("EWEB_IMGDBG"); imgdbg = (e && e[0] == '1') ? 1 : 0; }
+    if(imgdbg)
+        fprintf(stderr, "[IMGDBG] fetch done url=%.90s http_sz=%d decoded=%d ok=%d\n",
+            url.c_str(), sz, result.image ? 1 : 0, result.ok ? 1 : 0);
     pushResult(result);
     removeTask(url);
     EWEB_LOG("[ewebview] fetched image: ok=%d size=%d cost=%u ms\n",
@@ -3732,6 +4058,11 @@ bool EWebEngine::mountDecodedImage(const std::string& url, eweb_surface_t* img)
      * work here. */
     bool res = false;
     if(m_doc == nullptr && m_buildDoc == nullptr) {
+        static int imgdbg5 = -1;
+        if(imgdbg5 < 0) { const char* e = getenv("EWEB_IMGDBG"); imgdbg5 = (e && e[0] == '1') ? 1 : 0; }
+        if(imgdbg5)
+            fprintf(stderr, "[IMGDBG] mount-nodoc url=%.90s img=%d phase=%d\n",
+                url.c_str(), img ? 1 : 0, (int)m_buildPhase);
         EWEB_LOG("[ewebview] image mount deferred: no-doc url=%s hash=%08x\n",
             url.c_str(), debug_hash_text(url));
         return false;
@@ -3748,6 +4079,11 @@ bool EWebEngine::mountDecodedImage(const std::string& url, eweb_surface_t* img)
             markLayoutDirty(target_build);
         }
     }
+    static int imgdbg2 = -1;
+    if(imgdbg2 < 0) { const char* e = getenv("EWEB_IMGDBG"); imgdbg2 = (e && e[0] == '1') ? 1 : 0; }
+    if(imgdbg2)
+        fprintf(stderr, "[IMGDBG] mount url=%.90s img=%d res=%d build=%d\n",
+            url.c_str(), img ? 1 : 0, res ? 1 : 0, target_build ? 1 : 0);
     return res;
 }
 
@@ -3770,6 +4106,7 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     m_jsScriptSrcs.clear();
     m_jsScriptIds.clear();
     m_jsScriptDeferred.clear();
+    m_jsScriptAsync.clear();
     m_jsImportMap.clear();
     m_jsScriptDone.clear();
     m_jsScriptEls.clear();
@@ -3778,6 +4115,7 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     m_jsCurScriptEl = nullptr;
     m_jsCurScriptElUrl.clear();
     m_jsBuildHasModules = false;
+    m_jsStreamingSsr = false;
     /* Detect the `no-js` progressive-enhancement class on <html> before any
      * script runs. Pages like apple.com ship `<html class="no-js">` plus an
      * inline handler that strips it once JS is confirmed; their CSS exposes
@@ -3800,19 +4138,82 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
      * URLs) and lower <picture>/<source srcSet> to plain <img src> for litehtml
      * (which has no <picture> or srcSet support). */
     std::string preprocessed = preprocess_noscript_picture(content);
-    /* TEMP: dump preprocessed HTML to /tmp for debugging */
-    { FILE* _dbg = fopen("/tmp/eweb_preprocessed.html", "w");
-      if(_dbg) { fwrite(preprocessed.data(), 1, preprocessed.size(), _dbg); fclose(_dbg); } }
+    /* Streaming-SSR detection: React 18 streaming shells ship hidden
+     * <div id="S:n"> segments plus trailing inline $RC("B:n","S:n") reveal
+     * scripts (and <template id="B:n"> placeholders). The reveal inline scripts
+     * are the LAST slots in the script queue; the post-swap live budget must not
+     * drop them or the streamed content stays hidden and the page paints blank.
+     * Flag the build so the script runner grants the large skeleton budget. */
+    if(preprocessed.find("id=\"S:") != std::string::npos &&
+       preprocessed.find("$RC(") != std::string::npos)
+        m_jsStreamingSsr = true;
+    /* EWEB_HTMLDUMP=1: write the raw and preprocessed HTML of every navigation
+     * to /tmp/eweb_raw.html and /tmp/eweb_preprocessed.html so SSR-markup
+     * parity questions (noscript/picture/script presence) can be answered
+     * offline. Gated: an unconditional dump is overwritten by any local probe
+     * run before the live capture can be copied away. */
+    if(::getenv("EWEB_HTMLDUMP") != nullptr) {
+        FILE* _r = fopen("/tmp/eweb_raw.html", "w");
+        if(_r) { fwrite(content.data(), 1, content.size(), _r); fclose(_r); }
+        FILE* _dbg = fopen("/tmp/eweb_preprocessed.html", "w");
+        if(_dbg) { fwrite(preprocessed.data(), 1, preprocessed.size(), _dbg); fclose(_dbg); }
+    }
+    std::vector<char> scriptAsync;   /* per-slot: 1 = async external <script src> */
     m_buildHtmlContent = extract_scripts(preprocessed, m_jsEnabled ? &m_jsScripts : nullptr,
                                          m_jsEnabled ? &m_jsScriptSrcs : nullptr,
                                          m_jsEnabled ? &m_jsScriptIds : nullptr,
                                          m_jsEnabled ? &m_jsScriptDeferred : nullptr,
+                                         m_jsEnabled ? &scriptAsync : nullptr,
                                          m_jsEnabled ? &m_jsImportMap : nullptr,
                                          m_jsEnabled ? &m_jsHasInlineHandlers : nullptr,
                                          &m_jsBuildHasModules);
-    /* TEMP: dump final HTML to /tmp for debugging */
-    { FILE* _dbg2 = fopen("/tmp/eweb_final.html", "w");
-      if(_dbg2) { fwrite(m_buildHtmlContent.data(), 1, m_buildHtmlContent.size(), _dbg2); fclose(_dbg2); } }
+    /* TEMP: dump final HTML to /tmp for debugging (unique name: the old
+     * fixed path kept showing stale content from unrelated runs). */
+    { FILE* _dbg2 = fopen("/tmp/eweb_final_rk.html", "w");
+      if(_dbg2) { fwrite(m_buildHtmlContent.data(), 1, m_buildHtmlContent.size(), _dbg2); fclose(_dbg2); }
+      else fprintf(stderr, "[htmldump] eweb_final_rk fopen FAILED errno=%d\n", errno); }
+    /* Browser async-script ordering (DEFAULT ON): an `async` <script src> holds
+     * no document-order slot in a real browser - it executes when its fetch
+     * lands, which in practice is after the parser has already run every inline
+     * script (including the end-of-body React streaming-SSR $RC(...) reveals).
+     * Pure document order can let an async bundle's hydrateRoot fire BEFORE
+     * those reveals, so hydration diffs against un-revealed Suspense markup;
+     * keeping "reveals before hydrateRoot" is a necessary invariant for every
+     * streaming-SSR site (it is not sufficient on its own - rokid's residual
+     * #418/#423 needed the react-dom t5-widen patch in EWebJs.cc). Two
+     * known-good shapes:
+     *   - sites whose hydration entry is a "_client" ESM bundle (pinterest):
+     *     provider chunks must stay EARLY (they settle data thenables) and only
+     *     the entry moves last -> ewebOrderClientBundleLast;
+     *   - everyone else (rokid/Next): every async chunk belongs to the app and
+     *     must follow the inline reveals -> ewebOrderAsyncScriptsLast.
+     * Must happen before m_jsScriptDone/m_jsScriptEls are assigned below so
+     * they inherit the reordered slots. EWEB_NO_ASYNC_REORDER disables for A/B. */
+    if(m_jsEnabled && ::getenv("EWEB_NO_ASYNC_REORDER") == nullptr) {
+        bool hasClientBundle = false;
+        for(size_t i = 0; i < m_jsScriptSrcs.size() && i < scriptAsync.size(); ++i)
+            if(scriptAsync[i] && m_jsScriptSrcs[i].find("_client") != std::string::npos)
+                { hasClientBundle = true; break; }
+        if(::getenv("EWEB_CLIENT_LAST") != nullptr || hasClientBundle) {
+            ewebOrderClientBundleLast(m_jsScripts, m_jsScriptSrcs, m_jsScriptIds,
+                                      m_jsScriptDeferred, scriptAsync);
+        } else {
+            ewebOrderAsyncScriptsLast(m_jsScripts, m_jsScriptSrcs, m_jsScriptIds,
+                                      m_jsScriptDeferred, scriptAsync);
+        }
+    }
+    /* Persist the (post-reorder) async flags parallel to m_jsScripts so the
+     * run sites can bracket readyState per script flavour (see the member). */
+    m_jsScriptAsync = scriptAsync;
+    /* EWEB_SCRIPTDUMP: final queue order with per-slot async/defer flags and
+     * src, so ordering hypotheses can be checked against the real queue. */
+    if(m_jsEnabled && ::getenv("EWEB_SCRIPTDUMP") != nullptr) {
+        for(size_t i = 0; i < m_jsScripts.size(); ++i)
+            fprintf(stderr, "[SQ] i=%zu a=%d d=%d id=%s src=%s\n", i,
+                    (int)(i < scriptAsync.size() ? scriptAsync[i] : 0),
+                    (int)(i < m_jsScriptDeferred.size() ? m_jsScriptDeferred[i] : 0),
+                    m_jsScriptIds[i].c_str(), m_jsScriptSrcs[i].c_str());
+    }
     /* Mark each slot ready/pending: an external <script src> starts pending and
      * is filled when its EWEB_TASK_SCRIPT fetch lands; inline bodies are ready
      * now. extract_scripts keeps m_jsScriptSrcs the same length as m_jsScripts. */
@@ -3849,7 +4250,15 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     m_jsScriptWaitSince = 0;
     m_jsPostSwapRun = false;
     m_jsPostSwapAt = 0;
+    m_postSwapSkelLatch = false;
+    m_jsLoadFired = false;
     m_buildHtmlUrl = m_currentHtmlUrl;
+    /* Kick the background ES-module prefetch (document URL is now set):
+     * workers start pulling the module <script src>s and import-map targets,
+     * and fan out along each fetched body's import graph, so the VM's
+     * synchronous module evaluation mostly hits the cache instead of the
+     * network. */
+    jsSeedPrefetch();
     if(!m_defaultCSSUrl.empty()) {
         m_buildPhase = BUILD_PRELOAD_CSS;
     } else {
@@ -3942,6 +4351,11 @@ void EWebEngine::pushResult(const EWebResult& result)
     pthread_mutex_lock(&m_resultMutex);
     m_resultQueue.push_back(result);
     if(result.type == EWEB_TASK_IMAGE) {
+        static int imgdbg7 = -1;
+        if(imgdbg7 < 0) { const char* e = getenv("EWEB_IMGDBG"); imgdbg7 = (e && e[0] == '1') ? 1 : 0; }
+        if(imgdbg7)
+            fprintf(stderr, "[IMGDBG] push url=%.80s img=%d ok=%d q=%d\n",
+                result.url.c_str(), result.image ? 1 : 0, result.ok ? 1 : 0, (int)m_resultQueue.size());
         EWEB_LOG("[ewebview] push image result: queue=%d url=%s hash=%08x ok=%d size=%d\n",
             (int)m_resultQueue.size(), result.url.c_str(), debug_hash_text(result.url),
             result.ok ? 1 : 0, (int)result.content.size());
@@ -3972,6 +4386,24 @@ bool EWebEngine::processResults()
 {
     EWebResult result;
     bool drive_build = false;
+    {
+        static int imgdbgB = -1;
+        if(imgdbgB < 0) { const char* e = getenv("EWEB_IMGDBG"); imgdbgB = (e && e[0] == '1') ? 1 : 0; }
+        if(imgdbgB) {
+            static uint32_t s_pr_calls = 0;
+            s_pr_calls++;
+            /* Sample 1-in-2000 to keep the log readable; the point is to prove
+             * the engine still reaches processResults while image results
+             * pile up undelivered. */
+            if(s_pr_calls % 2000 == 1) {
+                pthread_mutex_lock(&m_resultMutex);
+                int qsz = (int)m_resultQueue.size();
+                pthread_mutex_unlock(&m_resultMutex);
+                fprintf(stderr, "[IMGDBG] processResults poll#%u q=%d phase=%d postswap=%d t=%u\n",
+                    s_pr_calls, qsz, (int)m_buildPhase, m_jsPostSwapRun ? 1 : 0, (uint32_t)ticMs());
+            }
+        }
+    }
     if(!getResult(result)) {
         return false;
     }
@@ -3986,6 +4418,11 @@ bool EWebEngine::processResults()
     if(result.type == EWEB_TASK_IMAGE && m_buildPhase != BUILD_IDLE && !m_jsPostSwapRun) {
         EWEB_LOG("[ewebview] process image deferred by build: size=%d phase=%d\n",
             (int)result.content.size(), (int)m_buildPhase);
+        static int imgdbg3 = -1;
+        if(imgdbg3 < 0) { const char* e = getenv("EWEB_IMGDBG"); imgdbg3 = (e && e[0] == '1') ? 1 : 0; }
+        if(imgdbg3)
+            fprintf(stderr, "[IMGDBG] DEFER url=%.80s phase=%d postswap=%d t=%u\n",
+                result.url.c_str(), (int)m_buildPhase, m_jsPostSwapRun ? 1 : 0, (uint32_t)ticMs());
         pthread_mutex_lock(&m_resultMutex);
         m_resultQueue.insert(m_resultQueue.begin(), result);
         pthread_mutex_unlock(&m_resultMutex);
@@ -4019,6 +4456,9 @@ bool EWebEngine::processResults()
     if(!result.ok) {
         if(result.type == EWEB_TASK_IMAGE) {
             EWEB_LOG("[ewebview] image load failed\n");
+            /* The fetch itself failed (network error / 404): settle any img
+             * parked on this url's onerror. */
+            jsFireImgElEvent(result.url, "error");
         }
         if(result.type == EWEB_TASK_CSS) {
             forgetCSS(result.url);
@@ -4027,6 +4467,9 @@ bool EWebEngine::processResults()
              * and a 404'd sheet must not make them wait out their caps. */
             if(m_pendingCss > 0)
                 m_pendingCss--;
+            /* A dynamic <link> that parked its chunk promise on onerror must be
+             * told the sheet failed, else the chunk promise strands forever. */
+            jsFireLinkElEvent(result.url, "error");
             if(result.url == m_defaultCSSUrl) {
                 m_defaultCssLoading = false;
                 m_defaultCssPrepared = true;
@@ -4047,8 +4490,17 @@ bool EWebEngine::processResults()
     }
     else if(result.type == EWEB_TASK_CSS) {
         loadCSSContent(result.url, result.content);
+        /* Settle any dynamic <link rel=stylesheet> that parked its chunk promise
+         * on onload (Rspack miniCss): the sheet is now applied. */
+        jsFireLinkElEvent(result.url, "load");
     }
     else if(result.type == EWEB_TASK_IMAGE) {
+        static int imgdbg4 = -1;
+        if(imgdbg4 < 0) { const char* e = getenv("EWEB_IMGDBG"); imgdbg4 = (e && e[0] == '1') ? 1 : 0; }
+        if(imgdbg4)
+            fprintf(stderr, "[IMGDBG] dispatch url=%.80s img=%d ok=%d mdoc=%d bdoc=%d phase=%d\n",
+                result.url.c_str(), result.image ? 1 : 0, result.ok ? 1 : 0,
+                m_doc ? 1 : 0, m_buildDoc ? 1 : 0, (int)m_buildPhase);
         bool mounted = false;
         if(result.image != nullptr) {
             mounted = mountDecodedImage(result.url, result.image);
@@ -4060,17 +4512,32 @@ bool EWebEngine::processResults()
         }
         if(!mounted) {
             bool retry_later = (m_doc == nullptr && m_buildDoc == nullptr);
+            static int imgdbg6 = -1;
+            if(imgdbg6 < 0) { const char* e = getenv("EWEB_IMGDBG"); imgdbg6 = (e && e[0] == '1') ? 1 : 0; }
+            if(imgdbg6)
+                fprintf(stderr, "[IMGDBG] dispatch-fail url=%.80s retry=%d img=%d phase=%d\n",
+                    result.url.c_str(), retry_later ? 1 : 0, result.image ? 1 : 0, (int)m_buildPhase);
             if(retry_later) {
                 pthread_mutex_lock(&m_resultMutex);
                 m_resultQueue.insert(m_resultQueue.begin(), result);
                 pthread_mutex_unlock(&m_resultMutex);
                 EWEB_LOG("[ewebview] image result requeued: url=%s hash=%08x size=%d\n",
                     result.url.c_str(), debug_hash_text(result.url), (int)result.content.size());
-            } else if(result.image != nullptr) {
-                /* Not requeued and not mounted: release the decoded surface. */
-                m_port.gfx.surface_free(m_port.gfx.ud, result.image);
-                result.image = nullptr;
+            } else {
+                /* Permanent failure (no doc to retry into, or the decode/mount
+                 * failed): settle any img parked on this url's onerror. */
+                jsFireImgElEvent(result.url, "error");
+                if(result.image != nullptr) {
+                    /* Not requeued and not mounted: release the decoded surface. */
+                    m_port.gfx.surface_free(m_port.gfx.ud, result.image);
+                    result.image = nullptr;
+                }
             }
+        } else {
+            /* Settle any img parked on this url's onload (React's preload-then-
+             * append waits on it; see jsMaybePreloadImage). No-op when no script
+             * set this src (a parser-path image never registers a waiter). */
+            jsFireImgElEvent(result.url, "load");
         }
     }
     EWEB_LOG("[ewebview] process result total: type=%d cost=%u ms\n",
@@ -4429,6 +4896,7 @@ void EWebEngine::advanceBuildStep()
             m_buildHtmlContent.clear();
             m_buildHtmlUrl.clear();
             m_jsPostSwapRun = false;
+            m_postSwapSkelLatch = false;
             m_buildPhase = BUILD_IDLE;
         }
         if(more) {
@@ -4558,6 +5026,11 @@ void EWebEngine::advanceBuildStep()
         }
         m_jsPostSwapRun = run_after;
         m_jsPostSwapAt = run_after ? ticMs() : 0;
+        m_postSwapSkelLatch = false;   /* fresh phase re-latches from the probe */
+        /* Load fires when this parser-extracted prefix finishes (see
+         * m_jsInitialScriptCount); dynamic chunks appended later run post-load. */
+        m_jsInitialScriptCount = m_jsScripts.size();
+        m_jsLoadFired = false;
         m_buildPhase = run_after ? BUILD_RUN_JS : BUILD_IDLE;
         /* The page on screen changed: re-arm the blank-SPA notice decision
          * for whatever just swapped in. */
@@ -4624,14 +5097,17 @@ void EWebEngine::advanceBuildStep()
 }
 
 static void ewebDumpLayoutFile(FILE* f, litehtml::element* el, int depth);
+
 void EWebEngine::drawPageToCacheLocked(int stripY, int stripH)
 {
     /* ENGINE-THREAD ONLY: m_doc and m_pageCache (the pooled buffer the engine
-     * is drawing into) are valid. The cache is viewport-local: the document
-     * origin is (-m_engineScrollX, -m_engineScrollY) and the clip strip is in
-     * cache coordinates. The surface clip backs up litehtml's own per-element
-     * clipping (does_intersect) so a partial strip draw can never spill over
-     * the shifted rows around it. */
+     * is drawing into) are valid. The cache is viewport-local PLUS overscan:
+     * the buffer is kFrameOverscan rows taller on each side so the embedder can
+     * shift-blit during scroll without exposing a gap.  The document origin is
+     * (-m_engineScrollX, kFrameOverscan - m_engineScrollY) in cache coordinates
+     * and the clip strip is in cache coordinates. The surface clip backs up
+     * litehtml's own per-element clipping (does_intersect) so a partial strip
+     * draw can never spill over the shifted rows around it. */
     eweb_surface_t* cache = m_pageCache;
     int cacheW = surfaceW(cache);
     int cacheH = surfaceH(cache);
@@ -4649,11 +5125,35 @@ void EWebEngine::drawPageToCacheLocked(int stripY, int stripH)
     }
     uint64_t draw_start = ticMs();
     litehtml::position pos(0, stripY, cacheW, stripH);
-    m_doc->draw((litehtml::uint_ptr)cache, -m_engineScrollX, -m_engineScrollY, &pos);
+    /* Draw offset: the viewport origin sits at row kFrameOverscan in the
+     * buffer, so the document is shifted down by that amount.  This renders
+     * kFrameOverscan extra rows above and below the viewport. */
+    int drawOfsX = -m_engineScrollX;
+    int drawOfsY = kFrameOverscan - m_engineScrollY;
+    /* Tell the document where the viewport sits inside the buffer so the
+     * fixed-position paint path (anchored at the client rect, not at the
+     * scrolled document origin) and the sticky pin math (true scroll =
+     * vp_origin - y) land on their viewport rows instead of 128px high. */
+    m_doc->set_draw_vp_origin_y(kFrameOverscan);
+    if(getenv("EWEB_DOCID") != nullptr) {
+        static int s_drawFp = 0;
+        if((s_drawFp++ % 200) == 0) {
+            fprintf(stderr, "[DRAWFP] doc=%p %dx%d els=%d scroll=%d,%d\n",
+                    (void*)m_doc, m_doc->width(), m_doc->height(),
+                    ewebCountEls(m_doc->root()), m_engineScrollX, m_engineScrollY);
+            if(m_doc->width() > cacheW) {
+                int budget = 48;
+                ewebDumpWideEls(m_doc->root(), cacheW, &budget);
+                int obudget = 10;
+                ewebDumpOverflowEls(m_doc->root(), 0, &obudget);
+            }
+        }
+    }
+    m_doc->draw((litehtml::uint_ptr)cache, drawOfsX, drawOfsY, &pos);
     /* Blit any <canvas> backing stores over the laid-out page, using the same
      * offset as m_doc->draw so canvases track scroll; the clip confines them
      * to the strip. litehtml itself draws nothing for <canvas>. */
-    compositeCanvases(cache, -m_engineScrollX, -m_engineScrollY);
+    compositeCanvases(cache, drawOfsX, drawOfsY);
     /* An open <select> dropdown floats above the page: draw it last so it is
      * never covered by the laid-out document. No-op unless one is open. */
     drawSelectPopup(cache);
@@ -4661,6 +5161,53 @@ void EWebEngine::drawPageToCacheLocked(int stripY, int stripH)
      * decideModuleNotice() armed it. */
     if(m_showModuleNotice)
         drawModuleNotice(cache, cacheW, cacheH);
+
+    /* Fill the OVERSCAN rows that fall outside the document's painted extent
+     * with the nearest viewport-edge colour, so a scroll-shift blit that runs
+     * past the top/bottom of the page never exposes the raw white clear.
+     *
+     * The document was drawn at offset drawOfsY = kFrameOverscan - scrollY, so
+     * document Y maps to cache row (Y + kFrameOverscan - scrollY).  Content
+     * therefore occupies cache rows [kFrameOverscan - scrollY,
+     * kFrameOverscan - scrollY + docHeight]; rows outside that range still hold
+     * the initial white fill.  Only those blank rows are recoloured - real
+     * overscan content (the strips above/below the viewport when scrolled into
+     * the middle of a page) is left untouched. */
+    if(m_port.gfx.get_pixel != nullptr && m_port.gfx.fill_rect != nullptr && m_doc != nullptr) {
+        int clientH  = m_clientHeight > 0 ? m_clientHeight : 1;
+        int docH     = m_doc->height();
+        int contentTop = kFrameOverscan - m_engineScrollY;             /* cache row of doc Y=0   */
+        int contentBot = contentTop + docH;                            /* cache row of doc Y=docH */
+        int vpTop = kFrameOverscan;
+        int vpBot = kFrameOverscan + clientH - 1;
+        if(vpTop >= cacheH) vpTop = cacheH - 1;
+        if(vpBot >= cacheH) vpBot = cacheH - 1;
+
+        /* Blank rows ABOVE the document (only when scrolled near the top). */
+        int topBlankEnd = contentTop;                 /* exclusive */
+        if(topBlankEnd > vpTop) topBlankEnd = vpTop;  /* never touch the viewport */
+        if(topBlankEnd > 0) {
+            int sampleRow = contentTop;
+            if(sampleRow < 0) sampleRow = 0;
+            if(sampleRow >= cacheH) sampleRow = cacheH - 1;
+            uint32_t col = m_port.gfx.get_pixel(m_port.gfx.ud, cache, cacheW / 2, sampleRow);
+            col |= 0xFF000000u;
+            m_port.gfx.fill_rect(m_port.gfx.ud, cache, 0, 0, cacheW, topBlankEnd, col);
+        }
+
+        /* Blank rows BELOW the document (only when scrolled near the bottom). */
+        int botBlankStart = contentBot + 1;
+        if(botBlankStart < vpBot + 1) botBlankStart = vpBot + 1;   /* never touch the viewport */
+        if(botBlankStart < cacheH) {
+            int sampleRow = contentBot;
+            if(sampleRow < 0) sampleRow = 0;
+            if(sampleRow >= cacheH) sampleRow = cacheH - 1;
+            uint32_t col = m_port.gfx.get_pixel(m_port.gfx.ud, cache, cacheW / 2, sampleRow);
+            col |= 0xFF000000u;
+            m_port.gfx.fill_rect(m_port.gfx.ud, cache, 0, botBlankStart, cacheW, cacheH - botBlankStart, col);
+        }
+    }
+
     if(m_port.gfx.surface_unset_clip != nullptr)
         m_port.gfx.surface_unset_clip(m_port.gfx.ud, cache);
     static const char* layoutDump = getenv("EWEB_LAYOUTDUMP");
@@ -4910,6 +5457,16 @@ static void ewebDumpLayoutFile(FILE* f, litehtml::element* el, int depth)
     if(cls != nullptr) fprintf(f, " class=\"%.80s\"", cls);
     const litehtml::tchar_t* inline_style = el->get_attr(_t("style"), nullptr);
     if(inline_style != nullptr) fprintf(f, " style=\"%.160s\"", inline_style);
+    /* Replaced-element payload: whether an <img> carries a loadable src/srcset
+     * (vs an empty/lazy placeholder) is the single fact that separates a real
+     * picture from a grey box, so surface it in the dump. Truncated: data URIs
+     * and signed CDN URLs are long. */
+    if(tag != nullptr && !t_strcasecmp(tag, _t("img"))) {
+        const litehtml::tchar_t* src = el->get_attr(_t("src"), nullptr);
+        if(src != nullptr) fprintf(f, " src=\"%.140s\"", src);
+        const litehtml::tchar_t* srcset = el->get_attr(_t("srcset"), nullptr);
+        if(srcset != nullptr) fprintf(f, " srcset=\"%.140s\"", srcset);
+    }
     fprintf(f, "> %s visible=%d", (disp >= 0 && disp < (int)(sizeof(DISP)/sizeof(DISP[0]))) ? DISP[disp] : "?", el->is_visible() ? 1 : 0);
     if(epos > 0 && epos < 4) fprintf(f, " pos=%s", POS[epos]);
     if(el->get_float() != litehtml::float_none) fprintf(f, " float");
@@ -4918,9 +5475,11 @@ static void ewebDumpLayoutFile(FILE* f, litehtml::element* el, int depth)
      * failures. This remains behind EWEB_LAYOUTDUMP and has no runtime effect
      * unless that diagnostic output is explicitly requested. */
     static const char* SIZE_PROPS[] = {
+        "display", "flex-direction", "flex-wrap", "overflow", "overflow-x",
         "width", "height", "min-width", "min-height", "max-width", "max-height",
         "flex", "flex-basis", "flex-grow", "flex-shrink", "align-items", "align-self",
-        "grid-template-columns", "grid-template-rows"
+        "grid-template-columns", "grid-template-rows",
+        "clip", "clip-path", "white-space", "font-size", "line-height", "position"
     };
     for(const char* prop : SIZE_PROPS) {
         const litehtml::tchar_t* value = el->get_style_property(_t(prop), false, nullptr);
@@ -5018,7 +5577,12 @@ void EWebEngine::drawModuleNotice(eweb_surface_t* cache, int cacheW, int cacheH)
     const int size = 16;
     eweb_font_metrics_t fm;
     m_port.font.metrics(m_port.font.ud, m_noticeFont, size, &fm);
-    int y = cacheH / 2 - (fm.height + 4);
+    /* Centre the notice in the VIEWPORT portion of the cache (the buffer
+     * includes kFrameOverscan rows above and below the visible area). */
+    int vpTop = kFrameOverscan;
+    int vpH = cacheH - 2 * kFrameOverscan;
+    if(vpH < 1) vpH = cacheH;
+    int y = vpTop + vpH / 2 - (fm.height + 4);
     for(int i = 0; i < 2; i++) {
         int w = 0, h = 0;
         m_port.font.text_size(m_port.font.ud, m_noticeFont, size, lines[i], &w, &h);
@@ -5061,7 +5625,8 @@ void EWebEngine::handleAnchorClick(int cx, int cy)
 
     /* Hit test in unscrolled document coordinates (add the engine scroll
      * offsets); the client-relative pair is what position:fixed elements test
-     * against. */
+     * against. Note the scroll first so sticky boxes test where they pin. */
+    doc->set_hit_scroll(m_engineScrollX, m_engineScrollY);
     litehtml::element::ptr target =
         root->get_element_by_point(cx + m_engineScrollX, cy + m_engineScrollY, cx, cy);
 

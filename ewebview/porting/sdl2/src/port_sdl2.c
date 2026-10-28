@@ -124,6 +124,8 @@ typedef struct {
     int       size;
     TTF_Font* face;       /* primary (CSS family) face */
     TTF_Font* fb;         /* CJK fallback face, NULL when primary == fallback */
+    TTF_Font* sy;         /* symbols/dingbats fallback face, NULL when absent */
+    TTF_Font* em;         /* emoji fallback face, NULL when absent */
 } sdl_face_slot_t;
 
 /* One concrete face: file + index (a plain .ttc face index, or a variable
@@ -142,6 +144,8 @@ typedef struct {
     int             resolved;     /* prim/fb filled in on first face open */
     sdl_face_spec_t prim;         /* face matching the CSS family */
     sdl_face_spec_t fb;           /* CJK fallback for glyphs prim lacks */
+    sdl_face_spec_t sy;           /* symbols/dingbats fallback for glyphs prim+fb lack */
+    sdl_face_spec_t em;           /* emoji fallback for glyphs prim+fb+sy lack */
     sdl_face_slot_t faces[SDL_FONT_MAX_FACES];
     int             face_count;
 } sdl_font_t;
@@ -938,6 +942,62 @@ static bool sdl2_file_exists(const char* path) {
     return true;
 }
 
+/* Emoji last-resort face: bundled Noto Emoji (monochrome outlines, OFL) under
+ * <program-dir>/res/fonts/. EWEBVIEW_SDL2_EMOJI_FONT pins another file. Only
+ * glyphs that BOTH the primary and the CJK face lack are taken from this face,
+ * so text-style symbols (✓ ★) keep the surrounding face while picture
+ * characters (U+1F300+, dingbats neither face covers) stop being tofu. */
+static char g_res_base[1024];   /* tentative; the = {0} definition sits by the res:// resolver below */
+static const char* sdl2_emoji_font_path(void) {
+    static char s_path[1200];
+    static int  s_state = -1;     /* -1 unknown, 0 absent, 1 present */
+    const char* env;
+    if(s_state >= 0) return s_state ? s_path : NULL;
+    s_state = 0;
+    env = SDL_getenv("EWEBVIEW_SDL2_EMOJI_FONT");
+    if(env && env[0] && sdl2_file_exists(env)) {
+        snprintf(s_path, sizeof(s_path), "%s", env);
+        s_state = 1;
+        return s_path;
+    }
+    if(g_res_base[0]) {
+        snprintf(s_path, sizeof(s_path), "%sfonts/NotoEmoji-Regular.ttf", g_res_base);
+        if(sdl2_file_exists(s_path)) {
+            s_state = 1;
+            return s_path;
+        }
+    }
+    return NULL;
+}
+
+/* Symbols/dingbats face (bundled Noto Sans Symbols 2, OFL): sits between the
+ * CJK fallback and the emoji face in the fallback chain. Noto Emoji is a
+ * picture-only font - it does NOT carry text symbols like U+2713 ✓ (only its
+ * heavy twin U+2714), so checkmarks/ballot marks/card suits stayed tofu on
+ * pages whose Latin and CJK faces both lack them. EWEBVIEW_SDL2_SYMBOLS_FONT
+ * pins another file. Same lazy singleton pattern as the emoji path. */
+static const char* sdl2_symbols_font_path(void) {
+    static char s_path[1200];
+    static int  s_state = -1;     /* -1 unknown, 0 absent, 1 present */
+    const char* env;
+    if(s_state >= 0) return s_state ? s_path : NULL;
+    s_state = 0;
+    env = SDL_getenv("EWEBVIEW_SDL2_SYMBOLS_FONT");
+    if(env && env[0] && sdl2_file_exists(env)) {
+        snprintf(s_path, sizeof(s_path), "%s", env);
+        s_state = 1;
+        return s_path;
+    }
+    if(g_res_base[0]) {
+        snprintf(s_path, sizeof(s_path), "%sfonts/NotoSansSymbols2-Regular.ttf", g_res_base);
+        if(sdl2_file_exists(s_path)) {
+            s_state = 1;
+            return s_path;
+        }
+    }
+    return NULL;
+}
+
 /* Case-insensitive substring test for face style names ("W6", "Bold", ...). */
 static bool sdl2_style_has(const char* style, const char* word) {
     size_t n = strlen(word);
@@ -1255,6 +1315,14 @@ static void sdl2_resolve_font(sdl_font_t* f) {
     bool have_prim = false;
     f->resolved = 1;
     f->prim.path = f->fb.path = NULL;
+    /* Emoji last-resort face (bundled Noto Emoji); never synthesised. */
+    f->em.path  = sdl2_emoji_font_path();
+    f->em.index = 0;
+    f->em.synth = TTF_STYLE_NORMAL;
+    /* Symbols/dingbats face (bundled Noto Sans Symbols 2); never synthesised. */
+    f->sy.path  = sdl2_symbols_font_path();
+    f->sy.index = 0;
+    f->sy.synth = TTF_STYLE_NORMAL;
     /* EWEBVIEW_SDL2_FONT pins everything to one face, as before. */
     if(!SDL_getenv("EWEBVIEW_SDL2_FONT")) {
         while(sdl2_family_token(&cur, tok, sizeof(tok))) {
@@ -1295,12 +1363,17 @@ static int sdl2_decode_utf8(const char* s, uint32_t* cp) {
 }
 
 /* Which face draws this code point: the primary whenever it has the glyph,
- * else the fallback if THAT has it, else the primary (renders its notdef).
+ * else the CJK fallback if THAT has it, else the symbols face (text-style
+ * checkmarks/dingbats), else the emoji face for the picture characters none
+ * of the others cover, else the primary (renders its notdef).
  * Control/format characters never trigger a fallback switch. */
-static TTF_Font* sdl2_face_for(TTF_Font* prim, TTF_Font* fb, uint32_t cp) {
-    if(!fb || cp < 0x80) return prim;
+static TTF_Font* sdl2_face_for(TTF_Font* prim, TTF_Font* fb, TTF_Font* sy, TTF_Font* em, uint32_t cp) {
+    if(!fb && !sy && !em) return prim;
+    if(cp < 0x80) return prim;
     if(TTF_GlyphIsProvided32(prim, cp)) return prim;
-    if(TTF_GlyphIsProvided32(fb, cp)) return fb;
+    if(fb && TTF_GlyphIsProvided32(fb, cp)) return fb;
+    if(sy && TTF_GlyphIsProvided32(sy, cp)) return sy;
+    if(em && TTF_GlyphIsProvided32(em, cp)) return em;
     return prim;
 }
 
@@ -1311,16 +1384,16 @@ static TTF_Font* sdl2_face_for(TTF_Font* prim, TTF_Font* fb, uint32_t cp) {
  * time, so "默认字体" arrives on its own - is emitted as one fallback run;
  * treating it as "not mixed" sent it to the Latin face and drew notdef boxes. */
 typedef void (*sdl2_run_fn)(TTF_Font* face, const char* run, int len, void* ud);
-static bool sdl2_for_each_run(TTF_Font* prim, TTF_Font* fb, const char* text, sdl2_run_fn fn, void* ud) {
+static bool sdl2_for_each_run(TTF_Font* prim, TTF_Font* fb, TTF_Font* sy, TTF_Font* em, const char* text, sdl2_run_fn fn, void* ud) {
     const char* p = text;
     const char* run_start = text;
     TTF_Font* run_face = NULL;
     bool mixed = false;
-    if(!fb) return false;
+    if(!fb && !sy && !em) return false;
     while(*p) {
         uint32_t cp;
         int n = sdl2_decode_utf8(p, &cp);
-        TTF_Font* face = sdl2_face_for(prim, fb, cp);
+        TTF_Font* face = sdl2_face_for(prim, fb, sy, em, cp);
         if(!run_face) run_face = face;
         else if(face != run_face) {
             mixed = true;
@@ -1338,7 +1411,7 @@ static bool sdl2_for_each_run(TTF_Font* prim, TTF_Font* fb, const char* text, sd
     while(*p) {
         uint32_t cp;
         int n = sdl2_decode_utf8(p, &cp);
-        TTF_Font* face = sdl2_face_for(prim, fb, cp);
+        TTF_Font* face = sdl2_face_for(prim, fb, sy, em, cp);
         if(run_face && face != run_face) {
             fn(run_face, run_start, (int)(p - run_start), ud);
             run_start = p;
@@ -1350,12 +1423,15 @@ static bool sdl2_for_each_run(TTF_Font* prim, TTF_Font* fb, const char* text, sd
     return true;
 }
 
-/* Open (or fetch from the per-size cache) the primary + fallback faces for
- * one pixel size. *fb is NULL when there is no separate fallback face. */
-static TTF_Font* sdl_font_faces(sdl_font_t* f, int size, TTF_Font** fb) {
+/* Open (or fetch from the per-size cache) the primary + fallback (+ symbols
+ * + emoji) faces for one pixel size. *fb / *sy / *em are NULL when there is
+ * no such face. */
+static TTF_Font* sdl_font_faces(sdl_font_t* f, int size, TTF_Font** fb, TTF_Font** sy, TTF_Font** em) {
     TTF_Font* face;
     int i;
     if(fb) *fb = NULL;
+    if(sy) *sy = NULL;
+    if(em) *em = NULL;
     if(!f) return NULL;
     if(size <= 0) size = 12;
     /* Linear scan: cache is tiny (<=24) and hits are overwhelmingly repeat
@@ -1363,6 +1439,8 @@ static TTF_Font* sdl_font_faces(sdl_font_t* f, int size, TTF_Font** fb) {
     for(i = 0; i < f->face_count; i++) {
         if(f->faces[i].size == size) {
             if(fb) *fb = f->faces[i].fb;
+            if(sy) *sy = f->faces[i].sy;
+            if(em) *em = f->faces[i].em;
             return f->faces[i].face;
         }
     }
@@ -1371,8 +1449,12 @@ static TTF_Font* sdl_font_faces(sdl_font_t* f, int size, TTF_Font** fb) {
          * holds a TTF_Font* across calls - it only sees eweb_font_t. */
         TTF_CloseFont(f->faces[0].face);
         if(f->faces[0].fb) TTF_CloseFont(f->faces[0].fb);
+        if(f->faces[0].sy) TTF_CloseFont(f->faces[0].sy);
+        if(f->faces[0].em) TTF_CloseFont(f->faces[0].em);
         f->faces[0].face = NULL;
         f->faces[0].fb = NULL;
+        f->faces[0].sy = NULL;
+        f->faces[0].em = NULL;
         f->faces[0].size = 0;
         /* Compact: shift the rest down so the next miss fills slot 0 cleanly. */
         for(i = 1; i < f->face_count; i++) f->faces[i-1] = f->faces[i];
@@ -1393,6 +1475,8 @@ static TTF_Font* sdl_font_faces(sdl_font_t* f, int size, TTF_Font** fb) {
     f->faces[f->face_count].size = size;
     f->faces[f->face_count].face = face;
     f->faces[f->face_count].fb = NULL;
+    f->faces[f->face_count].sy = NULL;
+    f->faces[f->face_count].em = NULL;
     if(f->fb.path) {
         TTF_Font* fbf = TTF_OpenFontIndex(f->fb.path, size, f->fb.index);
         if(fbf) {
@@ -1401,13 +1485,29 @@ static TTF_Font* sdl_font_faces(sdl_font_t* f, int size, TTF_Font** fb) {
             f->faces[f->face_count].fb = fbf;
         }
     }
+    if(f->sy.path) {
+        TTF_Font* syf = TTF_OpenFontIndex(f->sy.path, size, f->sy.index);
+        if(syf) {
+            TTF_SetFontHinting(syf, TTF_HINTING_NONE);
+            f->faces[f->face_count].sy = syf;
+        }
+    }
+    if(f->em.path) {
+        TTF_Font* emf = TTF_OpenFontIndex(f->em.path, size, f->em.index);
+        if(emf) {
+            TTF_SetFontHinting(emf, TTF_HINTING_NONE);
+            f->faces[f->face_count].em = emf;
+        }
+    }
     if(fb) *fb = f->faces[f->face_count].fb;
+    if(sy) *sy = f->faces[f->face_count].sy;
+    if(em) *em = f->faces[f->face_count].em;
     f->face_count++;
     return face;
 }
 
 static TTF_Font* sdl_font_face(sdl_font_t* f, int size) {
-    return sdl_font_faces(f, size, NULL);
+    return sdl_font_faces(f, size, NULL, NULL, NULL);
 }
 
 static eweb_font_t* ek_font_create_styled(void* ud, const char* family, int weight, int italic) {
@@ -1439,6 +1539,8 @@ static void ek_font_destroy(void* ud, eweb_font_t* h) {
     for(i = 0; i < f->face_count; i++) {
         if(f->faces[i].face) TTF_CloseFont(f->faces[i].face);
         if(f->faces[i].fb)   TTF_CloseFont(f->faces[i].fb);
+        if(f->faces[i].sy)   TTF_CloseFont(f->faces[i].sy);
+        if(f->faces[i].em)   TTF_CloseFont(f->faces[i].em);
     }
     free(f);
 }
@@ -1475,14 +1577,22 @@ static int ek_font_char_width(void* ud, eweb_font_t* h, int size, uint32_t codep
     sdl_font_t* f;
     TTF_Font* face;
     TTF_Font* fb = NULL;
+    TTF_Font* sy = NULL;
+    TTF_Font* em = NULL;
     int minx = 0, maxx = 0, miny = 0, maxy = 0, adv = 0;
     (void)ud;
     if(!h) return 0;
     if(size <= 0) return 0;   /* font-size:0 glyphs advance nothing */
+    /* Zero-width format chars (ZWSP/ZWNJ/ZWJ/BOM/soft-hyphen) carry no glyph
+     * and zero advance. FreeType does NOT error for them - it returns the
+     * .notdef metrics (~11px hollow box), which is how MDN's content:"\200b"
+     * anchor measured as a tofu square. Short-circuit to 0. */
+    if(codepoint == 0x200B || codepoint == 0x200C || codepoint == 0x200D ||
+       codepoint == 0xFEFF  || codepoint == 0x00AD) return 0;
     f = F(h);
-    face = sdl_font_faces(f, sdl2_font_px(size), &fb);   /* device-px face, logical result */
+    face = sdl_font_faces(f, sdl2_font_px(size), &fb, &sy, &em);   /* device-px face, logical result */
     if(!face) return 0;
-    face = sdl2_face_for(face, fb, codepoint);
+    face = sdl2_face_for(face, fb, sy, em, codepoint);
     /* TTF_GlyphMetrics32 is O(1) (FreeType charmap lookup), which matters
      * because char_width is the hottest layout callback. */
     if(TTF_GlyphMetrics32(face, codepoint, &minx, &maxx, &miny, &maxy, &adv) < 0)
@@ -1530,26 +1640,76 @@ static void sdl2_draw_run(TTF_Font* face, const char* run, int len, void* ud) {
     if(tmp != buf) free(tmp);
 }
 
+/* Zero-width format characters (U+200B ZWSP, U+200C ZWNJ, U+200D ZWJ,
+ * U+FEFF BOM/ZWNBSP, U+00AD soft hyphen) carry no glyph and zero advance
+ * width, but SDL_ttf has no cmap entry for them and falls back to a .notdef
+ * hollow box. Sites use them as invisible anchors - MDN's a.external::after
+ * is `content:"\200b"` behind a mask-image icon and rendered as a tofu
+ * square. Strip them before measure/paint so such anchors measure 0 and draw
+ * nothing. Returns the stripped byte length, or -1 when the input contains
+ * no zero-width char (caller keeps the original buffer, no copy). */
+static int sdl2_strip_zw(const char* in, char* out, int outcap) {
+    const unsigned char* p = (const unsigned char*)in;
+    int i, o = 0;
+    bool has_zw = false;
+    for(i = 0; p[i]; i++) {
+        if((p[i] == 0xE2 && p[i+1] == 0x80 && (p[i+2] == 0x8B || p[i+2] == 0x8C || p[i+2] == 0x8D)) ||
+           (p[i] == 0xEF && p[i+1] == 0xBB && p[i+2] == 0xBF) ||
+           (p[i] == 0xC2 && p[i+1] == 0xAD)) { has_zw = true; break; }
+    }
+    if(!has_zw) return -1;
+    for(i = 0; p[i]; ) {
+        unsigned char c = p[i];
+        int cl = 1;
+        bool zw = false;
+        if(c == 0xE2 && p[i+1] == 0x80 && (p[i+2] == 0x8B || p[i+2] == 0x8C || p[i+2] == 0x8D)) { cl = 3; zw = true; }
+        else if(c == 0xEF && p[i+1] == 0xBB && p[i+2] == 0xBF) { cl = 3; zw = true; }
+        else if(c == 0xC2 && p[i+1] == 0xAD) { cl = 2; zw = true; }
+        if(zw) { i += cl; continue; }
+        if((c & 0xE0) == 0xC0) cl = 2;
+        else if((c & 0xF0) == 0xE0) cl = 3;
+        else if((c & 0xF8) == 0xF0) cl = 4;
+        if(o + cl >= outcap) return -1;   /* safety: never overflow */
+        for(int k = 0; k < cl; k++) out[o++] = (char)p[i+k];
+        i += cl;
+    }
+    out[o] = 0;
+    return o;
+}
+
 static void ek_font_text_size(void* ud, eweb_font_t* h, int size, const char* text,
                                int* w, int* hh) {
     sdl_font_t* f;
     TTF_Font* face;
     TTF_Font* fb = NULL;
+    TTF_Font* sy = NULL;
+    TTF_Font* em = NULL;
     sdl_measure_ud_t m = { 0, 0 };
     int ww = 0, hgt = 0;
+    char zwstack[512];
+    char* zdyn = NULL;
+    const char* ttext = text;
     (void)ud;
     if(w)  *w  = 0;
     if(hh) *hh = 0;
     if(!h || !text) return;
     if(size <= 0) return;   /* font-size:0 measures empty */
+    if(strlen(text) + 1 <= sizeof(zwstack)) {
+        if(sdl2_strip_zw(text, zwstack, (int)sizeof(zwstack)) >= 0) ttext = zwstack;
+    } else {
+        zdyn = (char*)malloc(strlen(text) + 1);
+        if(zdyn && sdl2_strip_zw(text, zdyn, (int)strlen(text) + 1) >= 0) ttext = zdyn;
+    }
     f = F(h);
-    face = sdl_font_faces(f, sdl2_font_px(size), &fb);
-    if(!face) return;
-    if(sdl2_for_each_run(face, fb, text, sdl2_measure_run, &m)) {
+    face = sdl_font_faces(f, sdl2_font_px(size), &fb, &sy, &em);
+    if(!face) { free(zdyn); return; }
+    if(sdl2_for_each_run(face, fb, sy, em, ttext, sdl2_measure_run, &m)) {
         ww = m.w; hgt = m.h;
-    } else if(TTF_SizeUTF8(face, text, &ww, &hgt) < 0) {
+    } else if(TTF_SizeUTF8(face, ttext, &ww, &hgt) < 0) {
+        free(zdyn);
         return;
     }
+    free(zdyn);
     if(w)  *w  = sdl2_logical_px(ww);
     if(hh) *hh = sdl2_logical_px(hgt);
 }
@@ -1560,38 +1720,51 @@ static void ek_font_draw_text(void* ud, eweb_surface_t* sh, int x, int y, const 
     sdl_font_t* f;
     TTF_Font* face;
     TTF_Font* fb = NULL;
+    TTF_Font* sy = NULL;
+    TTF_Font* em = NULL;
     SDL_Color c;
     SDL_Surface* txt;
     SDL_Rect dst;
     sdl_draw_ud_t d;
+    char zwstack[512];
+    char* zdyn = NULL;
+    const char* ttext = text;
     (void)ud;
     if(!sh || !fh || !text || !text[0]) return;
     if(size <= 0) return;   /* font-size:0 draws nothing */
+    if(strlen(text) + 1 <= sizeof(zwstack)) {
+        if(sdl2_strip_zw(text, zwstack, (int)sizeof(zwstack)) >= 0) ttext = zwstack;
+    } else {
+        zdyn = (char*)malloc(strlen(text) + 1);
+        if(zdyn && sdl2_strip_zw(text, zdyn, (int)strlen(text) + 1) >= 0) ttext = zdyn;
+    }
+    if(!ttext[0]) { free(zdyn); return; }   /* pure zero-width anchor: paint nothing */
     s = S(sh);
-    if(!s->surf) return;
+    if(!s->surf) { free(zdyn); return; }
     f = F(fh);
     /* Rasterise at the TARGET surface's device resolution and place the glyph
      * bitmap at the surface's device coordinates (s->dpr, not g_dpr: a surface
      * created before a ratio change keeps rendering consistently). */
-    face = sdl_font_faces(f, sdl2_font_px_dpr(size, s->dpr), &fb);
-    if(!face) return;
+    face = sdl_font_faces(f, sdl2_font_px_dpr(size, s->dpr), &fb, &sy, &em);
+    if(!face) { free(zdyn); return; }
     c.r = (Uint8)((color >> 16) & 0xFF);
     c.g = (Uint8)((color >> 8)  & 0xFF);
     c.b = (Uint8)( color        & 0xFF);
     c.a = (Uint8)((color >> 24) & 0xFF);
     /* Mixed Latin/CJK text: one blit per same-face run. */
     d.s = s; d.x = sdl2_sp(s, x); d.y = sdl2_sp(s, y); d.ascent = TTF_FontAscent(face); d.c = c;
-    if(sdl2_for_each_run(face, fb, text, sdl2_draw_run, &d)) return;
+    if(sdl2_for_each_run(face, fb, sy, em, ttext, sdl2_draw_run, &d)) { free(zdyn); return; }
     /* TTF_RenderUTF8_Blended produces an ARGB8888 surface with per-pixel
      * alpha; blitting it with BLEND composites correctly onto our target.
      * The HAL anchors text at its TOP-LEFT (matching litehtml's baseline
      * convention via ascent), which is exactly where BlitSurface places it. */
-    txt = TTF_RenderUTF8_Blended(face, text, c);
-    if(!txt) return;
+    txt = TTF_RenderUTF8_Blended(face, ttext, c);
+    if(!txt) { free(zdyn); return; }
     SDL_SetSurfaceBlendMode(txt, SDL_BLENDMODE_BLEND);
     dst.x = d.x; dst.y = d.y; dst.w = txt->w; dst.h = txt->h;
     SDL_BlitSurface(txt, NULL, s->surf, &dst);
     SDL_FreeSurface(txt);
+    free(zdyn);
 }
 
 /* ------------------------------------------------------------------ */

@@ -27,6 +27,9 @@ VM_OBJS = \
 	$(ARCH)/vm/mario/mario.o \
 	$(ARCH)/vm/mario/lex/mario_lex.o \
 	$(ARCH)/vm/mario/bcdump/bcdump.o \
+	$(ARCH)/vm/mario/jit/mario_jit.o \
+	$(ARCH)/vm/mario/jit/mario_jit_mem.o \
+	$(ARCH)/vm/mario/jit/mario_jit_arm64.o \
 	$(ARCH)/vm/lang/js/compiler.o
 
 NATIVE_OBJS = \
@@ -58,6 +61,7 @@ NATIVE_OBJS = \
 	$(ARCH)/vm/lang/js/native/builtin/Date/native_Date.o \
 	$(ARCH)/vm/lang/js/native/builtin/JSON/JSON.o \
 	$(ARCH)/vm/lang/js/native/builtin/JSON/native_JSON.o \
+	$(ARCH)/vm/lang/js/native/builtin/Intl/native_Intl.o \
 	\
 	$(ARCH)/vm/lang/js/native/natives/natives.o \
 	$(ARCH)/vm/lang/js/native/natives/Console/native_Console.o \

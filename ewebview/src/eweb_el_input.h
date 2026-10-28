@@ -175,6 +175,7 @@ private:
     std::map<std::string, litehtml::style> m_widget_styles;
     litehtml::element::ptr m_part_thumb;
     litehtml::element::ptr m_part_track;
+    litehtml::element::ptr m_part_placeholder;
 
     static uint32_t make_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255);
 
@@ -209,6 +210,9 @@ private:
     void resolve_widget_parts();
     const litehtml::element::ptr& widget_part(bool thumb) const;
     bool part_color(bool thumb, litehtml::web_color& c) const;
+    /* Computed 'color' of the control's ::placeholder rule, when the page
+     * declared one; alpha 0 is a valid answer (transparent hides the hint). */
+    bool placeholder_color(litehtml::web_color& c) const;
     int  part_dim(bool thumb, const char* prop, int defval) const;
     float range_fraction();
     void extra_box_size(int& w, int& h) const;

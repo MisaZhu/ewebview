@@ -43,6 +43,8 @@ enum {
     TAG_STOP,
     TAG_SVG,
     TAG_SYMBOL,
+    TAG_TEXT,
+    TAG_TSPAN,
     TAG_USE
 };
 
@@ -94,7 +96,11 @@ enum {
     ATTR_X2,
     ATTR_Y,
     ATTR_Y1,
-    ATTR_Y2
+    ATTR_Y2,
+    ATTR_FONT_FAMILY,
+    ATTR_FONT_SIZE,
+    ATTR_FONT_WEIGHT,
+    ATTR_TEXT_ANCHOR
 };
 
 #define MAX_NAME 19
@@ -144,6 +150,8 @@ static int elementid(const char* data, size_t length)
         {"stop", TAG_STOP},
         {"svg", TAG_SVG},
         {"symbol", TAG_SYMBOL},
+        {"text", TAG_TEXT},
+        {"tspan", TAG_TSPAN},
         {"use", TAG_USE}
     };
 
@@ -164,6 +172,9 @@ static int attributeid(const char* data, size_t length)
         {"fill", ATTR_FILL},
         {"fill-opacity", ATTR_FILL_OPACITY},
         {"fill-rule", ATTR_FILL_RULE},
+        {"font-family", ATTR_FONT_FAMILY},
+        {"font-size", ATTR_FONT_SIZE},
+        {"font-weight", ATTR_FONT_WEIGHT},
         {"fx", ATTR_FX},
         {"fy", ATTR_FY},
         {"gradientTransform", ATTR_GRADIENT_TRANSFORM},
@@ -190,6 +201,7 @@ static int attributeid(const char* data, size_t length)
         {"stroke-opacity", ATTR_STROKE_OPACITY},
         {"stroke-width", ATTR_STROKE_WIDTH},
         {"style", ATTR_STYLE},
+        {"text-anchor", ATTR_TEXT_ANCHOR},
         {"transform", ATTR_TRANSFORM},
         {"viewBox", ATTR_VIEW_BOX},
         {"visibility", ATTR_VISIBILITY},
@@ -216,6 +228,9 @@ static int cssattributeid(const char* data, size_t length)
         {"fill", ATTR_FILL},
         {"fill-opacity", ATTR_FILL_OPACITY},
         {"fill-rule", ATTR_FILL_RULE},
+        {"font-family", ATTR_FONT_FAMILY},
+        {"font-size", ATTR_FONT_SIZE},
+        {"font-weight", ATTR_FONT_WEIGHT},
         {"opacity", ATTR_OPACITY},
         {"stop-color", ATTR_STOP_COLOR},
         {"stop-opacity", ATTR_STOP_OPACITY},
@@ -227,6 +242,7 @@ static int cssattributeid(const char* data, size_t length)
         {"stroke-miterlimit", ATTR_STROKE_MITERLIMIT},
         {"stroke-opacity", ATTR_STROKE_OPACITY},
         {"stroke-width", ATTR_STROKE_WIDTH},
+        {"text-anchor", ATTR_TEXT_ANCHOR},
         {"visibility", ATTR_VISIBILITY}
     };
 
@@ -251,6 +267,7 @@ typedef struct element {
     struct element* first_child;
     struct element* next_sibling;
     struct attribute* attributes;
+    string_t text;
 } element_t;
 
 typedef struct heap_chunk {
@@ -1286,8 +1303,22 @@ plutosvg_document_t* plutosvg_document_load_from_data(const char* data, int leng
                 break;
             }
         } else {
+            const char* text_begin = it;
             while(it < end && *it != '<') {
                 ++it;
+            }
+            /* Capture character data for <text>/<tspan> (SVG text content);
+             * other elements ignore it. Points into the source buffer, which
+             * the document keeps alive for the whole lifetime. */
+            if(current && (current->id == TAG_TEXT || current->id == TAG_TSPAN)) {
+                const char* s = text_begin;
+                const char* e = it;
+                while(s < e && IS_WS(*s)) ++s;
+                while(e > s && IS_WS(e[-1])) --e;
+                if(e > s) {
+                    current->text.data = s;
+                    current->text.length = (size_t)(e - s);
+                }
             }
         }
 
@@ -1398,6 +1429,8 @@ plutosvg_document_t* plutosvg_document_load_from_data(const char* data, int leng
                 element->first_child = NULL;
                 element->last_child = NULL;
                 element->attributes = NULL;
+                element->text.data = NULL;
+                element->text.length = 0;
                 if(document->root_element == NULL) {
                     if(element->id != TAG_SVG)
                         goto error;
@@ -2512,6 +2545,111 @@ static void render_image(const element_t* element, const render_context_t* conte
     render_state_end(&new_state);
 }
 
+/* Resolve a <text> font to a loaded face. The font-face-cache system loader is
+ * compiled out (PLUTOVG_DISABLE_FONT_FACE_CACHE_LOAD) to keep the cross build
+ * FreeType-free, so load a well-known system font file directly instead; the
+ * family list is honoured only as a hint (first face wins) which is enough for
+ * shields.io-style badge labels. */
+static plutovg_font_face_t* resolve_svg_font(const char* family_list, size_t family_len, bool bold)
+{
+    (void)family_list;
+    (void)family_len;
+    static plutovg_font_face_t* regular = NULL;
+    static plutovg_font_face_t* bold_face = NULL;
+    static bool tried = false;
+
+    if(!tried) {
+        tried = true;
+        static const char* regular_paths[] = {
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/Library/Fonts/Arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            NULL
+        };
+        static const char* bold_paths[] = {
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            NULL
+        };
+        for(int i = 0; regular_paths[i] && regular == NULL; ++i)
+            regular = plutovg_font_face_load_from_file(regular_paths[i], 0);
+        for(int i = 0; bold_paths[i] && bold_face == NULL; ++i)
+            bold_face = plutovg_font_face_load_from_file(bold_paths[i], 0);
+    }
+    if(bold && bold_face)
+        return bold_face;
+    return regular;
+}
+
+static void render_text(const element_t* element, const render_context_t* context, render_state_t* state)
+{
+    if(is_display_none(element) || is_visibility_hidden(element))
+        return;
+    if(state->mode == render_mode_bounding)
+        return;
+    if(element->text.length == 0)
+        return;
+
+    length_t x = {0, length_type_fixed};
+    length_t y = {0, length_type_fixed};
+    parse_length(element, ATTR_X, &x, true, false);
+    parse_length(element, ATTR_Y, &y, true, false);
+    float _x = resolve_length(state, &x, 'x');
+    float _y = resolve_length(state, &y, 'y');
+
+    length_t font_size = {16.f, length_type_fixed};
+    parse_length(element, ATTR_FONT_SIZE, &font_size, false, true);
+    float _fs = resolve_length(state, &font_size, 'y');
+    if(_fs <= 0.f)
+        _fs = 16.f;
+
+    bool bold = false;
+    const string_t* fw = find_attribute(element, ATTR_FONT_WEIGHT, true);
+    if(fw) {
+        if(fw->length == 4 && strncmp(fw->data, "bold", 4) == 0)
+            bold = true;
+        else if(fw->length >= 3) {
+            int w = (fw->data[0] - '0') * 100 + (fw->data[1] - '0') * 10 + (fw->data[2] - '0');
+            if(w >= 600)
+                bold = true;
+        }
+    }
+
+    const string_t* fam = find_attribute(element, ATTR_FONT_FAMILY, true);
+    plutovg_font_face_t* face = resolve_svg_font(fam ? fam->data : NULL, fam ? fam->length : 0, bold);
+    if(face == NULL)
+        return;
+
+    paint_t fill = {paint_type_color, {color_type_fixed, 0xFF000000}};
+    parse_paint(element, ATTR_FILL, &fill);
+    if(!apply_paint(state, context, &fill))
+        return;
+
+    float fill_opacity = 1.f;
+    parse_number(element, ATTR_FILL_OPACITY, &fill_opacity, true, true);
+
+    plutovg_canvas_set_font(context->canvas, face, _fs);
+    plutovg_canvas_set_opacity(context->canvas, fill_opacity * state->opacity);
+    plutovg_canvas_set_matrix(context->canvas, &state->matrix);
+
+    float advance = plutovg_canvas_text_extents(context->canvas, element->text.data, (int)element->text.length,
+        PLUTOVG_TEXT_ENCODING_UTF8, NULL);
+    float dx = 0.f;
+    const string_t* ta = find_attribute(element, ATTR_TEXT_ANCHOR, true);
+    if(ta) {
+        if(ta->length == 6 && strncmp(ta->data, "middle", 6) == 0)
+            dx = -advance / 2.f;
+        else if(ta->length == 3 && strncmp(ta->data, "end", 3) == 0)
+            dx = -advance;
+    }
+    plutovg_canvas_fill_text(context->canvas, element->text.data, (int)element->text.length,
+        PLUTOVG_TEXT_ENCODING_UTF8, _x + dx, _y);
+}
+
 static void render_element(const element_t* element, const render_context_t* context, render_state_t* state)
 {
     switch(element->id) {
@@ -2545,6 +2683,13 @@ static void render_element(const element_t* element, const render_context_t* con
         break;
     case TAG_IMAGE:
         render_image(element, context, state);
+        break;
+    case TAG_TEXT:
+        render_text(element, context, state);
+        render_children(element, context, state);
+        break;
+    case TAG_TSPAN:
+        render_text(element, context, state);
         break;
     }
 }

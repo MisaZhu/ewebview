@@ -93,6 +93,15 @@ public:
     /* Solid fill masked to the active rounded clip; false = use fill_rect. */
     bool                               fill_rect_round_clipped(eweb_surface_t* s, const eweb_gfx_t* gfx,
                                                                const litehtml::position& r, uint32_t argb);
+    /* CSS mask-image (alpha subset): resolve the mask value's url() to a
+     * cached bitmap (NULL = no url / not fetched yet), tint it with a solid
+     * colour and composite over dst, or multiply an already-rendered
+     * background surface's alpha by the mask (gradient path). */
+    eweb_surface_t*                    mask_bitmap(const litehtml::background_paint& bg, int* piw, int* pih);
+    bool                               paint_image_mask(eweb_surface_t* dst, const litehtml::background_paint& bg,
+                                                        uint32_t color, int xf_dx, int xf_dy);
+    bool                               apply_mask_alpha(eweb_surface_t* rendered, const litehtml::background_paint& bg,
+                                                        int log_w, int log_h);
 
     void                               get_client_rect(litehtml::position& client) const override;
     void                               set_client_size(int width, int height);
@@ -196,6 +205,13 @@ private:
      * being drawn), see litehtml document_container::push_paint_transform. */
     bool m_xform_on;
     float m_xform[6];
+    /* Save/restore stack: a CSS transform applies to the element's whole
+     * painted subtree, so html_tag::draw_children now keeps the element's
+     * matrix active while it paints content. A descendant with its own
+     * transform pushes over it and must restore (not clear) on pop, else the
+     * ancestor's matrix is lost for the remaining siblings. */
+    struct xform_save { bool on; float m[6]; };
+    std::vector<xform_save> m_xform_stack;
 
     std::vector<eweb_el_input*> m_vecInput;
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdlib.h>
 #include "element.h"
 #include "style.h"
 #include "background.h"
@@ -61,10 +62,11 @@ namespace litehtml
 		 * transition trigger in parse_styles can detect a change and fire a
 		 * transform transition. Empty means identity/none. */
 		tstring							m_transform_str;
-		/* Resolved --custom-properties visible to this element (inherited
-		 * from the parent chain plus own declarations), used to expand
-		 * var() references in raw property values at parse_styles time. */
-		string_map				m_custom_props;
+		/* Resolved --custom-properties: shared map. An element with no own
+		 * --* declarations simply holds the parent's merged map; only elements
+		 * declaring their own custom properties build a merged copy
+		 * (resolve_custom_properties). */
+		std::shared_ptr<const string_map>		m_custom_props;
 		string_map				m_attrs;
 		mutable string_map		m_style_property_cache;
 		vertical_align			m_vertical_align;
@@ -88,6 +90,15 @@ namespace litehtml
 		int						m_line_height;
 		bool					m_lh_predefined;
 		float					m_lh_factor;
+		/* CSS text-3 letter-spacing resolved to whole px (0 = 'normal'/unset).
+		 * Inherited; text runs read it via letter_spacing() to widen measured
+		 * width and to advance glyphs while drawing. */
+		int						m_letter_spacing;
+		/* css-mult-3 multi-column: parsed column-count / column-width (px after
+		 * cvt) / column-gap. count==0 && width==0 means no multicol. */
+		int						m_column_count;
+		int						m_column_width;
+		int						m_column_gap;
 		string_vector			m_pseudo_classes;
 		used_selector::vector	m_used_styles;		
 		
@@ -131,9 +142,16 @@ namespace litehtml
 		 * SVG global-nav wordmark. */
 		bool					m_has_css_clip;
 		css_offsets				m_css_clip;
+		/* CSS Masking clip-path:inset(top right bottom left), the modern
+		 * visually-hidden pattern (Pinterest's resting floating-label copy).
+		 * Intersected with the legacy clip rect at paint time; shape/url()
+		 * forms and the optional round radius are not modelled. */
+		bool					m_has_css_clip_path;
+		css_offsets				m_css_clip_path;
 
 		overflow				m_overflow;
 		visibility				m_visibility;
+		bool					m_pointer_events_none = false;
 		/* Own CSS 'opacity' (0..1, default 1) and the cumulative product with
 		 * every ancestor's opacity, resolved top-down in parse_styles. The
 		 * cumulative value drives drawing: ~0 skips the subtree entirely, an
@@ -208,7 +226,8 @@ namespace litehtml
 		virtual element_clear		get_clear() const override;
 		virtual size_t				get_children_count() const override;
 		virtual element::ptr		get_child(int idx) const override;
-		virtual const string_map*	get_custom_props() const override { return &m_custom_props; }
+		virtual const string_map*	get_custom_props() const override { return m_custom_props.get(); }
+		virtual std::shared_ptr<const string_map> get_custom_props_shared() const override { return m_custom_props; }
 		virtual element_position	get_element_position(css_offsets* offsets = 0) const override;
 		virtual overflow			get_overflow() const override;
 		box_sizing				get_box_sizing() const { return m_box_sizing; }
@@ -223,6 +242,34 @@ namespace litehtml
 			}
 			return h;
 		}
+		/* CSS2.1 10.4: the used height of a container box is capped by
+		 * max-height AFTER the min-height floor (min wins on conflict). Only
+		 * replaced elements and form widgets honoured the cap; block/flex/grid
+		 * containers never did, so bing.com's search form ("height:100%;
+		 * min-height:40px; max-height:52px" inside a full-viewport wrapper)
+		 * laid out 844px tall and the hero painted as one giant white card.
+		 * Returns the CONTENT-box cap, or -1 when max-height is absent/none
+		 * or a percentage against an indefinite containing block. */
+		int						content_box_max_height();
+		/* CSS2.1 10.4 on the used height: cap by max-height first, then apply
+		 * the min-height floor, so a min>max conflict resolves to the min
+		 * (css-sizing-3). render_box calls this once its content height is
+		 * final; render_positioned calls it AGAIN after restoring the
+		 * pre-render m_pos snapshot, because that restore replays the
+		 * unclamped CSS geometry and would otherwise discard the clamps
+		 * render_box applied inside el->render() (an absolute box with
+		 * height:100px;max-height:40px kept 100). */
+		void					clamp_used_block_height();
+		/* CSS sizing-4 §4 preferred aspect ratio (width/height) from the
+		 * `aspect-ratio` property; 0 when the box declares no usable ratio.
+		 * render_box transfers an auto block size from a definite inline size
+		 * through it. */
+		double					aspect_ratio();
+		/* -webkit-line-clamp line count (the multi-line twin of
+		 * text-overflow:ellipsis): >0 only for a clipped -webkit-box with a
+		 * positive clamp, else 0. render_box caps an auto block size to that many
+		 * line boxes. */
+		int						line_clamp_lines();
 		/* Automatic margins resolve against free space at pack time; they must
 		 * contribute 0 to intrinsic (min/max-content) sizes, so callers computing
 		 * those need to tell an auto margin apart from a resolved length. */
@@ -268,6 +315,7 @@ namespace litehtml
 		virtual int					line_height() const override;
 		virtual bool				is_line_height_normal() const override;
 		virtual float				line_height_factor() const override;
+		virtual int					letter_spacing() const override;
 		virtual text_align			get_text_align() const override;
 		virtual text_transform		get_text_transform() const override;
 		virtual white_space			get_white_space() const override;
@@ -311,6 +359,15 @@ namespace litehtml
 		 * translate percentages against the box size). False = identity. */
 		void						parse_transform_list(const tchar_t* val);
 		bool						compute_transform_matrix(const position& box, float m[6]) const;
+		virtual bool				eweb_self_xform(float m[6]) const override;
+		virtual bool				eweb_transform_bounds(litehtml::position& bb) const override;
+		virtual bool				eweb_sticky_offset(int scroll_y, int view_h, int* dy) const override;
+		virtual bool				eweb_hit_testable() const override {
+			/* EWEB_NOPE=1: diagnostic bypass to A/B whether a live-site hit miss
+			 * is caused by pointer-events filtering at all. */
+			static const bool bypass = getenv("EWEB_NOPE") != nullptr;
+			return bypass ? true : !m_pointer_events_none;
+		}
 
 		virtual const tchar_t*		get_style_property_own(const tchar_t* name) const override;
 		virtual const tchar_t*		get_style_property(const tchar_t* name, bool inherited, const tchar_t* def = 0) override;
@@ -363,6 +420,7 @@ namespace litehtml
 		virtual void				get_redraw_box(litehtml::position& pos, int x = 0, int y = 0) override;
 		virtual void				add_style(const litehtml::style& st, const litehtml::selector_specificity& spec = litehtml::inline_style_specificity) override;
 		virtual element::ptr		get_element_by_point(int x, int y, int client_x, int client_y) override;
+		element::ptr			eweb_gebp_inner(int x, int y, int client_x, int client_y);
 		virtual element::ptr		get_child_by_point(int x, int y, int client_x, int client_y, draw_flag flag, int zindex) override;
 
 		virtual bool				is_nth_child(const element::ptr& el, int num, int off, bool of_type) const override;
@@ -378,8 +436,15 @@ namespace litehtml
 		void						propagate_opacity_cum();
 		bool						push_css_clip(uint_ptr hdc, int x, int y);
 		bool						css_clip_rect(position& out, int x, int y) const;
+		bool						css_clip_path_rect(position& out, int x, int y) const;
+		bool						css_effective_clip_rect(position& out, int x, int y) const;
 		bool						css_clip_hides_all(int x, int y) const;
 		int							render_box(int x, int y, int max_width, bool second_pass = false);
+		/* css-mult-3 balanced column flow over block-level children. Returns
+		 * the container content height, or -1 when the box is not eligible
+		 * (inline children need line-level fragmentation) and normal flow
+		 * must take over. */
+		int							render_multicol(const std::vector<element::ptr>& kids, int content_width, bool second_pass);
 		int											render_flex(int x, int y, int max_width, bool second_pass = false);
 		int											render_grid(int x, int y, int max_width, bool second_pass = false);
 		int							render_table(int x, int y, int max_width, bool second_pass = false);
@@ -402,4 +467,9 @@ namespace litehtml
 	{
 		return m_children;
 	}
+
+	/* True when the CSS property inherits its parent's computed value by
+	 * default (custom properties always do). Callers that emulate
+	 * getComputedStyle must only walk the ancestor chain for these. */
+	bool css_property_inherited( const tchar_t* name );
 }

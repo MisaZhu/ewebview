@@ -5,6 +5,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* EWEB_IMGDBG (release-build image pipeline trace, default off): Pinterest's
+ * "More winning ideas" carousel thumbs carry a valid i.pinimg.com/236x src yet
+ * paint grey while sibling marketing imgs (736x) load - this surfaces, per
+ * <img>, whether load_image fired and whether a decoded bitmap was cached by
+ * paint time, separating "never fetched" from "fetched but not mounted". */
+static bool eweb_imgdbg()
+{
+	static int v = -1;
+	if(v < 0) { const char* e = getenv("EWEB_IMGDBG"); v = (e && e[0] == '1') ? 1 : 0; }
+	return v == 1;
+}
+
 /* Pick one URL from a srcset attribute: an exact 1x candidate wins, then the
  * narrowest w descriptor (this device is a low-density viewport), then the
  * first candidate. Descriptors other than x/w are ignored. */
@@ -154,6 +166,7 @@ litehtml::el_image::el_image(litehtml::document* doc) : html_tag(doc)
 	m_attr_height = 0;
 	m_resolved_mw = -1;
 	m_resolved_mh = -1;
+	m_dbg_logged_loaded = false;
 }
 
 litehtml::el_image::~el_image( void )
@@ -300,7 +313,15 @@ int litehtml::el_image::render( int x, int y, int max_width, bool second_pass )
 	{
 		if (!get_predefined_height(m_pos.height))
 		{
-			m_pos.height = (int)m_css_height.val();
+			/* A percentage height whose containing-block chain is indefinite
+			 * behaves as 'auto' (CSS 2.1 10.5); keep the intrinsic height rather
+			 * than the raw percent value (100 for "100%") as pixels. */
+			if (m_css_height.units() == css_units_percentage)
+				m_pos.height = sz.height;
+			else
+				m_pos.height = (int)m_css_height.val();
+			/* width stays auto here: the intrinsic-ratio recomputation below
+			 * derives it from the resolved height. */
 		}
 
 		// check for max-height
@@ -319,6 +340,16 @@ int litehtml::el_image::render( int x, int y, int max_width, bool second_pass )
 		} else
 		{
 			m_pos.width = sz.width;
+		}
+		/* A declared `aspect-ratio` is the preferred ratio: it overrides the
+		 * intrinsic one and supplies one when the source has none, so an auto
+		 * width follows the resolved height through it. */
+		{
+			double ar = aspect_ratio();
+			if(ar > 0.0 && m_pos.height > 0)
+			{
+				m_pos.width = (int)(m_pos.height * ar + 0.5);
+			}
 		}
 	} else if(m_css_height.is_predefined() && !m_css_width.is_predefined())
 	{
@@ -346,13 +377,31 @@ int litehtml::el_image::render( int x, int y, int max_width, bool second_pass )
 		{
 			m_pos.height = sz.height;
 		}
+		/* A declared `aspect-ratio` is the preferred ratio: it overrides the
+		 * intrinsic one and supplies one when the source has none, so an auto
+		 * height follows the resolved width through it. */
+		{
+			double ar = aspect_ratio();
+			if(ar > 0.0 && m_pos.width > 0)
+			{
+				m_pos.height = (int)(m_pos.width / ar + 0.5);
+			}
+		}
 	} else
 	{
 		m_pos.width		= (int) m_css_width.calc_percent(parent_width);
 		m_pos.height	= 0;
 		if (!get_predefined_height(m_pos.height))
 		{
-			m_pos.height = (int)m_css_height.val();
+			/* Percentage height against an indefinite containing-block chain is
+			 * 'auto' (CSS 2.1 10.5): derive height from the resolved width via the
+			 * intrinsic ratio. The old fallback used the raw percent value as px
+			 * (100 for "100%"), collapsing e.g. the pinterest hero collage to a
+			 * 100px sliver. */
+			if (m_css_height.units() == css_units_percentage)
+				m_pos.height = sz.width ? (int)((float)m_pos.width * (float)sz.height / (float)sz.width) : sz.height;
+			else
+				m_pos.height = (int)m_css_height.val();
 		}
 
 		// check for max-height
@@ -488,6 +537,12 @@ void litehtml::el_image::draw( uint_ptr hdc, int x, int y, const position* clip 
 				doc->container()->get_image_size(m_src.c_str(), 0, nat);
 				iw = nat.width; ih = nat.height;
 			}
+			if(eweb_imgdbg() && iw > 0 && ih > 0 && !m_dbg_logged_loaded)
+			{
+				m_dbg_logged_loaded = true;
+				fprintf(stderr, "[IMGDBG] draw LOADED src=%.90s nat=%dx%d box=%dx%d\n",
+					m_src.c_str(), iw, ih, pos.width, pos.height);
+			}
 			if (iw > 0 && ih > 0)
 			{
 				const tchar_t* of = get_style_property(_t("object-fit"), false, 0);
@@ -593,6 +648,9 @@ void litehtml::el_image::parse_styles( bool is_reparse /*= false*/ )
 	document* doc = get_document();
 	if(!m_src.empty() && doc && doc->container())
 	{
+		if(eweb_imgdbg())
+			fprintf(stderr, "[IMGDBG] load_image src=%.90s cssw_pre=%d cssh_pre=%d\n",
+				m_src.c_str(), (int)!m_css_width.is_predefined(), (int)!m_css_height.is_predefined());
 		if(!m_css_height.is_predefined() && !m_css_width.is_predefined())
 		{
 			doc->container()->load_image(m_src.c_str(), 0, true);

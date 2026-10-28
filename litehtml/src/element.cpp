@@ -1,6 +1,7 @@
 #include "html.h"
 #include "element.h"
 #include "document.h"
+#include "html_tag.h"	/* [CDSK] diagnostic: html_tag::children() walk */
 
 #define LITEHTML_EMPTY_FUNC			{}
 #define LITEHTML_RETURN_FUNC(ret)	{return ret;}
@@ -9,6 +10,8 @@ litehtml::element::element(litehtml::document* doc) : m_doc(doc), m_parent(nullp
 {
 	m_box		= 0;
 	m_skip		= false;
+	m_has_pospart	= false;
+	m_has_floater	= false;
 	m_step_stamp	= 0;
 	m_step_done		= false;
 	m_sheets_applied = false;
@@ -52,6 +55,79 @@ bool litehtml::element::is_point_inside( int x, int y )
 	return false;
 }
 
+/* Paint-time var() fallback. A runtime re-cascade can re-add a raw
+ * var(--token) declaration to m_style after the node was last parsed (the
+ * re-parse that would expand it has not reached the node), and
+ * web_color::from_string maps such a leftover to alpha 0 - the text paints
+ * invisible (Pinterest's Gestalt hero/button labels). The token is still
+ * resolvable: each html_tag's m_custom_props is the inherited+own merged map
+ * populated by resolve_custom_properties, so the nearest non-null map up the
+ * chain holds every custom property visible here. Token values may themselves
+ * reference other tokens (a --comp-* aliasing a --sema-* aliasing a --base-*),
+ * so expand recursively. Returns false when a referenced name is undefined and
+ * carries no fallback. Hot path: get_color gates on a "var(" substring test, so
+ * already-resolved values never reach this. */
+static bool eweb_expand_var_chain(const litehtml::element* el, const litehtml::tstring& in, litehtml::tstring& out, int depth)
+{
+	if(depth > 8)
+		return false;
+	out.clear();
+	size_t i = 0;
+	while(i < in.length())
+	{
+		size_t f = in.find(_t("var("), i);
+		if(f == litehtml::tstring::npos)
+		{
+			out += in.substr(i);
+			break;
+		}
+		out += in.substr(i, f - i);
+		int paren = 1;
+		size_t j = f + 4;
+		size_t comma = litehtml::tstring::npos;
+		while(j < in.length() && paren > 0)
+		{
+			litehtml::tchar_t c = in[j];
+			if(c == _t('(')) paren++;
+			else if(c == _t(')')) { paren--; if(paren == 0) break; }
+			else if(c == _t(',') && paren == 1 && comma == litehtml::tstring::npos) comma = j;
+			j++;
+		}
+		if(j >= in.length())
+			return false;
+		litehtml::tstring name = in.substr(f + 4, (comma == litehtml::tstring::npos ? j : comma) - (f + 4));
+		while(!name.empty() && (name.front() == ' ' || name.front() == '\t')) name.erase(name.begin());
+		while(!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
+		litehtml::tstring sub;
+		bool found = false;
+		for(const litehtml::element* p = el; p != nullptr && !found; p = p->parent())
+		{
+			const litehtml::string_map* cp = p->get_custom_props();
+			if(cp == nullptr) continue;
+			litehtml::string_map::const_iterator it = cp->find(name);
+			if(it != cp->end()) { sub = it->second; found = true; }
+		}
+		if(!found)
+		{
+			if(comma == litehtml::tstring::npos)
+				return false;
+			sub = in.substr(comma + 1, j - comma - 1);
+			while(!sub.empty() && (sub.front() == ' ' || sub.front() == '\t')) sub.erase(sub.begin());
+			while(!sub.empty() && (sub.back() == ' ' || sub.back() == '\t')) sub.pop_back();
+		}
+		if(sub.find(_t("var(")) != litehtml::tstring::npos)
+		{
+			litehtml::tstring sub2;
+			if(!eweb_expand_var_chain(el, sub, sub2, depth + 1))
+				return false;
+			sub = sub2;
+		}
+		out += sub;
+		i = j + 1;
+	}
+	return true;
+}
+
 litehtml::web_color litehtml::element::get_color( const tchar_t* prop_name, bool inherited, const litehtml::web_color& def_color )
 {
 	const tchar_t* clrstr = get_style_property(prop_name, inherited, 0);
@@ -59,7 +135,88 @@ litehtml::web_color litehtml::element::get_color( const tchar_t* prop_name, bool
 	{
 		return def_color;
 	}
-	return web_color::from_string(clrstr, get_document()->container());
+	/* CSS-wide keywords have spec-defined computed values, but
+	 * web_color::from_string maps any unrecognised token (them included) to
+	 * alpha 0, the invalid-colour fallback. The UA sheet dresses form controls
+	 * in `color: initial`, which turned every glyph inside a container-mode
+	 * <button> transparent. Resolve the keywords here instead: the initial
+	 * value of `color` is canvastext black, background-color's is transparent,
+	 * border/outline-color's is currentColor; `inherit` and `unset` on the
+	 * inherited `color` property take the parent's computed value. */
+	if(!t_strcasecmp(clrstr, _t("initial")) || !t_strcasecmp(clrstr, _t("inherit")) ||
+	   !t_strcasecmp(clrstr, _t("unset")))
+	{
+		bool want_parent = !t_strcasecmp(clrstr, _t("inherit")) ||
+			(!t_strcasecmp(clrstr, _t("unset")) && !t_strcmp(prop_name, _t("color")));
+		if(want_parent)
+		{
+			element::ptr p = parent();
+			if(p)
+			{
+				return p->get_color(prop_name, true, def_color);
+			}
+			return def_color;
+		}
+		if(!t_strcmp(prop_name, _t("color")))
+		{
+			return web_color(0, 0, 0, 255);
+		}
+		if(!t_strcmp(prop_name, _t("background-color")))
+		{
+			return web_color(0, 0, 0, 0);
+		}
+		return get_color(_t("color"), true, def_color);
+	}
+	/* A raw var(--token) that survived the cascade (a runtime re-cascade re-added
+	 * the declaration but the re-parse has not reached this node) maps to alpha 0
+	 * in from_string, so the text paints invisible. Resolve it against the
+	 * element's custom-property chain first; the merged map still holds the token
+	 * even when m_style's expanded copy was rebuilt raw (see eweb_expand_var_chain).
+	 * Gated on a "var(" substring so resolved values skip this entirely. */
+	litehtml::tstring resolved_var;
+	const tchar_t* raw_clrstr = clrstr;
+	if(t_strstr(clrstr, _t("var(")) != nullptr &&
+	   eweb_expand_var_chain(this, clrstr, resolved_var, 0))
+	{
+		clrstr = resolved_var.c_str();
+	}
+	litehtml::web_color rc = web_color::from_string(clrstr, get_document()->container());
+	/* TEMP DIAGNOSTIC (EWEB_COLDBG): reveal a raw-var text colour and whether the
+	 * paint-time fallback resolved it (Pinterest hero text painted invisible). */
+	static int s_coldbg = -1;
+	if(s_coldbg < 0) s_coldbg = (getenv("EWEB_COLDBG") != NULL) ? 1 : 0;
+	if(s_coldbg && !t_strcmp(prop_name, _t("color")) &&
+	   t_strstr(raw_clrstr, _t("var(")) != nullptr) {
+		static int s_coldbg_n = 0;
+		if(s_coldbg_n < 40) {
+			s_coldbg_n++;
+			const tchar_t* cls = get_attr(_t("class"));
+			fprintf(stderr, "[COLDBG] var color \"%s\" -> \"%s\" a=%d el=<%s class=\"%s\">\n",
+				raw_clrstr, clrstr, (int)rc.alpha, get_tagName() ? get_tagName() : "?",
+				cls ? cls : "");
+		}
+	}
+	return rc;
+}
+
+/* Resolve a colour VALUE obtained from an own-property fetch (the
+ * background-color and border-*-color parse sites keep their own fetch so
+ * animation overrides still win). The currentcolor keyword computes to the
+ * element's own computed `color`, but web_color::from_string maps any
+ * unrecognised token - it included - to alpha 0, which silently dropped
+ * every `background-color: currentcolor` paint (MDN's mask-image icon glyphs
+ * and nav icon boxes are solid currentcolor colours shaped by a mask). */
+litehtml::web_color litehtml::element::resolve_color_value( const tchar_t* val, const litehtml::web_color& def_color )
+{
+	if(!val)
+	{
+		return def_color;
+	}
+	if(!t_strcasecmp(val, _t("currentcolor")))
+	{
+		return get_color(_t("color"), true, def_color);
+	}
+	return web_color::from_string(val, get_document()->container());
 }
 
 litehtml::position litehtml::element::get_placement() const
@@ -151,6 +308,81 @@ void litehtml::element::calc_document_size( litehtml::size& sz, int x /*= 0*/, i
 {
 	if(is_visible())
 	{
+		/* EWEB_DOCID diagnostic: log the ACCUMULATED contributors that push the
+		 * document width past the 1280 viewport (window 1284..1500 catches the
+		 * observed 1350). The draw-side [WIDE] walker only sees parent-relative
+		 * boxes, so it cannot identify who sets sz.width. */
+		if(getenv("EWEB_DOCID") != nullptr)
+		{
+			int val = x + right();
+			if(val > 1284 && val < 1500)
+			{
+				static int s_cdsBudget = 400;
+				if(s_cdsBudget > 0)
+				{
+					s_cdsBudget--;
+					const char* cdstag = get_tagName();
+					const char* cdscls = get_attr("class");
+					fprintf(stderr, "[CDS] val=%d x=%d right=%d tag=%s cls=%s\n",
+							val, x, right(),
+							(cdstag != nullptr) ? cdstag : "",
+							(cdscls != nullptr) ? cdscls : "");
+					/* parent chain (6 levels up) to identify WHICH box_k this is */
+					element* cdsp = parent();
+					for(int up = 0; up < 6 && cdsp != nullptr; up++)
+					{
+						const char* ptag = cdsp->get_tagName();
+						const char* pcls = cdsp->get_attr("class");
+						const position& pp = cdsp->get_position();
+						fprintf(stderr, "[CDSP] up%d tag=%s cls=%s w=%d\n", up,
+								(ptag != nullptr) ? ptag : "",
+								(pcls != nullptr) ? pcls : "", pp.width);
+						cdsp = cdsp->parent();
+					}
+					/* one-level child dump of the near-max contributor (the
+					 * 1350 footer box_k): which inner column refuses to shrink
+					 * or wrap. Element base has no children(); div/tag elements
+					 * are html_tag in litehtml (text nodes have empty tag). */
+					if(val >= 1340 && cdstag != nullptr && cdstag[0] != 0 && cdstag[0] != ':')
+					{
+						/* culprit's OWN computed style: children are only 980
+						 * wide, so 1350 comes from this box's sizing, not from
+						 * content min-content. */
+						const tchar_t* cw = get_style_property(_t("width"), false); const tchar_t* cbs = get_style_property(_t("box-sizing"), false);
+						const tchar_t* cminw = get_style_property(_t("min-width"), false);
+						const tchar_t* cmaxw = get_style_property(_t("max-width"), false);
+						const tchar_t* cgrow = get_style_property(_t("flex-grow"), false);
+						const tchar_t* cbasis = get_style_property(_t("flex-basis"), false);
+						const tchar_t* cpl = get_style_property(_t("padding-left"), false);
+						const tchar_t* cpr = get_style_property(_t("padding-right"), false);
+						fprintf(stderr, "[CDSW] bs=%s width=%s min=%s max=%s grow=%s basis=%s pl=%s pr=%s\n",
+								cbs ? cbs : _t("-"), cw ? cw : _t("-"), cminw ? cminw : _t("-"), cmaxw ? cmaxw : _t("-"),
+								cgrow ? cgrow : _t("-"), cbasis ? cbasis : _t("-"),
+								cpl ? cpl : _t("-"), cpr ? cpr : _t("-"));
+						/* resolved box values: decompose the bogus 1350
+						 * (980 content + 300 padding + 70 ? = 1350). */
+						const position& selfp = get_placement();
+						fprintf(stderr, "[CDSV] mx=%d mw=%d padL=%d padR=%d borL=%d borR=%d marL=%d marR=%d\n",
+								selfp.x, selfp.width, padding_left(), padding_right(),
+								border_left(), border_right(),
+								content_margins_left(), content_margins_right());
+						html_tag* cdsself = static_cast<html_tag*>(this);
+						int cn = 0;
+						for(auto& cdsch : cdsself->children())
+						{
+							if(cn >= 14) break;
+							const char* ctag = cdsch->get_tagName();
+							const char* ccls = cdsch->get_attr("class");
+							const position& cp = cdsch->get_position();
+							fprintf(stderr, "[CDSK] ch%d tag=%s cls=%s x=%d w=%d\n",
+									cn, (ctag != nullptr) ? ctag : "",
+									(ccls != nullptr) ? ccls : "", cp.x, cp.width);
+							cn++;
+						}
+					}
+				}
+			}
+		}
 		sz.width	= std::max(sz.width,	x + right());
 		sz.height	= std::max(sz.height,	y + bottom());
 	}
@@ -233,6 +465,21 @@ int litehtml::element::get_inline_shift_left()
 					{
 						ret += el_parent->padding_left() + el_parent->border_left() + el_parent->margin_left();
 					}
+					else
+					{
+						/* This node is NOT the first inline child of el_parent, so
+						 * it does not sit at el_parent's left content edge. By CSS
+						 * an inline box's left padding only offsets the very
+						 * first inline content on the line; any preceding sibling
+						 * already consumed it. Stop the ascent: no outer ancestor's
+						 * left padding may apply either. Without this break a nested
+						 * inline (e.g. <span style="padding:0 1em"><a>Contact
+						 * us</a></span>) leaked the outer padding onto EVERY word -
+						 * "us" is not a's first child, yet a IS span's first child,
+						 * so the old walk kept going and stretched the inter-word
+						 * space by 1em. */
+						break;
+					}
 					el = el_parent;
 					el_parent = el_parent->parent();
 				}
@@ -261,6 +508,13 @@ int litehtml::element::get_inline_shift_right()
 					if (el_parent->is_last_child_inline(el))
 					{
 						ret += el_parent->padding_right() + el_parent->border_right() + el_parent->margin_right();
+					}
+					else
+					{
+						/* Mirror of get_inline_shift_left: not the last inline child
+						 * => not at el_parent's right content edge, so no outer
+						 * ancestor's right padding applies. Stop the ascent. */
+						break;
 					}
 					el = el_parent;
 					el_parent = el_parent->parent();
@@ -390,6 +644,7 @@ bool litehtml::element::is_comment() const
 }
 void litehtml::element::set_tagName( const tchar_t* tag )							LITEHTML_EMPTY_FUNC
 void litehtml::element::set_data( const tchar_t* data )								LITEHTML_EMPTY_FUNC
+void litehtml::element::set_data_replace( const tchar_t* data )						LITEHTML_EMPTY_FUNC
 void litehtml::element::set_attr( const tchar_t* name, const tchar_t* val )			LITEHTML_EMPTY_FUNC
 void litehtml::element::remove_attr( const tchar_t* name )					LITEHTML_EMPTY_FUNC
 void litehtml::element::apply_stylesheet( const litehtml::css& stylesheet )
@@ -426,6 +681,7 @@ bool litehtml::element::is_replaced() const											LITEHTML_RETURN_FUNC(false
 int litehtml::element::line_height() const											LITEHTML_RETURN_FUNC(0)
 bool litehtml::element::is_line_height_normal() const							LITEHTML_RETURN_FUNC(false)
 float litehtml::element::line_height_factor() const								LITEHTML_RETURN_FUNC(0.0f)
+int litehtml::element::letter_spacing() const									LITEHTML_RETURN_FUNC(0)
 litehtml::text_align litehtml::element::get_text_align() const						LITEHTML_RETURN_FUNC(text_align_left)
 litehtml::text_transform litehtml::element::get_text_transform() const				LITEHTML_RETURN_FUNC(text_transform_none)
 void litehtml::element::draw( uint_ptr hdc, int x, int y, const position* clip )	LITEHTML_EMPTY_FUNC

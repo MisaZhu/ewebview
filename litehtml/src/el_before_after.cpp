@@ -53,6 +53,45 @@ void litehtml::el_before_after_base::add_style(const litehtml::style& st, const 
 
 	tstring fnc;
 	tstring::size_type i = 0;
+	/* css-content-3 alternative text: `content: <content-list> / "<alt>"`. The
+	 * string after the slash is exposed to assistive technology only and is
+	 * never rendered (MDN's external-link icon hides "(external)" this way).
+	 * Drop it before tokenizing: a top-level '/' cannot occur inside a content
+	 * list item because quoted strings and url()/attr() parentheses are scanned
+	 * past, so the first slash outside them is the alt separator. */
+	{
+		bool in_quote = false;
+		tchar_t quote = 0;
+		int paren = 0;
+		for(tstring::size_type p = 0; p < content.length(); p++)
+		{
+			tchar_t c = content.at(p);
+			if(in_quote)
+			{
+				if(c == _t('\\'))
+				{
+					p++;
+				} else if(c == quote)
+				{
+					in_quote = false;
+				}
+			} else if(c == _t('"') || c == _t('\''))
+			{
+				in_quote = true;
+				quote = c;
+			} else if(c == _t('('))
+			{
+				paren++;
+			} else if(c == _t(')'))
+			{
+				paren--;
+			} else if(c == _t('/') && paren == 0)
+			{
+				content.erase(p);
+				break;
+			}
+		}
+	}
 	while(i < content.length() && i != tstring::npos)
 	{
 		if(content.at(i) == _t('"'))
@@ -207,10 +246,40 @@ void litehtml::el_before_after_base::add_function( const tstring& fnc, const tst
 	}
 }
 
-litehtml::tchar_t litehtml::el_before_after_base::convert_escape( const tchar_t* txt )
+litehtml::tstring litehtml::el_before_after_base::convert_escape( const tchar_t* txt )
 {
 	tchar_t* sss = 0;
-	return (tchar_t) t_strtol(txt, &sss, 16);
+	unsigned long cp = (unsigned long) t_strtol(txt, &sss, 16);
+	/* CSS Syntax 3 §4.3.6: a hex escape denotes a Unicode code point; 0,
+	 * surrogates and >10FFFF become U+FFFD. Encode as UTF-8 - returning a
+	 * single tchar_t truncated 0x200B to a 0x0B control byte, which the font
+	 * painted as a .notdef hollow box (MDN's a.external::after invisible
+	 * anchor `content:"\200b"` showed up as a tofu square). */
+	if(cp == 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+	tstring out;
+	if(cp < 0x80)
+	{
+		out += (tchar_t)cp;
+	}
+	else if(cp < 0x800)
+	{
+		out += (tchar_t)(0xC0 | (cp >> 6));
+		out += (tchar_t)(0x80 | (cp & 0x3F));
+	}
+	else if(cp < 0x10000)
+	{
+		out += (tchar_t)(0xE0 | (cp >> 12));
+		out += (tchar_t)(0x80 | ((cp >> 6) & 0x3F));
+		out += (tchar_t)(0x80 | (cp & 0x3F));
+	}
+	else
+	{
+		out += (tchar_t)(0xF0 | (cp >> 18));
+		out += (tchar_t)(0x80 | ((cp >> 12) & 0x3F));
+		out += (tchar_t)(0x80 | ((cp >> 6) & 0x3F));
+		out += (tchar_t)(0x80 | (cp & 0x3F));
+	}
+	return out;
 }
 
 void litehtml::el_before_after_base::apply_stylesheet( const litehtml::css& stylesheet )

@@ -198,6 +198,15 @@ typedef struct eweb_listener {
     void (*on_tasks_end)(void* ud);
 } eweb_listener_t;
 
+/* Vertical overscan (logical CSS px) rendered above and below the viewport in
+ * each frame surface delivered via on_frame.  The frame surface height equals
+ * viewport_h + 2 * EWEB_FRAME_OVERSCAN; the viewport content starts at row
+ * EWEB_FRAME_OVERSCAN (in logical px, scaled by dpr in device px).  Embedders
+ * position the frame texture offset by -overscan so the viewport aligns with
+ * the content rect; scroll-shift blits are then absorbed by the overscan rows
+ * without exposing a gap.  Set to 0 to disable (frame == viewport). */
+#define EWEB_FRAME_OVERSCAN 128
+
 /* Zero an eweb_listener_t. Handy for embedders that only implement a few hooks. */
 void eweb_listener_init(eweb_listener_t* l);
 

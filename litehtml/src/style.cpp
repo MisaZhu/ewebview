@@ -52,7 +52,54 @@ void litehtml::style::parse( const tchar_t* txt, const tchar_t* baseurl )
 		clean += *p++;
 	}
 	std::vector<tstring> properties;
-	split_string(clean.c_str(), properties, _t(";"));
+	/* Native CSS nesting: a rule's declaration block can contain nested rules
+	 * (`&:hover {...}`, `&::scroll-button(*) {...}`). A naive split on ';'
+	 * cuts through the nested block's braces and parses its declarations as
+	 * the parent's own -- Pinterest's "More winning ideas" carousel lost its
+	 * display:flex to a nested scroll-button's display:inline-block exactly
+	 * this way (the nested decl is later, and same-rule ties go to the later
+	 * declaration). Split only at brace depth 0, outside quotes; a '{' at
+	 * depth 0 opens a nested rule whose selector is the text accumulated so
+	 * far (discard it) and whose body runs to the matching '}'. Nested styles
+	 * are dropped, not merged -- full nested-rule recovery is separate. */
+	{
+		int depth = 0;
+		int paren = 0;
+		tchar_t quote = 0;
+		tstring cur;
+		for(size_t i = 0; i < clean.length(); i++)
+		{
+			tchar_t c = clean[i];
+			if(quote)
+			{
+				if(depth == 0) cur += c;
+				if(c == quote) quote = 0;
+				continue;
+			}
+			if(c == _t('"') || c == _t('\'')) { quote = c; if(depth == 0) cur += c; continue; }
+			if(c == _t('{')) { if(depth == 0) cur.clear(); depth++; continue; }   /* nested rule: drop its selector (depth 0), then descend; depth++ (not =1) so a deeper block does not collapse the level count and leak its trailing decls into the parent */
+			if(c == _t('}')) { if(depth > 0) { depth--; if(depth == 0) cur.clear(); } continue; }
+			if(depth > 0) continue;                                   /* nested rule body: drop */
+			/* A ';' inside a functional token belongs to the token, not the
+			 * declaration list: unquoted url(data:image/png;base64,...) data
+			 * URIs carry one, and splitting there truncated the value to
+			 * "url(data:image/png" (no closing paren -> parse_css_url found
+			 * nothing), so Wikimedia's .vector-icon 1x1 transparent PNG
+			 * placeholder mask was never queued and the icon span painted as
+			 * a solid square. Parens only nest inside url()/functions at
+			 * declaration level, so a plain depth count is safe here. */
+			if(c == _t('(')) { paren++; cur += c; continue; }
+			if(c == _t(')')) { if(paren > 0) paren--; cur += c; continue; }
+			if(c == _t(';') && paren == 0)
+			{
+				if(cur.find_first_not_of(_t(" \t\r\n")) != tstring::npos) properties.push_back(cur);
+				cur.clear();
+				continue;
+			}
+			cur += c;
+		}
+		if(cur.find_first_not_of(_t(" \t\r\n")) != tstring::npos) properties.push_back(cur);
+	}
 
 	for(std::vector<tstring>::const_iterator i = properties.begin(); i != properties.end(); i++)
 	{
@@ -146,6 +193,17 @@ void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, con
 void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, const tchar_t* baseurl, bool important )
 {
 	if(!name || !val)
+	{
+		return;
+	}
+
+	/* A `color` declaration carrying light-dark() is a parse error in an
+	 * engine without light-dark support (the csstools polyfill emits it as
+	 * the unconditional progressive-enhancement twin of the var() toggle
+	 * form). Drop it here so the earlier var()-toggle declaration keeps the
+	 * cascade slot; web_color::from_string would otherwise alpha-0 the value
+	 * and erase the text (MDN's inline <code> labels). */
+	if(!t_strcmp(name, _t("color")) && t_strstr(val, _t("light-dark(")) != nullptr)
 	{
 		return;
 	}
@@ -789,7 +847,55 @@ void litehtml::style::add_property( const tchar_t* name, const tchar_t* val, con
 			return;
 		}
 		parse_short_font(val, important);
-	} else 
+	} else
+
+	// grid-template shorthand, <track-list> / <track-list> form (the one the
+	// vector-2022 skin uses: `grid-template:min-content 1fr min-content /
+	// 12.25rem minmax(0,1fr)` is the ONLY column-width source at 1280px, so
+	// without expanding it render_grid sees no tracks and collapses the
+	// content column to 0). The string-areas form ('a b' 10px / ...) keeps
+	// its raw value: grid-template-areas is normally declared separately and
+	// splitting on '/' inside quoted areas would corrupt it.
+	if(!t_strcmp(name, _t("grid-template")))
+	{
+		tstring v = val;
+		trim(v);
+		if(v.empty() || !t_strcasecmp(v.c_str(), _t("none")))
+		{
+			add_parsed_property(_t("grid-template-rows"),    _t("none"), important);
+			add_parsed_property(_t("grid-template-columns"), _t("none"), important);
+			add_parsed_property(_t("grid-template-areas"),   _t("none"), important);
+			return;
+		}
+		if(v.find(_t('\'')) != tstring::npos || v.find(_t('"')) != tstring::npos)
+		{
+			add_parsed_property(name, val, important);
+			return;
+		}
+		/* Paren-aware split ('(' passed as the quote char) so minmax(0,1fr)
+		 * keeps its comma and no stray '/' inside a function is honoured. */
+		string_vector halves;
+		split_string(v, halves, _t("/"), _t(""), _t("("));
+		if(halves.size() != 2)
+		{
+			add_parsed_property(name, val, important);
+			return;
+		}
+		trim(halves[0]);
+		trim(halves[1]);
+		if(halves[0].empty() || halves[1].empty())
+		{
+			add_parsed_property(name, val, important);
+			return;
+		}
+		/* The shorthand resets the unspecified sub-properties; areas are
+		 * dropped here exactly as a browser would, and a later longhand
+		 * grid-template-areas declaration in the same rule (the vector skin
+		 * emits one) re-sets them through the normal cascade. */
+		add_parsed_property(_t("grid-template-rows"),    halves[0], important);
+		add_parsed_property(_t("grid-template-columns"), halves[1], important);
+		remove_property(_t("grid-template-areas"), important);
+	} else
 	{
 		add_parsed_property(name, val, important);
 	}

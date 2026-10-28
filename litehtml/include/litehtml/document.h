@@ -61,9 +61,32 @@ namespace litehtml
 	private:
 		element::ptr					m_root;
 		document_container*					m_container;
+		/* Scroll position noted by the embedder before a hit test, so
+		 * position:sticky boxes can be tested where they are pinned (the hit
+		 * walk itself only sees local/document coordinates). */
+		int								m_hit_scroll_x = 0;
+		int								m_hit_scroll_y = 0;
+		/* Scroll captured at the top of draw(); the paint walk reads it so
+		 * position:sticky pinning is depth-independent. */
+		int								m_draw_scroll_x = 0;
+		int								m_draw_scroll_y = 0;
+		/* Frame-space row of the viewport origin (vertical overscan). The
+		 * embedder may draw into a buffer taller than the viewport with the
+		 * viewport starting this many rows down, so draw() receives
+		 * y = vp_origin - scroll. Fixed-position boxes paint at the client
+		 * rect (viewport-relative), so they must be shifted down by this
+		 * offset to land at their viewport rows in the buffer, and the true
+		 * scroll derives as vp_origin - y. 0 = no overscan (buffer ==
+		 * viewport, the long-standing layout). */
+		int								m_draw_vp_origin_y = 0;
 		fonts_map							m_fonts;
 		css_text::vector					m_css;
 		litehtml::css						m_styles;
+		/* True once create_document's one-shot m_css sweep has parsed every
+		 * queued sheet into m_styles. m_css is never consumed again afterwards,
+		 * so add_stylesheet must parse a later sheet (a <style> JS injects at
+		 * runtime) straight into m_styles instead of queuing it to be dropped. */
+		bool								m_css_swept = false;
 		litehtml::web_color					m_def_color;
 		litehtml::context*					m_context;
 		litehtml::size						m_size;
@@ -76,6 +99,14 @@ namespace litehtml
 		bool								m_tables_dirty;
 		element::ptr						m_over_element;
 		elements_vector						m_tabular_elements;
+		/* Set when add_tabular registers an element that was not already in
+		 * m_tabular_elements. create_document runs fix_tables_layout() once at
+		 * the end of the initial parse; elements registered later (fast-mode
+		 * builds register nothing until the chunked reparse, and JS restyles
+		 * can flip display to table) would otherwise never get their anonymous
+		 * boxes, so document::render consumes this flag and re-runs the fixup
+		 * before layout. */
+		bool								m_tabular_dirty = false;
 		media_features						m_media;
 		tstring                             m_lang;
 		tstring                             m_culture;
@@ -144,6 +175,11 @@ namespace litehtml
 		int								width() const;
 		int								height() const;
 		void							add_stylesheet(const tchar_t* str, const tchar_t* baseurl, const tchar_t* media);
+		/* Parse a sheet straight into m_styles NOW, for sheets that appear or
+		 * change after the creation-time m_css sweep (a <style> whose text JS
+		 * rewrites). add_stylesheet only queues m_css, which is consumed once at
+		 * create_document, so late queues would never be parsed. */
+		void							add_stylesheet_now(const tchar_t* str, const tchar_t* baseurl, const tchar_t* media);
 		bool							on_mouse_over(int x, int y, int client_x, int client_y, position::vector& redraw_boxes);
 		bool							on_lbutton_down(int x, int y, int client_x, int client_y, position::vector& redraw_boxes);
 		bool							on_lbutton_up(int x, int y, int client_x, int client_y, position::vector& redraw_boxes);
@@ -156,8 +192,14 @@ namespace litehtml
 		 * html_tag::reapply_style_cascade, because they may have been styled while
 		 * detached, where ancestor-dependent selectors could not match. A work
 		 * budget bounds each call. */
-		void style_detached_subtree(element* el);
+		bool style_detached_subtree(element* el);
 		element::ptr					root();
+		void							set_hit_scroll(int x, int y) { m_hit_scroll_x = x; m_hit_scroll_y = y; }
+		int								get_hit_scroll_x() const { return m_hit_scroll_x; }
+		int								get_hit_scroll_y() const { return m_hit_scroll_y; }
+		int								get_draw_scroll_y() const { return m_draw_scroll_y; }
+		void							set_draw_vp_origin_y(int v) { m_draw_vp_origin_y = v; }
+		int								get_draw_vp_origin_y() const { return m_draw_vp_origin_y; }
 		void							get_fixed_boxes(position::vector& fixed_boxes);
 		void							add_fixed_box(const position& pos);
 		void							add_media_list(media_query_list::ptr list);
@@ -184,6 +226,9 @@ namespace litehtml
 		 * pass per element, so a resumed chunk keeps a single consistent stamp
 		 * epoch instead of re-walking the tree once per sheet. */
 		const litehtml::css&			doc_styles() const { return m_styles; }
+		/* True when any applied selector tests the named attribute; the DOM
+		 * bridge uses it to restyle on data- and aria- mutations (EWebJs.cc). */
+		bool							uses_attribute_selector(const tchar_t* name) const;
 		/* The context (master) sheet set. Async containers (ewebview) feed every
 		 * fetched <link> sheet to context::load_master_stylesheet, so doc_styles
 		 * alone can be empty; late-cascade sites (el_svg shape children) must
@@ -266,7 +311,16 @@ namespace litehtml
 	}
 	inline void document::add_tabular(const element::ptr& el)
 	{
-		m_tabular_elements.push_back(el);
+		/* parse_styles re-runs on every restyle/reparse epoch: registering the
+		 * same element again would grow m_tabular_elements without bound (the
+		 * deferred fixup walks the whole list). Only a genuinely new entry
+		 * marks the list dirty. */
+		if (std::find(m_tabular_elements.begin(), m_tabular_elements.end(), el)
+				== m_tabular_elements.end())
+		{
+			m_tabular_elements.push_back(el);
+			m_tabular_dirty = true;
+		}
 	}
 	inline bool document::match_lang(const tstring & lang)
 	{
