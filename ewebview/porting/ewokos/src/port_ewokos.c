@@ -58,9 +58,9 @@
  * natural-pixel buffers with dpr == 1; blit scales the src rect by the
  * source's dpr and the dst rect by the destination's.
  *
- * On EwokOS the embedder sets dpr = 1 by default (see WidgetWebview), so every
- * path below is numerically identical to a plain 1x port - no scaling. The
- * machinery only kicks in when a caller opts into a higher ratio. */
+ * WidgetWebview follows the xwin HiDPI setting (see XBROWSER_DPR for an
+ * explicit override). At dpr == 1 every path below is numerically identical
+ * to a plain 1x port; higher ratios rasterise at native device resolution. */
 typedef struct {
     graph_t* g;    /* device-pixel buffer: w = lw*dpr, h = lh*dpr        */
     int      lw;   /* logical (CSS) width the core sees via surface_dims */
@@ -649,8 +649,7 @@ void eweb_port_ewokos(eweb_port_t* port, void* ud) {
 
 /* HiDPI mechanism: set the device-pixel ratio the port rasterises at. Call
  * BEFORE the first ewebview_set_viewport() so the frame pool allocates
- * device-sized (logical*dpr) buffers. EwokOS embedder passes 1.0 by default,
- * i.e. a plain 1x port with no scaling. */
+ * device-sized (logical*dpr) buffers. The standalone port defaults to 1.0. */
 void eweb_port_ewokos_set_dpr(float dpr) {
     g_dpr = (dpr > 0.0f) ? dpr : 1.0f;
 }
