@@ -1757,6 +1757,38 @@ void EWebEngine::engineLoop()
             more = processResults();
         }
 
+        /* TEMP DIAGNOSTIC (taobao CNA): build-state heartbeat. A wedged
+         * post-swap script queue (advanceBuildStep still pumping but
+         * runNextPageScript never advancing) looks identical to a terminated
+         * phase from the outside; this print tells them apart. Gated on
+         * EWEB_SCRIPTDBG, 1 s throttle plus immediate print on change. */
+        if(getenv("EWEB_SCRIPTDBG") != NULL) {
+            static int s_hbPhase = -1, s_hbNext = -1, s_hbDefer = -1;
+            static int s_hbAbort = -1, s_hbPostRun = -1, s_hbSize = -1;
+            static uint64_t s_hbAt = 0;
+            uint64_t hbNow = ticMs();
+            if(hbNow - s_hbAt > 1000 ||
+               (int)m_buildPhase != s_hbPhase ||
+               (int)m_jsNextScript != s_hbNext ||
+               (int)m_jsScripts.size() != s_hbSize ||
+               (int)m_deferBuildStep != s_hbDefer ||
+               (int)m_buildAbort != s_hbAbort ||
+               (int)m_jsPostSwapRun != s_hbPostRun) {
+                s_hbAt = hbNow;
+                s_hbPhase = (int)m_buildPhase;
+                s_hbNext = (int)m_jsNextScript;
+                s_hbSize = (int)m_jsScripts.size();
+                s_hbDefer = (int)m_deferBuildStep;
+                s_hbAbort = (int)m_buildAbort;
+                s_hbPostRun = (int)m_jsPostSwapRun;
+                fprintf(stderr, "[ewebview] jsdbg: tick phase=%d abort=%d defer=%d postRun=%d next=%d/%d vm=%p skelLatch=%d\n",
+                        (int)m_buildPhase, m_buildAbort ? 1 : 0,
+                        m_deferBuildStep ? 1 : 0, m_jsPostSwapRun ? 1 : 0,
+                        (int)m_jsNextScript, (int)m_jsScripts.size(),
+                        (void*)m_jsVm, m_postSwapSkelLatch ? 1 : 0);
+            }
+        }
+
         /* 4. style/layout for both the build and the visible doc. */
         if(applyPendingLayoutUpdates())
             markContentDirty();
@@ -1769,6 +1801,25 @@ void EWebEngine::engineLoop()
                 m_deferBuildStep = false;
             } else {
                 advanceBuildStep();
+            }
+        } else if(m_deferBuildStep) {
+            /* A subresource result landed after the run phase went idle. A
+             * script fetch fills an ordered queue slot (processResults), but
+             * nothing re-arms the pump from IDLE, so the landed body sleeps in
+             * the queue: taobao's lib-mtop JSONP login check wedges exactly
+             * here - its callback never runs, isLoginByMtop() never settles,
+             * the nav status class never lands and the left cluster stays
+             * visibility:hidden. Consume the flag either way (a stale true
+             * also pins busy/idle forever) and restart the post-swap pump
+             * when scripts are still queued, as jsDynamicScriptInserted does
+             * for a late insertion. */
+            m_deferBuildStep = false;
+            if(m_jsVm != nullptr && m_jsEnabled && !m_jsPageDisabled &&
+               m_jsNextScript < m_jsScripts.size()) {
+                m_jsPostSwapRun = true;
+                m_jsPostSwapAt = ticMs();
+                m_postSwapSkelLatch = false;
+                m_buildPhase = BUILD_RUN_JS;
             }
         } else if(m_jsPageHasModules && !m_moduleNoticeDecided && !m_jsPostSwapRun &&
                   (ticMs() - m_swapAtMs) > 2500) {
@@ -3058,12 +3109,26 @@ bool EWebEngine::applyPseudoClassChain(litehtml::element* el, const char* name, 
     for(litehtml::element* cur = el; cur != nullptr && guard++ < 256; cur = cur->parent()) {
         if(cur->set_pseudo_class(name, add)) changed = true;
     }
+    if(getenv("EWEB_HOVERDBG") != nullptr) {
+        fprintf(stderr, "[hoverdbg] applyPseudoClassChain name=%s add=%d el=%s changed=%d\n",
+                name, (int)add, el != nullptr ? el->get_tagName() : "(null)", (int)changed);
+    }
     if(!changed) return false;
 
     litehtml::element::ptr root = doc->root();
     if(root != nullptr) {
         litehtml::position::vector redraw_boxes;
-        root->find_styles_changes(redraw_boxes, 0, 0);
+        /* A flipped pseudo-class changes computed style without any DOM or
+         * layout mutation, so nothing else schedules a repaint: a pure-CSS
+         * :hover/:focus rule would restyle the tree but keep presenting the
+         * stale raster until an unrelated dirty tick. Mark the content dirty
+         * whenever the restyle walk actually changed an element. */
+        bool restyled = root->find_styles_changes(redraw_boxes, 0, 0);
+        if(getenv("EWEB_HOVERDBG") != nullptr) {
+            fprintf(stderr, "[hoverdbg]   restyled=%d boxes=%zu\n", (int)restyled, redraw_boxes.size());
+        }
+        if(restyled)
+            markContentDirty();
     }
     return true;
 }
@@ -3076,6 +3141,28 @@ void EWebEngine::setFocus(litehtml::element* el)
      * do. The widget's own focus flag drives the caret / focus ring in draw(). */
     litehtml::element* old = (litehtml::element*)m_focusElement;
     if(old == el) return;
+
+    /* EWEB_FOCUSDBG: trace every focus move (tag#id) to pin down focus
+     * stealers on live pages (headless forensics). */
+    if(getenv("EWEB_FOCUSDBG") != nullptr) {
+        char bo[96], bn[96];
+        const char* t = old != nullptr ? old->get_tagName() : nullptr;
+        const char* id = old != nullptr ? old->get_attr("id", nullptr) : nullptr;
+        snprintf(bo, sizeof(bo), "%s#%s",
+                 old == nullptr ? "(none)" : ((t != nullptr && t[0] != 0) ? t : "(text)"),
+                 (id != nullptr && id[0] != 0) ? id : "-");
+        t = el != nullptr ? el->get_tagName() : nullptr;
+        id = el != nullptr ? el->get_attr("id", nullptr) : nullptr;
+        snprintf(bn, sizeof(bn), "%s#%s",
+                 el == nullptr ? "(none)" : ((t != nullptr && t[0] != 0) ? t : "(text)"),
+                 (id != nullptr && id[0] != 0) ? id : "-");
+        fprintf(stderr, "[focusdbg] setFocus %s -> %s\n", bo, bn);
+        if(el != nullptr) {
+            litehtml::position p = el->get_placement();
+            fprintf(stderr, "[focusdbg]   new rect=%d,%d %dx%d display=%d\n",
+                    p.x, p.y, p.width, p.height, (int)el->get_display());
+        }
+    }
 
     if(old != nullptr) {
         void* w = widgetAt(old);
@@ -3654,6 +3741,8 @@ void EWebEngine::taskLoop()
                 res = loadImageTask(task.url);
             } else if(task.type == EWEB_TASK_SCRIPT) {
                 res = loadScriptTask(task.url);
+            } else if(task.type == EWEB_TASK_FONT_FACE) {
+                res = loadFontFaceTask(task.url);
             }
 
             EWebUiEvent sev; sev.task = task;
@@ -3820,7 +3909,7 @@ bool EWebEngine::getTask(EWebTask& task)
 
 bool EWebEngine::loadHtmlTask(const std::string& url)
 {
-    EWebResult result = {url, EWEB_TASK_HTML, false, "", nullptr};
+    EWebResult result = {url, EWEB_TASK_HTML, false, "", nullptr, ""};
     int sz = 0;
     uint64_t fetch_start = ticMs();
     /* Top-level navigation: SameSite=Lax cookies may ride along even when the
@@ -3851,7 +3940,7 @@ bool EWebEngine::loadHtmlTask(const std::string& url)
 
 bool EWebEngine::loadCSSTask(const std::string& url)
 {
-    EWebResult result = {url, EWEB_TASK_CSS, false, "", nullptr};
+    EWebResult result = {url, EWEB_TASK_CSS, false, "", nullptr, ""};
     int sz = 0;
     uint64_t fetch_start = ticMs();
     /* Subresource of the document being built: not a top-level navigation, so
@@ -3873,9 +3962,155 @@ bool EWebEngine::loadCSSTask(const std::string& url)
     return result.ok;
 }
 
+/* True for the container formats a FreeType-backed port can open straight
+ * from memory: TTF/OTF (sfnt), TTC, WOFF and WOFF2 magics. Anything else
+ * (an HTML error page, a gzip wrapper the HTTP layer left alone) is rejected
+ * so a bogus blob never reaches the font registry. */
+static bool ewebIsFontMagic(const uint8_t* d, int n)
+{
+    if(n < 4) return false;
+    if(d[0] == 0x00 && d[1] == 0x01 && d[2] == 0x00 && d[3] == 0x00) return true;  /* sfnt TTF */
+    if(d[0] == 'O' && d[1] == 'T' && d[2] == 'T' && d[3] == 'O') return true;      /* sfnt OTF */
+    if(d[0] == 't' && d[1] == 't' && d[2] == 'c' && d[3] == 'f') return true;      /* TTC */
+    if(d[0] == 'w' && d[1] == 'O' && d[2] == 'F' && d[3] == 'F') return true;      /* WOFF */
+    if(d[0] == 'w' && d[1] == 'O' && d[2] == 'F' && d[3] == '2') return true;      /* WOFF2 */
+    return false;
+}
+
+/* Trim whitespace and one layer of wrapping quotes off a descriptor value
+ * (font-family:'iconfont' -> iconfont). */
+static std::string ewebCleanFontToken(const std::string& v)
+{
+    size_t b = 0, e = v.size();
+    while(b < e && (v[b] == ' ' || v[b] == '\t' || v[b] == '\n' || v[b] == '\r')) b++;
+    while(e > b && (v[e-1] == ' ' || v[e-1] == '\t' || v[e-1] == '\n' || v[e-1] == '\r')) e--;
+    if(e - b >= 2 && ((v[b] == '"' && v[e-1] == '"') || (v[b] == '\'' && v[e-1] == '\''))) {
+        b++;
+        e--;
+    }
+    return v.substr(b, e - b);
+}
+
+void EWebEngine::scanFontFaces(const std::string& text, const std::string& baseUrl)
+{
+    /* litehtml drops unknown at-rules, so @font-face never reaches the style
+     * system: walk the raw text here instead. Every block yields its
+     * font-family name plus the first url() of its src descriptor; the blob
+     * is fetched as a FONT_FACE task and registered with the port under that
+     * family, which is what turns iconfont PUA codepoints from tofu into
+     * glyphs. Relative src urls resolve against the sheet (or document) url. */
+    size_t pos = 0;
+    for(;;) {
+        size_t at = std::string::npos;
+        for(size_t i = pos; i + 10 <= text.size(); i++) {
+            if(text[i] != '@') continue;
+            const char* kw = "font-face";
+            size_t k = 0;
+            while(k < 9 && tolower((unsigned char)text[i + 1 + k]) == kw[k]) k++;
+            if(k == 9) { at = i; break; }
+        }
+        if(at == std::string::npos) break;
+        size_t open = text.find('{', at);
+        if(open == std::string::npos) break;
+        /* @font-face bodies never nest braces. */
+        size_t close = text.find('}', open);
+        if(close == std::string::npos) break;
+        pos = close + 1;
+        std::string block = text.substr(open + 1, close - open - 1);
+        std::string lower = block;
+        for(size_t i = 0; i < lower.size(); i++)
+            lower[i] = (char)tolower((unsigned char)lower[i]);
+        size_t ff = lower.find("font-family:");
+        if(ff == std::string::npos) continue;
+        size_t fe = block.find(';', ff);
+        std::string fam = ewebCleanFontToken(
+            block.substr(ff + 12, (fe == std::string::npos ? block.size() : fe) - ff - 12));
+        if(fam.empty()) continue;
+        size_t su = lower.find("src:");
+        if(su == std::string::npos) continue;
+        /* The src descriptor usually lists several formats (woff2, woff, ttf).
+         * FreeType/SDL_ttf opens sfnt (ttf/otf/ttc) and woff but NOT woff2
+         * (needs brotli), so prefer the most-openable format rather than
+         * blindly taking the first url(). */
+        std::string rel;
+        int best = 99;
+        for(size_t scan = su; scan != std::string::npos; ) {
+            size_t uo = block.find("url(", scan);
+            size_t uo2 = block.find("url (", scan);
+            if(uo2 != std::string::npos && (uo == std::string::npos || uo2 < uo)) uo = uo2;
+            if(uo == std::string::npos) break;
+            size_t ub = uo + (block[uo + 3] == '(' ? 4 : 5);
+            size_t ue = block.find(')', ub);
+            if(ue == std::string::npos) break;
+            scan = ue + 1;
+            std::string cand = ewebCleanFontToken(block.substr(ub, ue - ub));
+            if(cand.empty() || cand.compare(0, 5, "data:") == 0) continue;
+            std::string lc = cand;
+            for(size_t i = 0; i < lc.size(); i++) lc[i] = (char)tolower((unsigned char)lc[i]);
+            size_t q = lc.find_first_of("?#");
+            if(q != std::string::npos) lc = lc.substr(0, q);
+            int score;
+            if(lc.size() > 4 && (lc.compare(lc.size()-4, 4, ".ttf") == 0 ||
+                                 lc.compare(lc.size()-4, 4, ".otf") == 0 ||
+                                 lc.compare(lc.size()-4, 4, ".ttc") == 0)) score = 0;
+            else if(lc.size() > 5 && lc.compare(lc.size()-5, 5, ".woff") == 0) score = 1;
+            else if(lc.size() > 6 && lc.compare(lc.size()-6, 6, ".woff2") == 0) score = 2;
+            else score = 3;
+            if(score < best) { best = score; rel = cand; }
+            if(best == 0) break;
+        }
+        if(rel.empty()) continue;
+        std::string url = EWebContainer::getFullURL(&m_port, rel, baseUrl);
+        if(url.empty()) continue;
+        pthread_mutex_lock(&m_taskMutex);
+        bool seen = false;
+        for(size_t i = 0; i < m_seenFontUrls.size(); i++)
+            if(m_seenFontUrls[i] == url) { seen = true; break; }
+        if(!seen) {
+            m_seenFontUrls.push_back(url);
+            m_fontFaceFamily[url] = fam;
+        }
+        pthread_mutex_unlock(&m_taskMutex);
+        if(seen) continue;
+        EWebTask task;
+        task.url = url;
+        task.type = EWEB_TASK_FONT_FACE;
+        task.loading = false;
+        addTask(task);
+        EWEB_LOG("[ewebview] @font-face queued: family=%s url=%s\n", fam.c_str(), url.c_str());
+        if(getenv("EWEB_FONTDBG") != nullptr)
+            fprintf(stderr, "[fontdbg] queued family=%s url=%s\n", fam.c_str(), url.c_str());
+    }
+}
+
+bool EWebEngine::loadFontFaceTask(const std::string& url)
+{
+    EWebResult result = {url, EWEB_TASK_FONT_FACE, false, "", nullptr, ""};
+    int sz = 0;
+    uint64_t fetch_start = ticMs();
+    /* Subresource, same cookie reasoning as loadCSSTask(). */
+    uint8_t* content = EWebContainer::loadURL(&m_port, url, &sz, taskPageUrl(), false);
+    if(content != NULL && sz > 4 && ewebIsFontMagic(content, sz)) {
+        pthread_mutex_lock(&m_taskMutex);
+        std::unordered_map<std::string, std::string>::iterator it = m_fontFaceFamily.find(url);
+        if(it != m_fontFaceFamily.end()) result.family = it->second;
+        pthread_mutex_unlock(&m_taskMutex);
+        if(!result.family.empty()) {
+            result.content.assign((char*)content, (size_t)sz);
+            result.ok = true;
+        }
+    }
+    if(content != NULL) free(content);
+    pushResult(result);
+    removeTask(url);
+    EWEB_LOG("[ewebview] fetched font-face: url=%s ok=%d size=%d cost=%u ms\n",
+        url.c_str(), result.ok ? 1 : 0, sz, (uint32_t)(ticMs() - fetch_start));
+    return result.ok;
+}
+
 bool EWebEngine::loadScriptTask(const std::string& url)
 {
-    EWebResult result = {url, EWEB_TASK_SCRIPT, false, "", nullptr};
+    EWebResult result = {url, EWEB_TASK_SCRIPT, false, "", nullptr, ""};
     int sz = 0;
     uint64_t fetch_start = ticMs();
     /* Subresource of the document being built (a classic <script src>): not a
@@ -3898,7 +4133,7 @@ bool EWebEngine::loadScriptTask(const std::string& url)
 
 bool EWebEngine::loadImageTask(const std::string& url)
 {
-    EWebResult result = {url, EWEB_TASK_IMAGE, false, "", nullptr};
+    EWebResult result = {url, EWEB_TASK_IMAGE, false, "", nullptr, ""};
     int sz = 0;
     uint64_t fetch_start = ticMs();
     /* Subresource, same reasoning as loadCSSTask(). */
@@ -3939,6 +4174,10 @@ bool EWebEngine::loadCSSContent(const std::string& url, const std::string& conte
     }
     bool res = false;
     if(!content.empty()) {
+        /* @font-face blocks live in this sheet: queue their src blobs before
+         * parsing so the glyphs land as early as possible. Relative urls
+         * resolve against the sheet's own url. */
+        scanFontFaces(content, url);
         uint64_t parse_start = ticMs();
         litehtml::context* ctx = m_activeContext;
         litehtml::document::ptr target_doc = m_doc;
@@ -4096,6 +4335,10 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
      * exclusively owns the documents; the loop renders frames and posts them
      * to the UI. */
     cleanupBuildResources();
+    /* Inline <style> blocks can carry @font-face too: scan the raw document
+     * text (relative src urls resolve against the document url) before the
+     * script-stripping rewrite so the fetches start during the build. */
+    scanFontFaces(content, m_currentHtmlUrl);
     m_buildTargetContext = (m_activeContext == &m_browser_context) ? &m_buildContext : &m_browser_context;
     m_buildTargetContext->master_css().clear();
     pthread_mutex_lock(&m_cssMediaMutex);
@@ -4488,6 +4731,33 @@ bool EWebEngine::processResults()
         { EWebUiEvent uev; uev.kind = EUET_URL; uev.text = result.url; postUiEvent(uev); }
         loadHtmlContent(result.content);
         drive_build = true;
+    }
+    else if(result.type == EWEB_TASK_FONT_FACE) {
+        /* ENGINE-THREAD ONLY: register the downloaded blob with the port
+         * under its CSS family. The port bumps its webfont generation, which
+         * invalidates every live font handle (their next measurement or draw
+         * re-resolves the family list), so all that is left here is to mark
+         * both documents dirty and let the engine loop re-measure a frame -
+         * no page reload, no cache flush. */
+        if(result.ok && !result.family.empty() && m_port.font.webfont_add) {
+            m_port.font.webfont_add(m_port.font.ud, result.family.c_str(),
+                (const unsigned char*)result.content.data(), (int)result.content.size());
+            EWEB_LOG("[ewebview] webfont registered: family=%s size=%d\n",
+                result.family.c_str(), (int)result.content.size());
+            if(getenv("EWEB_FONTDBG") != nullptr)
+                fprintf(stderr, "[fontdbg] registered family=%s size=%d\n",
+                    result.family.c_str(), (int)result.content.size());
+            m_needsStyleUpdate = true;
+            m_needsLayout = true;
+            if(m_buildPhase != BUILD_IDLE) {
+                m_buildNeedsStyleUpdate = true;
+                m_buildNeedsLayout = true;
+            }
+            drive_build = true;
+        } else if(getenv("EWEB_FONTDBG") != nullptr) {
+            fprintf(stderr, "[fontdbg] fetch-fail ok=%d family=%s url=%s\n",
+                (int)result.ok, result.family.c_str(), result.url.c_str());
+        }
     }
     else if(result.type == EWEB_TASK_CSS) {
         loadCSSContent(result.url, result.content);

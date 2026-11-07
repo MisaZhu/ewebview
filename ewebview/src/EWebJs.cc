@@ -543,6 +543,12 @@ void EWebEngine::initJsVm()
 void EWebEngine::resetJsVm()
 {
     if(m_jsVm == nullptr) return;
+    /* Abandon async-fetch jobs created on this VM before freeing it: their
+     * __resolve/__reject closures live inside the VM, and the global fetch
+     * queues outlive it, so the next js_web_fetch_poll() (on the fresh
+     * post-navigation VM) would otherwise settle a stale job through dangling
+     * closures - a heap-use-after-free on the freed VM region. */
+    js_web_fetch_purge_vm(m_jsVm);
     vm_close(m_jsVm);      /* frees the VM and everything it owns */
     m_jsVm = nullptr;
 }
@@ -1577,6 +1583,40 @@ bool EWebEngine::runPageScripts()
     return true;
 }
 
+/* True for telemetry / tracking / security-beacon bundles by URL substring
+ * (lower-cased). These bodies contribute NOTHING to what the page paints or how
+ * it interacts - they instrument and phone home - yet on a single-threaded VM
+ * one heavy minified SDK (taobao.com's o.alicdn.com/tbpc/traceSDK, ~400 KB)
+ * spins for minutes and, sitting AHEAD of the app chain in document order,
+ * starves the React bundles that would replace the server-side skeleton, so the
+ * page is a permanent grey placeholder. While the viewport still shows only
+ * that skeleton (the render-critical window) such a body is skipped outright
+ * instead of executed: skipping - unlike watchdog-terminating it mid-run -
+ * leaves no torn VM state behind for the next script to fault on. Once real
+ * content paints the probe goes false and every script runs normally.
+ * "polyfill" (core-js bundles) is in the list because on a real browser those
+ * bodies are near-no-ops, whereas on this VM their feature-detection writes
+ * overflow a heap buffer and abort the process mid-boot (taobao.com's
+ * index.umd.es5.production.js); the VM's own built-ins cover the features the
+ * app chain actually uses. */
+static bool jsIsTelemetryUrl(const std::string& url) {
+    if(url.empty())
+        return false;
+    std::string u;
+    u.reserve(url.size());
+    for(char c : url)
+        u.push_back((char)tolower((unsigned char)c));
+    static const char* kNeedles[] = {
+        "tracesdk", "securitysdk", "beacon", "analytics", "retcode",
+        "goldlog", "tracker", "telemetry", "polyfill",
+    };
+    for(const char* n : kNeedles) {
+        if(u.find(n) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
 bool EWebEngine::runNextPageScript()
 {
     /* Post-swap counterpart of runPageScripts(): the DOM on screen is the
@@ -1585,6 +1625,26 @@ bool EWebEngine::runNextPageScript()
      * blocks. Same VM rules as above: a page with only inline on* handlers
      * still needs the VM, a page with neither never gets one. */
     if(!m_jsEnabled || m_jsPageDisabled || jsActiveDoc() == nullptr) return false;
+    /* TEMP DIAGNOSTIC (taobao CNA): entry heartbeat. Prints when the entry
+     * state changes so a silent early return (page-disabled / doc gone) is
+     * distinguishable from an advanceBuildStep that was never called. */
+    if(getenv("EWEB_SCRIPTDBG") != NULL) {
+        static int s_entNext = -1, s_entSize = -1;
+        static int s_entDisabled = -1, s_entDoc = -1;
+        int entDoc = (jsActiveDoc() != nullptr) ? 1 : 0;
+        if((int)m_jsNextScript != s_entNext ||
+           (int)m_jsScripts.size() != s_entSize ||
+           (int)m_jsPageDisabled != s_entDisabled ||
+           entDoc != s_entDoc) {
+            s_entNext = (int)m_jsNextScript;
+            s_entSize = (int)m_jsScripts.size();
+            s_entDisabled = (int)m_jsPageDisabled;
+            s_entDoc = entDoc;
+            fprintf(stderr, "[ewebview] jsdbg: rnps enter enabled=%d disabled=%d doc=%d next=%d/%d\n",
+                    m_jsEnabled ? 1 : 0, m_jsPageDisabled ? 1 : 0, entDoc,
+                    (int)m_jsNextScript, (int)m_jsScripts.size());
+        }
+    }
     if(m_jsVm == nullptr && m_jsScripts.empty() && !m_jsHasInlineHandlers) return false;
     initJsVm();
     if(m_jsVm == nullptr) return false;
@@ -1791,6 +1851,17 @@ bool EWebEngine::runNextPageScript()
                         (i < m_jsScriptDone.size() ? (int)m_jsScriptDone[i] : -1));
             jsFireScriptElEvent(i, "error"); continue;
         }
+        /* Render-critical window: while only the server-side skeleton paints,
+         * drop telemetry/tracking bundles (see jsIsTelemetryUrl) so the app
+         * chain behind them gets the VM. Report load so nothing awaits them. */
+        if(pageShowsSkeletonPlaceholder() &&
+           jsIsTelemetryUrl(i < m_jsScriptSrcs.size() ? m_jsScriptSrcs[i] : std::string())) {
+            if(getenv("EWEB_SCRIPTDBG") != NULL)
+                fprintf(stderr, "[ewebview] jsdbg: post skip script %d (telemetry, skeleton) url=%.80s\n",
+                        (int)i, m_jsScriptSrcs[i].c_str());
+            jsFireScriptElEvent(i, "load");
+            continue;
+        }
         if(jsIsRunaway(src)) {
             EWEB_LOG("[ewebview] js: script %d skipped (runaway body, %u bytes)\n",
                 (int)i, (unsigned)src.size());
@@ -1948,6 +2019,10 @@ bool EWebEngine::runNextPageScript()
          * matched by "react-dom" in the src (React is loaded, XMLHttpRequest
          * and fetch exist, the webpack app chunks have not run yet). Fires once
          * per page. */
+        if(getenv("EWEB_INJECTDBG") != NULL)
+            fprintf(stderr, "[injectdbg] i=%d nsrc=%zu done=%d src=%.70s\n", (int)i,
+                m_jsScriptSrcs.size(), (int)m_jsInjectDone,
+                (i < m_jsScriptSrcs.size() ? m_jsScriptSrcs[i].c_str() : "?"));
         if(!m_jsInjectDone && i < m_jsScriptSrcs.size()) {
             /* TEMP: anchor substring overridable so sites whose react-dom chunk
              * is hash-named (rokid: fd9d1056-*.js) can still be hooked. */
@@ -1959,12 +2034,16 @@ bool EWebEngine::runNextPageScript()
                 m_jsInjectDone = true;
                 std::string body;
                 FILE* f = fopen(injPath, "rb");
+                if(getenv("EWEB_INJECTDBG") != NULL)
+                    fprintf(stderr, "[injectdbg] inject i=%d fopen=%p path=%s\n", (int)i, (void*)f, injPath);
                 if(f != nullptr) {
                     char buf[4096];
                     size_t n;
                     while((n = fread(buf, 1, sizeof(buf), f)) > 0) body.append(buf, n);
                     fclose(f);
                 }
+                if(getenv("EWEB_INJECTDBG") != NULL)
+                    fprintf(stderr, "[injectdbg] inject bodylen=%zu\n", body.size());
                 if(!body.empty()) {
                     EWEB_LOG("[ewebview] js: running EWEB_INJECT_JS=%s (%u bytes) after entry script %d\n",
                         injPath, (unsigned)body.size(), (int)i);
@@ -1973,7 +2052,10 @@ bool EWebEngine::runNextPageScript()
                     m_jsVm->propagating_err = nullptr;
                     m_jsVm->call_depth = 0;
                     jsVmEnter();
-                    if(!vm_load_run(m_jsVm, body.c_str()))
+                    int inj_rc = vm_load_run(m_jsVm, body.c_str());
+                    if(getenv("EWEB_INJECTDBG") != NULL)
+                        fprintf(stderr, "[injectdbg] inject run rc=%d\n", inj_rc);
+                    if(!inj_rc)
                         EWEB_LOG("[ewebview] js: inject body failed to compile\n");
                     jsVmExit();
                     jsProgressiveFlush(true);
@@ -2005,6 +2087,12 @@ void EWebEngine::jsFireScriptElEvent(size_t i, const char* type)
     if(m_jsVm == nullptr || i >= m_jsScriptEls.size()) return;
     void* el = m_jsScriptEls[i];
     m_jsScriptEls[i] = nullptr;   /* fire at most once per element */
+    /* TEMP DIAGNOSTIC (taobao cna chain): show every load/error dispatch the
+     * ordered run fires on a dynamic <script> slot, plus element liveness, so
+     * a missing aplus setEtag can be told apart from a missing dispatch. */
+    if(getenv("EWEB_SCRIPTDBG") != NULL)
+        fprintf(stderr, "[ewebview] jsdbg: fire script %zu %s el=%p live=%d\n",
+                i, type, el, (el != nullptr && jsElIsLive(this, el)) ? 1 : 0);
     if(el == nullptr || !jsElIsLive(this, el)) return;
     jsVmEnter();
     js_event_dispatch_simple(m_jsVm, el, type, false);
@@ -2192,6 +2280,25 @@ void EWebEngine::jsDynamicScriptInserted(void* script_el)
     }
     EWEB_LOG("[ewebview] js: dynamic <script> queued: %s\n",
         srcabs.empty() ? "(inline)" : srcabs.c_str());
+}
+
+/* DOM insertion connects a whole subtree, not just its root. Walk in document
+ * order so a detached-built container carrying <script src> descendants starts
+ * those scripts when the container is appended. The iterative walk avoids
+ * making script execution depend on the depth of an application-built tree. */
+static void jsDynamicScriptTreeInserted(EWebEngine* self, litehtml::element* root)
+{
+    std::vector<litehtml::element*> pending;
+    pending.push_back(root);
+    while(!pending.empty()) {
+        litehtml::element* el = pending.back();
+        pending.pop_back();
+        const char* tn = el->get_tagName();
+        if(tn != nullptr && strcmp(tn, "script") == 0)
+            self->jsDynamicScriptInserted(el);
+        for(size_t i = el->get_children_count(); i > 0; --i)
+            pending.push_back(el->get_child((int)i - 1));
+    }
 }
 
 void EWebEngine::jsProgressiveFlush(bool force)
@@ -2601,6 +2708,41 @@ void EWebEngine::jsOnVmStep(struct st_vm* vm)
             }
         }
     }
+    /* EWEB_SPINSTATE: per-sample CPS state trace. fireyejs-style state machines
+     * keep their dispatch id in the local array "a" slot 6 (a[6]); printing the
+     * top frames' a[6] whenever it changes exposes the exact state sequence a
+     * wedged machine cycles through (map id -> case via ze = 31 & a[6],
+     * t = (a[6] >> 5) & 31 against the source switch). */
+    static int s_state = -1;
+    if(s_state < 0) s_state = (getenv("EWEB_SPINSTATE") != nullptr) ? 1 : 0;
+    if(s_state) {
+        static uint64_t s_state_last = 0;
+        static int s_lastA[3] = {-1, -1, -1};
+        uint64_t t = ticMs();
+        if(t - s_state_last >= 200) {
+            s_state_last = t;
+            char out[240]; int off = 0; int shown = 0; bool chg = false;
+            for(int si = (int)vm->scope_stack_top - 1; si >= 0 && shown < 3; --si) {
+                scope_t* sc = vm->scope_stack[si];
+                if(sc == nullptr || !sc->is_func || sc->var == nullptr) continue;
+                int st = -1;
+                var_t* a = var_find_own_member_var(sc->var, "a");
+                if(a != nullptr) {
+                    var_t* v6 = var_array_get_var(a, 6);
+                    st = (v6 != nullptr) ? var_get_int(v6) : -1;
+                }
+                if(st != s_lastA[shown]) { s_lastA[shown] = st; chg = true; }
+                const char* nm = (sc->func != nullptr && sc->func->nfe_name != nullptr)
+                                 ? sc->func->nfe_name : "-";
+                off += snprintf(out + off, sizeof(out) - off, "%sd%d:%d/%s",
+                                shown ? " " : "", shown, st, nm);
+                shown++;
+            }
+            if(chg)
+                fprintf(stderr, "[spinstate] depth=%d %s pc=%u\n",
+                        (int)vm->call_depth, out, (unsigned)vm->pc);
+        }
+    }
     /* A termination request (stop / back / reload / exit) bumps m_buildAbortGen
      * from the UI thread; if the generation moved past this run's jsVmEnter
      * snapshot the abort arrived DURING this run, so unwind at once instead of
@@ -2660,6 +2802,54 @@ void EWebEngine::jsOnVmStep(struct st_vm* vm)
                     /* Dump the call site (retpc-2) so the CALL opcode names the
                      * method each frame invoked (split/replace/exec/...). */
                     if(sc->pc > 2) bc_dump_window(&vm->bc, (PC)(sc->pc - 2), 4);
+                    /* Dump the CPS state array "a" slots 0..7 so the machine's
+                     * dispatch id, continuations and operands at the cut are
+                     * visible (pairs with EWEB_SPINSTATE's live trace). */
+                    if(sc->var != nullptr) {
+                        var_t* a = var_find_own_member_var(sc->var, "a");
+                        if(a != nullptr) {
+                            char sb[512]; int so = 0;
+                            for(int k = 0; k < 8 && so < (int)sizeof(sb) - 48; k++) {
+                                var_t* av = var_array_get_var(a, k);
+                                if(av == nullptr) {
+                                    so += snprintf(sb + so, sizeof(sb) - so, " a%d=?", k);
+                                    continue;
+                                }
+                                switch(av->type) {
+                                case V_INT:
+                                    so += snprintf(sb + so, sizeof(sb) - so, " a%d=%d", k, var_get_int(av));
+                                    break;
+                                case V_STRING: {
+                                    const char* s = var_get_str(av);
+                                    so += snprintf(sb + so, sizeof(sb) - so, " a%d=\"%.24s\"", k, s ? s : "<null>");
+                                    break;
+                                }
+                                case V_BOOL:
+                                    so += snprintf(sb + so, sizeof(sb) - so, " a%d=%s", k, var_get_bool(av) ? "true" : "false");
+                                    break;
+                                case V_UNDEF:
+                                    so += snprintf(sb + so, sizeof(sb) - so, " a%d=undef", k);
+                                    break;
+                                case V_NULL:
+                                    so += snprintf(sb + so, sizeof(sb) - so, " a%d=null", k);
+                                    break;
+                                case V_FLOAT:
+                                    so += snprintf(sb + so, sizeof(sb) - so, " a%d=%.3f", k, (double)var_get_float(av));
+                                    break;
+                                case V_FLOAT64:
+                                    so += snprintf(sb + so, sizeof(sb) - so, " a%d=%.3f", k, var_get_float64(av));
+                                    break;
+                                case V_INT64:
+                                    so += snprintf(sb + so, sizeof(sb) - so, " a%d=%lld", k, (long long)var_get_int64(av));
+                                    break;
+                                default:
+                                    so += snprintf(sb + so, sizeof(sb) - so, " a%d=t%d", k, (int)av->type);
+                                    break;
+                                }
+                            }
+                            fprintf(stderr, "[spindbg]  state:%s\n", sb);
+                        }
+                    }
                 }
                 bc_dump_window(&vm->bc, vm->pc, rad);
                 fflush(stderr);
@@ -2705,6 +2895,80 @@ int EWebEngine::jsPollTimers()
         m_jsInScript = false;
         m_jsEnterAt = 0;
         return 0;
+    }
+    /* EWEB_INJECT_AT_MS=<ms> + EWEB_INJECT_JS=<file>: run the file once in page
+     * scope when the engine clock passes <ms> after the first timer poll. The
+     * anchor-based hook fires pre-swap (its timers/DOM die in BUILD_SWAP_DOC);
+     * CSR apps (taobao) only reach their render gate post-swap, so late
+     * introspection needs a clock trigger instead of a script-src anchor. */
+    {
+        static uint64_t s_injT0 = 0;
+        static bool     s_injFired = false;
+        const char* atms = getenv("EWEB_INJECT_AT_MS");
+        if(atms != nullptr && atms[0] != 0 && !s_injFired) {
+            if(s_injT0 == 0) s_injT0 = ticMs();
+            if(ticMs() - s_injT0 >= (uint64_t)atoi(atms)) {
+                s_injFired = true;
+                const char* p = getenv("EWEB_INJECT_JS");
+                std::string body;
+                if(p != nullptr && p[0] != 0) {
+                    FILE* f = fopen(p, "rb");
+                    if(f != nullptr) {
+                        char buf[4096]; size_t n;
+                        while((n = fread(buf, 1, sizeof(buf), f)) > 0) body.append(buf, n);
+                        fclose(f);
+                    }
+                }
+                if(!body.empty()) {
+                    fprintf(stderr, "[injectat] running %zu bytes at +%sms\n", body.size(), atms);
+                    m_jsVm->terminated = false;
+                    m_jsVm->abort_run = false;
+                    m_jsVm->propagating_err = nullptr;
+                    m_jsVm->call_depth = 0;
+                    jsVmEnter();
+                    bool ok = vm_load_run(m_jsVm, body.c_str()) != 0;
+                    fprintf(stderr, "[injectat] vm_load_run ok=%d terminated=%d abort=%d err=%s\n",
+                        (int)ok, (int)m_jsVm->terminated, (int)m_jsVm->abort_run,
+                        m_jsVm->propagating_err ? "set" : "none");
+                    jsVmExit();
+                }
+            }
+        }
+    }
+    /* Stuck cross-origin bridge mask (taobao.com/tmall.com): the mtop middleware
+     * wraps its token-bridge <iframe> (h5api.m.taobao.com) in a fixed,
+     * z-index:2147483647, rgba(0,0,0,.5) full-viewport mask that a real browser
+     * removes once the bridge completes its cross-origin postMessage handshake.
+     * This engine has no iframe-document/postMessage lifecycle, so the handshake
+     * never completes and the mask dims (and click-blocks) the mounted shell
+     * forever. The middleware RE-CREATES the widget after a hide (probe: fresh
+     * instance at ~3.8 s), so a one-shot sweep is not enough: re-sweep every
+     * 500 ms for the first 60 s of the page, which reproduces the browser's
+     * post-handshake end-state. Host-scoped; runs in page scope so the DOM
+     * bridge repaints. */
+    {
+        static uint64_t s_maskT0 = 0;
+        static uint64_t s_maskLast = 0;
+        if(s_maskT0 == 0) s_maskT0 = ticMs();
+        uint64_t now = ticMs();
+        std::string url = jsDocumentUrl();
+        bool host = (url.find("taobao.com") != std::string::npos ||
+                     url.find("tmall.com")  != std::string::npos);
+        if(host && (now - s_maskT0) <= 60000 && (now - s_maskLast) >= 500) {
+            s_maskLast = now;
+            static const char* kHideMask =
+                "(function(){var w=document.querySelectorAll('.J_MIDDLEWARE_FRAME_WIDGET');"
+                "for(var i=0;i<w.length;i++){if(w[i].style.display!=='none')w[i].style.display='none';}})();";
+            m_jsVm->terminated = false;
+            m_jsVm->abort_run = false;
+            m_jsVm->propagating_err = nullptr;
+            m_jsVm->call_depth = 0;
+            jsVmEnter();
+            vm_load_run(m_jsVm, kHideMask);
+            if(m_jsVm->propagating_err != nullptr) vm_report_uncaught(m_jsVm);
+            jsVmExit();
+            markContentDirty();
+        }
     }
     jsVmEnter();
     int fired = js_dom_poll_timers(m_jsVm, ticMs());
@@ -3027,8 +3291,18 @@ void EWebEngine::jsElSetText(void* ctx, void* el, const char* text)
          * re-registers with the document, but the restyle itself is driven by
          * the engine loop, so raise the style-update flag here. */
         const char* tg = e->get_tagName();
-        if(tg != nullptr && !strcmp(tg, "style"))
+        if(tg != nullptr && !strcmp(tg, "style")) {
             self->jsMarkStyleDirty();
+            /* A textContent swap on a <style> is another injection path the
+             * appendChild/insertBefore hooks never see (taobao's tbnav ships
+             * its global-iconfont @font-face on exactly this setter). */
+            if(text != nullptr && text[0] != 0) {
+                if(getenv("EWEB_FONTDBG") != nullptr &&
+                   strstr(text, "@font-face") != nullptr)
+                    fprintf(stderr, "[fontdbg] hook set-text csslen=%zu\n", strlen(text));
+                self->scanFontFaces(text, self->m_currentHtmlUrl);
+            }
+        }
         const char* idv = ((litehtml::element*)el)->get_attr("id", nullptr);
         if(idv != nullptr && idv[0] != 0)
             self->recordJsMutation(0, idv, "", text != nullptr ? text : "");
@@ -3060,9 +3334,18 @@ void EWebEngine::jsElSetHtml(void* ctx, void* el, const char* html)
      * fetches and renders instead of being flattened to text. */
     if(self != nullptr && e->get_document() != nullptr) {
         js_apply_inner_html(e, frag, &self->m_jsDetached);
+        /* A fragment assigned to innerHTML can carry whole <style> blocks
+         * (head.innerHTML += ...): scan its raw text for @font-face too. */
+        if(frag.find("@font-face") != std::string::npos) {
+            if(getenv("EWEB_FONTDBG") != nullptr)
+                fprintf(stderr, "[fontdbg] hook inner-html len=%zu\n", frag.size());
+            self->scanFontFaces(frag, self->m_currentHtmlUrl);
+        }
         const char* idv = e->get_attr("id", nullptr);
         if(idv != nullptr && idv[0] != 0)
             self->recordJsMutation(3, idv, "", frag);   /* kind 3: innerHTML (replay re-parses) */
+        /* A fragment mounted wholesale can carry an autofocus widget. */
+        self->jsAutofocusInserted(e);
         self->jsMarkLayoutDirty();
     } else {
         /* No document to parse against: fall back to the text-only setter. */
@@ -3146,6 +3429,19 @@ void EWebEngine::jsElSetAttr(void* ctx, void* el, const char* name, const char* 
     EWebEngine* self = (EWebEngine*)ctx;
     if(el == nullptr || name == nullptr) return;
     litehtml::element* e = (litehtml::element*)el;
+    /* Inserting an empty <script> does not start it: a loader may set its src
+     * immediately afterwards (including through a with(insertBefore(...))
+     * expression). Remember that transition before set_attr overwrites the old
+     * value; only the FIRST non-empty src is eligible, so repeated assignments
+     * cannot queue the element again. */
+    bool late_script_src = false;
+    if(self != nullptr && strcmp(name, "src") == 0 &&
+       value != nullptr && value[0] != 0) {
+        const char* tn = e->get_tagName();
+        const char* old_src = e->get_attr("src", nullptr);
+        late_script_src = (tn != nullptr && strcmp(tn, "script") == 0 &&
+                           (old_src == nullptr || old_src[0] == 0));
+    }
     /* Writing .value / .checked goes to the widget so the edit buffer and the
      * drawn text stay the single source of truth (setValue re-syncs the
      * attribute itself); every other name keeps plain attribute behaviour. */
@@ -3194,6 +3490,21 @@ void EWebEngine::jsElSetAttr(void* ctx, void* el, const char* name, const char* 
      * onload); see jsMaybePreloadImage. */
     if(self != nullptr && strcmp(name, "src") == 0)
         jsMaybePreloadImage(self, e);
+    if(late_script_src) {
+        /* createElement gives even a detached node a document pointer, and a
+         * detached wrapper can already have a parent. Walk to the tree root so
+         * src-before-append remains the insertion hook's job and is not queued
+         * here as well. A non-empty body means the insertion hook already
+         * queued an inline script; it must not gain a second external run. */
+        std::string body;
+        e->get_text(body);
+        litehtml::document* doc = e->get_document();
+        litehtml::element* root = e;
+        while(root->parent() != nullptr) root = root->parent();
+        if(body.empty() && doc != nullptr && doc->root() != nullptr &&
+           root == doc->root())
+            self->jsDynamicScriptInserted(e);
+    }
 }
 
 char* EWebEngine::jsElGetTag(void* ctx, void* el)
@@ -3808,6 +4119,12 @@ bool EWebEngine::jsElAppendChild(void* ctx, void* parent, void* child)
     }
     litehtml::element* p = (litehtml::element*)parent;
     litehtml::element* c = (litehtml::element*)child;
+    if(getenv("EWEB_FONTDBG") != nullptr) {
+        const char* pt0 = p->get_tagName(); const char* ct0 = c->get_tagName();
+        fprintf(stderr, "[fontdbg] appendChild enter p=%s c=%s\n",
+                (pt0 != nullptr && pt0[0] != 0) ? pt0 : "(text)",
+                (ct0 != nullptr && ct0[0] != 0) ? ct0 : "(text)");
+    }
     if(!p->appendChild(c)) return false;
     /* DIAG (temp): catch the README->READMEREADME text duplication that trips
      * React's r3 textContent hydration check (#519). Fires only when a text run
@@ -3854,8 +4171,7 @@ bool EWebEngine::jsElAppendChild(void* ctx, void* parent, void* child)
          * the hook queues it and re-arms the post-swap run. */
         const char* tn = c->get_tagName();
         EWEB_LOG("[ewebview] appendChild cb tag=%s\n", tn != nullptr ? tn : "(null)");
-        if(tn != nullptr && strcmp(tn, "script") == 0)
-            self->jsDynamicScriptInserted(c);
+        jsDynamicScriptTreeInserted(self, c);
         /* A runtime-injected <style> contributes its sheet inside
          * style_detached_subtree's parse_attributes -> document::add_stylesheet
          * (which parses straight into m_styles once the creation sweep is done).
@@ -3863,8 +4179,34 @@ bool EWebEngine::jsElAppendChild(void* ctx, void* parent, void* child)
          * the tree, so styling the new <style> node is not enough: raise the
          * style-update flag to drive a full re-cascade that re-matches them
          * (gestalt's per-field `#label-x > div { color: transparent }`). */
-        if(tn != nullptr && strcmp(tn, "style") == 0)
+        if(tn != nullptr && strcmp(tn, "style") == 0) {
             self->jsMarkStyleDirty();
+            /* An @font-face rule inside a runtime-injected <style> never
+             * crosses the raw-HTML or the external-sheet scanners (taobao's
+             * tbnav bundle ships its global-iconfont face exactly this way),
+             * so scan the element text here; addTask dedups repeat fetches of
+             * the same src url. */
+            std::string css;
+            c->get_text(css);
+            if(getenv("EWEB_FONTDBG") != nullptr &&
+               css.find("@font-face") != std::string::npos)
+                fprintf(stderr, "[fontdbg] hook append-style csslen=%zu\n", css.size());
+            if(!css.empty()) self->scanFontFaces(css, self->m_currentHtmlUrl);
+        }
+        /* Text appended into an EXISTING <style> (the style-loader textContent
+         * path) carries a sheet the same way. */
+        if((tn == nullptr || tn[0] == 0) && p->get_tagName() != nullptr &&
+           strcmp(p->get_tagName(), "style") == 0) {
+            std::string css;
+            p->get_text(css);
+            if(getenv("EWEB_FONTDBG") != nullptr &&
+               css.find("@font-face") != std::string::npos)
+                fprintf(stderr, "[fontdbg] hook append-text csslen=%zu\n", css.size());
+            if(!css.empty()) self->scanFontFaces(css, self->m_currentHtmlUrl);
+        }
+        /* The autofocus insertion step: a mounted template string can carry
+         * the attribute (taobao's combobox template ships <input autofocus>). */
+        self->jsAutofocusInserted(c);
         /* The attach walk is budgeted: a detached-built subtree larger than the
          * budget keeps starved styles (var() declarations its detached parse
          * dropped) on the nodes past the cut. A full chunked restyle is the
@@ -3926,11 +4268,33 @@ bool EWebEngine::jsElInsertBefore(void* ctx, void* parent, void* child, void* re
     c->parse_styles(false);
     if(self != nullptr) {
         js_unpark(self->m_jsDetached, c);
-        /* See jsElAppendChild: a <script> spliced in via insertBefore fetches
-         * and runs the same way. */
+        /* See jsElAppendChild: scripts anywhere in a subtree spliced in via
+         * insertBefore fetch and run the same way. */
         const char* tn = c->get_tagName();
-        if(tn != nullptr && strcmp(tn, "script") == 0)
-            self->jsDynamicScriptInserted(c);
+        jsDynamicScriptTreeInserted(self, c);
+        /* See jsElAppendChild: a runtime-injected <style> (or text spliced into
+         * an existing one) can carry @font-face rules the raw-HTML and the
+         * external-sheet scanners never see. */
+        if(tn != nullptr && strcmp(tn, "style") == 0) {
+            std::string css;
+            c->get_text(css);
+            if(getenv("EWEB_FONTDBG") != nullptr &&
+               css.find("@font-face") != std::string::npos)
+                fprintf(stderr, "[fontdbg] hook ib-style csslen=%zu\n", css.size());
+            if(!css.empty()) self->scanFontFaces(css, self->m_currentHtmlUrl);
+        }
+        if((tn == nullptr || tn[0] == 0) && p->get_tagName() != nullptr &&
+           strcmp(p->get_tagName(), "style") == 0) {
+            std::string css;
+            p->get_text(css);
+            if(getenv("EWEB_FONTDBG") != nullptr &&
+               css.find("@font-face") != std::string::npos)
+                fprintf(stderr, "[fontdbg] hook ib-text csslen=%zu\n", css.size());
+            if(!css.empty()) self->scanFontFaces(css, self->m_currentHtmlUrl);
+        }
+        /* See jsElAppendChild: the autofocus insertion step on the spliced
+         * subtree. */
+        self->jsAutofocusInserted(c);
         if(attach_starved)
             self->jsMarkStyleDirty();
         jsMaybeLoadDynamicStylesheet(self, c);
@@ -3991,6 +4355,25 @@ void EWebEngine::jsElRemoveAttr(void* ctx, void* el, const char* name)
     if(self != nullptr) self->jsMarkLayoutDirty();
 }
 
+void EWebEngine::jsForceReflow()
+{
+    /* Layout-only synchronous flush for geometry reads. Real browsers reflow
+     * before returning a box or a used-value; reading the stale m_pos let
+     * taobao's measuring script (slick/jQuery) see width 0 for .main's flex
+     * child and pin .core J_Core to inline width:0, collapsing the populated
+     * mid carousel (11 real slide images) to a blank strip. No raster here:
+     * the engine loop paints on its next frame. Only runs when dirty, so
+     * clean reads stay cheap. */
+    if(m_doc == nullptr || m_buildDoc != nullptr) return;
+    if(!m_needsLayout) return;
+    m_doc->render(m_clientWidth);
+    m_needsLayout = false;
+    m_layoutDirtyAt = 0;
+    m_layoutDirtySince = 0;
+    clampScrollLocked(m_doc->width(), m_doc->height());
+    markContentDirty();
+}
+
 void EWebEngine::jsElGetRect(void* ctx, void* el, int* x, int* y, int* w, int* h)
 {
     EWebEngine* self = (EWebEngine*)ctx;
@@ -4000,6 +4383,7 @@ void EWebEngine::jsElGetRect(void* ctx, void* el, int* x, int* y, int* w, int* h
     if(h) *h = 0;
     if(el == nullptr) return;
     litehtml::element* e = (litehtml::element*)el;
+    if(self != nullptr) self->jsForceReflow();
     if(e->get_display() == litehtml::display_none) return;
     /* get_placement() accumulates the per-element m_pos, and m_pos is the
      * CONTENT box (html_tag.h: "m_pos.height is always the content box"; and
@@ -4219,8 +4603,18 @@ void EWebEngine::jsGetDocumentSize(void* ctx, int* w, int* h)
 
 char* EWebEngine::jsElGetStyle(void* ctx, void* el, const char* prop)
 {
-    (void)ctx;
     if(el == nullptr || prop == nullptr || prop[0] == 0) return nullptr;
+    /* getComputedStyle() resolves USED values for the box geometry props, and
+     * a used value is only meaningful post-layout: slick/jQuery size the
+     * carousel from getComputedStyle(...).width, so a stale (pre-reflow) 0
+     * here pinned .core to inline width:0. Force a reflow for exactly those
+     * props; every other property is a pure computed value and stays cheap. */
+    if(strcmp(prop, "width") == 0 || strcmp(prop, "height") == 0 ||
+       strcmp(prop, "top") == 0 || strcmp(prop, "right") == 0 ||
+       strcmp(prop, "bottom") == 0 || strcmp(prop, "left") == 0) {
+        EWebEngine* self = (EWebEngine*)ctx;
+        if(self != nullptr) self->jsForceReflow();
+    }
     /* get_style_property resolves the used value; per CSS only INHERITED
      * properties may fall back to an ancestor's computed value -- for the
      * rest an absent own declaration means the initial value, so passing
@@ -4233,28 +4627,52 @@ char* EWebEngine::jsElGetStyle(void* ctx, void* el, const char* prop)
     return js_strdup_mario(v);
 }
 
+/* HTML autofocus is a boolean attribute: the mere presence of the name
+ * enables it - even autofocus="false" (taobao's search box ships exactly
+ * that). Tree-order search for the first carrier in a subtree. */
+static litehtml::element* findAutofocusElement(litehtml::element* e)
+{
+    if(e == nullptr) return nullptr;
+    if(e->get_attr("autofocus", nullptr) != nullptr) return e;
+    for(size_t i = 0; i < e->get_children_count(); i++) {
+        litehtml::element* r =
+            findAutofocusElement((litehtml::element*)(void*)e->get_child(i));
+        if(r != nullptr) return r;
+    }
+    return nullptr;
+}
+
+/* Focus-candidate test shared by focus() and the autofocus insertion step:
+ * form widgets, <a href>, or anything carrying a tabindex. Anything else is
+ * not focusable, exactly as in a browser (a bare <div> never takes focus). */
+static bool elIsFocusCandidate(litehtml::element* e)
+{
+    void* w = e->eweb_form_widget();
+    if(w != nullptr) return ((eweb_el_input*)w)->isFocusable();
+    const litehtml::tchar_t* tag = e->get_tagName();
+    const litehtml::tchar_t* href = e->get_attr("href", nullptr);
+    if(tag != nullptr && tag[0] == 'a' && tag[1] == 0 &&
+            href != nullptr && href[0] != 0)
+        return true;
+    return e->get_attr("tabindex", nullptr) != nullptr;
+}
+
 void EWebEngine::jsElFocus(void* ctx, void* el)
 {
     EWebEngine* self = (EWebEngine*)ctx;
     if(self == nullptr || el == nullptr) return;
     litehtml::element* e = (litehtml::element*)el;
-    /* Only focusable elements take focus: form widgets, <a href>, or anything
-     * carrying a tabindex. focus() on anything else is a no-op, exactly as in
-     * a browser (a bare <div> is not focusable). */
-    bool focusable = false;
-    void* w = e->eweb_form_widget();
-    if(w != nullptr) {
-        focusable = ((eweb_el_input*)w)->isFocusable();
-    } else {
-        const litehtml::tchar_t* tag = e->get_tagName();
-        const litehtml::tchar_t* href = e->get_attr("href", nullptr);
-        if(tag != nullptr && tag[0] == 'a' && tag[1] == 0 &&
-                href != nullptr && href[0] != 0)
-            focusable = true;
-        else if(e->get_attr("tabindex", nullptr) != nullptr)
-            focusable = true;
-    }
-    if(focusable) self->setFocus(e);
+    if(elIsFocusCandidate(e)) self->setFocus(e);
+}
+
+void EWebEngine::jsAutofocusInserted(litehtml::element* root)
+{
+    if(root == nullptr) return;
+    litehtml::element* t = findAutofocusElement(root);
+    if(t == nullptr || !elIsFocusCandidate(t)) return;
+    /* The spec insertion step: a connected autofocus element takes the
+     * document focus, displacing whatever held it. */
+    setFocus(t);
 }
 
 void EWebEngine::jsElBlur(void* ctx, void* el)
@@ -5025,11 +5443,16 @@ bool EWebEngine::jsRunScriptBody(const std::string& src, bool moduleish)
     if(getenv("EWEB_SCRIPTDBG") != nullptr)
         fprintf(stderr, "[ewebview] jsdbg: runBody moduleish=%d url=%.90s\n",
                 (int)moduleish, m_jsCurScriptUrl.c_str());
-    if(moduleish && !m_jsCurScriptUrl.empty()) {
+    /* Attribute the upcoming compile to this script's absolute URL so
+     * bc_srcmap_begin records it and Error.stack emits V8 "url:line:col". */
+    if(!m_jsCurScriptUrl.empty()) {
         std::string abs = EWebContainer::getFullURL(&m_port, m_jsCurScriptUrl.c_str(),
                                                     jsDocumentUrl());
-        if(!abs.empty())
+        mario_set_script_url(abs.empty() ? m_jsCurScriptUrl.c_str() : abs.c_str());
+        if(moduleish && !abs.empty())
             return vm_load_run_module(m_jsVm, src.c_str(), abs.c_str());
+    } else {
+        mario_set_script_url(nullptr);
     }
     return vm_load_run(m_jsVm, src.c_str());
 }
@@ -5332,6 +5755,9 @@ void EWebEngine::jsWebSetCookie(void* ctx, const char* cookie)
      * Max-Age/Expires/SameSite are honoured here; HttpOnly is dropped (only a
      * server may set it). Stored against the document's own site, which is
      * what makes it reach the HTTP side too. */
+    if(getenv("EWEB_NETDBG") != NULL)
+        fprintf(stderr, "[netdbg] set document.cookie url=%s value=%s\n",
+                self->jsDocumentUrl().c_str(), cookie != nullptr ? cookie : "(null)");
     EWebCookieJar::instance().jsSet(self->jsDocumentUrl(),
                                     cookie != nullptr ? cookie : "");
 }
@@ -5533,6 +5959,14 @@ void EWebEngine::jsFireLoadEvents()
     js_event_fire_dom_content_loaded(m_jsVm);
     js_event_fire_load(m_jsVm);
     jsVmExit();
+    /* Parser-inserted autofocus elements never cross the bridge insertion
+     * hooks; take the focus here when nothing holds it yet. A user focus
+     * established before load completes keeps it, as in a browser (there the
+     * focusing task ran during parse, ahead of any interaction). */
+    if(m_focusElement == nullptr) {
+        litehtml::document* doc = jsActiveDoc();
+        if(doc != nullptr) jsAutofocusInserted(doc->root());
+    }
 }
 
 void EWebEngine::jsFireResizeEvent()
@@ -5680,9 +6114,14 @@ bool EWebEngine::jsDispatchMouseEvent(int mouseState, int button, int cx, int cy
             if(prev != nullptr) {
                 js_event_dispatch_mouse(m_jsVm, (void*)prev, "mouseout",
                                         cx, cy, m_engineScrollX, m_engineScrollY, domButton, 0);
+                /* mouseenter/mouseleave are the non-bubbling counterparts sites
+                 * bind flyouts/hover controllers to (taobao's category menu uses
+                 * them); mouseover/mouseout alone leave those listeners dead. */
+                js_event_dispatch_simple(m_jsVm, (void*)prev, "mouseleave", false);
             }
             js_event_dispatch_mouse(m_jsVm, (void*)target, "mouseover",
                                     cx, cy, m_engineScrollX, m_engineScrollY, domButton, 0);
+            js_event_dispatch_simple(m_jsVm, (void*)target, "mouseenter", false);
         }
         allowed = js_event_dispatch_mouse(m_jsVm, (void*)target, type,
                                           cx, cy, m_engineScrollX, m_engineScrollY,
@@ -5844,6 +6283,18 @@ void EWebEngine::handleKeyEvent(const eweb_key_event_t& kev)
         jsVmExit();
     }
 
+    /* EWEB_KEYDBG: trace the keydown target and whether a handler cancelled
+     * it (headless forensics for "typing goes nowhere" on live pages). */
+    if(getenv("EWEB_KEYDBG") != nullptr) {
+        litehtml::element* fe = (litehtml::element*)m_focusElement;
+        const char* t = fe != nullptr ? fe->get_tagName() : nullptr;
+        const char* id = fe != nullptr ? fe->get_attr("id", nullptr) : nullptr;
+        fprintf(stderr, "[keydbg] keydown key=%s code=%d target=%s#%s allowed=%d\n",
+                key, code,
+                fe == nullptr ? "(none)" : ((t != nullptr && t[0] != 0) ? t : "(text)"),
+                (id != nullptr && id[0] != 0) ? id : "-", (int)allowed);
+    }
+
     if(!allowed)
         return;   /* a handler called preventDefault(): no default action */
 
@@ -5851,6 +6302,14 @@ void EWebEngine::handleKeyEvent(const eweb_key_event_t& kev)
      * layered in by the later implementation stages; this is the single hook
      * point they extend. */
     handleKeyDefault(kev, key, mods);
+
+    if(getenv("EWEB_KEYDBG") != nullptr) {
+        litehtml::element* fe2 = (litehtml::element*)m_focusElement;
+        eweb_el_input* w2 = (fe2 != nullptr) ? (eweb_el_input*)widgetAt(fe2) : nullptr;
+        fprintf(stderr, "[keydbg] post-default w=%p edit=%d value=%s\n",
+                (void*)w2, w2 != nullptr ? (int)w2->isTextEditing() : -1,
+                w2 != nullptr ? w2->value().c_str() : "-");
+    }
 }
 
 /* ==================================================================

@@ -69,6 +69,16 @@ public:
      * that HttpOnly is dropped: only a server may set it. */
     void jsSet(const std::string& url, const std::string& setCookie);
 
+    /* Seed the jar from a raw "Cookie:" request-header string (flat
+     * "name=value; name=value" pairs, no attributes). Every pair is filed
+     * under the registrable domain of `url` with Path=/, so a session copied
+     * from a real browser reaches subdomain APIs (h5api.m.taobao.com) and not
+     * just the one host. Used by the embedder to inject a logged-in /
+     * anti-bot-cleared session for parity validation; it is NOT part of the
+     * normal Set-Cookie response path. A leading "Cookie:" prefix is
+     * tolerated. */
+    void seedFromHeader(const std::string& url, const std::string& cookieHeader);
+
     void   clear();
     size_t count() const;
 

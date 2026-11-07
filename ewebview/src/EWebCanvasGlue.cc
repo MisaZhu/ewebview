@@ -221,6 +221,12 @@ static void jsCanvasBlit(void* ctx, void* canvas, void* src,
 
 /* ---- Text ---- */
 
+static void jsCanvasSetFont(void* ctx, void* canvas, const char* family, int weight, int italic)
+{
+    (void)ctx; EWebCanvas* cv = (EWebCanvas*)canvas;
+    if(cv) cv->setFont(family, weight, italic);
+}
+
 static void jsCanvasDrawText(void* ctx, void* canvas, int x, int y, const char* text, float size, uint32_t color)
 {
     (void)ctx; EWebCanvas* cv = (EWebCanvas*)canvas;
@@ -384,6 +390,7 @@ void EWebEngine::registerCanvasNatives(struct st_vm* vm)
     /* Blit */
     cb.blit                  = jsCanvasBlit;
     /* Text */
+    cb.set_font              = jsCanvasSetFont;
     cb.draw_text             = jsCanvasDrawText;
     cb.stroke_text           = jsCanvasStrokeText;
     cb.text_size             = jsCanvasTextSize;

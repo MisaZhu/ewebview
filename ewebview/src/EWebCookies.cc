@@ -607,6 +607,35 @@ void EWebCookieJar::jsSet(const std::string& url, const std::string& setCookie)
     store(url, setCookie, false);
 }
 
+void EWebCookieJar::seedFromHeader(const std::string& url, const std::string& cookieHeader)
+{
+    std::string host = hostOf(url);
+    if(host.empty())
+        return;
+    /* A real browser's Cookie: header carries no attributes, so without an
+     * explicit Domain every pair would be filed host-only for `url` and never
+     * sent to the subdomain APIs (h5api.m.taobao.com) that actually gate the
+     * page. Expand each to the registrable domain instead. */
+    std::string domainAttr = "; Domain=." + siteOf(host) + "; Path=/";
+
+    std::string h = cookieHeader;
+    if(h.size() >= 7 && to_lower(h.substr(0, 7)) == "cookie:")   /* tolerate a pasted full header */
+        h = h.substr(7);
+
+    size_t pos = 0;
+    while(pos < h.size()) {
+        size_t next = h.find_first_of(";\r\n", pos);
+        size_t stop = (next == std::string::npos) ? h.size() : next;
+        std::string one = trim(h.substr(pos, stop - pos));
+        /* Skip empty fragments and anything that is not a name=value pair. */
+        if(!one.empty() && one.find('=') != std::string::npos)
+            store(url, one + domainAttr, true);
+        if(next == std::string::npos)
+            break;
+        pos = next + 1;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* matching                                                           */
 /* ------------------------------------------------------------------ */

@@ -1933,10 +1933,17 @@ static var_t* js_ctx_strokeRect(vm_t* vm, var_t* env, void* data) {
 
 /* Resolve the text drawing origin given align/baseline. Returns the
  * device-space top-left of the text box. */
+static void cv_sync_font(js_canvas_state* st, js_canvas_ctx* cv) {
+    if(st == NULL || cv == NULL || st->cb.set_font == NULL) return;
+    st->cb.set_font(st->ctx, cv->canvas,
+                    cv->fontFamily ? cv->fontFamily : "sans-serif",
+                    cv->fontWeight, cv->fontItalic);
+}
 static void cv_text_origin(js_canvas_state* st, js_canvas_ctx* cv,
                            const char* text, float dx, float dy,
                            int* px, int* py) {
     int tw = 0, th = 0;
+    cv_sync_font(st, cv);
     if(st != NULL && st->cb.text_size != NULL)
         st->cb.text_size(st->ctx, cv->canvas, text, cv->fontSize, &tw, &th);
     int x = (int)(dx + 0.5f), y = (int)(dy + 0.5f);
@@ -2018,6 +2025,7 @@ static var_t* js_ctx_measureText(vm_t* vm, var_t* env, void* data) {
     js_canvas_ctx* cv = ctx_from_env(env);
     const char* text = get_str(env, "text");
     int tw = 0, th = 0;
+    cv_sync_font(st, cv);
     if(cv != NULL && st != NULL && st->cb.text_size != NULL && text != NULL)
         st->cb.text_size(st->ctx, cv->canvas, text, cv->fontSize, &tw, &th);
     var_t* obj = new_obj(vm, CLS_TEXTMETRICS, 0);
@@ -3616,6 +3624,310 @@ static int el_int_attr(js_canvas_state* st, void* el, const char* name, int def)
     return (v > 0) ? v : def;
 }
 
+/* ------------------------------------------------------------------ */
+/* toDataURL: minimal PNG encoder (stored-deflate) + base64            */
+/*                                                                     */
+/* Bot-detection VMPs (baxia et_f / fireye) call canvas.toDataURL()    */
+/* inside their initialization try-block as the primary fingerprint    */
+/* vector; a missing method THROWS and aborts the whole init phase.    */
+/* We therefore encode the REAL backing pixels as a spec-valid PNG so  */
+/* the call returns a data: URL instead of throwing. The deflate layer */
+/* uses only STORED (uncompressed) blocks, which need no zlib: a raw   */
+/* block is BFINAL/BTYPE header + LEN/NLEN + literal bytes, wrapped in */
+/* a 2-byte zlib header and an Adler-32 trailer.                       */
+/* ------------------------------------------------------------------ */
+
+static uint32_t cv_crc32_tab[256];
+static int cv_crc32_ready = 0;
+static void cv_crc32_init(void) {
+    if(cv_crc32_ready) return;
+    for(uint32_t i = 0; i < 256; ++i) {
+        uint32_t c = i;
+        for(int k = 0; k < 8; ++k)
+            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        cv_crc32_tab[i] = c;
+    }
+    cv_crc32_ready = 1;
+}
+static uint32_t cv_crc32(const uint8_t* p, size_t n) {
+    cv_crc32_init();
+    uint32_t c = 0xFFFFFFFFu;
+    for(size_t i = 0; i < n; ++i)
+        c = cv_crc32_tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+static uint32_t cv_adler32(const uint8_t* p, size_t n) {
+    uint32_t a = 1, b = 0;
+    for(size_t i = 0; i < n; ++i) {
+        a = (a + p[i]) % 65521;
+        b = (b + a) % 65521;
+    }
+    return (b << 16) | a;
+}
+
+/* Growable byte buffer for assembling the PNG. */
+typedef struct { uint8_t* d; size_t n, cap; } cv_buf_t;
+static int cv_buf_put(cv_buf_t* b, const void* p, size_t n) {
+    if(b->n + n > b->cap) {
+        size_t nc = (b->cap == 0) ? 4096 : b->cap;
+        while(nc < b->n + n) nc *= 2;
+        uint8_t* nd = (uint8_t*)realloc(b->d, nc);
+        if(nd == NULL) return 0;
+        b->d = nd; b->cap = nc;
+    }
+    memcpy(b->d + b->n, p, n);
+    b->n += n;
+    return 1;
+}
+static void cv_buf_u8(cv_buf_t* b, uint8_t v) { cv_buf_put(b, &v, 1); }
+static void cv_buf_be32(cv_buf_t* b, uint32_t v) {
+    uint8_t t[4] = { (uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v };
+    cv_buf_put(b, t, 4);
+}
+/* One PNG chunk: len BE32, type(4), data, crc32(type+data) BE32. */
+static void cv_png_chunk(cv_buf_t* b, const char type[4], const uint8_t* data, size_t dn) {
+    cv_buf_be32(b, (uint32_t)dn);
+    size_t tstart = b->n;
+    cv_buf_put(b, type, 4);
+    if(dn > 0 && data != NULL) cv_buf_put(b, data, dn);
+    uint32_t crc = cv_crc32(b->d + tstart, 4 + dn);
+    cv_buf_be32(b, crc);
+}
+
+/* Encode RGBA pixels (w*h*4, row-major, no per-row filter byte yet) as a
+ * complete PNG byte stream into `out`. Each scanline is emitted with a
+ * leading filter-type-0 (None) byte as the spec requires. */
+static int cv_png_encode(cv_buf_t* out, const uint8_t* rgba, int w, int h) {
+    static const uint8_t sig[8] = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+    cv_buf_put(out, sig, 8);
+    /* IHDR */
+    uint8_t ihdr[13];
+    ihdr[0] = (uint8_t)(w >> 24); ihdr[1] = (uint8_t)(w >> 16); ihdr[2] = (uint8_t)(w >> 8); ihdr[3] = (uint8_t)w;
+    ihdr[4] = (uint8_t)(h >> 24); ihdr[5] = (uint8_t)(h >> 16); ihdr[6] = (uint8_t)(h >> 8); ihdr[7] = (uint8_t)h;
+    ihdr[8] = 8;   /* bit depth */
+    ihdr[9] = 6;   /* color type RGBA */
+    ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    cv_png_chunk(out, "IHDR", ihdr, 13);
+
+    /* Raw (pre-deflate) stream: per-row filter byte + RGBA row bytes. */
+    size_t rowbytes = (size_t)w * 4;
+    size_t rawcap = (size_t)h * (rowbytes + 1);
+    uint8_t* raw = (uint8_t*)malloc(rawcap ? rawcap : 1);
+    if(raw == NULL) return 0;
+    size_t rn = 0;
+    for(int y = 0; y < h; ++y) {
+        raw[rn++] = 0;   /* filter None */
+        memcpy(raw + rn, rgba + (size_t)y * rowbytes, rowbytes);
+        rn += rowbytes;
+    }
+
+    /* IDAT = zlib(stored-deflate(raw)). */
+    cv_buf_t idat = { NULL, 0, 0 };
+    cv_buf_u8(&idat, 0x78); cv_buf_u8(&idat, 0x01);   /* zlib header, no preset */
+    size_t off = 0;
+    while(off < rn || (off == 0 && rn == 0)) {
+        size_t blk = rn - off;
+        if(blk > 65535) blk = 65535;
+        int final = (off + blk >= rn) ? 1 : 0;
+        cv_buf_u8(&idat, (uint8_t)(final ? 0x01 : 0x00));   /* BFINAL | BTYPE=00 */
+        uint16_t len = (uint16_t)blk, nlen = (uint16_t)(~blk);
+        uint8_t lh[4] = { (uint8_t)(len & 0xFF), (uint8_t)(len >> 8), (uint8_t)(nlen & 0xFF), (uint8_t)(nlen >> 8) };
+        cv_buf_put(&idat, lh, 4);
+        if(blk > 0) cv_buf_put(&idat, raw + off, blk);
+        off += blk;
+        if(rn == 0) break;   /* single empty stored block for a 0-size image */
+    }
+    uint32_t adl = cv_adler32(raw, rn);
+    cv_buf_be32(&idat, adl);
+    free(raw);
+
+    cv_png_chunk(out, "IDAT", idat.d, idat.n);
+    free(idat.d);
+    cv_png_chunk(out, "IEND", NULL, 0);
+    return 1;
+}
+
+static const char cv_b64_alphabet[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/* base64-encode `n` bytes into a freshly malloc'd NUL-terminated string. */
+static char* cv_base64(const uint8_t* p, size_t n) {
+    size_t olen = 4 * ((n + 2) / 3);
+    char* o = (char*)malloc(olen + 1);
+    if(o == NULL) return NULL;
+    size_t j = 0;
+    for(size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)p[i] << 16;
+        if(i + 1 < n) v |= (uint32_t)p[i + 1] << 8;
+        if(i + 2 < n) v |= (uint32_t)p[i + 2];
+        o[j++] = cv_b64_alphabet[(v >> 18) & 63];
+        o[j++] = cv_b64_alphabet[(v >> 12) & 63];
+        o[j++] = (i + 1 < n) ? cv_b64_alphabet[(v >> 6) & 63] : '=';
+        o[j++] = (i + 2 < n) ? cv_b64_alphabet[v & 63] : '=';
+    }
+    o[j] = 0;
+    return o;
+}
+
+/* canvas.toDataURL([type, quality]): read the backing pixels and return a
+ * "data:image/png;base64,..." URL. Only image/png is produced (the default);
+ * any other requested type still yields a PNG rather than throwing, which is
+ * what fingerprinting code needs to keep running. */
+static var_t* js_el_toDataURL(vm_t* vm, var_t* env, void* data) {
+    js_canvas_state* st = state_any(vm, data);
+    var_t* t = get_obj(env, THIS);
+    void* el = (t != NULL) ? t->value : NULL;
+    int w = el_int_attr(st, el, "width", 300);
+    int h = el_int_attr(st, el, "height", 150);
+
+    /* Reuse the drawn canvas when one exists for this element id; otherwise
+     * canvas_create yields a fresh (transparent) bitmap of the right size. */
+    void* canvas = NULL;
+    if(st != NULL && st->cb.canvas_create != NULL && el != NULL) {
+        char idbuf[48];
+        const char* id = NULL;
+        if(st->cb.el_get_attr != NULL) id = st->cb.el_get_attr(st->ctx, el, "id");
+        if(id == NULL || id[0] == 0) {
+            snprintf(idbuf, sizeof(idbuf), "@cv%p", el);
+            if(id != NULL) mario_free((void*)id);
+            id = idbuf;
+        }
+        canvas = st->cb.canvas_create(st->ctx, id, w, h);
+        if(id != idbuf && id != NULL) mario_free((void*)id);
+    }
+
+    size_t npix = (size_t)w * h;
+    uint8_t* rgba = (uint8_t*)calloc(npix ? npix : 1, 4);
+    if(rgba == NULL) return var_new_str(vm, "data:, ");
+    if(canvas != NULL && st->cb.get_pixel != NULL) {
+        for(int y = 0; y < h; ++y) {
+            for(int x = 0; x < w; ++x) {
+                uint32_t p = st->cb.get_pixel(st->ctx, canvas, x, y);   /* 0xAARRGGBB */
+                uint8_t* q = rgba + ((size_t)y * w + x) * 4;
+                q[0] = (uint8_t)((p >> 16) & 0xFF);   /* R */
+                q[1] = (uint8_t)((p >> 8) & 0xFF);    /* G */
+                q[2] = (uint8_t)(p & 0xFF);           /* B */
+                q[3] = (uint8_t)((p >> 24) & 0xFF);   /* A */
+            }
+        }
+    }
+
+    cv_buf_t png = { NULL, 0, 0 };
+    char* url = NULL;
+    if(cv_png_encode(&png, rgba, w, h)) {
+        char* b64 = cv_base64(png.d, png.n);
+        if(b64 != NULL) {
+            size_t ulen = strlen("data:image/png;base64,") + strlen(b64);
+            url = (char*)malloc(ulen + 1);
+            if(url != NULL) {
+                memcpy(url, "data:image/png;base64,", 22);
+                memcpy(url + 22, b64, strlen(b64) + 1);
+            }
+            free(b64);
+        }
+    }
+    free(png.d);
+    free(rgba);
+    if(url == NULL) return var_new_str(vm, "data:, ");
+    var_t* ret = var_new_str(vm, url);
+    free(url);
+    return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* WebGL reconnaissance proxy (DIAGNOSTIC, EWEB_GLRECON only)          */
+/*                                                                    */
+/* The engine has no GL backend, so getContext('webgl') honestly       */
+/* returns null. Before committing to a software-WebGL backend we need  */
+/* to know the EXACT surface the page's fingerprint code touches. This  */
+/* builds a Proxy whose get trap logs every property name read and      */
+/* returns a logging method stub; each stub call logs its name + argc.  */
+/* It renders nothing and fabricates no GPU identity - pure observation */
+/* - and is activated only under EWEB_GLRECON (default off => null).    */
+/* ------------------------------------------------------------------ */
+#define GLRECON_INTERN_MAX 1024
+static char* s_glrecon_intern[GLRECON_INTERN_MAX];
+static int   s_glrecon_intern_n = 0;
+
+/* Persistent copy of a property name so the method stub's data pointer stays
+ * valid; bounded by the intern table (a few bytes per DISTINCT name). */
+static const char* glrecon_intern(const char* k) {
+    for(int i = 0; i < s_glrecon_intern_n; ++i)
+        if(strcmp(s_glrecon_intern[i], k) == 0) return s_glrecon_intern[i];
+    if(s_glrecon_intern_n >= GLRECON_INTERN_MAX) return k;
+    char* d = (char*)mario_malloc((uint32_t)strlen(k) + 1);
+    if(d == NULL) return k;
+    strcpy(d, k);
+    s_glrecon_intern[s_glrecon_intern_n++] = d;
+    return d;
+}
+
+/* Method stub handed back by the get trap: logs the call, then returns an
+ * empty string (the least-crash-prone generic value - string methods exist,
+ * numeric coercion yields NaN without throwing - so the probe walks as much
+ * of the surface as possible before any divergence). */
+static var_t* gl_recon_method(vm_t* vm, var_t* env, void* data) {
+    const char* name = (data != NULL) ? (const char*)data : "?";
+    fprintf(stderr, "[glrecon] CALL %s argc=%u\n", name, get_func_args_num(env));
+    return var_new_str(vm, "");
+}
+
+/* Proxy get trap: get(target, key, receiver). Logs the key, returns a bound
+ * logging method stub so `gl.foo(...)` records the call too. */
+static var_t* gl_recon_get(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* key = get_func_arg(env, 1);
+    const char* k = (key != NULL) ? var_get_str(key) : NULL;
+    if(k == NULL || k[0] == 0) k = "?";
+    fprintf(stderr, "[glrecon] GET %s\n", k);
+    return var_new_native_func(vm, gl_recon_method, (void*)glrecon_intern(k));
+}
+
+static var_t* make_gl_recon_proxy(vm_t* vm) {
+    /* Brand realism: a fingerprinter typically validates the context with
+     * Object.prototype.toString.call(gl) === '[object WebGLRenderingContext]'
+     * and/or gl instanceof WebGLRenderingContext BEFORE reading any property.
+     * toString reads @@toStringTag via a DIRECT var_find_member (not the proxy
+     * trap), and instanceof resolves through proxy_get_prototype -> the target's
+     * prototype. So we register a real global WebGLRenderingContext class, hang
+     * its prototype on both the target (instanceof) and the proxy (chain reads),
+     * and lay an own @@toStringTag on the proxy (toString). Without this the
+     * probe would be brand-rejected and we would falsely conclude the page never
+     * touches WebGL. */
+    static var_t* s_gl_proto = NULL;
+    if(s_gl_proto == NULL) {
+        var_t* cls = vm_new_class(vm, "WebGLRenderingContext");
+        if(cls != NULL) {
+            var_t* proto = var_get_prototype(cls);
+            if(proto != NULL) {
+                node_t* pn = var_add(proto, SYMKEY_TOSTRINGTAG,
+                                     var_new_str(vm, "WebGLRenderingContext"));
+                if(pn != NULL) { pn->invisable = 1; pn->be_unenumerable = 1; }
+                s_gl_proto = proto;
+            }
+        }
+    }
+    var_t* target  = var_new_obj_no_proto(vm, NULL, NULL);
+    var_t* handler = var_new_obj_no_proto(vm, NULL, NULL);
+    var_t* p       = var_new_obj_no_proto(vm, NULL, NULL);
+    if(target == NULL || handler == NULL || p == NULL) return var_new_null(vm);
+    if(s_gl_proto != NULL) {
+        var_set_prototype(target, s_gl_proto);
+        var_set_prototype(p, s_gl_proto);
+    }
+    var_add(handler, "get", var_new_native_func(vm, gl_recon_get, NULL));
+    node_t* mn = var_add(p, EXOTIC_MARKER, var_new_str(vm, EXOTIC_PROXY));
+    if(mn != NULL) { mn->invisable = 1; mn->be_unenumerable = 1; }
+    node_t* tn = var_add(p, PROXY_TARGET, target);
+    if(tn != NULL) { tn->invisable = 1; tn->be_unenumerable = 1; }
+    node_t* hn = var_add(p, PROXY_HANDLER, handler);
+    if(hn != NULL) { hn->invisable = 1; hn->be_unenumerable = 1; }
+    node_t* rn = var_add(p, PROXY_REVOKED, var_new_bool(vm, false));
+    if(rn != NULL) { rn->invisable = 1; rn->be_unenumerable = 1; }
+    node_t* sn = var_add(p, SYMKEY_TOSTRINGTAG, var_new_str(vm, "WebGLRenderingContext"));
+    if(sn != NULL) { sn->invisable = 1; sn->be_unenumerable = 1; }
+    return p;
+}
+
 static var_t* js_el_getContext(vm_t* vm, var_t* env, void* data) {
     js_canvas_state* st = state_any(vm, data);
     if(st == NULL || st->cb.canvas_create == NULL) return var_new_null(vm);
@@ -3624,10 +3936,21 @@ static var_t* js_el_getContext(vm_t* vm, var_t* env, void* data) {
     void* el = t->value;
 
     /* Per spec, getContext returns null for an unsupported context id. We
-     * only support "2d". */
+     * rasterise only "2d". ewebview has no WebGL implementation, so webgl /
+     * webgl2 ids honestly return null - we do NOT fabricate a partial
+     * WebGLRenderingContext with hardcoded GPU strings, which would be both a
+     * lie and a detectable inconsistency (measured: a stub context yielded no
+     * token while adding fingerprint risk). Under EWEB_GLRECON we instead hand
+     * back a LOGGING PROXY (see above) purely to enumerate the surface the
+     * page touches; it renders nothing and claims no GPU identity. */
     const char* type = get_str(env, "type");
-    if(type != NULL && type[0] != 0 && strcmp(type, "2d") != 0)
+    if(getenv("EWEB_CTXDBG") != NULL)
+        fprintf(stderr, "[ctxdbg] getContext type='%s'\n", (type != NULL) ? type : "(null)");
+    if(type != NULL && type[0] != 0 && strcmp(type, "2d") != 0) {
+        if(getenv("EWEB_GLRECON") != NULL && strstr(type, "webgl") != NULL)
+            return make_gl_recon_proxy(vm);
         return var_new_null(vm);
+    }
 
     int w = el_int_attr(st, el, "width", 300);
     int h = el_int_attr(st, el, "height", 150);
@@ -3845,6 +4168,7 @@ bool js_register_canvas_natives(vm_t* vm, void* ctx, const js_canvas_callbacks_t
     var_t* el_cls = var_find_own_member_var(vm->root, CLS_ELEMENT);
     if(el_cls != NULL) {
         vm_reg_native(vm, el_cls, "getContext(type)", js_el_getContext, bridge);
+        vm_reg_native(vm, el_cls, "toDataURL(type, quality)", js_el_toDataURL, bridge);
         reg_accessor(vm, el_cls, "width",  js_el_get_width,  NULL);
         reg_accessor(vm, el_cls, "height", js_el_get_height, NULL);
     }

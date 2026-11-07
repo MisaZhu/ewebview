@@ -38,6 +38,7 @@
 
 #include <ewebview_port.h>
 #include <string>
+#include <vector>
 #include <stdint.h>
 
 namespace eweb {
@@ -86,6 +87,7 @@ public:
                   int dx, int dy, int dw, int dh, uint8_t alpha);
 
     /* --- text --- */
+    void setFont(const char* family, int weight, int italic);
     void drawText(int x, int y, const char* text, float size, uint32_t color);
     void strokeText(int x, int y, const char* text, float size, int lw, uint32_t color);
     void textSize(const char* text, float size, int* w, int* h);
@@ -98,11 +100,18 @@ private:
     /* Create the drawing font on first use (canvas text is rare enough that
      * paying for the font lazily keeps non-text canvases cheap). */
     eweb_font_t* ensureFont();
+    eweb_font_t* findOrCreateFont(const char* family, int weight, int italic);
+
+    struct FontEntry {
+        std::string key;   /* "family|weight|italic" */
+        eweb_font_t* f;
+    };
 
     const eweb_port_t* m_port;
     std::string     m_id;
     eweb_surface_t* m_bmp;    /* offscreen ARGB surface, m_w x m_h */
-    eweb_font_t*    m_font;   /* lazily created on first text op */
+    eweb_font_t*    m_font;   /* currently selected font (owned by m_fontCache) */
+    std::vector<FontEntry> m_fontCache;
     int             m_w;
     int             m_h;
 };

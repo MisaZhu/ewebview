@@ -177,6 +177,18 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb);
  * Returns the number of promises settled (0 when idle or no async fetch). */
 int js_web_fetch_poll(vm_t* vm);
 
+/* Abandon every async-fetch job owned by `vm` BEFORE that VM is closed.
+ * A fetch job holds var_ref'd __resolve/__reject closures that live inside the
+ * VM which created it; vm_close() frees the whole VM (and those closures), but
+ * the global job lists survive it, so a later js_web_fetch_poll() on the fresh
+ * post-navigation VM would settle a stale job through dangling closures
+ * (heap-use-after-free on the freed VM region). Call this from resetJsVm()
+ * right before vm_close(): it drops the jobs' closure refs while the VM is
+ * still alive and marks them abandoned so the poll releases them unsettled.
+ * In-flight jobs keep their struct (a detached worker still writes results
+ * into it); completed jobs are freed outright. */
+void js_web_fetch_purge_vm(vm_t* vm);
+
 /* ------------------------------------------------------------------ */
 /* Storage helpers                                                    */
 /* ------------------------------------------------------------------ */

@@ -146,6 +146,7 @@ enum {
     EWEB_TASK_CSS,
     EWEB_TASK_IMAGE,
     EWEB_TASK_SCRIPT,
+    EWEB_TASK_FONT_FACE,   /* an @font-face src blob (TTF/OTF/WOFF bytes) */
 };
 
 /* ------------------------------------------------------------------ */

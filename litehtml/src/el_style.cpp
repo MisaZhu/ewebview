@@ -31,10 +31,7 @@ void litehtml::el_style::parse_attributes()
 void litehtml::el_style::register_if_changed()
 {
 	tstring text;
-	for(auto& el : m_children)
-	{
-		el->get_text(text);
-	}
+	get_text(text);
 	if(m_registered && text == m_reg_text)
 	{
 		return;
@@ -60,6 +57,14 @@ bool litehtml::el_style::appendChild(const ptr &el)
 		register_if_changed();
 	}
 	return true;
+}
+
+void litehtml::el_style::get_text(tstring& text)
+{
+	for(auto& el : m_children)
+	{
+		el->get_text(text);
+	}
 }
 
 const litehtml::tchar_t* litehtml::el_style::get_tagName() const

@@ -10,6 +10,7 @@
 #include "EWebCanvas.h"
 
 #include <string.h>
+#include <stdio.h>
 
 namespace eweb {
 
@@ -33,15 +34,47 @@ EWebCanvas::~EWebCanvas()
 {
     if(m_bmp != nullptr && m_port->gfx.surface_free)
         m_port->gfx.surface_free(m_port->gfx.ud, m_bmp);
-    if(m_font != nullptr && m_port->font.destroy)
-        m_port->font.destroy(m_port->font.ud, m_font);
+    for(size_t i = 0; i < m_fontCache.size(); ++i) {
+        if(m_fontCache[i].f != nullptr && m_port->font.destroy)
+            m_port->font.destroy(m_port->font.ud, m_fontCache[i].f);
+    }
+    m_fontCache.clear();
+    m_font = nullptr;
 }
 
 eweb_font_t* EWebCanvas::ensureFont()
 {
-    if(m_font == nullptr && m_port->font.create)
-        m_font = m_port->font.create(m_port->font.ud, "sans-serif");
+    if(m_font == nullptr)
+        m_font = findOrCreateFont("sans-serif", 400, 0);
     return m_font;
+}
+
+eweb_font_t* EWebCanvas::findOrCreateFont(const char* family, int weight, int italic)
+{
+    if(family == nullptr) family = "sans-serif";
+    /* Build cache key: "family|weight|italic" */
+    char keybuf[256];
+    snprintf(keybuf, sizeof(keybuf), "%s|%d|%d", family, weight, italic);
+    std::string key(keybuf);
+    for(size_t i = 0; i < m_fontCache.size(); ++i) {
+        if(m_fontCache[i].key == key)
+            return m_fontCache[i].f;
+    }
+    /* Create via the port: prefer create_styled when available */
+    eweb_font_t* f = nullptr;
+    if(m_port->font.create_styled)
+        f = m_port->font.create_styled(m_port->font.ud, family, weight, italic);
+    if(f == nullptr && m_port->font.create)
+        f = m_port->font.create(m_port->font.ud, family);
+    FontEntry e; e.key = key; e.f = f;
+    m_fontCache.push_back(e);
+    return f;
+}
+
+void EWebCanvas::setFont(const char* family, int weight, int italic)
+{
+    eweb_font_t* f = findOrCreateFont(family, weight, italic);
+    if(f != nullptr) m_font = f;
 }
 
 /* ==================================================================

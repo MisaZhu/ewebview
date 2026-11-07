@@ -34,6 +34,15 @@ static int flex_stats_enabled(void)
 	}
 	return s;
 }
+/* TEMPORARY diagnosis gate (EWEB_FLEXDBG=1): per-line dump of the resolved
+ * flex main sizes plus the authored flex/width strings, to attribute a
+ * collapsed flex item (taobao .core) to collection vs distribution. */
+static int flexdbg_enabled(void)
+{
+	static int s = -1;
+	if (s < 0) s = (getenv("EWEB_FLEXDBG") != NULL) ? 1 : 0;
+	return s;
+}
 struct flex_depth_guard {
 	flex_depth_guard() { if(++g_flex_depth > g_flex_maxdepth) g_flex_maxdepth = g_flex_depth; }
 	~flex_depth_guard() { --g_flex_depth; }
@@ -827,7 +836,27 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 	int avail = max_width;
 	bool width_auto = true;
 
-	if(!m_css_width.is_predefined())
+	if(m_pct_cb_width > 0)
+	{
+		/* A row flex item's used main size is the FLEXED value render() passed
+		 * as parent_width and it OVERRIDES the item's own specified width
+		 * (Flexbox §9.7: the used main size is the flexed size). Without this a
+		 * flex item that is itself a flex container kept honouring its declared
+		 * width: taobao's .core J_Core - which 603.js pins to inline width:0
+		 * after reading a negative offsetWidth - stayed avail=0 and collapsed
+		 * its already-populated carousel to a blank column even though the
+		 * outer flex algorithm had allotted it main=672. m_pct_cb_width>0 marks
+		 * the row PLACE pass (render_item); the MEASURE pass renders items
+		 * directly with m_pct_cb_width==0 so base sizes keep the specified
+		 * width. Self flex-direction is irrelevant: a row parent's main axis is
+		 * horizontal, so the item's used WIDTH is the flexed main size. */
+		int flexed = parent_width - (margin_left() + margin_right())
+			- (m_padding.left + m_borders.left + m_padding.right + m_borders.right);
+		if(flexed < 0) flexed = 0;
+		ret_width = avail = flexed;
+		width_auto = false;
+	}
+	else if(!m_css_width.is_predefined())
 	{
 		/* Resolve a percentage width against the containing block's used
 		 * content width (parent_width), not calc_width's recursive walk of
@@ -1581,6 +1610,24 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 			}
 		}
 		if(free < 0) free = 0;
+		if(flexdbg_enabled())
+		{
+			const tchar_t* ccls = get_attr(_t("class"), 0);
+			fprintf(stderr, "[flexdbg] cont cls=%s avail=%d sum=%d free=%d tgrow=%f tshrink=%f n=%d\n",
+				ccls ? ccls : _t("-"), avail, sum, free, total_grow, total_shrink, (int)line.size());
+			for(size_t i = 0; i < line.size(); i++)
+			{
+				flex_item& it = items[line[i]];
+				const tchar_t* icls = it.el->get_attr(_t("class"), 0);
+				const tchar_t* fsh = it.el->get_style_property(_t("flex"), false, 0);
+				const tchar_t* fgw = it.el->get_style_property(_t("flex-grow"), false, 0);
+				const tchar_t* fbs = it.el->get_style_property(_t("flex-basis"), false, 0);
+				css_length cwv = it.el->get_css_width();
+				fprintf(stderr, "[flexdbg]   item cls=%s grow=%f shrink=%f base=%d hasmain=%d main=%d | flex=%s grow=%s basis=%s width=%f/%d\n",
+					icls ? icls : _t("-"), it.grow, it.shrink, it.base, (int)it.has_main, it.main,
+					fsh ? fsh : _t("-"), fgw ? fgw : _t("-"), fbs ? fbs : _t("-"), (float)cwv.val(), (int)cwv.units());
+			}
+		}
 
 		/* auto margins absorb leftover free space before justify-content */
 		{

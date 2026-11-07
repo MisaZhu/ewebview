@@ -18,6 +18,7 @@
 #include "eweb_el_input.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #ifdef __ewokos__
@@ -912,6 +913,35 @@ uint8_t* EWebContainer::loadURL(const eweb_port_t* port, const std::string& url,
 
     std::string full_url = getFullURL(port, url, "");
     EWEB_LOG("[ewebview] loadURL: %s -> %s\n", url.c_str(), full_url.c_str());
+
+    /* One-time seed of an externally supplied browser session (login +
+     * anti-bot cookies) for parity validation. EWEB_COOKIE_FILE names a file
+     * holding a raw "Cookie:" header; its pairs are filed under the target's
+     * registrable domain so the subdomain MTOP APIs receive them. Runs before
+     * the first requestHeader() below, so the very first navigation already
+     * carries the injected session. */
+    {
+        static bool s_cookieSeeded = false;
+        if(!s_cookieSeeded) {
+            s_cookieSeeded = true;
+            const char* cf = getenv("EWEB_COOKIE_FILE");
+            if(cf != NULL && cf[0] != '\0') {
+                FILE* f = fopen(cf, "rb");
+                if(f != NULL) {
+                    std::string hdr;
+                    char buf[4096];
+                    size_t n;
+                    while((n = fread(buf, 1, sizeof(buf), f)) > 0)
+                        hdr.append(buf, n);
+                    fclose(f);
+                    EWebCookieJar::instance().seedFromHeader(full_url, hdr);
+                    EWEB_LOG("[ewebview] seeded cookies from %s: jar=%d\n",
+                             cf, (int)EWebCookieJar::instance().count());
+                }
+            }
+        }
+    }
+
     if(full_url.compare(0, 5, "data:") == 0) {
         ret = decode_data_url(full_url, sz);
         if(ret != NULL && finalUrl != NULL)

@@ -190,6 +190,13 @@ typedef struct eweb_font_api {
      * every weight/style renders with the same face. Appended last so ports
      * that memset the table keep working unchanged. */
     eweb_font_t* (*create_styled)(void* ud, const char* family, int weight, int italic);
+
+    /* Register one downloaded @font-face family (raw TTF/OTF bytes) so later
+     * create()/create_styled() calls that name it resolve to these glyphs
+     * instead of falling back to the system sans. Already-live handles
+     * re-resolve themselves on their next use. The port copies the bytes.
+     * OPTIONAL: without it web-font families keep rendering their fallback. */
+    void (*webfont_add)(void* ud, const char* family, const unsigned char* data, int len);
 } eweb_font_api_t;
 
 /* ------------------------------------------------------------------ */

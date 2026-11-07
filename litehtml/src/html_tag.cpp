@@ -1400,6 +1400,16 @@ void litehtml::html_tag::apply_stylesheet_own( const litehtml::css& stylesheet )
 			apply = select(*sel, true);
 			if(apply == select_no_match)
 			{
+				/* A state-driven pseudo-class (:hover/:focus/:active/...) whose
+					 * non-pseudo part matches the element but whose state is not set
+					 * YET must still be remembered. The runtime restyle walk
+					 * (find_styles_changes) only re-evaluates selectors present in
+					 * m_used_styles, and refresh_styles() re-runs the pseudo pass over
+					 * that list, so dropping the rule here made :hover/:focus styles
+					 * unreachable forever once the engine toggled the pseudo-class on
+					 * pointer move / focus. Record it unused (no declarations applied
+					 * now); it is picked up the moment the state flips. */
+				m_used_styles.emplace_back(sel, false);
 				if(sprof) g_apply_match_ms += (uint32_t)(sys_tic_ms(0) - match_start);
 				continue;
 			}
@@ -6393,11 +6403,22 @@ bool litehtml::html_tag::find_styles_changes( position::vector& redraw_boxes, in
 
 	bool ret = false;
 	bool apply = false;
+	static int s_fscdbg = -1;
+	if(s_fscdbg < 0) s_fscdbg = (getenv("EWEB_FSCDBG") != nullptr) ? 1 : 0;
 	for (used_selector::vector::iterator iter = m_used_styles.begin(); iter != m_used_styles.end() && !apply; iter++)
 	{
 		if(iter->m_selector->is_media_valid())
 		{
 			int res = select(*(iter->m_selector), true);
+			if(s_fscdbg)
+			{
+				const tchar_t* tn = get_tagName();
+				if(tn != nullptr && !t_strcmp(tn, _t("button")))
+				{
+					fprintf(stderr, "[fscdbg] button used_sel res=%d used=%d\n",
+							(int)res, (int)iter->m_used);
+				}
+			}
 			if( (res == select_no_match && iter->m_used) || (res == select_match && !iter->m_used) )
 			{
 				apply = true;
@@ -9945,6 +9966,22 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 		if (max_width)
 		{
 			max_width -= content_margins_left() + content_margins_right();
+		}
+		/* A row flex item's used main size is the FLEXED value render() passed
+		 * as parent_width even when width is auto: post-flex the main size is
+		 * definite, so shrink-to-fit would under-size a grown item to its
+		 * (possibly empty) content - taobao's .core J_Core item (flex grow,
+		 * width:auto, content that contributes no max-content) measured 0 and
+		 * collapsed the already-populated carousel column to a blank strip.
+		 * m_pct_cb_width>0 marks the flex PLACE pass (render_item); the row
+		 * MEASURE pass renders items directly with m_pct_cb_width==0 and keeps
+		 * shrink-to-fit so base sizes stay content-driven. */
+		if (m_pct_cb_width > 0)
+		{
+			int flexed = parent_width - (margin_left() + margin_right())
+				- (m_padding.left + m_borders.left + m_padding.right + m_borders.right);
+			if (flexed < 0) flexed = 0;
+			ret_width = max_width = block_width = flexed;
 		}
 	}
 

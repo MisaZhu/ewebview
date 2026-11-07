@@ -142,8 +142,14 @@ static const uint32_t kJsPostSwapBudgetMs = 8000;
  * data call) sits behind the heavy telemetry/nav SDKs that consume the normal
  * budget. While nothing real is on screen we therefore keep starting scripts
  * up to this much larger cap; the moment real content paints the ordinary
- * kJsPostSwapBudgetMs applies again so ad-heavy portals still go idle fast. */
-static const uint32_t kJsPostSwapSkeletonBudgetMs = 90000;
+ * kJsPostSwapBudgetMs applies again so ad-heavy portals still go idle fast.
+ * 180s (was 90s): a classic CSR shell (taobao.com) carries several hundred-KB
+ * app bundles (polyfill + react + framework + entry) that each need many
+ * seconds on this interpreter; at 90s the phase clock expired while still in
+ * the ahead-of-app SDKs and dropped the very bundles that replace the skeleton
+ * ("post budget exhausted at script 4 of 36"), guaranteeing a permanent
+ * placeholder. The window only applies while NOTHING real is on screen. */
+static const uint32_t kJsPostSwapSkeletonBudgetMs = 180000;
 
 /* Visible non-whitespace characters at or above which the blank-shell probe
  * (pageShowsSkeletonPlaceholder) counts a page as carrying real content.
@@ -232,6 +238,10 @@ struct EWebResult {
     bool             ok;
     std::string      content;
     eweb_surface_t*  image;
+    /* FONT_FACE results only: the CSS family name the blob registers under
+     * (copied from m_fontFaceFamily on the worker so the engine thread needs
+     * no lock to register it). */
+    std::string      family;
 };
 
 /* ------------------------------------------------------------------ */
@@ -412,6 +422,12 @@ public:
     bool loadHtmlTask(const std::string& url);
     bool loadCSSTask(const std::string& url);
     bool loadImageTask(const std::string& url);
+    bool loadFontFaceTask(const std::string& url);
+    /* Scan raw CSS/HTML text for @font-face blocks and queue a FONT_FACE
+     * fetch for every not-yet-seen src url (see ewebview.cc). baseUrl
+     * resolves relative src urls (the stylesheet's own url, or the document
+     * url for inline <style>). */
+    void scanFontFaces(const std::string& text, const std::string& baseUrl);
     bool loadScriptTask(const std::string& url);
     void pushResult(const EWebResult& result);
     bool getResult(EWebResult& result);
@@ -468,6 +484,12 @@ public:
         if(!m_needsStyleUpdate) m_styleNeedSince = ticMs();
         m_needsStyleUpdate = true;
     }
+    /* Forced reflow: geometry reads (getBoundingClientRect and the offset,
+     * client, scroll families via jsElGetRect, and getComputedStyle
+     * used-values via jsElGetStyle) must reflect pending layout, as in a real
+     * browser. Runs a synchronous layout-only flush (no raster) when the
+     * visible doc is dirty. Defined in EWebJs.cc. */
+    void jsForceReflow();
 
     void jsFireLoadEvents();
     void jsRestoreNoJsFallback();
@@ -622,6 +644,9 @@ public:
     static void  jsGetDocumentSize(void* ctx, int* w, int* h);
     static char* jsElGetStyle(void* ctx, void* el, const char* prop);
     static void  jsElFocus(void* ctx, void* el);
+    /* HTML autofocus insertion step: focus the first [autofocus] focus
+     * candidate inside `root` (bridge insertion hooks + load scan). */
+    void         jsAutofocusInserted(litehtml::element* root);
     static void  jsElBlur(void* ctx, void* el);
     static void* jsGetActiveElement(void* ctx);
     /* document.currentScript backend: the <script> element whose body is
@@ -798,6 +823,10 @@ public:
      * m_taskMutex; the worker reads it on every fetch). */
     std::string                 m_taskPageUrl;
     std::vector<std::string>    m_seenCssUrls;
+    /* @font-face bookkeeping (m_taskMutex-guarded): urls already queued or
+     * fetched, and url -> CSS family name for in-flight font fetches. */
+    std::vector<std::string>    m_seenFontUrls;
+    std::unordered_map<std::string, std::string> m_fontFaceFamily;
     /* url -> <link media> attribute for in-flight stylesheet fetches. */
     std::unordered_map<std::string, std::string> m_cssMedia;
     pthread_mutex_t             m_cssMediaMutex;

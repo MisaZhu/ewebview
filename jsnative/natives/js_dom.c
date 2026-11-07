@@ -94,6 +94,11 @@ typedef struct {
      * timer path would never supply. The engine has no real idle notion, so the
      * deadline always reports zero remaining time. */
     bool                  idle;
+    /* requestAnimationFrame: the callback's first argument is a
+     * DOMHighResTimeStamp (a number, same clock family as performance.now).
+     * The plain timer path passes no arguments, so animation / timing code that
+     * reads the rAF timestamp saw undefined and diverged from Chrome. */
+    bool                  raf;
 } js_timer_t;
 
 typedef struct {
@@ -247,7 +252,14 @@ static var_t* native_alert(vm_t* vm, var_t* env, void* data) {
 /* returned unchanged, per spec.                                       */
 /* ------------------------------------------------------------------ */
 
-#define EVAL_RET_KEY "@@evalret"
+/* The capture key doubles as (a) an identifier the compiler must accept inside
+ * the generated `KEY = (src);` source and (b) the member name read back off
+ * vm->root. '@' is NOT a legal JS identifier start in this engine (mario_lex.c
+ * is_alpha covers a-z A-Z _ $ >=0x80; mario.c:10709 documents the rule), so the
+ * former "@@evalret" wrapper never compiled and EVERY value-returning eval()
+ * silently fell through to the statement path and yielded undefined. Use a
+ * legal, collision-proof $_ identifier instead. */
+#define EVAL_RET_KEY "__$mario_eval_ret$__"
 
 static var_t* native_eval(vm_t* vm, var_t* env, void* data) {
     (void)data;
@@ -430,6 +442,48 @@ static void js_reanchor_el_cache(vm_t* vm, js_dom_state* st) {
     vm->gc.gc_defer--;
 }
 
+/* Map a lower-case HTML tag name to its DOM interface name for the
+ * Object.prototype.toString brand ([object HTMLDivElement] ...). Most tags are
+ * the generic HTML<Cap>tag<Element>; the spec special-cases a handful (a, img,
+ * p, the table family, lists, headings, ...), so those are tabled and anything
+ * else falls back to the generic form. `out` receives a NUL-terminated name. */
+static void js_html_interface_name(const char* tag, char* out, size_t outsz) {
+    static const struct { const char* tag; const char* iface; } sp[] = {
+        { "a", "HTMLAnchorElement" },        { "img", "HTMLImageElement" },
+        { "p", "HTMLParagraphElement" },    { "textarea", "HTMLTextAreaElement" },
+        { "td", "HTMLTableCellElement" },   { "th", "HTMLTableCellElement" },
+        { "tr", "HTMLTableRowElement" },    { "table", "HTMLTableElement" },
+        { "tbody", "HTMLTableSectionElement" }, { "thead", "HTMLTableSectionElement" },
+        { "tfoot", "HTMLTableSectionElement" }, { "caption", "HTMLTableCaptionElement" },
+        { "col", "HTMLTableColElement" },   { "colgroup", "HTMLTableColElement" },
+        { "ul", "HTMLUListElement" },       { "ol", "HTMLOListElement" },
+        { "li", "HTMLLIElement" },          { "dl", "HTMLDListElement" },
+        { "iframe", "HTMLIFrameElement" },  { "hr", "HTMLHRElement" },
+        { "br", "HTMLBRElement" },          { "q", "HTMLQuoteElement" },
+        { "blockquote", "HTMLQuoteElement" },{ "ins", "HTMLModElement" },
+        { "del", "HTMLModElement" },        { "embed", "HTMLEmbedElement" },
+        { "object", "HTMLObjectElement" },  { "param", "HTMLParamElement" },
+        { "pre", "HTMLPreElement" },        { "html", "HTMLHtmlElement" },
+        { "head", "HTMLHeadElement" },      { "title", "HTMLTitleElement" },
+        { "meta", "HTMLMetaElement" },      { "base", "HTMLBaseElement" },
+    };
+    for(size_t i = 0; i < sizeof(sp) / sizeof(sp[0]); ++i)
+        if(strcmp(tag, sp[i].tag) == 0) {
+            snprintf(out, outsz, "%s", sp[i].iface);
+            return;
+        }
+    /* h1..h6 all share HTMLHeadingElement. */
+    if(tag[0] == 'h' && tag[1] >= '1' && tag[1] <= '6' && tag[2] == 0) {
+        snprintf(out, outsz, "HTMLHeadingElement");
+        return;
+    }
+    /* Generic HTML<Cap>tag<Element>. */
+    char cap[48];
+    snprintf(cap, sizeof(cap), "%s", tag);
+    if(cap[0] != 0) cap[0] = js_ascii_upper(cap[0]);
+    snprintf(out, outsz, "HTML%sElement", cap);
+}
+
 static var_t* wrap_element(vm_t* vm, js_element_t el) {
     js_dom_state* st = state_from_vm(vm);
     if(st != NULL) {
@@ -462,6 +516,33 @@ static var_t* wrap_element(vm_t* vm, js_element_t el) {
         if(hcls != NULL) {
             var_t* hproto = var_get_prototype(hcls);
             if(hproto != NULL) var_set_prototype(obj, hproto);
+        }
+        /* Object.prototype.toString brand: a browser reports [object HTMLDivElement]
+         * / [object HTMLAnchorElement] / ... via each interface's Symbol.toStringTag.
+         * mario has a single Element class, so pin a per-element tag built from the
+         * tag name (generic HTML<Cap>tag<Element> form) as a hidden own member;
+         * native_Object_proto_toString reads it through the prototype chain and the
+         * result matches Chrome instead of the fingerprintable [object Object]. */
+        if(st->cb.el_get_tag != NULL) {
+            char* tg = st->cb.el_get_tag(st->ctx, el);
+            if(tg != NULL) {
+                if(strcmp(tg, "script") == 0) {
+                    var_t* scls = var_find_own_member_var(vm->root, "HTMLScriptElement");
+                    if(scls != NULL) {
+                        var_t* sproto = var_get_prototype(scls);
+                        if(sproto != NULL) var_set_prototype(obj, sproto);
+                    }
+                }
+                if(tg[0] != 0) {
+                    char brand[64];
+                    js_html_interface_name(tg, brand, sizeof(brand));
+                    vm->gc.gc_defer++;
+                    node_t* btn = var_add(obj, SYMKEY_TOSTRINGTAG, var_new_str(vm, brand));
+                    if(btn != NULL) { btn->invisable = 1; btn->be_unenumerable = 1; }
+                    vm->gc.gc_defer--;
+                }
+                mario_free(tg);
+            }
         }
     }
     if(st != NULL) {
@@ -1250,6 +1331,7 @@ static int js_add_timer(vm_t* vm, js_dom_state* st, var_t* cb, uint32_t ms, bool
     t->cb           = cb;
     t->microtask    = microtask;
     t->idle         = idle;
+    t->raf          = false;
     if(microtask) {
         /* Due on the very next poll (remaining_ms 0) and never repeats: a promise
          * reaction / queueMicrotask / process.nextTick runs once, ahead of any
@@ -1523,6 +1605,8 @@ static int js_fire_timer(vm_t* vm, js_dom_state* st, int idx) {
         var_add(dl, "@@idle_start", var_new_int64(vm, js_now_ms()));
         var_array_add(args, dl);
     }
+    if(t->raf)
+        var_array_add(args, var_new_float64(vm, (double)js_dom_monotonic_ms()));
     /* Each timer/microtask callback is an independent JOB: per the HTML/ES event
      * loop a task runs to completion and an error that escapes it is reported to
      * the global handler and then CLEARED - it must never leak into the next job.
@@ -3971,7 +4055,10 @@ static var_t* native_requestAnimationFrame(vm_t* vm, var_t* env, void* data) {
     js_dom_state* st = state_any(vm, data);
     var_t* cb = js_arg_func(env, 0);
     if(st == NULL || cb == NULL) return var_new_int(vm, 0);
-    return var_new_int(vm, js_add_timer(vm, st, cb, JS_FRAME_MS, false, false, false));
+    int id = js_add_timer(vm, st, cb, JS_FRAME_MS, false, false, false);
+    for(int i = 0; i < JS_TIMER_MAX; ++i)
+        if(st->timers[i].active && st->timers[i].id == id) { st->timers[i].raf = true; break; }
+    return var_new_int(vm, id);
 }
 
 static var_t* native_cancelAnimationFrame(vm_t* vm, var_t* env, void* data) {
@@ -4382,6 +4469,30 @@ static var_t* native_observer_observe(vm_t* vm, var_t* env, void* data) {
  * ResizeObserver independently queues a delayed initial size delivery. */
 typedef struct io_disp { var_t* observer; var_t* target; } io_disp_t;
 
+/* IntersectionObserverEntry prototype getters. The dispatch below builds each
+ * entry with own members; these getters exist so capability probes of the form
+ *   "intersectionRatio" in window.IntersectionObserverEntry.prototype
+ * see the standard surface, and so an entry read before/without a member still
+ * yields a sane default. taobao's appear-polyfill runs exactly that probe and,
+ * when any leg fails, swaps in a scroll-position fallback that never reports
+ * "appear" in a headless engine - leaving every IO-gated lazy widget (home
+ * right rail, guess-you-like feed) stuck as a skeleton forever. */
+static var_t* s_ioe_proto = NULL;
+
+static var_t* native_ioe_get(vm_t* vm, var_t* env, void* data) {
+    var_t* self = get_obj(env, THIS);
+    const char* key = (const char*)data;
+    if(self != NULL && key != NULL) {
+        var_t* v = var_find_own_member_var(self, key);
+        if(v != NULL) { var_ref(v); return v; }
+    }
+    if(key != NULL && strcmp(key, "isIntersecting") == 0)
+        return var_new_bool(vm, false);
+    if(key != NULL && (strcmp(key, "intersectionRatio") == 0 || strcmp(key, "time") == 0))
+        return var_new_int(vm, 0);
+    return var_new_null(vm);
+}
+
 static var_t* native_io_dispatch(vm_t* vm, var_t* env, void* data) {
     (void)env;
     io_disp_t* d = (io_disp_t*)data;
@@ -4414,6 +4525,7 @@ static var_t* native_io_dispatch(vm_t* vm, var_t* env, void* data) {
     var_add(entry, "intersectionRect", rect);
     var_add(entry, "rootBounds", var_new_null(vm));
     var_add(entry, "time", var_new_float64(vm, 0.0));
+    if(s_ioe_proto != NULL) var_set_prototype(entry, s_ioe_proto);
     var_t* entries = var_new_array(vm);
     var_array_add(entries, entry);
     var_t* args = var_new_array(vm);
@@ -5629,6 +5741,10 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
             var_add(dproto, "COMMENT_NODE", var_new_int(vm, 8));
             var_add(dproto, "DOCUMENT_NODE", var_new_int(vm, 9));
             var_add(dproto, "DOCUMENT_FRAGMENT_NODE", var_new_int(vm, 11));
+            /* [object HTMLDocument] brand (Chrome parity for
+             * Object.prototype.toString.call(document)). */
+            node_t* dtn = var_add(dproto, SYMKEY_TOSTRINGTAG, var_new_str(vm, "HTMLDocument"));
+            if(dtn != NULL) { dtn->invisable = 1; dtn->be_unenumerable = 1; }
         }
     }
 
@@ -5709,6 +5825,60 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     vm_reg_native(vm, io_cls, "unobserve(target)", native_observer_unobserve, bridge);
     vm_reg_native(vm, io_cls, "disconnect()", native_observer_disconnect, bridge);
     vm_reg_native(vm, io_cls, "takeRecords()", native_observer_takeRecords, bridge);
+    /* IntersectionObserverEntry: the interface global itself. Sites gate on its
+     * presence (see native_ioe_get); without it they fall back to scroll-driven
+     * visibility that a static render can never trigger. The prototype stays
+     * alive through the published constructor, so the cached pointer is safe. */
+    var_t* ioe_cls = vm_new_class(vm, "IntersectionObserverEntry");
+    if(ioe_cls != NULL) {
+        static const char* kIoeAttrs[] = {
+            "time", "rootBounds", "target", "intersectionRect",
+            "boundingClientRect", "isIntersecting", "intersectionRatio"
+        };
+        for(size_t i = 0; i < sizeof(kIoeAttrs) / sizeof(kIoeAttrs[0]); ++i)
+            reg_accessor(vm, ioe_cls, kIoeAttrs[i], native_ioe_get, NULL,
+                         (void*)kIoeAttrs[i]);
+        s_ioe_proto = var_get_prototype(ioe_cls);
+    }
+    /* HTML*Element interface constructors: Chrome exposes one global binding per
+     * WebIDL element interface, and bot-detection VMPs (baxia et_f / fireye)
+     * resolve their decoded names with `name in window` - a window without
+     * HTMLDivElement reads as a non-browser and drops the VMP to a degraded
+     * token. mario wraps every tag with the single HTMLElement class, so the
+     * per-interface bindings never existed; register them as inert
+     * constructors (element behaviour stays on the wrapped objects). */
+    static const char* kHtmlIfaces[] = {
+        "HTMLDivElement", "HTMLSpanElement", "HTMLImageElement", "HTMLAnchorElement",
+        "HTMLInputElement", "HTMLButtonElement", "HTMLFormElement", "HTMLTextAreaElement",
+        "HTMLSelectElement", "HTMLOptionElement", "HTMLOptGroupElement", "HTMLLabelElement",
+        "HTMLFieldSetElement", "HTMLLegendElement", "HTMLTableElement", "HTMLTableSectionElement",
+        "HTMLTableRowElement", "HTMLTableCellElement", "HTMLTableCaptionElement", "HTMLTableColElement",
+        "HTMLUListElement", "HTMLOListElement", "HTMLLIElement", "HTMLDListElement",
+        "HTMLIFrameElement", "HTMLCanvasElement", "HTMLVideoElement", "HTMLAudioElement",
+        "HTMLSourceElement", "HTMLTrackElement", "HTMLMediaElement", "HTMLHeadElement",
+        "HTMLBodyElement", "HTMLHtmlElement", "HTMLScriptElement", "HTMLStyleElement",
+        "HTMLLinkElement", "HTMLMetaElement", "HTMLTitleElement", "HTMLBaseElement",
+        "HTMLParagraphElement", "HTMLHeadingElement", "HTMLPreElement", "HTMLQuoteElement",
+        "HTMLBlockquoteElement", "HTMLHRElement", "HTMLBRElement", "HTMLModElement",
+        "HTMLDelElement", "HTMLInsElement", "HTMLObjectElement", "HTMLEmbedElement",
+        "HTMLParamElement", "HTMLMapElement", "HTMLAreaElement", "HTMLSlotElement",
+        "HTMLTemplateElement", "HTMLPictureElement", "HTMLProgressElement", "HTMLMeterElement",
+        "HTMLOutputElement", "HTMLDataElement", "HTMLTimeElement", "HTMLDialogElement",
+        "HTMLDetailsElement", "HTMLSummaryElement", "HTMLFrameElement", "HTMLFontElement"
+    };
+    for(size_t i = 0; i < sizeof(kHtmlIfaces) / sizeof(kHtmlIfaces[0]); ++i) {
+        if(var_find_own_member_var(vm->root, kHtmlIfaces[i]) != NULL) continue;
+        vm_new_class(vm, kHtmlIfaces[i]);
+    }
+    /* baxia wraps HTMLScriptElement.prototype.src to decorate JSONP URLs. The
+     * descriptor must be own to this interface and script wrappers must inherit
+     * it; a generic Element.src is invisible to Object.getOwnPropertyDescriptor. */
+    var_t* script_cls = var_find_own_member_var(vm->root, "HTMLScriptElement");
+    if(script_cls != NULL) {
+        var_set_prototype(var_get_prototype(script_cls), var_get_prototype(htmlel_cls));
+        js_acc_cls(vm, script_cls, "src", attr_prop_get, attr_prop_set,
+                   (void*)(intptr_t)1); /* kAttrProps: src */
+    }
     var_t* ro_cls = vm_new_class(vm, "ResizeObserver");
     vm_reg_native(vm, ro_cls, "constructor(cb)", native_observer_ctor, bridge);
     vm_reg_native(vm, ro_cls, "observe(target, options)", native_ro_observe, bridge);
@@ -5944,9 +6114,21 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     var_t* loc_cls = vm_new_class(vm, CLS_LOCATION);
     reg_accessor(vm, loc_cls, "href", native_location_get_href, NULL, bridge);
 
-    /* `new Image()` constructs an <img> element wrapper (preloader idiom). */
+    /* `new Image()` constructs an <img> element wrapper (preloader idiom).
+     * In a browser `Image` is ALSO a real callable: `typeof Image` is
+     * "function", bare `Image()` constructs, and Function.prototype.bind
+     * accepts it. A class var is deliberately not callable (var_is_callable
+     * rejects is_class-only vars), so baxia fireyejs's `bind.call(window
+     * .Image, ...)` environment probe threw "bind target is not callable"
+     * here and aborted the VMP boot (no bx-ua token -> recommend punished
+     * with RGV587 -> grey feed). Make the class callable IN PLACE via
+     * var_make_native_func: it keeps the var's own prototype and members
+     * (`x instanceof Image` and the @@ctor machinery survive) while is_func
+     * flips var_is_callable to true and routes calls to the same native
+     * ctor, matching Chrome's legacy Image factory semantics. */
     var_t* img_cls = vm_new_class(vm, "Image");
     vm_reg_native(vm, img_cls, "constructor(w, h)", native_image_ctor, bridge);
+    var_make_native_func(vm, img_cls, native_image_ctor, bridge);
 
     var_t* location = new_obj(vm, CLS_LOCATION, 0);
     /* A browser's `window` IS the global object: a UMD bundle that exports
@@ -5959,6 +6141,14 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     var_t* window = vm->root;
     var_add(window, "location", location);
     var_add(vm->root, "window", window);
+    /* [object Window] brand: in a browser `window` IS the global object and
+     * Object.prototype.toString.call(window) === "[object Window]". Pin the
+     * well-known tag on the global (a hidden, non-identifier key, so it never
+     * leaks into scope lookups or enumeration). */
+    {
+        node_t* wtn = var_add(window, SYMKEY_TOSTRINGTAG, var_new_str(vm, "Window"));
+        if(wtn != NULL) { wtn->invisable = 1; wtn->be_unenumerable = 1; }
+    }
     /* window.document / document.defaultView: both directions of the pair
      * pages use to hop between the global and the document. */
     var_add(window, "document", document);

@@ -1621,6 +1621,11 @@ static void inj_post_mouse(browser_t* b, int state, int cx, int cy) {
 
 static void inj_exec(browser_t* b, const inj_step_t* s) {
     if(!b->view) return;
+    if(getenv("EWEB_INJDBG") != NULL) {
+        fprintf(stderr, "[injdbg] step kind=%d x=%d y=%d key=%d text=%s\n",
+                (int)s->kind, s->x, s->y, s->key,
+                s->text[0] != 0 ? s->text : "-");
+    }
     switch(s->kind) {
     case INJ_CLICK:
         inj_post_mouse(b, EWEB_MOUSE_DOWN, s->x, s->y);

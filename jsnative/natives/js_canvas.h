@@ -278,7 +278,15 @@ typedef struct js_canvas_callbacks {
      * `size` is the resolved font size in px; the embedder owns the font
      * handle (creating it lazily) and measures/draws with it. stroke_text
      * may be implemented as a series of offset draws or via a real outline
-     * font; if NULL, the bridge approximates with draw_text. */
+     * font; if NULL, the bridge approximates with draw_text.
+     *
+     * set_font (OPTIONAL): called by the bridge before any text operation
+     * whenever the font family/weight/style changes, so the embedder can
+     * select (or lazily create) the matching font handle.  If NULL, the
+     * embedder uses its default font for all text.  `family` is the CSS
+     * font-family string (e.g. "Arial", "sans-serif"); weight is 100..900;
+     * italic is 0 (normal) or 1 (italic). */
+    void (*set_font)(void* ctx, void* canvas, const char* family, int weight, int italic);
     void (*draw_text)(void* ctx, void* canvas, int x, int y, const char* text, float size, uint32_t color);
     void (*stroke_text)(void* ctx, void* canvas, int x, int y, const char* text, float size, int lw, uint32_t color);
     void (*text_size)(void* ctx, void* canvas, const char* text, float size, int* w, int* h);

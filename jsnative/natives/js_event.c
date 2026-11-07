@@ -854,6 +854,14 @@ static var_t* on_prop_set(vm_t* vm, var_t* env, void* data) {
         return NULL;
     }
     ev_add_listener(vm, st, kind, h, self, type, fn, false, false, true);
+    /* TEMP DIAGNOSTIC (taobao cna chain): confirm the aplus eg.js loader's
+     * `s.onload = cb` registration actually lands in the listener table, so a
+     * missing cookie write can be told apart from a missing registration. */
+    if(getenv("EWEB_SCRIPTDBG") != NULL &&
+       (strcmp(type, "load") == 0 || strcmp(type, "error") == 0 ||
+        strcmp(type, "readystatechange") == 0)) {
+        fprintf(stderr, "[ewebview] jsdbg: on_prop_set type=%s h=%p\n", type, h);
+    }
     return NULL;
 }
 

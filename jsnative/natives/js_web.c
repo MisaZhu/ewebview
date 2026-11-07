@@ -22,6 +22,7 @@ extern "C" {
 #include "js_dom.h"            /* js_dom_has_pending_timers / monotonic ms */
 #include "js_natives_priv.h"
 #include "Promise/native_Promise.h"   /* promise_new_deferred(): async fetch */
+#include "TypedArray/native_TypedArray.h" /* AudioBuffer Float32Array channels */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,15 @@ extern "C" {
 #include <math.h>
 #include <time.h>
 #include <pthread.h>
+#ifdef __has_include
+#  if __has_include(<unistd.h>)
+#    include <unistd.h>
+#    define WEB_HAVE_UNISTD 1
+#  endif
+#else
+#  include <unistd.h>
+#  define WEB_HAVE_UNISTD 1
+#endif
 
 #define CLS_STORAGE   "Storage"
 #define CLS_LOCATION  "Location"
@@ -39,6 +49,7 @@ extern "C" {
 #define CLS_CONSOLE   "Console"
 #define CLS_XHR       "XMLHttpRequest"
 #define CLS_ELEMENT   "Element"
+#define CLS_DOMEXCEPTION "DOMException"
 /* Class names owned by the sibling bridges, repeated here because the lookup
  * goes through vm->root by name. */
 #define CLS_DOCUMENT  "Document"
@@ -54,10 +65,23 @@ extern "C" {
 #define XHR_RESP_HDRS  "@@respHeaders"
 
 /* Fallbacks for the identity strings, so feature detection that reads
- * navigator.userAgent unconditionally always sees something sane. */
-#define DEFAULT_UA      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 MyEwokoBrowser/1.0"
-#define DEFAULT_LANG    "en-US"
+ * navigator.userAgent unconditionally always sees something sane. The OS
+ * token must match the host we actually run on: Chrome derives both the UA
+ * platform substring and navigator.platform from the real OS, and bot
+ * detectors cross-check them against other signals. A Linux UA on a macOS
+ * build (or a bespoke product token like "MyEwokoBrowser") is an immediate
+ * headless/custom-engine tell, so pick the Chrome-shaped string per host. */
+#if defined(__APPLE__)
+#define DEFAULT_UA      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+#define DEFAULT_PLATFORM "MacIntel"
+#elif defined(_WIN32)
+#define DEFAULT_UA      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+#define DEFAULT_PLATFORM "Win32"
+#else
+#define DEFAULT_UA      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 #define DEFAULT_PLATFORM "Linux x86_64"
+#endif
+#define DEFAULT_LANG    "en-US"
 
 typedef struct {
     vm_t*              vm;
@@ -526,25 +550,52 @@ static int b64_index(char c) {
     return -1;
 }
 
-/* btoa(): encode the string's bytes. The spec restricts input to Latin-1 and
- * throws otherwise; emitting the UTF-8 bytes is more useful here and never
- * fails, which matters because a throw would abort the whole page script. */
+/* btoa(): encode the string's code units as Latin-1 bytes then base64 (WHATWG).
+ * NUL-safe + Chrome-parity: read the argument's stored byte length (not strlen,
+ * which cuts at the first 0x00) and decode UTF-8 code units, so a byte-buffer
+ * string (String.fromCharCode over 0..255) round-trips; a code unit > 0xFF
+ * throws InvalidCharacterError exactly like Chrome. The taobao AWSC VMP builds
+ * its tables with fromCharCode over byte arrays containing 0x00, so the old
+ * strlen-bounded path emptied them and aborted the script. */
 static var_t* native_btoa(vm_t* vm, var_t* env, void* data) {
     (void)data;
-    mstr_t* s = mstr_new("");
-    const char* str = js_arg_cstr(env, 0, s);
-    uint32_t len = (uint32_t)strlen(str);
+    var_t* av = get_func_arg(env, 0);
+    mstr_t* tmp = NULL;
+    const char* str; uint32_t bytes;
+    if(av != NULL && av->type == V_STRING) { str = var_get_str(av); bytes = av->size; }
+    else { tmp = mstr_new(""); var_to_str(av, tmp); str = tmp->cstr; bytes = tmp->len; }
+    mstr_t* bin = mstr_new("");
+    const char* p = str;
+    const char* end = str + bytes;
+    while(p < end) {
+        uint32_t cp = (unsigned char)p[0];
+        if(cp < 0x80) { p += 1; }
+        else if((cp & 0xE0) == 0xC0 && p + 1 < end) { cp = ((cp & 0x1F) << 6) | ((unsigned char)p[1] & 0x3F); p += 2; }
+        else if((cp & 0xF0) == 0xE0 && p + 2 < end) { cp = ((cp & 0x0F) << 12) | (((unsigned char)p[1] & 0x3F) << 6) | ((unsigned char)p[2] & 0x3F); p += 3; }
+        else if((cp & 0xF8) == 0xF0 && p + 3 < end) { cp = ((cp & 0x07) << 18) | (((unsigned char)p[1] & 0x3F) << 12) | (((unsigned char)p[2] & 0x3F) << 6) | ((unsigned char)p[3] & 0x3F); p += 4; }
+        else { p += 1; }
+        if(cp > 0xFF) {
+            mstr_free(bin);
+            if(tmp != NULL) mstr_free(tmp);
+            vm_throw_type_native(vm, "InvalidCharacterError", "The string to be encoded contains characters outside of the Latin1 range.");
+            return NULL;
+        }
+        mstr_add(bin, (char)cp);
+    }
+    if(tmp != NULL) mstr_free(tmp);
+    uint32_t len = bin->len;
+    const char* b = bin->cstr;
     mstr_t* out = mstr_new("");
     for(uint32_t i = 0; i < len; i += 3) {
-        unsigned b0 = (unsigned char)str[i];
-        unsigned b1 = (i + 1 < len) ? (unsigned char)str[i+1] : 0;
-        unsigned b2 = (i + 2 < len) ? (unsigned char)str[i+2] : 0;
+        unsigned b0 = (unsigned char)b[i];
+        unsigned b1 = (i + 1 < len) ? (unsigned char)b[i+1] : 0;
+        unsigned b2 = (i + 2 < len) ? (unsigned char)b[i+2] : 0;
         mstr_add(out, kB64[(b0 >> 2) & 0x3F]);
         mstr_add(out, kB64[((b0 << 4) | (b1 >> 4)) & 0x3F]);
         mstr_add(out, (i + 1 < len) ? kB64[((b1 << 2) | (b2 >> 6)) & 0x3F] : '=');
         mstr_add(out, (i + 2 < len) ? kB64[b2 & 0x3F] : '=');
     }
-    mstr_free(s);
+    mstr_free(bin);
     var_t* r = var_new_str(vm, out->cstr);
     mstr_free(out);
     return r;
@@ -554,7 +605,7 @@ static var_t* native_atob(vm_t* vm, var_t* env, void* data) {
     (void)data;
     mstr_t* s = mstr_new("");
     const char* str = js_arg_cstr(env, 0, s);
-    mstr_t* out = mstr_new("");
+    mstr_t* bytes = mstr_new("");
     int acc = 0, bits = 0;
     for(const char* p = str; *p != 0; ++p) {
         if(*p == '=' || *p == '\n' || *p == '\r' || *p == ' ' || *p == '\t') continue;
@@ -564,11 +615,21 @@ static var_t* native_atob(vm_t* vm, var_t* env, void* data) {
         bits += 6;
         if(bits >= 8) {
             bits -= 8;
-            mstr_add(out, (char)((acc >> bits) & 0xFF));
+            mstr_add(bytes, (char)((acc >> bits) & 0xFF));
         }
     }
+    /* Each decoded byte becomes one code unit: UTF-8-encode it so charCodeAt /
+     * length read it back, and keep embedded 0x00 via the binary ctor (Chrome's
+     * atob("AAEC/w==") is a 4-char string with charCodeAt [0,1,2,255]). */
+    mstr_t* out = mstr_new("");
+    for(uint32_t i = 0; i < bytes->len; i++) {
+        uint32_t cp = (unsigned char)bytes->cstr[i];
+        if(cp < 0x80) mstr_add(out, (char)cp);
+        else { mstr_add(out, (char)(0xC0 | (cp >> 6))); mstr_add(out, (char)(0x80 | (cp & 0x3F))); }
+    }
     mstr_free(s);
-    var_t* r = var_new_str(vm, out->cstr);
+    mstr_free(bytes);
+    var_t* r = var_new_str_bin(vm, out->cstr, out->len);
     mstr_free(out);
     return r;
 }
@@ -584,6 +645,113 @@ static var_t* native_queueMicrotask(vm_t* vm, var_t* env, void* data) {
         if(getenv("MARIO_TIMERDBG") != NULL)
             fprintf(stderr, "[timerdbg] qmt fn=%p -> id=%d\n", (void*)fn, id);
     }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* setImmediate / clearImmediate                                       */
+/*                                                                     */
+/* react-dom 18's scheduler picks setImmediate AHEAD of MessageChannel */
+/* whenever the global exists. taobao's webpack shim installs a        */
+/* setImmediate polyfill whose drain path never fires in this engine   */
+/* (probe: setImmediate(cb) left cb uncalled), so every async render   */
+/* starves while flushSync still commits - exactly the "#ice-container */
+/* stays empty forever" signature. The setimmediate/core-js shims only */
+/* install when the global is MISSING, so a working native one here    */
+/* pre-empts the broken polyfill. Rides the DOM timer table at 0 ms    */
+/* (macrotask, behind microtasks). GC anchoring mirrors MessageChannel:*/
+/* the captured fn+args pair lives in a hidden @@si_pending array on   */
+/* the bridge until dispatch removes it.                               */
+/* ------------------------------------------------------------------ */
+#define SI_PENDING "@@si_pending"
+
+typedef struct si_disp { var_t* pair; var_t* bridge; } si_disp_t;
+
+static var_t* si_pending_of(vm_t* vm, var_t* bridge, bool create) {
+    var_t* pend = (bridge != NULL) ? var_find_own_member_var(bridge, SI_PENDING) : NULL;
+    if(pend == NULL && create && bridge != NULL) {
+        node_t* n = var_add(bridge, SI_PENDING, var_new_array(vm));
+        if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+        pend = var_find_own_member_var(bridge, SI_PENDING);
+    }
+    return pend;
+}
+
+static void si_unanchor(vm_t* vm, var_t* bridge, var_t* pair) {
+    var_t* pend = si_pending_of(vm, bridge, false);
+    if(pend == NULL) return;
+    uint32_t sz = var_array_size(pend);
+    for(uint32_t i = 0; i < sz; ++i) {
+        node_t* nd = var_array_get(pend, (int32_t)i);
+        if(nd != NULL && nd->var == pair) { var_array_del(pend, (int32_t)i); return; }
+    }
+}
+
+static var_t* native_si_dispatch(vm_t* vm, var_t* env, void* data) {
+    (void)env;
+    si_disp_t* d = (si_disp_t*)data;
+    if(d == NULL) return NULL;
+    var_t* pair = d->pair;
+    var_t* bridge = d->bridge;
+    mario_free(d);
+    if(pair == NULL) return NULL;
+    node_t* fn = var_array_get(pair, 0);
+    node_t* an = var_array_get(pair, 1);
+    var_t* f = (fn != NULL) ? fn->var : NULL;
+    var_t* args = (an != NULL) ? an->var : NULL;
+    if(f == NULL || !f->is_func) { si_unanchor(vm, bridge, pair); return NULL; }
+    var_ref(f);
+    if(args != NULL) var_ref(args);
+    si_unanchor(vm, bridge, pair);   /* pair (and its refs) may die here */
+    var_t* r = call_m_func(vm, NULL, f, args);
+    if(r != NULL) var_unref(r);
+    var_unref(f);
+    if(args != NULL) var_unref(args);
+    return NULL;
+}
+
+static var_t* native_setImmediate(vm_t* vm, var_t* env, void* data) {
+    var_t* bridge = (var_t*)data;
+    var_t* fn = js_arg_func(env, 0);
+    if(fn == NULL) return var_new_int(vm, 0);
+    var_t* in = get_func_args(env);
+    var_t* rest = var_new_array(vm);
+    uint32_t n = (in != NULL) ? var_array_size(in) : 0;
+    for(uint32_t i = 1; i < n; ++i) {
+        node_t* nd = var_array_get(in, (int32_t)i);
+        if(nd != NULL && nd->var != NULL) {
+            var_ref(nd->var);
+            var_array_add(rest, nd->var);
+        }
+    }
+    var_t* pair = var_new_array(vm);
+    var_ref(fn);   var_array_add(pair, fn);
+    var_ref(rest); var_array_add(pair, rest);
+    var_t* pend = si_pending_of(vm, bridge, true);
+    if(pend != NULL) {
+        vm->gc.gc_defer++;
+        var_array_add(pend, pair);   /* adopts the pair's only ref */
+        vm->gc.gc_defer--;
+    }
+    si_disp_t* d = (si_disp_t*)mario_malloc(sizeof(si_disp_t));
+    if(d == NULL) return var_new_int(vm, 0);
+    d->pair = pair;
+    d->bridge = bridge;
+    var_t* tr = var_new_native_func(vm, native_si_dispatch, d);
+    int id = js_dom_add_timer(vm, tr, 0, false);
+    if(id == 0) {
+        mario_free(d);
+        var_unref(tr);          /* not anchored: release the trampoline */
+        si_unanchor(vm, bridge, pair);
+    }
+    /* Success: the @@timers reanchor holds tr, @@si_pending holds pair. */
+    return var_new_int(vm, id);
+}
+
+static var_t* native_clearImmediate(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* idv = get_func_arg(env, 0);
+    if(idv != NULL) js_dom_clear_timer(vm, var_get_int(idv));
     return NULL;
 }
 
@@ -843,6 +1011,8 @@ static void console_emit(const char* prefix, var_t* env) {
     mstr_free(line);
     mstr_free(msg);
 }
+
+static var_t* native_console_log(vm_t* vm, var_t* env, void* data) { (void)vm; (void)data; console_emit("", env); return NULL; }
 
 static var_t* native_console_warn(vm_t* vm, var_t* env, void* data)  { (void)vm; (void)data; console_emit("[warn] ", env);  return NULL; }
 static var_t* native_console_error(vm_t* vm, var_t* env, void* data) {
@@ -1255,6 +1425,29 @@ static var_t* loc_get(vm_t* vm, var_t* env, void* data) {
     return out;
 }
 
+/* window.isSecureContext: true for potentially-trustworthy schemes (https and
+ * file/localhost), false otherwise. A live getter, not a snapshot: the page
+ * URL is only known after navigation begins, and anti-bot code cross-checks
+ * it against location.protocol - a hard-coded false on an https page is an
+ * immediate inconsistency tell. */
+static var_t* win_secure_get(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    char* url = web_current_url(vm);
+    bool secure = false;
+    if(url != NULL) {
+        js_url_t u;
+        url_parse(url, &u);
+        secure = (u.protocol != NULL &&
+                  (strcmp(u.protocol, "https:") == 0 ||
+                   strcmp(u.protocol, "wss:") == 0 ||
+                   strcmp(u.protocol, "file:") == 0 ||
+                   strcmp(u.protocol, "about:") == 0));
+        url_free(&u);
+        mario_free(url);
+    }
+    return var_new_bool(vm, secure);
+}
+
 static void web_navigate(vm_t* vm, const char* url) {
     js_web_state* st = web_state(vm);
     if(st == NULL || url == NULL || url[0] == 0) return;
@@ -1437,10 +1630,14 @@ static var_t* nav_get(vm_t* vm, var_t* env, void* data) {
             if(st != NULL && st->cb.get_user_agent != NULL) owned = st->cb.get_user_agent(ctx);
             r = (owned != NULL && owned[0] != 0) ? owned : DEFAULT_UA;
             break;
-        case 1:
+        case 1: {
+            /* appVersion is the UA with the leading "Mozilla/" token dropped,
+             * exactly as Chrome reports it. */
             if(st != NULL && st->cb.get_user_agent != NULL) owned = st->cb.get_user_agent(ctx);
             r = (owned != NULL && owned[0] != 0) ? owned : DEFAULT_UA;
+            if(strncmp(r, "Mozilla/", 8) == 0) r += 8;
             break;
+        }
         case 2:
             if(st != NULL && st->cb.get_platform != NULL) owned = st->cb.get_platform(ctx);
             r = (owned != NULL && owned[0] != 0) ? owned : DEFAULT_PLATFORM;
@@ -1449,7 +1646,7 @@ static var_t* nav_get(vm_t* vm, var_t* env, void* data) {
             if(st != NULL && st->cb.get_language != NULL) owned = st->cb.get_language(ctx);
             r = (owned != NULL && owned[0] != 0) ? owned : DEFAULT_LANG;
             break;
-        case 4:  r = "";                  break;   /* vendor: deprecated, always "" */
+        case 4:  r = "Google Inc.";      break;   /* vendor: Chrome reports this */
         case 5:  r = "Gecko";              break;
         case 6:  r = "Mozilla";            break;
         case 7:  r = "Netscape";           break;
@@ -1472,9 +1669,24 @@ static var_t* metric_get(vm_t* vm, var_t* env, void* data) {
     int w = 0, h = 0, depth = 0;
 
     switch(which) {
-        case 0:  return var_new_int(vm, 1);      /* single-core assumption */
+        case 0: {                       /* hardwareConcurrency: report the real
+                                         * core count. A single-core value is a
+                                         * classic headless/bot tell that bot
+                                         * detectors (e.g. taobao baxia) probe. */
+            int n = 0;
+#ifdef WEB_HAVE_UNISTD
+#  ifdef _SC_NPROCESSORS_ONLN
+            long sc = sysconf(_SC_NPROCESSORS_ONLN);
+            if(sc > 0) n = (int)sc;
+#  endif
+#endif
+            if(n <= 0) n = 8;
+            return var_new_int(vm, n);
+        }
         case 1:  return var_new_int(vm, 0);      /* no touch device hook */
-        case 2:  return var_new_int(vm, 0);
+        case 2:  return var_new_int(vm, 8);      /* deviceMemory: 8 GiB, the
+                                                  * Chrome desktop default. 0 is
+                                                  * another headless tell. */
         default: break;
     }
     if(st != NULL && st->cb.get_screen != NULL) st->cb.get_screen(ctx, &w, &h, &depth);
@@ -1542,6 +1754,100 @@ static var_t* nav_get_bool(vm_t* vm, var_t* env, void* data) {
      * navigator.cookieEnabled is false) refused to boot even though cookies
      * actually worked. */
     return var_new_bool(vm, true);
+}
+
+/* navigator.plugins / navigator.mimeTypes: Chrome desktop exposes five PDF
+ * plugins and two matching mime types. An empty (or missing) PluginArray is one
+ * of the most reliable headless-browser tells, so bot detectors read
+ * navigator.plugins.length very early when fingerprinting. Built fresh per
+ * access, like navigator.languages. */
+static const char* const kPdfPluginNames[] = {
+    "PDF Viewer", "Chrome PDF Viewer", "Chromium PDF Viewer",
+    "Microsoft Edge PDF Viewer", "WebKit built-in PDF"
+};
+
+/* PluginArray/MimeTypeArray item(i): this[i]. */
+static var_t* nav_al_item(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return var_new_null(vm);
+    int i = js_arg_int(env, 0);
+    if(i < 0 || i >= (int)var_array_size(self)) return var_new_null(vm);
+    var_t* e = var_array_get_var(self, i);
+    return (e != NULL) ? e : var_new_null(vm);
+}
+
+/* namedItem(key): scan a member ("name" for plugins, "type" for mimeTypes);
+ * the member name comes from `data` so one native serves both array kinds. */
+static var_t* nav_al_namedItem(vm_t* vm, var_t* env, void* data) {
+    const char* key = (const char*)data;
+    var_t* self = js_this(env);
+    if(self == NULL || key == NULL) return var_new_null(vm);
+    mstr_t* s = mstr_new("");
+    const char* want = js_arg_cstr(env, 0, s);
+    uint32_t n = var_array_size(self);
+    var_t* hit = var_new_null(vm);
+    for(uint32_t i = 0; i < n; ++i) {
+        var_t* e = var_array_get_var(self, (int32_t)i);
+        if(e == NULL) continue;
+        var_t* kv = var_find_member_var(e, key);
+        const char* ks = (kv != NULL) ? var_get_str(kv) : NULL;
+        if(ks != NULL && want != NULL && strcmp(ks, want) == 0) { hit = e; break; }
+    }
+    mstr_free(s);
+    return hit;
+}
+
+static var_t* nav_get_plugins(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* arr = var_new_array(vm);
+    vm->gc.gc_defer++;
+    for(int i = 0; i < (int)(sizeof(kPdfPluginNames) / sizeof(kPdfPluginNames[0])); ++i) {
+        var_t* p = var_new_obj_no_proto(vm, NULL, NULL);
+        var_add(p, "name",        var_new_str(vm, kPdfPluginNames[i]));
+        var_add(p, "description", var_new_str(vm, "Portable Document Format"));
+        var_add(p, "filename",    var_new_str(vm, "internal-pdf-viewer"));
+        var_add(p, "length",      var_new_int(vm, 1));
+        var_array_add(arr, p);
+    }
+    vm_reg_native_on(vm, arr, "item(i)",      nav_al_item,      NULL);
+    vm_reg_native_on(vm, arr, "namedItem(n)", nav_al_namedItem, (void*)"name");
+    vm->gc.gc_defer--;
+    return arr;
+}
+
+static var_t* nav_get_mimeTypes(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    static const char* const kTypes[] = { "application/pdf", "text/pdf" };
+    var_t* arr = var_new_array(vm);
+    vm->gc.gc_defer++;
+    for(int i = 0; i < 2; ++i) {
+        var_t* m = var_new_obj_no_proto(vm, NULL, NULL);
+        var_add(m, "type",        var_new_str(vm, kTypes[i]));
+        var_add(m, "description", var_new_str(vm, "Portable Document Format"));
+        var_add(m, "suffixes",    var_new_str(vm, "pdf"));
+        var_array_add(arr, m);
+    }
+    vm_reg_native_on(vm, arr, "item(i)",      nav_al_item,      NULL);
+    vm_reg_native_on(vm, arr, "namedItem(n)", nav_al_namedItem, (void*)"type");
+    vm->gc.gc_defer--;
+    return arr;
+}
+
+/* navigator.connection: a minimal NetworkInformation. Capability probes read
+ * it to confirm a real desktop browser; the values are the Chrome-on-wifi
+ * defaults. */
+static var_t* nav_get_connection(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* o = var_new_obj_no_proto(vm, NULL, NULL);
+    vm->gc.gc_defer++;
+    var_add(o, "effectiveType",     var_new_str(vm, "4g"));
+    var_add(o, "rtt",               var_new_int(vm, 50));
+    var_add(o, "downlink",          var_new_float(vm, 10.0f));
+    var_add(o, "saveData",          var_new_bool(vm, false));
+    var_add(o, "type",              var_new_str(vm, "wifi"));
+    vm->gc.gc_defer--;
+    return o;
 }
 
 /* navigator.userAgentData: the Chromium client-hints object. Analytics and
@@ -2321,6 +2627,7 @@ static void web_set_str(vm_t* vm, var_t* self, const char* name, const char* v) 
 
 #define XHR_METHOD "@@method"
 #define XHR_URL    "@@url"
+#define XHR_READY  "@@readyState"
 
 /* Case-insensitive "Name: value" lookup inside a "\r\n"-joined header block.
  * Returns a mario_malloc'd copy of the value, or NULL when absent. */
@@ -2371,7 +2678,7 @@ static var_t* native_xhr_ctor(vm_t* vm, var_t* env, void* data) {
     (void)data;
     var_t* self = js_this(env);
     if(self == NULL) return NULL;
-    web_set_int(vm, self, "readyState", 0);
+    web_set_int(vm, self, XHR_READY, 0);
     web_set_int(vm, self, "status", 0);
     web_set_str(vm, self, "statusText", "");
     web_set_str(vm, self, "responseText", "");
@@ -2393,10 +2700,19 @@ static var_t* native_xhr_ctor(vm_t* vm, var_t* env, void* data) {
     return NULL;
 }
 
+/* readyState is a WebIDL prototype accessor, not an own data property. Keeping
+ * the state hidden lets libraries wrap the native descriptor just like Chrome. */
+static var_t* native_xhr_get_readyState(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    var_t* v = (self != NULL) ? get_obj(self, XHR_READY) : NULL;
+    return var_new_int(vm, (v != NULL) ? var_get_int(v) : 0);
+}
+
 /* readyState transitions fire onreadystatechange, so the assignment and the
  * notification live in one place. */
 static void xhr_set_ready(vm_t* vm, var_t* self, int state) {
-    web_set_int(vm, self, "readyState", state);
+    web_set_int(vm, self, XHR_READY, state);
     web_fire_handler(vm, self, "onreadystatechange");
 }
 
@@ -2502,7 +2818,7 @@ static var_t* native_xhr_abort(vm_t* vm, var_t* env, void* data) {
     if(self == NULL) return NULL;
     /* send() is blocking, so abort() can only ever run before or after it.
      * Reset to UNSENT and notify, which is what a browser leaves behind. */
-    web_set_int(vm, self, "readyState", 0);
+    web_set_int(vm, self, XHR_READY, 0);
     web_fire_handler(vm, self, "onabort");
     web_fire_handler(vm, self, "onreadystatechange");
     return NULL;
@@ -2739,6 +3055,40 @@ static var_t* native_resp_get_headers(vm_t* vm, var_t* env, void* data) {
     var_t* self = js_this(env);
     var_t* h = (self != NULL) ? get_obj(self, RESP_HDR_OBJ) : NULL;
     return (h != NULL) ? h : headers_new(vm, "");
+}
+
+/* clone(): a second Response over the same body text. taobao's container
+ * loader fans one fetch response out to several parsers via clone(); with
+ * the method missing the call throws "can not find function 'clone' on
+ * object{status,prototype,type,redirected}" inside the loader's promise
+ * chain, the suspense promise never settles and the root render commits
+ * nothing (#ice-container stays empty). The spec forbids cloning after the
+ * body was read; our body is an immutable string, so both copies stay
+ * readable - exactly the semantics the fan-out relies on. */
+static var_t* native_resp_clone(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    var_t* t  = get_obj(self, RESP_TEXT);
+    var_t* h  = get_obj(self, RESP_HDR_OBJ);
+    var_t* u  = get_obj(self, "url");
+    var_t* sv = get_obj(self, "status");
+    var_t* r = response_new(vm, (sv != NULL) ? var_get_int(sv) : 200,
+                            (u != NULL) ? var_get_str(u) : "",
+                            (t != NULL) ? var_get_str(t) : "", NULL);
+    if(r != NULL && h != NULL) {
+        var_ref(h);   /* var_add adopts one ref; keep the original alive */
+        var_add(r, RESP_HDR_OBJ, h);
+    }
+    return r;
+}
+
+/* bodyUsed: the body is an immutable string here, so it is never consumed
+ * in the spec's sense; loaders only read this to decide whether clone()
+ * or text() is still allowed, and both always are. */
+static var_t* native_resp_bodyused(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)env; (void)data;
+    return var_new_bool(vm, false);
 }
 
 /* hash_map_iterate callback that flattens one `{Name: value}` entry into the
@@ -3064,6 +3414,49 @@ static var_t* native_fetch(vm_t* vm, var_t* env, void* data) {
     return result;
 }
 
+/* Abandon every fetch job owned by `vm` before vm_close() frees it. The job's
+ * __resolve/__reject closures are var_ref'd into `vm`, and the global job lists
+ * outlive the VM, so settling them after a navigation would call dangling
+ * closures (heap-use-after-free on the freed VM region). Runs on the engine
+ * thread (resetJsVm), serialized with js_web_fetch_poll and the detached
+ * workers by g_fetch_mtx. */
+void js_web_fetch_purge_vm(vm_t* vm) {
+    if(vm == NULL) return;
+    pthread_mutex_lock(&g_fetch_mtx);
+    /* Completed jobs: no worker touches them any more, so free them outright.
+     * Drop the closure refs first - still valid because `vm` is not closed
+     * until after this returns; the promise object keeps its own ref, so this
+     * only releases the job's extra reference. */
+    fetch_job_t* d = g_fetch_done;
+    g_fetch_done = NULL;
+    while(d != NULL) {
+        fetch_job_t* n = d->next;
+        if(d->vm == vm) {
+            if(d->resolve != NULL) var_unref(d->resolve);
+            if(d->reject  != NULL) var_unref(d->reject);
+            d->resolve = NULL; d->reject = NULL;
+            fetch_job_free(d);
+        } else {
+            d->next = g_fetch_done;   /* belongs to another live VM: keep */
+            g_fetch_done = d;
+        }
+        d = n;
+    }
+    /* In-flight jobs: a detached worker still owns the struct and will write
+     * results into it, then move it to g_fetch_done. Do NOT free it here - only
+     * drop the VM-owned closure refs and clear vm so the poll treats it as
+     * abandoned (releases the struct unsettled once the worker is done). */
+    for(fetch_job_t* h = g_fetch_head; h != NULL; h = h->next) {
+        if(h->vm == vm) {
+            if(h->resolve != NULL) var_unref(h->resolve);
+            if(h->reject  != NULL) var_unref(h->reject);
+            h->resolve = NULL; h->reject = NULL;
+            h->vm = NULL;
+        }
+    }
+    pthread_mutex_unlock(&g_fetch_mtx);
+}
+
 /* ------------------------------------------------------------------ */
 /* js_web_fetch_poll: drain completed async-fetch jobs on the VM thread */
 /* ------------------------------------------------------------------ */
@@ -3094,16 +3487,20 @@ int js_web_fetch_poll(vm_t* vm) {
          * the first hydration commit - pinterest.com's landing page suspends the
          * whole tree on /_/graphql/, so deferring settlement until a commit that can
          * only happen after that fetch deadlocks to the 60 s deadline, by which time
-         * hydration has wedged and the page renders blank. For those hosts the
-         * deferred path is strictly worse than the (browser-like) immediate path, so
-         * open the gate at once; github.com keeps the deferred path that fixes
-         * #519/#156. */
+         * hydration has wedged and the page renders blank. Pure-CSR apps are the same
+         * shape one step further: taobao.com/tmall.com (ice.js, renderMode=CSR) ship an
+         * empty #ice-container, so the FIRST commit itself is driven by the data fetch
+         * and the defer-until-commit gate is circular. For those hosts the deferred
+         * path is strictly worse than the (browser-like) immediate path, so open the
+         * gate at once; github.com keeps the deferred path that fixes #519/#156. */
         static int s_host_nogate = -1;
         if(s_host_nogate < 0) {
             char* u = web_current_url(vm);
             if(u != NULL) {
                 if(u[0] != '\0')
-                    s_host_nogate = (strstr(u, "pinterest.com") != NULL) ? 1 : 0;
+                    s_host_nogate = (strstr(u, "pinterest.com") != NULL ||
+                                     strstr(u, "taobao.com")    != NULL ||
+                                     strstr(u, "tmall.com")     != NULL) ? 1 : 0;
                 mario_free(u);
             }
         }
@@ -3140,6 +3537,18 @@ int js_web_fetch_poll(vm_t* vm) {
         fetch_job_t* j = batch;
         batch = j->next;
         j->next = NULL;
+
+        /* Abandoned job: js_web_fetch_purge_vm() closed out its owning VM (a
+         * navigation freed the VM that held these closures) and dropped the
+         * resolve/reject refs, nulling them. There is nothing to settle on -
+         * building a Response or calling a NULL/dangling closure here would
+         * touch the dead VM. Release the struct (its rbody/rhdrs/strings are
+         * plain heap, not VM memory) and move on. */
+        if(j->resolve == NULL && j->reject == NULL) {
+            fetch_job_free(j);
+            settled++;
+            continue;
+        }
 
         /* Error-state isolation (same pattern as js_fire_timer): clear any
          * residual propagating_err so one failed settlement does not poison
@@ -4942,6 +5351,113 @@ static void web_link_global(vm_t* vm, var_t* window, const char* name) {
     var_add(window, name, v);
 }
 
+/* Pin an Object.prototype.toString brand ([object Navigator] / [object History]
+ * / [object Location] / ...) on a singleton instance. Same hidden own-member
+ * trick js_dom.c uses for elements: without it these read as the
+ * fingerprintable [object Object]. */
+static void web_tag_brand(vm_t* vm, var_t* obj, const char* brand) {
+    if(vm == NULL || obj == NULL || brand == NULL) return;
+    vm->gc.gc_defer++;
+    node_t* n = var_add(obj, SYMKEY_TOSTRINGTAG, var_new_str(vm, brand));
+    if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+    vm->gc.gc_defer--;
+}
+
+/* ------------------------------------------------------------------ */
+/* DOMException                                                        */
+/*                                                                     */
+/* core-js's DOMException polyfill (taobao 603.js) opens with          */
+/*   O = globalThis.DOMException || (probe IIFE)                       */
+/* where the probe posts a WeakMap through a MessageChannel and expects */
+/* a DataCloneError to come back. With no DOMException global the probe */
+/* runs, our postMessage does not throw, the IIFE returns undefined,    */
+/* and every later `new O(...)` throws "there is no class: 'O'" - the   */
+/* module dies before React mounts, leaving #ice-container empty. A     */
+/* spec-shaped DOMException short-circuits `i("DOMException")` so O is   */
+/* a real constructor and the whole feature-test cascade passes.        */
+/* ------------------------------------------------------------------ */
+
+/* Legacy DOMException name -> code (Web IDL). Unknown names map to 0. */
+static int domex_legacy_code(const char* name) {
+    if(name == NULL) return 0;
+    static const struct { const char* n; int c; } tbl[] = {
+        {"IndexSizeError",1},{"HierarchyRequestError",3},{"WrongDocumentError",4},
+        {"InvalidCharacterError",5},{"NoModificationAllowedError",7},{"NotFoundError",8},
+        {"NotSupportedError",9},{"InUseAttributeError",10},{"InvalidStateError",11},
+        {"SyntaxError",12},{"InvalidModificationError",13},{"NamespaceError",14},
+        {"InvalidAccessError",15},{"TypeMismatchError",17},{"SecurityError",18},
+        {"NetworkError",19},{"AbortError",20},{"URLMismatchError",21},
+        {"QuotaExceededError",22},{"TimeoutError",23},{"InvalidNodeTypeError",24},
+        {"DataCloneError",25}
+    };
+    for(size_t i = 0; i < sizeof(tbl)/sizeof(tbl[0]); ++i)
+        if(strcmp(tbl[i].n, name) == 0) return tbl[i].c;
+    return 0;
+}
+
+/* new DOMException(message, name): name defaults to "Error"; code is the
+ * legacy mapping of name. */
+static var_t* native_domex_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    mstr_t* a = mstr_new("");
+    mstr_t* b = mstr_new("");
+    var_t* m = js_arg(env, 0);
+    var_t* n = js_arg(env, 1);
+    const char* msg = "";
+    if(m != NULL && m->type != V_UNDEF && m->type != V_NULL) msg = js_cstr(m, a);
+    const char* nm = "Error";
+    if(n != NULL && n->type != V_UNDEF && n->type != V_NULL) {
+        const char* s = js_cstr(n, b);
+        if(s != NULL && s[0] != '\0') nm = s;
+    }
+    web_set_str(vm, self, "message", msg);
+    web_set_str(vm, self, "name", nm);
+    web_set_int(vm, self, "code", domex_legacy_code(nm));
+    mstr_free(a);
+    mstr_free(b);
+    return NULL;
+}
+
+/* "name: message" - matches Error.prototype.toString so core-js's
+ * `"2: 1" !== String(new DOMException(1,2))` feature test passes. */
+static var_t* native_domex_toString(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    mstr_t* out = mstr_new("");
+    mstr_t* t = mstr_new("");
+    if(self != NULL) {
+        var_t* nm = get_obj(self, "name");
+        var_t* ms = get_obj(self, "message");
+        mstr_append(out, (nm != NULL) ? js_cstr(nm, t) : "Error");
+        mstr_reset(t);
+        mstr_append(out, ": ");
+        if(ms != NULL) mstr_append(out, js_cstr(ms, t));
+    }
+    var_t* r = var_new_str(vm, out->cstr);
+    mstr_free(out);
+    mstr_free(t);
+    return r;
+}
+
+/* Growable name list used to snapshot the global scope's own binding names
+ * before mirroring them onto window (mutating a hash map while iterating it is
+ * unsafe, so collect first, link second). */
+typedef struct { char** v; size_t n; size_t cap; } web_name_list_t;
+static void web_collect_root_name(const char* key, void* value, void* ud) {
+    web_name_list_t* l = (web_name_list_t*)ud;
+    node_t* node = (node_t*)value;
+    if(key == NULL || node == NULL || node->invisable) return;
+    if(l->n == l->cap) {
+        size_t nc = (l->cap == 0) ? 256 : l->cap * 2;
+        char** nv = (char**)realloc(l->v, nc * sizeof(char*));
+        if(nv == NULL) return;
+        l->v = nv; l->cap = nc;
+    }
+    l->v[l->n++] = strdup(key);
+}
+
 static void web_mirror_globals(vm_t* vm, var_t* window) {
     static const char* kNames[] = {
         /* dialogs + timers (alert/setTimeout come from the DOM bridge) */
@@ -4962,7 +5478,8 @@ static void web_mirror_globals(vm_t* vm, var_t* window) {
         "Element", "Document", "Storage", "Location", "History",
         "Navigator", "Screen", "Performance", "XMLHttpRequest",
         "Response", "Headers", "URL", "URLSearchParams", "CSS",
-        "Request", "Blob", "FormData"
+        "Request", "Blob", "FormData", "DOMException", "MessageChannel",
+        "MessagePort"
     };
     /* A/B knob (MARIO_NOQMT): withhold the native queueMicrotask so polyfills
      * (core-js) install their own - on rokid.com the engine-backed microtask
@@ -4982,6 +5499,23 @@ static void web_mirror_globals(vm_t* vm, var_t* window) {
     };
     for(size_t i = 0; i < sizeof(kWinProps) / sizeof(kWinProps[0]); ++i)
         web_link_global(vm, window, kWinProps[i]);
+
+    /* Chrome's window IS the global object: every global binding (engine
+     * builtins, DOM/WebIDL constructors, host functions) is simultaneously an
+     * own window property. The fixed lists above can never keep up with the
+     * full surface, and bot-detection VMPs (baxia et_f / fireye) probe it
+     * directly - a sparse window reads as a non-browser and sends them down a
+     * degraded path. Mirror every visible global-scope binding onto window so
+     * `window.HTMLDivElement`, `window.WebSocket`, ... resolve exactly as in
+     * Chrome. web_link_global skips names window already owns, so the
+     * DOM-specific properties installed earlier keep precedence. */
+    web_name_list_t rl = { NULL, 0, 0 };
+    hash_map_iterate(&vm->root->children, web_collect_root_name, &rl);
+    for(size_t i = 0; i < rl.n; ++i) {
+        web_link_global(vm, window, rl.v[i]);
+        free(rl.v[i]);
+    }
+    free(rl.v);
 }
 
 /* ------------------------------------------------------------------ */
@@ -4990,6 +5524,76 @@ static void web_mirror_globals(vm_t* vm, var_t* window) {
 
 void js_web_callbacks_init(js_web_callbacks_t* cb) {
     if(cb != NULL) memset(cb, 0, sizeof(*cb));
+}
+
+/* window.chrome: Chromium exposes this object; its absence is one of the
+ * strongest "not a real Chrome" tells that bot detectors check first. The
+ * methods return inert values - only their existence and shape matter. */
+static var_t* chrome_null(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data; return var_new_null(vm);
+}
+static var_t* chrome_false(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data; return var_new_bool(vm, false);
+}
+static var_t* chrome_csi(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* o = var_new_obj_no_proto(vm, NULL, NULL);
+    vm->gc.gc_defer++;
+    var_add(o, "startE",  var_new_int(vm, 0));
+    var_add(o, "onloadT", var_new_int(vm, 0));
+    var_add(o, "pageT",   var_new_int(vm, 0));
+    var_add(o, "tran",    var_new_int(vm, 15));
+    vm->gc.gc_defer--;
+    return o;
+}
+static var_t* chrome_loadTimes(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* o = var_new_obj_no_proto(vm, NULL, NULL);
+    vm->gc.gc_defer++;
+    var_add(o, "requestTime",    var_new_float(vm, 0.0f));
+    var_add(o, "startLoadTime",  var_new_float(vm, 0.0f));
+    var_add(o, "commitLoadTime", var_new_float(vm, 0.0f));
+    var_add(o, "finishDocumentLoadTime", var_new_float(vm, 0.0f));
+    var_add(o, "finishLoadTime", var_new_float(vm, 0.0f));
+    var_add(o, "firstPaintTime", var_new_float(vm, 0.0f));
+    var_add(o, "firstPaintAfterLoadTime", var_new_float(vm, 0.0f));
+    var_add(o, "navigationType", var_new_str(vm, "Other"));
+    var_add(o, "npnNegotiatedProtocol", var_new_str(vm, "http/1.1"));
+    var_add(o, "wasNpnNegotiated", var_new_bool(vm, false));
+    var_add(o, "wasAlternateProtocolAvailable", var_new_bool(vm, false));
+    var_add(o, "wasFetchedViaSpdy", var_new_bool(vm, false));
+    vm->gc.gc_defer--;
+    return o;
+}
+static var_t* chrome_new(vm_t* vm) {
+    var_t* c = var_new_obj_no_proto(vm, NULL, NULL);
+    if(c == NULL) return NULL;
+    vm->gc.gc_defer++;
+    var_t* app = var_new_obj_no_proto(vm, NULL, NULL);
+    var_add(app, "isInstalled", var_new_bool(vm, false));
+    var_t* is = var_new_obj_no_proto(vm, NULL, NULL);
+    var_add(is, "DISABLED",      var_new_str(vm, "disabled"));
+    var_add(is, "INSTALLED",     var_new_str(vm, "installed"));
+    var_add(is, "NOT_INSTALLED", var_new_str(vm, "not_installed"));
+    var_add(app, "InstallState", is);
+    var_t* rs = var_new_obj_no_proto(vm, NULL, NULL);
+    var_add(rs, "CANNOT_RUN",   var_new_str(vm, "cannot_run"));
+    var_add(rs, "READY_TO_RUN", var_new_str(vm, "ready_to_run"));
+    var_add(rs, "RUNNING",      var_new_str(vm, "running"));
+    var_add(app, "RunningState", rs);
+    vm_reg_native_on(vm, app, "getDetails()",     chrome_null,  NULL);
+    vm_reg_native_on(vm, app, "getIsInstalled()", chrome_false, NULL);
+    vm_reg_native_on(vm, app, "installState(cb)", chrome_null,  NULL);
+    vm_reg_native_on(vm, app, "runningState()",   chrome_null,  NULL);
+    var_add(c, "app", app);
+    var_t* rt = var_new_obj_no_proto(vm, NULL, NULL);
+    vm_reg_native_on(vm, rt, "connect(i)",   chrome_null, NULL);
+    vm_reg_native_on(vm, rt, "sendMessage(m, r, o)", chrome_null, NULL);
+    var_add(c, "runtime", rt);
+    vm_reg_native_on(vm, c, "csi()",       chrome_csi,       NULL);
+    vm_reg_native_on(vm, c, "loadTimes()", chrome_loadTimes, NULL);
+    vm->gc.gc_defer--;
+    return c;
 }
 
 static var_t* storage_new(vm_t* vm) {
@@ -5002,6 +5606,647 @@ static var_t* storage_new(vm_t* vm) {
     if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
     vm->gc.gc_defer--;
     return s;
+}
+
+/* ---- Bot-detection surface parity: WebSocket / FileReader / Worker /
+ * visualViewport are standard Chrome globals this engine never registered.
+ * baxia et_f and fireye resolve every decoded identifier with `name in window`
+ * and a sparse window reads as a non-browser, dropping the VMP down a degraded
+ * token path - so existence and spec shape matter even where the wire behaviour
+ * (socket frames, file decoding, thread spawn) is not backed yet. The
+ * constructors carry the spec members and constants; event hooks are present
+ * and inert. */
+static var_t* native_ws_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    var_t* u = js_arg(env, 0);
+    var_add(self, "url", var_new_str(vm,
+        (u != NULL && u->type == V_STRING) ? var_get_str(u) : ""));
+    var_add(self, "readyState",     var_new_int(vm, 0));
+    var_add(self, "bufferedAmount", var_new_int(vm, 0));
+    var_add(self, "extensions",     var_new_str(vm, ""));
+    var_add(self, "protocol",       var_new_str(vm, ""));
+    var_add(self, "binaryType",     var_new_str(vm, "blob"));
+    var_add(self, "onopen",    var_new_null(vm));
+    var_add(self, "onmessage", var_new_null(vm));
+    var_add(self, "onerror",   var_new_null(vm));
+    var_add(self, "onclose",   var_new_null(vm));
+    return NULL;
+}
+
+static var_t* native_ws_noop(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)env; (void)data; return NULL;
+}
+
+static var_t* native_ws_close(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self != NULL) var_add(self, "readyState", var_new_int(vm, 3));
+    return NULL;
+}
+
+static var_t* native_fr_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    var_add(self, "readyState", var_new_int(vm, 0));
+    var_add(self, "result", var_new_null(vm));
+    var_add(self, "error",  var_new_null(vm));
+    var_add(self, "onloadstart", var_new_null(vm));
+    var_add(self, "onprogress",  var_new_null(vm));
+    var_add(self, "onload",      var_new_null(vm));
+    var_add(self, "onabort",     var_new_null(vm));
+    var_add(self, "onerror",     var_new_null(vm));
+    var_add(self, "onloadend",   var_new_null(vm));
+    return NULL;
+}
+
+/* readAs*: flip to DONE with an empty result and run the load hooks. The blob
+ * payload is not decoded yet; the state machine and callback order are what the
+ * feature probes observe. */
+static var_t* native_fr_read(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    var_add(self, "readyState", var_new_int(vm, 2));
+    var_add(self, "result", var_new_str(vm, ""));
+    static const char* kHooks[] = { "onload", "onloadend" };
+    for(size_t i = 0; i < sizeof(kHooks) / sizeof(kHooks[0]); ++i) {
+        var_t* cb = var_find_own_member_var(self, kHooks[i]);
+        if(cb == NULL || !cb->is_func) continue;
+        var_t* args = var_new_array(vm);
+        var_t* r = call_m_func(vm, self, cb, args);
+        if(r != NULL) var_unref(r);
+        var_unref(args);
+    }
+    return NULL;
+}
+
+static var_t* native_worker_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    var_add(self, "onmessage", var_new_null(vm));
+    var_add(self, "onerror",   var_new_null(vm));
+    return NULL;
+}
+
+static var_t* native_vv_scale(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data; return var_new_float64(vm, 1.0);
+}
+static var_t* native_vv_zero(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data; return var_new_int(vm, 0);
+}
+
+/* ================================================================== */
+/* Web Audio API: AudioContext / OfflineAudioContext                   */
+/* ================================================================== */
+
+static void audio_dbg(vm_t* vm, const char* event) {
+    if(getenv("MARIO_AUDIODBG") == NULL) return;
+    char* stack = mario_format_stack(vm, NULL);
+    fprintf(stderr, "[audiodbg] %s\n%s\n", event, stack != NULL ? stack : "");
+    mario_free(stack);
+}
+
+/* AudioParam: { value, defaultValue, minValue, maxValue, + scheduling noops }.
+ * The VMP sets .value then reads it back; scheduling methods are accepted but
+ * only setValueAtTime actually updates the stored value (sufficient for the
+ * offline-render fingerprint which sets params before startRendering). */
+static var_t* native_ap_get_value(vm_t* vm, var_t* env, void* data) {
+    (void)data; var_t* t = js_this(env);
+    var_t* v = t ? var_find_own_member_var(t, "@@apval") : NULL;
+    if(v != NULL) { var_ref(v); return v; }
+    return var_new_float64(vm, 0.0);
+}
+static var_t* native_ap_set_value(vm_t* vm, var_t* env, void* data) {
+    (void)data; var_t* t = js_this(env);
+    if(t == NULL) return NULL;
+    var_t* v = js_arg(env, 0);
+    double d = js_num(v);
+    var_add(t, "@@apval", var_new_float64(vm, d));
+    return NULL;
+}
+static var_t* native_ap_sched(vm_t* vm, var_t* env, void* data) {
+    /* setValueAtTime / linearRamp / exponentialRamp / setTargetAtTime:
+     * store the target value so the render pass sees it. */
+    (void)data; var_t* t = js_this(env);
+    if(t == NULL) return NULL;
+    double d = js_num(js_arg(env, 0));
+    var_add(t, "@@apval", var_new_float64(vm, d));
+    return t; /* spec returns the AudioParam for chaining */
+}
+static var_t* native_ap_cancel(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)env; (void)data; var_t* t = js_this(env); return t;
+}
+
+static var_t* make_audio_param(vm_t* vm, double def, double mn, double mx) {
+    var_t* p = var_new_obj_no_proto(vm, NULL, NULL);
+    if(p == NULL) return NULL;
+    var_add(p, "@@apval", var_new_float64(vm, def));
+    var_add(p, "defaultValue", var_new_float64(vm, def));
+    var_add(p, "minValue", var_new_float64(vm, mn));
+    var_add(p, "maxValue", var_new_float64(vm, mx));
+    js_acc_on(vm, p, "value", native_ap_get_value, native_ap_set_value, NULL);
+    vm_reg_native_on(vm, p, "setValueAtTime(v, t)",              native_ap_sched,  NULL);
+    vm_reg_native_on(vm, p, "linearRampToValueAtTime(v, t)",     native_ap_sched,  NULL);
+    vm_reg_native_on(vm, p, "exponentialRampToValueAtTime(v, t)",native_ap_sched,  NULL);
+    vm_reg_native_on(vm, p, "setTargetAtTime(v, t, c)",          native_ap_sched,  NULL);
+    vm_reg_native_on(vm, p, "cancelScheduledValues(t)",          native_ap_cancel, NULL);
+    vm_reg_native_on(vm, p, "cancelAndHoldAtTime(t)",            native_ap_cancel, NULL);
+    return p;
+}
+
+/* AudioNode.connect(dest) returns dest (spec); disconnect is a noop. */
+static var_t* native_an_connect(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)data;
+    var_t* dest = js_arg(env, 0);
+    /* Track the connection on the context for the render pass: store the
+     * destination node id on the source so startRendering can walk the graph.
+     * For the common fingerprint pattern (osc→comp→dest) we just record
+     * that a connection happened; the render uses the stored node refs. */
+    var_t* src = js_this(env);
+    if(src != NULL && dest != NULL) {
+        var_t* arr = var_find_own_member_var(src, "@@conn");
+        if(arr == NULL) { arr = var_new_array(vm); var_add(src, "@@conn", arr); }
+        var_array_add(arr, dest);
+    }
+    if(dest != NULL) { var_ref(dest); return dest; }
+    return NULL;
+}
+static var_t* native_an_disconnect(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)data; (void)env; return NULL;
+}
+
+/* Helper: read an AudioParam's current value from a node member. */
+static double ap_read(var_t* node, const char* name, double fallback) {
+    if(node == NULL) return fallback;
+    var_t* p = var_find_own_member_var(node, name);
+    if(p == NULL) return fallback;
+    var_t* v = var_find_own_member_var(p, "@@apval");
+    return v ? (double)var_get_float64(v) : fallback;
+}
+
+/* --- OscillatorNode --- */
+static var_t* native_create_oscillator(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    audio_dbg(vm, "createOscillator");
+    var_t* ctx = js_this(env);
+    var_t* osc = var_new_obj_no_proto(vm, NULL, NULL);
+    if(osc == NULL) return NULL;
+    var_add(osc, "@@nodetype", var_new_str(vm, "osc"));
+    var_add(osc, "type", var_new_str(vm, "sine"));
+    var_add(osc, "frequency", make_audio_param(vm, 440.0, -22050.0, 22050.0));
+    var_add(osc, "detune", make_audio_param(vm, 0.0, -153600.0, 153600.0));
+    var_add(osc, "onended", var_new_null(vm));
+    var_add(osc, "numberOfInputs", var_new_int(vm, 0));
+    var_add(osc, "numberOfOutputs", var_new_int(vm, 1));
+    var_add(osc, "channelCount", var_new_int(vm, 2));
+    var_add(osc, "channelCountMode", var_new_str(vm, "max"));
+    var_add(osc, "channelInterpretation", var_new_str(vm, "speakers"));
+    if(ctx != NULL) var_add(osc, "context", ctx);
+    vm_reg_native_on(vm, osc, "connect(d, o, i)",  native_an_connect,    NULL);
+    vm_reg_native_on(vm, osc, "disconnect(o)",     native_an_disconnect, NULL);
+    vm_reg_native_on(vm, osc, "start(t)",          native_ws_noop,       NULL);
+    vm_reg_native_on(vm, osc, "stop(t)",           native_ws_noop,       NULL);
+    vm_reg_native_on(vm, osc, "setPeriodicWave(w)",native_ws_noop,       NULL);
+    vm_reg_native_on(vm, osc, "addEventListener(t, f)",    native_ws_noop, NULL);
+    vm_reg_native_on(vm, osc, "removeEventListener(t, f)", native_ws_noop, NULL);
+    /* Track on context for render */
+    if(ctx != NULL) var_add(ctx, "@@osc", osc);
+    return osc;
+}
+
+/* --- GainNode --- */
+static var_t* native_create_gain(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* ctx = js_this(env);
+    var_t* g = var_new_obj_no_proto(vm, NULL, NULL);
+    if(g == NULL) return NULL;
+    var_add(g, "@@nodetype", var_new_str(vm, "gain"));
+    var_add(g, "gain", make_audio_param(vm, 1.0, 0.0, 1.0));
+    var_add(g, "numberOfInputs", var_new_int(vm, 1));
+    var_add(g, "numberOfOutputs", var_new_int(vm, 1));
+    if(ctx != NULL) var_add(g, "context", ctx);
+    vm_reg_native_on(vm, g, "connect(d, o, i)",  native_an_connect,    NULL);
+    vm_reg_native_on(vm, g, "disconnect(o)",     native_an_disconnect, NULL);
+    vm_reg_native_on(vm, g, "addEventListener(t, f)",    native_ws_noop, NULL);
+    vm_reg_native_on(vm, g, "removeEventListener(t, f)", native_ws_noop, NULL);
+    return g;
+}
+
+/* --- DynamicsCompressorNode --- */
+static var_t* native_create_compressor(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    audio_dbg(vm, "createDynamicsCompressor");
+    var_t* ctx = js_this(env);
+    var_t* c = var_new_obj_no_proto(vm, NULL, NULL);
+    if(c == NULL) return NULL;
+    var_add(c, "@@nodetype", var_new_str(vm, "comp"));
+    var_add(c, "threshold", make_audio_param(vm, -24.0, -100.0, 0.0));
+    var_add(c, "knee",      make_audio_param(vm, 30.0, 0.0, 40.0));
+    var_add(c, "ratio",     make_audio_param(vm, 12.0, 1.0, 20.0));
+    var_add(c, "attack",    make_audio_param(vm, 0.003, 0.0, 1.0));
+    var_add(c, "release",   make_audio_param(vm, 0.250, 0.0, 1.0));
+    var_add(c, "reduction", var_new_float64(vm, 0.0));
+    var_add(c, "numberOfInputs", var_new_int(vm, 1));
+    var_add(c, "numberOfOutputs", var_new_int(vm, 1));
+    if(ctx != NULL) var_add(c, "context", ctx);
+    vm_reg_native_on(vm, c, "connect(d, o, i)",  native_an_connect,    NULL);
+    vm_reg_native_on(vm, c, "disconnect(o)",     native_an_disconnect, NULL);
+    vm_reg_native_on(vm, c, "addEventListener(t, f)",    native_ws_noop, NULL);
+    vm_reg_native_on(vm, c, "removeEventListener(t, f)", native_ws_noop, NULL);
+    if(ctx != NULL) var_add(ctx, "@@comp", c);
+    return c;
+}
+
+/* --- AnalyserNode (minimal: getFloatFrequencyData fills with -100 dB) --- */
+static var_t* native_analyser_getFloat(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* arr = js_arg(env, 0);
+    if(arr == NULL || (!arr->is_array && !var_is_typedarray(arr))) return NULL;
+    uint32_t n = var_array_size(arr);
+    for(uint32_t i = 0; i < n; ++i)
+        var_typedarray_set_at(vm, arr, (int64_t)i, var_new_float64(vm, -100.0));
+    return NULL;
+}
+static var_t* native_analyser_getByte(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* arr = js_arg(env, 0);
+    if(arr == NULL || (!arr->is_array && !var_is_typedarray(arr))) return NULL;
+    uint32_t n = var_array_size(arr);
+    for(uint32_t i = 0; i < n; ++i)
+        var_typedarray_set_at(vm, arr, (int64_t)i, var_new_int(vm, 0));
+    return NULL;
+}
+static var_t* native_create_analyser(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* ctx = js_this(env);
+    var_t* a = var_new_obj_no_proto(vm, NULL, NULL);
+    if(a == NULL) return NULL;
+    var_add(a, "@@nodetype", var_new_str(vm, "analyser"));
+    var_add(a, "fftSize", var_new_int(vm, 2048));
+    var_add(a, "frequencyBinCount", var_new_int(vm, 1024));
+    var_add(a, "minDecibels", var_new_float64(vm, -100.0));
+    var_add(a, "maxDecibels", var_new_float64(vm, -30.0));
+    var_add(a, "smoothingTimeConstant", var_new_float64(vm, 0.8));
+    var_add(a, "numberOfInputs", var_new_int(vm, 1));
+    var_add(a, "numberOfOutputs", var_new_int(vm, 1));
+    if(ctx != NULL) var_add(a, "context", ctx);
+    vm_reg_native_on(vm, a, "getFloatFrequencyData(arr)", native_analyser_getFloat, NULL);
+    vm_reg_native_on(vm, a, "getByteFrequencyData(arr)",  native_analyser_getByte,  NULL);
+    vm_reg_native_on(vm, a, "getFloatTimeDomainData(arr)",native_analyser_getFloat, NULL);
+    vm_reg_native_on(vm, a, "getByteTimeDomainData(arr)", native_analyser_getByte,  NULL);
+    vm_reg_native_on(vm, a, "connect(d, o, i)",  native_an_connect,    NULL);
+    vm_reg_native_on(vm, a, "disconnect(o)",     native_an_disconnect, NULL);
+    return a;
+}
+
+/* --- BiquadFilterNode (minimal) --- */
+static var_t* native_create_biquad(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* ctx = js_this(env);
+    var_t* f = var_new_obj_no_proto(vm, NULL, NULL);
+    if(f == NULL) return NULL;
+    var_add(f, "@@nodetype", var_new_str(vm, "biquad"));
+    var_add(f, "type", var_new_str(vm, "lowpass"));
+    var_add(f, "frequency", make_audio_param(vm, 350.0, 0.0, 22050.0));
+    var_add(f, "detune", make_audio_param(vm, 0.0, -153600.0, 153600.0));
+    var_add(f, "Q", make_audio_param(vm, 1.0, -3.4028235e38, 3.4028235e38));
+    var_add(f, "gain", make_audio_param(vm, 0.0, -40.0, 40.0));
+    var_add(f, "numberOfInputs", var_new_int(vm, 1));
+    var_add(f, "numberOfOutputs", var_new_int(vm, 1));
+    if(ctx != NULL) var_add(f, "context", ctx);
+    vm_reg_native_on(vm, f, "connect(d, o, i)",  native_an_connect,    NULL);
+    vm_reg_native_on(vm, f, "disconnect(o)",     native_an_disconnect, NULL);
+    vm_reg_native_on(vm, f, "getFrequencyResponse(f, m, p)", native_ws_noop, NULL);
+    return f;
+}
+
+/* --- AudioBuffer --- */
+static var_t* audio_new_instance(vm_t* vm, const char* class_name) {
+    var_t* cls = var_find_own_member_var(vm->root, class_name);
+    return var_new_obj(vm, cls != NULL ? var_get_prototype(cls) : NULL,
+                       NULL, NULL);
+}
+
+static var_t* audio_empty_float32(vm_t* vm) {
+    return native_TypedArray_from_bytes(vm, TA_FLOAT32, NULL, 0);
+}
+
+static var_t* audio_buffer_channel(var_t* buf, int channel) {
+    if(buf == NULL || channel < 0) return NULL;
+    var_t* channels = var_find_own_member_var(buf, "@@channels");
+    if(channels == NULL || channel >= (int)var_array_size(channels)) return NULL;
+    node_t* n = var_array_get(channels, channel);
+    return n != NULL ? n->var : NULL;
+}
+
+static var_t* native_ab_getChannelData(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    audio_dbg(vm, "getChannelData");
+    var_t* samples = audio_buffer_channel(js_this(env), js_arg_int(env, 0));
+    if(samples != NULL) { var_ref(samples); return samples; }
+    return audio_empty_float32(vm);
+}
+static var_t* native_ab_copyFrom(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)env; (void)data; return NULL;
+}
+
+static var_t* make_audio_buffer(vm_t* vm, int channels, int length, double sr,
+                                const float* samples) {
+    var_t* buf = audio_new_instance(vm, "AudioBuffer");
+    if(buf == NULL) return NULL;
+    vm->gc.gc_defer++;
+    var_add(buf, "length", var_new_int(vm, length));
+    var_add(buf, "duration", var_new_float64(vm, (double)length / sr));
+    var_add(buf, "sampleRate", var_new_float64(vm, sr));
+    var_add(buf, "numberOfChannels", var_new_int(vm, channels));
+    var_t* channel_list = var_new_array(vm);
+    var_add(buf, "@@channels", channel_list);
+    for(int c = 0; c < channels; ++c) {
+        const uint8_t* bytes = (c == 0 && samples != NULL)
+                             ? (const uint8_t*)samples : NULL;
+        var_t* arr = native_TypedArray_from_bytes(
+            vm, TA_FLOAT32, bytes, (int64_t)length * (int64_t)sizeof(float));
+        if(arr != NULL) var_array_add(channel_list, arr);
+    }
+    vm->gc.gc_defer--;
+    return buf;
+}
+
+/* --- createBuffer(ch, len, sr) --- */
+static var_t* native_create_buffer(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    int ch = js_arg_int(env, 0); if(ch < 1) ch = 1;
+    int len = js_arg_int(env, 1); if(len < 1) len = 1;
+    double sr = js_num(js_arg(env, 2)); if(sr < 1) sr = 44100.0;
+    return make_audio_buffer(vm, ch, len, sr, NULL);
+}
+
+/* --- DSP render for startRendering --- */
+static void audio_render(float* out, int length, double sr,
+                         var_t* osc, var_t* comp) {
+    /* Oscillator parameters */
+    double freq = ap_read(osc, "frequency", 440.0);
+    double detune = ap_read(osc, "detune", 0.0);
+    freq *= pow(2.0, detune / 1200.0);
+    const char* type = "sine";
+    if(osc != NULL) {
+        var_t* tv = var_find_own_member_var(osc, "type");
+        if(tv != NULL && tv->type == V_STRING && tv->value != NULL)
+            type = (const char*)tv->value;
+    }
+    /* Compressor parameters */
+    double threshold = ap_read(comp, "threshold", -24.0);
+    double knee      = ap_read(comp, "knee", 30.0);
+    double ratio     = ap_read(comp, "ratio", 12.0);
+    double attack    = ap_read(comp, "attack", 0.003);
+    double release   = ap_read(comp, "release", 0.25);
+    double attCoef   = (attack > 0) ? exp(-1.0 / (attack * sr)) : 0.0;
+    double relCoef   = (release > 0) ? exp(-1.0 / (release * sr)) : 0.0;
+
+    double phase = 0.0;
+    double phaseInc = 2.0 * M_PI * freq / sr;
+    double envelope = 0.0;
+
+    for(int i = 0; i < length; ++i) {
+        /* Generate oscillator sample */
+        double sample = 0.0;
+        if(strcmp(type, "sine") == 0) {
+            sample = sin(phase);
+        } else if(strcmp(type, "triangle") == 0) {
+            double p = phase / (2.0 * M_PI);
+            p = p - floor(p);
+            sample = (p < 0.25) ? (4.0 * p)
+                   : (p < 0.75) ? (2.0 - 4.0 * p)
+                   : (4.0 * p - 4.0);
+        } else if(strcmp(type, "square") == 0) {
+            double p = phase / (2.0 * M_PI);
+            p = p - floor(p);
+            sample = (p < 0.5) ? 1.0 : -1.0;
+        } else { /* sawtooth */
+            double p = phase / (2.0 * M_PI);
+            p = p - floor(p);
+            sample = 2.0 * p - 1.0;
+        }
+        phase += phaseInc;
+        if(phase > 2.0 * M_PI) phase -= 2.0 * M_PI;
+
+        /* Dynamics compressor (simplified feed-forward) */
+        double absIn = fabs(sample);
+        double inputDb = (absIn > 1e-10) ? (20.0 * log10(absIn)) : -100.0;
+        double gainDb = 0.0;
+        if(knee > 0 && inputDb > threshold - knee / 2.0) {
+            if(inputDb < threshold + knee / 2.0) {
+                double x = inputDb - threshold + knee / 2.0;
+                gainDb = (1.0 / ratio - 1.0) * x * x / (2.0 * knee);
+            } else {
+                gainDb = (inputDb - threshold) * (1.0 / ratio - 1.0);
+            }
+        } else if(inputDb > threshold) {
+            gainDb = (inputDb - threshold) * (1.0 / ratio - 1.0);
+        }
+        double targetEnv = pow(10.0, gainDb / 20.0);
+        /* Envelope follower */
+        if(targetEnv > envelope)
+            envelope = attCoef * envelope + (1.0 - attCoef) * targetEnv;
+        else
+            envelope = relCoef * envelope + (1.0 - relCoef) * targetEnv;
+
+        out[i] = (float)(sample * envelope);
+    }
+}
+
+/* --- startRendering() → Promise<AudioBuffer> --- */
+static var_t* native_start_rendering(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    audio_dbg(vm, "startRendering");
+    var_t* ctx = js_this(env);
+    if(ctx == NULL) return promise_new_resolved(vm, var_new_null(vm));
+
+    int length = 44100;
+    var_t* lv = var_find_own_member_var(ctx, "@@length");
+    if(lv != NULL) length = var_get_int(lv);
+    double sr = 44100.0;
+    var_t* srv = var_find_own_member_var(ctx, "sampleRate");
+    if(srv != NULL) sr = (double)var_get_float64(srv);
+    if(length < 1) length = 1;
+    if(length > 44100 * 10) length = 44100 * 10; /* cap at 10s */
+
+    var_t* osc  = var_find_own_member_var(ctx, "@@osc");
+    var_t* comp = var_find_own_member_var(ctx, "@@comp");
+
+    float* samples = (float*)calloc((size_t)length, sizeof(float));
+    if(samples != NULL && osc != NULL) {
+        audio_render(samples, length, sr, osc, comp);
+        /* Mark state as running then suspended (spec: state becomes "suspended"
+         * after render completes for OfflineAudioContext) */
+    }
+    var_add(ctx, "state", var_new_str(vm, "suspended"));
+
+    var_t* buf = make_audio_buffer(vm, 1, length, sr, samples);
+    free(samples);
+    return promise_new_resolved(vm, buf ? buf : var_new_null(vm));
+}
+
+/* --- AudioContext / OfflineAudioContext constructors --- */
+static var_t* native_audio_ctx_ctor(vm_t* vm, var_t* env, void* data) {
+    int offline = (data != NULL);
+    audio_dbg(vm, offline ? "OfflineAudioContext" : "AudioContext");
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    /* Parse arguments: OfflineAudioContext(ch, len, sr) or
+     * OfflineAudioContext({numberOfChannels, length, sampleRate}) or
+     * AudioContext() / AudioContext({latencyHint, sampleRate}) */
+    int channels = 2;
+    int length = 44100;
+    double sr = 44100.0;
+    int argc = js_arg_count(env);
+    if(argc >= 3) {
+        channels = js_arg_int(env, 0); if(channels < 1) channels = 1;
+        length   = js_arg_int(env, 1); if(length < 1) length = 1;
+        sr       = js_num(js_arg(env, 2)); if(sr < 3000) sr = 44100.0;
+    } else if(argc == 1) {
+        var_t* opts = js_arg(env, 0);
+        if(opts != NULL && opts->type == V_OBJECT) {
+            var_t* v;
+            v = var_find_own_member_var(opts, "numberOfChannels");
+            if(v) channels = var_get_int(v);
+            v = var_find_own_member_var(opts, "length");
+            if(v) length = var_get_int(v);
+            v = var_find_own_member_var(opts, "sampleRate");
+            if(v) sr = (double)var_get_float64(v);
+        }
+    }
+    if(channels < 1) channels = 1;
+    if(channels > 32) channels = 32;
+    if(length < 1) length = 1;
+
+    var_add(self, "@@length", var_new_int(vm, length));
+    var_add(self, "sampleRate", var_new_float64(vm, sr));
+    var_add(self, "currentTime", var_new_float64(vm, 0.0));
+    var_add(self, "state", var_new_str(vm, "suspended"));
+    var_add(self, "baseLatency", var_new_float64(vm, 0.0));
+    var_add(self, "outputLatency", var_new_float64(vm, 0.0));
+
+    /* destination node */
+    var_t* dest = var_new_obj_no_proto(vm, NULL, NULL);
+    if(dest != NULL) {
+        var_add(dest, "@@nodetype", var_new_str(vm, "dest"));
+        var_add(dest, "maxChannelCount", var_new_int(vm, channels));
+        var_add(dest, "channelCount", var_new_int(vm, channels));
+        var_add(dest, "numberOfInputs", var_new_int(vm, 1));
+        var_add(dest, "numberOfOutputs", var_new_int(vm, 0));
+        var_add(dest, "context", self);
+        vm_reg_native_on(vm, dest, "connect(d, o, i)",  native_an_connect,    NULL);
+        vm_reg_native_on(vm, dest, "disconnect(o)",     native_an_disconnect, NULL);
+    }
+    var_add(self, "destination", dest);
+    var_add(self, "listener", var_new_obj_no_proto(vm, NULL, NULL));
+
+    if(offline) {
+        var_add(self, "length", var_new_int(vm, length));
+        var_add(self, "oncomplete", var_new_null(vm));
+    }
+    return NULL;
+}
+
+static void web_register_audio(vm_t* vm, var_t* window, var_t* bridge) {
+    (void)bridge;
+
+    /* BaseAudioContext owns the common factory surface.  Keeping these methods
+     * only on constructed instances makes both `method in AudioContext.prototype`
+     * and normal WebIDL brand/inheritance probes disagree with a browser. */
+    var_t* base = vm_new_class(vm, "BaseAudioContext");
+    if(base != NULL) {
+        vm_reg_native(vm, base, "createOscillator()",           native_create_oscillator, NULL);
+        vm_reg_native(vm, base, "createGain()",                 native_create_gain,       NULL);
+        vm_reg_native(vm, base, "createDynamicsCompressor()",   native_create_compressor, NULL);
+        vm_reg_native(vm, base, "createAnalyser()",             native_create_analyser,   NULL);
+        vm_reg_native(vm, base, "createBiquadFilter()",         native_create_biquad,     NULL);
+        vm_reg_native(vm, base, "createBuffer(c, l, sr)",       native_create_buffer,     NULL);
+        vm_reg_native(vm, base, "createBufferSource()",         native_create_gain,       NULL);
+        vm_reg_native(vm, base, "createChannelMerger(n)",       native_create_gain,       NULL);
+        vm_reg_native(vm, base, "createChannelSplitter(n)",     native_create_gain,       NULL);
+        vm_reg_native(vm, base, "createConvolver()",            native_create_gain,       NULL);
+        vm_reg_native(vm, base, "createDelay(t)",               native_create_gain,       NULL);
+        vm_reg_native(vm, base, "createPanner()",               native_create_gain,       NULL);
+        vm_reg_native(vm, base, "createStereoPanner()",         native_create_gain,       NULL);
+        vm_reg_native(vm, base, "createWaveShaper()",           native_create_gain,       NULL);
+        vm_reg_native(vm, base, "createPeriodicWave(r, i)",     native_ws_noop,           NULL);
+        vm_reg_native(vm, base, "createScriptProcessor(b, i, o)", native_create_gain,     NULL);
+        vm_reg_native(vm, base, "decodeAudioData(b, s, e)",     native_ws_noop,           NULL);
+        vm_reg_native(vm, base, "addEventListener(t, f)",       native_ws_noop,           NULL);
+        vm_reg_native(vm, base, "removeEventListener(t, f)",    native_ws_noop,           NULL);
+        vm_reg_var(vm, base, SYMKEY_TOSTRINGTAG,
+                   var_new_str(vm, "BaseAudioContext"), true);
+    }
+
+    var_t* audio = vm_new_class(vm, "AudioContext");
+    if(audio != NULL) {
+        if(base != NULL)
+            var_set_prototype(var_get_prototype(audio), var_get_prototype(base));
+        vm_reg_native(vm, audio, "constructor(o)", native_audio_ctx_ctor, NULL);
+        vm_reg_native(vm, audio, "close()",   native_ws_noop, NULL);
+        vm_reg_native(vm, audio, "suspend()", native_ws_noop, NULL);
+        vm_reg_native(vm, audio, "resume()",  native_ws_noop, NULL);
+        vm_reg_var(vm, audio, SYMKEY_TOSTRINGTAG,
+                   var_new_str(vm, "AudioContext"), true);
+    }
+    var_t* webkit_audio = vm_new_class(vm, "webkitAudioContext");
+    if(webkit_audio != NULL) {
+        if(audio != NULL)
+            var_set_prototype(var_get_prototype(webkit_audio), var_get_prototype(audio));
+        vm_reg_native(vm, webkit_audio, "constructor(o)", native_audio_ctx_ctor, NULL);
+    }
+
+    var_t* offline = vm_new_class(vm, "OfflineAudioContext");
+    if(offline != NULL) {
+        if(base != NULL)
+            var_set_prototype(var_get_prototype(offline), var_get_prototype(base));
+        vm_reg_native(vm, offline, "constructor(c, l, sr)",
+                      native_audio_ctx_ctor, (void*)1);
+        vm_reg_native(vm, offline, "startRendering()", native_start_rendering, NULL);
+        vm_reg_native(vm, offline, "suspend()",        native_ws_noop,         NULL);
+        vm_reg_native(vm, offline, "resume()",         native_ws_noop,         NULL);
+        vm_reg_var(vm, offline, SYMKEY_TOSTRINGTAG,
+                   var_new_str(vm, "OfflineAudioContext"), true);
+    }
+    var_t* webkit_offline = vm_new_class(vm, "webkitOfflineAudioContext");
+    if(webkit_offline != NULL) {
+        if(offline != NULL)
+            var_set_prototype(var_get_prototype(webkit_offline), var_get_prototype(offline));
+        vm_reg_native(vm, webkit_offline, "constructor(c, l, sr)",
+                      native_audio_ctx_ctor, (void*)1);
+        vm_reg_native(vm, webkit_offline, "startRendering()", native_start_rendering, NULL);
+    }
+
+    /* Supporting interface globals (existence probes) */
+    static const char* kAudioIdl[] = {
+        "AudioNode", "AudioParam", "AudioBuffer", "AudioBufferSourceNode",
+        "OscillatorNode", "GainNode", "DynamicsCompressorNode",
+        "AnalyserNode", "BiquadFilterNode", "AudioDestinationNode",
+        "AudioListener", "PeriodicWave", "ChannelMergerNode",
+        "ChannelSplitterNode", "ConvolverNode", "DelayNode",
+        "PannerNode", "StereoPannerNode", "WaveShaperNode",
+        "ScriptProcessorNode", "MediaElementAudioSourceNode",
+        "MediaStreamAudioSourceNode", "AudioWorklet", "AudioWorkletNode"
+    };
+    for(size_t i = 0; i < sizeof(kAudioIdl) / sizeof(kAudioIdl[0]); ++i) {
+        if(var_find_own_member_var(vm->root, kAudioIdl[i]) != NULL) continue;
+        vm_new_class(vm, kAudioIdl[i]);
+    }
+    var_t* buffer = var_find_own_member_var(vm->root, "AudioBuffer");
+    if(buffer != NULL) {
+        vm_reg_native(vm, buffer, "getChannelData(c)",       native_ab_getChannelData, NULL);
+        vm_reg_native(vm, buffer, "copyFromChannel(d, c, s)",native_ab_copyFrom,      NULL);
+        vm_reg_native(vm, buffer, "copyToChannel(s, c, o)",  native_ab_copyFrom,      NULL);
+        vm_reg_var(vm, buffer, SYMKEY_TOSTRINGTAG,
+                   var_new_str(vm, "AudioBuffer"), true);
+    }
+    (void)window;
 }
 
 bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
@@ -5056,6 +6301,8 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
     vm_reg_static(vm, NULL, "btoa(v)",                  native_btoa,               bridge);
     if(getenv("MARIO_NOQMT") == NULL)
         vm_reg_static(vm, NULL, "queueMicrotask(f)",        native_queueMicrotask,     bridge);
+    vm_reg_static(vm, NULL, "setImmediate(fn)",         native_setImmediate,       bridge);
+    vm_reg_static(vm, NULL, "clearImmediate(id)",       native_clearImmediate,     bridge);
     vm_reg_static(vm, NULL, "getComputedStyle(e, p)",   native_getComputedStyle,   bridge);
     vm_reg_static(vm, NULL, "matchMedia(q)",            native_matchMedia,         bridge);
     vm_reg_static(vm, NULL, "fetch(i, init)",           native_fetch,              bridge);
@@ -5104,7 +6351,15 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
      * The engine's Console only has write()/log(); everything else goes on the
      * same prototype so the global `console` instance picks it up. */
     cls = var_find_own_member_var(vm->root, CLS_CONSOLE);
+    if(getenv("EWEB_SCRIPTDBG") != NULL)
+        fprintf(stderr, "[consoletrace] Console cls on root=%p\n", (void*)cls);
     if(cls != NULL) {
+        /* The core Console class only carries write()/log() as STATIC methods
+         * (native_Console.c); an instance lookup (`console.log(...)`) does not
+         * reach them, so page probes calling the standard `console.log` raised
+         * TypeError and every diagnostic print was silently swallowed. Register
+         * log as an instance method like the other extras below. */
+        vm_reg_native(vm, cls, "log(v)",           native_console_log,        bridge);
         vm_reg_native(vm, cls, "warn(v)",           native_console_warn,       bridge);
         vm_reg_native(vm, cls, "error(v)",          native_console_error,      bridge);
         vm_reg_native(vm, cls, "info(v)",           native_console_info,       bridge);
@@ -5179,6 +6434,7 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
     }
     /* js_dom.c only linked location off `window`; a bare `location.href` in a
      * page script needs it on the global scope too. */
+    web_tag_brand(vm, st->location, "Location");
     web_publish(vm, window, "location", st->location);
 
     /* ---- history ---- */
@@ -5193,6 +6449,7 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
         vm_reg_native(vm, cls, "replaceState(s, t, u)",     native_history_pushState,  bridge);
     }
     var_t* history = new_obj(vm, CLS_HISTORY, 0);
+    web_tag_brand(vm, history, "History");
     web_publish(vm, window, "history", history);
     if(history != NULL) var_add(bridge, "@@history", history);
 
@@ -5209,20 +6466,32 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
         js_acc_cls(vm, cls, "maxTouchPoints",      metric_get, NULL, (void*)(intptr_t)1);
         js_acc_cls(vm, cls, "deviceMemory",        metric_get, NULL, (void*)(intptr_t)2);
         js_acc_cls(vm, cls, "languages",  nav_get_languages, NULL, bridge);
+        js_acc_cls(vm, cls, "plugins",    nav_get_plugins,   NULL, bridge);
+        js_acc_cls(vm, cls, "mimeTypes",  nav_get_mimeTypes, NULL, bridge);
+        js_acc_cls(vm, cls, "connection", nav_get_connection, NULL, bridge);
         js_acc_cls(vm, cls, "userAgentData", nav_get_userAgentData, NULL, bridge);
         js_acc_cls(vm, cls, "onLine",        nav_get_bool, NULL, (void*)(intptr_t)0);
         js_acc_cls(vm, cls, "cookieEnabled", nav_get_bool, NULL, (void*)(intptr_t)1);
         /* Not const: pages do assign to these during feature detection and a
          * browser silently ignores the write rather than throwing. */
         vm_reg_var(vm, cls, "webdriver",       var_new_bool(vm, false), false);
-        vm_reg_var(vm, cls, "pdfViewerEnabled", var_new_bool(vm, false), false);
+        vm_reg_var(vm, cls, "pdfViewerEnabled", var_new_bool(vm, true), false);
         vm_reg_native(vm, cls, "javaEnabled()",      nav_javaEnabled, bridge);
         vm_reg_native(vm, cls, "sendBeacon(u, d)",   nav_sendBeacon,  bridge);
         vm_reg_native(vm, cls, "vibrate(n)",         nav_vibrate,     bridge);
     }
     var_t* navigator = new_obj(vm, CLS_NAVIGATOR, 0);
+    web_tag_brand(vm, navigator, "Navigator");
     web_publish(vm, window, "navigator", navigator);
     if(navigator != NULL) var_add(bridge, "@@navigator", navigator);
+    /* window.chrome: publish the Chromium marker object (bot-detection parity). */
+    {
+        var_t* chrome = chrome_new(vm);
+        if(chrome != NULL) {
+            web_publish(vm, window, "chrome", chrome);
+            var_add(bridge, "@@chrome", chrome);
+        }
+    }
     /* navigator.credentials (CredentialsContainer): FedCM / Password Credential
      * Management API surface used by capability probes. get() resolves(null) and
      * the mutators resolve(undefined) - no credential store in this engine.
@@ -5283,6 +6552,41 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
         var_add(mem, "totalJSHeapSize", var_new_int(vm, 0));
         var_add(mem, "usedJSHeapSize",  var_new_int(vm, 0));
         var_add(performance, "memory", mem);
+        /* performance.timing (legacy PerformanceTiming, still present in every
+         * real browser incl. Chrome): epoch-ms milestones. Fingerprint/anti-bot
+         * scripts (baxia et_f) read navigationStart/responseEnd/etc.; with the
+         * object absent entirely (`performance.timing === undefined`) their
+         * timing-fingerprint step bails and the ET/bx-ua token collapses to a
+         * 1-char stub. Mirror the timeOrigin derivation so the values line up
+         * with Date.now()/now(). unload/redirect are 0 (no unload/redirect). */
+        {
+            int64_t mono = js_dom_monotonic_ms();
+            int64_t t0   = (st != NULL) ? st->t0_ms : mono;
+            int64_t navs = js_dom_wall_ms() - (mono - t0);   /* navigationStart */
+            var_t* tm = var_new_obj_no_proto(vm, NULL, NULL);
+            var_add(tm, "navigationStart",           var_new_int64(vm, navs));
+            var_add(tm, "unloadEventStart",          var_new_int64(vm, 0));
+            var_add(tm, "unloadEventEnd",            var_new_int64(vm, 0));
+            var_add(tm, "redirectStart",             var_new_int64(vm, 0));
+            var_add(tm, "redirectEnd",               var_new_int64(vm, 0));
+            var_add(tm, "fetchStart",                var_new_int64(vm, navs + 1));
+            var_add(tm, "domainLookupStart",         var_new_int64(vm, navs + 2));
+            var_add(tm, "domainLookupEnd",           var_new_int64(vm, navs + 6));
+            var_add(tm, "connectStart",              var_new_int64(vm, navs + 6));
+            var_add(tm, "connectEnd",                var_new_int64(vm, navs + 40));
+            var_add(tm, "secureConnectionStart",     var_new_int64(vm, navs + 12));
+            var_add(tm, "requestStart",              var_new_int64(vm, navs + 41));
+            var_add(tm, "responseStart",             var_new_int64(vm, navs + 120));
+            var_add(tm, "responseEnd",               var_new_int64(vm, navs + 260));
+            var_add(tm, "domLoading",                var_new_int64(vm, navs + 262));
+            var_add(tm, "domInteractive",            var_new_int64(vm, navs + 700));
+            var_add(tm, "domContentLoadedEventStart",var_new_int64(vm, navs + 720));
+            var_add(tm, "domContentLoadedEventEnd",  var_new_int64(vm, navs + 725));
+            var_add(tm, "domComplete",               var_new_int64(vm, navs + 1500));
+            var_add(tm, "loadEventStart",            var_new_int64(vm, navs + 1502));
+            var_add(tm, "loadEventEnd",              var_new_int64(vm, navs + 1510));
+            var_add(performance, "timing", tm);
+        }
         vm->gc.gc_defer--;
         var_add(bridge, "@@performance", performance);
     }
@@ -5328,6 +6632,7 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
     cls = vm_new_class(vm, CLS_XHR);
     if(cls != NULL) {
         vm_reg_native(vm, cls, "constructor()",             native_xhr_ctor,                  bridge);
+        js_acc_cls(vm, cls, "readyState", native_xhr_get_readyState, NULL, bridge);
         vm_reg_native(vm, cls, "open(m, u, a)",             native_xhr_open,                  bridge);
         vm_reg_native(vm, cls, "send(b)",                   native_xhr_send,                  bridge);
         vm_reg_native(vm, cls, "abort()",                   native_xhr_abort,                 bridge);
@@ -5357,11 +6662,47 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
     if(cls != NULL)
         vm_reg_native(vm, cls, "constructor()", native_mc_ctor, bridge);
 
+    /* ---- DOMException: core-js's polyfill feature-tests the global; a missing
+     * DOMException makes its probe IIFE return undefined and every `new O()`
+     * throw, aborting the taobao 603.js module (React never mounts). ---- */
+    cls = vm_new_class(vm, CLS_DOMEXCEPTION);
+    if(cls != NULL) {
+        vm_reg_native(vm, cls, "constructor(m, n)", native_domex_ctor,     bridge);
+        vm_reg_native(vm, cls, "toString()",        native_domex_toString, bridge);
+        /* Legacy code constants, readable as both DOMException.X and instance.X
+         * (vm_reg_var installs them on the class's instance prototype). */
+        static const struct { const char* n; int c; } kConst[] = {
+            {"INDEX_SIZE_ERR",1},{"DOMSTRING_SIZE_ERR",2},{"HIERARCHY_REQUEST_ERR",3},
+            {"WRONG_DOCUMENT_ERR",4},{"INVALID_CHARACTER_ERR",5},{"NO_DATA_ALLOWED_ERR",6},
+            {"NO_MODIFICATION_ALLOWED_ERR",7},{"NOT_FOUND_ERR",8},{"NOT_SUPPORTED_ERR",9},
+            {"INUSE_ATTRIBUTE_ERR",10},{"INVALID_STATE_ERR",11},{"SYNTAX_ERR",12},
+            {"INVALID_MODIFICATION_ERR",13},{"NAMESPACE_ERR",14},{"INVALID_ACCESS_ERR",15},
+            {"VALIDATION_ERR",16},{"TYPE_MISMATCH_ERR",17},{"SECURITY_ERR",18},
+            {"NETWORK_ERR",19},{"ABORT_ERR",20},{"URL_MISMATCH_ERR",21},
+            {"QUOTA_EXCEEDED_ERR",22},{"TIMEOUT_ERR",23},{"INVALID_NODE_TYPE_ERR",24},
+            {"DATA_CLONE_ERR",25}
+        };
+        for(size_t i = 0; i < sizeof(kConst)/sizeof(kConst[0]); ++i)
+            vm_reg_var(vm, cls, kConst[i].n, var_new_int(vm, kConst[i].c), true);
+        /* `new DOMException() instanceof Error` must hold (core-js's D test):
+         * chain the instance prototype under Error.prototype. var_set_father is
+         * mario-static, so replicate it with the public prototype accessors. */
+        var_t* err = vm->builtin_vars.var_Error;
+        if(err != NULL) {
+            var_t* dp = var_get_prototype(cls);
+            var_t* ep = var_get_prototype(err);
+            if(dp != NULL && ep != NULL && dp != ep)
+                var_set_prototype(dp, ep);
+        }
+    }
+
     cls = vm_new_class(vm, CLS_RESPONSE);
     if(cls != NULL) {
         vm_reg_native(vm, cls, "text()", native_resp_text, bridge);
         vm_reg_native(vm, cls, "json()", native_resp_json, bridge);
+        vm_reg_native(vm, cls, "clone()", native_resp_clone, bridge);
         js_acc_cls(vm, cls, "headers", native_resp_get_headers, NULL, bridge);
+        js_acc_cls(vm, cls, "bodyUsed", native_resp_bodyused, NULL, bridge);
     }
     cls = vm_new_class(vm, CLS_HEADERS);
     if(cls != NULL) {
@@ -5454,7 +6795,10 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
         var_add(window, "name",   var_new_str(vm, ""));
         var_add(window, "opener", var_new_null(vm));
         var_add(window, "frameElement", var_new_null(vm));
-        var_add(window, "isSecureContext", var_new_bool(vm, false));
+        /* isSecureContext is a live getter (see win_secure_get): https pages
+         * must report true or the value contradicts location.protocol. */
+        js_acc_on(vm, window, "isSecureContext", win_secure_get, NULL, NULL);
+        js_acc_on(vm, vm->root, "isSecureContext", win_secure_get, NULL, NULL);
     }
 
     /* window.origin mirrors location.origin, so it is a live getter reading the
@@ -5462,6 +6806,98 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
     js_acc_on(vm, vm->root, "origin", loc_get, NULL, (void*)(intptr_t)8);
     if(window != NULL)
         js_acc_on(vm, window, "origin", loc_get, NULL, (void*)(intptr_t)8);
+
+    /* ---- WebSocket / FileReader / Worker: spec-shaped constructors (see the
+     * native_*_ctor comments above). Constants are readable on both the class
+     * and the instance, as in Chrome. ---- */
+    cls = vm_new_class(vm, "WebSocket");
+    if(cls != NULL) {
+        vm_reg_native(vm, cls, "constructor(u, p)",       native_ws_ctor,  bridge);
+        vm_reg_native(vm, cls, "send(d)",                 native_ws_noop,  bridge);
+        vm_reg_native(vm, cls, "close(c, r)",             native_ws_close, bridge);
+        vm_reg_native(vm, cls, "addEventListener(t, f)",    native_ws_noop, bridge);
+        vm_reg_native(vm, cls, "removeEventListener(t, f)", native_ws_noop, bridge);
+        static const struct { const char* n; int c; } kWs[] = {
+            {"CONNECTING",0},{"OPEN",1},{"CLOSING",2},{"CLOSED",3} };
+        for(size_t i = 0; i < sizeof(kWs) / sizeof(kWs[0]); ++i)
+            vm_reg_var(vm, cls, kWs[i].n, var_new_int(vm, kWs[i].c), true);
+    }
+    cls = vm_new_class(vm, "FileReader");
+    if(cls != NULL) {
+        vm_reg_native(vm, cls, "constructor()",        native_fr_ctor, bridge);
+        vm_reg_native(vm, cls, "readAsText(b, e)",     native_fr_read, bridge);
+        vm_reg_native(vm, cls, "readAsDataURL(b)",     native_fr_read, bridge);
+        vm_reg_native(vm, cls, "readAsArrayBuffer(b)", native_fr_read, bridge);
+        vm_reg_native(vm, cls, "readAsBinaryString(b)",native_fr_read, bridge);
+        vm_reg_native(vm, cls, "abort()",              native_ws_noop, bridge);
+        vm_reg_native(vm, cls, "addEventListener(t, f)",    native_ws_noop, bridge);
+        vm_reg_native(vm, cls, "removeEventListener(t, f)", native_ws_noop, bridge);
+        static const struct { const char* n; int c; } kFr[] = {
+            {"EMPTY",0},{"LOADING",1},{"DONE",2} };
+        for(size_t i = 0; i < sizeof(kFr) / sizeof(kFr[0]); ++i)
+            vm_reg_var(vm, cls, kFr[i].n, var_new_int(vm, kFr[i].c), true);
+    }
+    cls = vm_new_class(vm, "Worker");
+    if(cls != NULL) {
+        vm_reg_native(vm, cls, "constructor(u, o)",     native_worker_ctor, bridge);
+        vm_reg_native(vm, cls, "postMessage(m, t)",     native_ws_noop,     bridge);
+        vm_reg_native(vm, cls, "terminate()",           native_ws_noop,     bridge);
+        vm_reg_native(vm, cls, "addEventListener(t, f)",    native_ws_noop, bridge);
+        vm_reg_native(vm, cls, "removeEventListener(t, f)", native_ws_noop, bridge);
+    }
+
+    /* ---- visualViewport: live width/height reuse the window inner metrics;
+     * scale is 1 and the scroll/page offsets are 0 in this engine. ---- */
+    {
+        var_t* vv = var_new_obj_no_proto(vm, NULL, NULL);
+        if(vv != NULL) {
+            vm->gc.gc_defer++;
+            js_acc_on(vm, vv, "width",  win_metric_get, NULL, (void*)(intptr_t)0);
+            js_acc_on(vm, vv, "height", win_metric_get, NULL, (void*)(intptr_t)1);
+            js_acc_on(vm, vv, "scale",  native_vv_scale, NULL, NULL);
+            js_acc_on(vm, vv, "offsetLeft", native_vv_zero, NULL, NULL);
+            js_acc_on(vm, vv, "offsetTop",  native_vv_zero, NULL, NULL);
+            js_acc_on(vm, vv, "pageLeft",   native_vv_zero, NULL, NULL);
+            js_acc_on(vm, vv, "pageTop",    native_vv_zero, NULL, NULL);
+            var_add(vv, "onresize",   var_new_null(vm));
+            var_add(vv, "onscroll",   var_new_null(vm));
+            vm_reg_native_on(vm, vv, "addEventListener(t, f)",    native_ws_noop, bridge);
+            vm_reg_native_on(vm, vv, "removeEventListener(t, f)", native_ws_noop, bridge);
+            vm->gc.gc_defer--;
+            web_publish(vm, window, "visualViewport", vv);
+        }
+    }
+
+    /* ---- AudioContext / OfflineAudioContext: functional Web Audio API ----
+     * Bot-detection VMPs (baxia et_f) use OfflineAudioContext to compute an
+     * audio fingerprint: create oscillator + compressor, render offline, read
+     * specific sample values.  An inert class (no methods) causes the VMP to
+     * catch a TypeError and degrade the token.  This implementation provides
+     * the full node-graph surface and a deterministic DSP render so the
+     * fingerprint pipeline completes without throwing. ---- */
+    web_register_audio(vm, window, bridge);
+
+    /* ---- Inert WebIDL interface globals: constructors Chrome exposes that a
+     * bot-detection VMP probes with `name in window`. Only the binding exists;
+     * behaviour stays with the wrapped DOM objects as before. ---- */
+    static const char* kWebIdl[] = {
+        "Node", "NodeList", "HTMLCollection", "DOMTokenList", "NamedNodeMap",
+        "CSSStyleDeclaration", "CSSStyleSheet", "StyleSheet", "MediaQueryList",
+        "Text", "Comment", "Attr", "DocumentFragment", "CharacterData",
+        "DOMRect", "DOMRectReadOnly", "DOMParser", "XMLSerializer",
+        "EventSource", "BroadcastChannel", "Notification",
+        "SpeechRecognition",
+        "ServiceWorker", "ServiceWorkerRegistration", "IDBFactory",
+        "ImageBitmap", "ImageData", "Path2D", "CanvasRenderingContext2D",
+        "SVGElement", "SVGSVGElement",
+        "HTMLAllCollection", "MimeTypeArray", "PluginArray", "Plugin",
+        "BarProp", "PerformanceNavigation", "PerformanceTiming",
+        "ScreenOrientation", "Cache", "CacheStorage", "Crypto", "SubtleCrypto"
+    };
+    for(size_t i = 0; i < sizeof(kWebIdl) / sizeof(kWebIdl[0]); ++i) {
+        if(var_find_own_member_var(vm->root, kWebIdl[i]) != NULL) continue;
+        vm_new_class(vm, kWebIdl[i]);
+    }
 
     /* ---- mirror the globals onto window ---- */
     web_mirror_globals(vm, window);

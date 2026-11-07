@@ -126,15 +126,19 @@ typedef struct {
     TTF_Font* fb;         /* CJK fallback face, NULL when primary == fallback */
     TTF_Font* sy;         /* symbols/dingbats fallback face, NULL when absent */
     TTF_Font* em;         /* emoji fallback face, NULL when absent */
+    SDL_RWops* rw;        /* memory stream backing a webfont primary, else NULL */
 } sdl_face_slot_t;
 
 /* One concrete face: file + index (a plain .ttc face index, or a variable
  * font's named instance in the high 16 bits, as FreeType expects) + the
- * TTF_STYLE_* bits the file cannot supply and must be synthesised. */
+ * TTF_STYLE_* bits the file cannot supply and must be synthesised.
+ * wf >= 0 selects a registered @font-face blob (registry index) instead of
+ * a file; the bytes live in the registry for the process lifetime. */
 typedef struct {
     const char* path;
     long        index;
     int         synth;
+    int         wf;
 } sdl_face_spec_t;
 
 typedef struct {
@@ -142,6 +146,7 @@ typedef struct {
     int             weight;       /* CSS font-weight 100..900 */
     int             italic;
     int             resolved;     /* prim/fb filled in on first face open */
+    unsigned        resolved_gen; /* webfont generation this resolution saw */
     sdl_face_spec_t prim;         /* face matching the CSS family */
     sdl_face_spec_t fb;           /* CJK fallback for glyphs prim lacks */
     sdl_face_spec_t sy;           /* symbols/dingbats fallback for glyphs prim+fb lack */
@@ -1209,6 +1214,64 @@ static bool sdl2_spec_ttc(sdl_face_spec_t* spec, const char* path, bool want_bol
     return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* Web fonts (@font-face)                                              */
+/*                                                                     */
+/* The core downloads @font-face sources and registers the raw TTF/OTF */
+/* bytes here under their CSS family name (lowercased, the same form   */
+/* sdl2_family_token produces). Family lookup consults this table      */
+/* before the installed-font chain, so a page that sets                */
+/* font-family:iconfont draws the downloaded glyphs. Bumping the       */
+/* generation invalidates every live handle: its next measurement or   */
+/* draw re-resolves the family list and reopens the per-size faces.    */
+/* ------------------------------------------------------------------ */
+#define SDL_WEBFONT_MAX 24
+typedef struct {
+    char           family[128];
+    unsigned char* data;
+    int            len;
+} sdl_webfont_t;
+
+static sdl_webfont_t s_webfonts[SDL_WEBFONT_MAX];
+static int           s_webfont_count = 0;
+static unsigned      s_webfont_gen   = 0;
+
+static int sdl2_webfont_find(const char* tok) {
+    int i;
+    for(i = 0; i < s_webfont_count; i++)
+        if(strcmp(s_webfonts[i].family, tok) == 0) return i;
+    return -1;
+}
+
+static void ek_font_webfont_add(void* ud, const char* family, const unsigned char* data, int len) {
+    char tok[128];
+    size_t n = 0;
+    (void)ud;
+    if(!family || !data || len <= 0) return;
+    if(!sdl2_ensure_libs()) return;
+    /* Lowercase + drop quotes, matching sdl2_family_token's token form. */
+    while(*family == ' ') family++;
+    for(; *family && n + 1 < sizeof(tok); family++) {
+        char c = *family;
+        if(c == '"' || c == '\'') continue;
+        if(c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        tok[n++] = c;
+    }
+    while(n > 0 && tok[n-1] == ' ') n--;
+    tok[n] = 0;
+    if(n == 0) return;
+    if(sdl2_webfont_find(tok) >= 0) return;   /* already registered */
+    if(s_webfont_count >= SDL_WEBFONT_MAX) return;
+    s_webfonts[s_webfont_count].data = (unsigned char*)malloc((size_t)len);
+    if(!s_webfonts[s_webfont_count].data) return;
+    memcpy(s_webfonts[s_webfont_count].data, data, (size_t)len);
+    s_webfonts[s_webfont_count].len = len;
+    snprintf(s_webfonts[s_webfont_count].family,
+             sizeof(s_webfonts[s_webfont_count].family), "%s", tok);
+    s_webfont_count++;
+    s_webfont_gen++;
+}
+
 enum { SDL_GEN_NONE = 0, SDL_GEN_SANS, SDL_GEN_SERIF, SDL_GEN_MONO, SDL_GEN_SYSTEM };
 
 static bool sdl2_has(const char* tok, const char* name) { return strcmp(tok, name) == 0; }
@@ -1248,6 +1311,18 @@ static bool sdl2_spec_for_family(sdl_face_spec_t* spec, const char* tok, int wei
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf" };
     bool bold = weight >= 600;
     int gen = SDL_GEN_NONE;
+    spec->wf = -1;
+    /* A registered @font-face family wins over every installed face. */
+    {
+        int wf = sdl2_webfont_find(tok);
+        if(wf >= 0) {
+            spec->path = NULL;
+            spec->index = 0;
+            spec->wf = wf;
+            spec->synth = bold ? TTF_STYLE_BOLD : TTF_STYLE_NORMAL;
+            return true;
+        }
+    }
 
     /* Named families installed on macOS. */
     if(sdl2_has(tok, "-apple-system") || sdl2_has(tok, "blinkmacsystemfont") ||
@@ -1314,15 +1389,19 @@ static void sdl2_resolve_font(sdl_font_t* f) {
     bool italic = f->italic != 0;
     bool have_prim = false;
     f->resolved = 1;
+    f->resolved_gen = s_webfont_gen;
     f->prim.path = f->fb.path = NULL;
+    f->prim.wf = f->fb.wf = -1;
     /* Emoji last-resort face (bundled Noto Emoji); never synthesised. */
     f->em.path  = sdl2_emoji_font_path();
     f->em.index = 0;
     f->em.synth = TTF_STYLE_NORMAL;
+    f->em.wf = -1;
     /* Symbols/dingbats face (bundled Noto Sans Symbols 2); never synthesised. */
     f->sy.path  = sdl2_symbols_font_path();
     f->sy.index = 0;
     f->sy.synth = TTF_STYLE_NORMAL;
+    f->sy.wf = -1;
     /* EWEBVIEW_SDL2_FONT pins everything to one face, as before. */
     if(!SDL_getenv("EWEBVIEW_SDL2_FONT")) {
         while(sdl2_family_token(&cur, tok, sizeof(tok))) {
@@ -1338,7 +1417,7 @@ static void sdl2_resolve_font(sdl_font_t* f) {
         /* No Latin face installed: the CJK collection is the only face. */
         f->prim = f->fb;
         f->fb.path = NULL;
-    } else if(f->fb.path && strcmp(f->fb.path, f->prim.path) == 0 && f->fb.index == f->prim.index) {
+    } else if(f->fb.path && f->prim.path && strcmp(f->fb.path, f->prim.path) == 0 && f->fb.index == f->prim.index) {
         f->fb.path = NULL;
     }
 }
@@ -1434,6 +1513,20 @@ static TTF_Font* sdl_font_faces(sdl_font_t* f, int size, TTF_Font** fb, TTF_Font
     if(em) *em = NULL;
     if(!f) return NULL;
     if(size <= 0) size = 12;
+    /* A webfont registered after this handle resolved its family list may
+     * have turned an unknown family into a real face: drop every cached face
+     * and re-resolve so the new glyphs take effect without a page reload. */
+    if(f->resolved && f->resolved_gen != s_webfont_gen) {
+        for(i = 0; i < f->face_count; i++) {
+            if(f->faces[i].face) TTF_CloseFont(f->faces[i].face);
+            if(f->faces[i].fb)   TTF_CloseFont(f->faces[i].fb);
+            if(f->faces[i].sy)   TTF_CloseFont(f->faces[i].sy);
+            if(f->faces[i].em)   TTF_CloseFont(f->faces[i].em);
+            if(f->faces[i].rw)   SDL_FreeRW(f->faces[i].rw);
+        }
+        f->face_count = 0;
+        f->resolved = 0;
+    }
     /* Linear scan: cache is tiny (<=24) and hits are overwhelmingly repeat
      * sizes, so this is faster than any hash we'd write. */
     for(i = 0; i < f->face_count; i++) {
@@ -1451,19 +1544,32 @@ static TTF_Font* sdl_font_faces(sdl_font_t* f, int size, TTF_Font** fb, TTF_Font
         if(f->faces[0].fb) TTF_CloseFont(f->faces[0].fb);
         if(f->faces[0].sy) TTF_CloseFont(f->faces[0].sy);
         if(f->faces[0].em) TTF_CloseFont(f->faces[0].em);
+        if(f->faces[0].rw) SDL_FreeRW(f->faces[0].rw);
         f->faces[0].face = NULL;
         f->faces[0].fb = NULL;
         f->faces[0].sy = NULL;
         f->faces[0].em = NULL;
+        f->faces[0].rw = NULL;
         f->faces[0].size = 0;
         /* Compact: shift the rest down so the next miss fills slot 0 cleanly. */
         for(i = 1; i < f->face_count; i++) f->faces[i-1] = f->faces[i];
         f->face_count--;
     }
     if(!f->resolved) sdl2_resolve_font(f);
-    if(!f->prim.path) return NULL;
-    face = TTF_OpenFontIndex(f->prim.path, size, f->prim.index);
-    if(!face) return NULL;
+    if(f->prim.wf < 0 && !f->prim.path) return NULL;
+    if(f->prim.wf >= 0) {
+        /* Webfont: open from the registry bytes; the RWops must outlive the
+         * TTF_Font (FreeType reads the tables lazily), so the slot owns it. */
+        sdl_webfont_t* wfn = &s_webfonts[f->prim.wf];
+        SDL_RWops* rw = SDL_RWFromMem(wfn->data, wfn->len);
+        face = rw ? TTF_OpenFontRW(rw, SDL_FALSE, size) : NULL;
+        if(!face) { if(rw) SDL_FreeRW(rw); return NULL; }
+        f->faces[f->face_count].rw = rw;
+    } else {
+        face = TTF_OpenFontIndex(f->prim.path, size, f->prim.index);
+        if(!face) return NULL;
+        f->faces[f->face_count].rw = NULL;
+    }
     /* No hinting: browsers on macOS position glyphs by their unhinted
      * fractional advances (with kerning), and with hinting off SDL_ttf's
      * TTF_SizeUTF8 equals the rendered width AND that browser measurement,
@@ -1541,6 +1647,7 @@ static void ek_font_destroy(void* ud, eweb_font_t* h) {
         if(f->faces[i].fb)   TTF_CloseFont(f->faces[i].fb);
         if(f->faces[i].sy)   TTF_CloseFont(f->faces[i].sy);
         if(f->faces[i].em)   TTF_CloseFont(f->faces[i].em);
+        if(f->faces[i].rw)   SDL_FreeRW(f->faces[i].rw);
     }
     free(f);
 }
@@ -2170,12 +2277,32 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
     if(getenv("EWEB_NETDBG") != NULL) {
         fprintf(stderr, "[netdbg] url=%s status=%d body=%d\n", url,
                 (int)resp->status, (int)resp->body_size);
+        for(i = 0; i < resp->header_count; i++) {
+            const char* k = resp->headers[i].key;
+            const char* v = resp->headers[i].value;
+            if(k != NULL && v != NULL && strcasecmp(k, "Set-Cookie") == 0)
+                fprintf(stderr, "[netdbg] set-cookie url=%s value=%s\n", url, v);
+        }
+        if(strstr(url, "fourier.") != NULL) {
+            for(i = 0; i < resp->header_count; i++) {
+                const char* k = resp->headers[i].key;
+                const char* v = resp->headers[i].value;
+                if(k != NULL && v != NULL)
+                    fprintf(stderr, "[netdbg] response header %s: %s\n", k, v);
+            }
+        }
         /* On a refusal, the first bytes of the body say WHO refused: a WAF
          * page carries a vendor reference id, an app-level refusal carries a
          * csrf/permission message. Dump a prefix so the layer is identifiable
          * without a rebuild. */
-        if(resp->status >= 400 && resp->body && resp->body_size > 0) {
-            int len = resp->body_size < 512 ? (int)resp->body_size : 512;
+        /* MTOP (h5api) returns HTTP 200 even for logical refusals
+         * (FAIL_SYS_TOKEN_EMPTY / LOGIN_FAILED / an empty result), so a 200
+         * body prefix is needed to tell a real payload from an error
+         * envelope. Dump for refusals and for every MTOP hop. */
+        int want_body = (resp->status >= 400) ||
+                        (strstr(url, "h5api") != NULL);
+        if(want_body && resp->body && resp->body_size > 0) {
+            int len = resp->body_size < 700 ? (int)resp->body_size : 700;
             fprintf(stderr, "[netdbg] body[0..%d]=\n%.*s\n", len, len,
                     (const char*)resp->body);
         }
@@ -2381,6 +2508,7 @@ void eweb_port_sdl2(eweb_port_t* port, void* ud) {
     port->font.text_size   = ek_font_text_size;
     port->font.draw_text   = ek_font_draw_text;
     port->font.create_styled = ek_font_create_styled;
+    port->font.webfont_add   = ek_font_webfont_add;
 
     port->image.ud     = ud;
     port->image.decode = ek_image_decode;
