@@ -490,7 +490,7 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
                        strcasecmp(st->headers[i].key, "Content-Encoding") == 0)
                         st->headers[i].value = "identity";
             } else {
-                klog("[ewebview] net: Content-Encoding gzip but "
+                slog("[ewebview] net: Content-Encoding gzip but "
                      "inflate failed: url=%s bytes=%d\n", url, resp->body_size);
             }
         }
@@ -501,7 +501,7 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
      * this port uses) on a transport error or a non-2xx status, so a failed
      * fetch is diagnosable without a rebuild. */
     if(resp->error || resp->status < 200 || resp->status > 299) {
-        klog("[ewebview] net.request diag: url=%s status=%d error=%d code=%d "
+        slog("[ewebview] net.request diag: url=%s status=%d error=%d code=%d "
              "msg=%s body=%d\n",
              url, resp->status, resp->error ? 1 : 0,
              HttpsResponseGetErrorCode(response),
@@ -561,7 +561,7 @@ static bool ek_sys_ptr_sane(void* ud, const void* p) { (void)ud; return ewok_ptr
 
 static void ek_sys_log(void* ud, const char* text) {
     (void)ud;
-    if(text) klog("%s", text);
+    if(text) slog("%s", text);
 }
 
 /* System clipboard: EwokOS keeps one global text clipboard at /tmp/.clipboard
