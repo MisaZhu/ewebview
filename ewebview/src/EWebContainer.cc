@@ -299,9 +299,10 @@ static bool is_redirect_status(int status)
 } /* anonymous namespace */
 
 /* Non-zero winding scanline fill over all subpaths at once (icon-font paths
- * rely on winding, not parity, for their counters). Geometry is already in
- * device space; spans are clipped to clip. Shared by draw_svg and the
- * transformed border quads, hence the extraction. */
+ * rely on winding, not parity, for their counters). Geometry is in LOGICAL
+ * space - fill_rect scales it to the target's device pixels; spans are
+ * clipped to clip (also logical). Shared by draw_svg and the transformed
+ * border quads, hence the extraction. */
 static void fill_polys_nz(eweb_surface_t* s, const eweb_gfx_t* gfx,
                           const litehtml::position& clip,
                           const float* pts, const int* counts, int nsubs,
@@ -389,11 +390,18 @@ static inline int char_width_cache_slot(uint64_t key)
 /* Anti-aliased counterpart of fill_polys_nz: rasterise the subpaths with
  * plutovg (the same FreeType smooth raster EwokOS' libsvg renders SVGs
  * with) into a bbox-sized offscreen surface, then composite the coverage
- * back through gfx->fill_rect, which blends per the HAL contract and
- * honours the current clip. The offscreen pixels are premultiplied, but
- * the paint is one uniform colour, so a pixel's alpha byte IS its
- * coverage and the un-premultiplied source colour for the blend is just
- * `argb`'s rgb - consecutive equal-alpha pixels share one fill_rect. */
+ * back onto the target. The paint is one uniform colour, so a pixel's
+ * alpha byte IS its coverage and the un-premultiplied source colour for
+ * the blend is just `argb`'s rgb.
+ *
+ * HiDPI: rasterising at the LOGICAL bbox size and writing back through
+ * fill_rect (which scales to device pixels) stretches every 1x coverage
+ * pixel into a dpr x dpr block - SVG text/icons came out visibly blurry
+ * on Retina (apple.com's globalnav labels are inline SVG paths). So when
+ * the HAL can hand out a device-resolution temp surface, rasterise at
+ * THAT resolution and composite 1:1 through blit_fit_alpha (src-over,
+ * honours the target clip). The 1x run-length fill_rect path stays for
+ * dpr==1 surfaces and as the fallback when the temp surface is missing. */
 static bool fill_polys_aa(eweb_surface_t* s, const eweb_gfx_t* gfx,
                           const litehtml::position& clip,
                           const float* pts, const int* counts, int nsubs,
@@ -433,6 +441,69 @@ static bool fill_polys_aa(eweb_surface_t* s, const eweb_gfx_t* gfx,
     if ((int64_t)w * h > 4 * 1024 * 1024)
         return false;
 
+    uint32_t rgb = argb & 0xFFFFFFu;
+
+    /* Device-resolution path: surface_new(w, h) backs the logical box with
+     * w*dpr x h*dpr device pixels; rasterise the geometry scaled into that
+     * buffer, then blit it back 1:1 in device space (blit_fit_alpha maps
+     * both rects through each surface's own dpr). */
+    if (gfx->surface_new && gfx->surface_pixels && gfx->surface_free &&
+        gfx->blit_fit_alpha) {
+        eweb_surface_t* tmp = gfx->surface_new(gfx->ud, w, h);
+        if (tmp) {
+            int tw = 0, th = 0;
+            uint32_t* tpx = gfx->surface_pixels(gfx->ud, tmp, &tw, &th);
+            if (tpx && tw > w && th > h && (int64_t)tw * th <= 4 * 1024 * 1024) {
+                float sx = (float)tw / (float)w, sy = (float)th / (float)h;
+                plutovg_surface_t* surf = plutovg_surface_create(tw, th);
+                plutovg_canvas_t* cv = surf ? plutovg_canvas_create(surf) : NULL;
+                if (cv) {
+                    plutovg_canvas_set_fill_rule(cv, PLUTOVG_FILL_RULE_NON_ZERO);
+                    plutovg_canvas_set_rgba(cv,
+                                            (float)((argb >> 16) & 0xFF) / 255.0f,
+                                            (float)((argb >> 8) & 0xFF) / 255.0f,
+                                            (float)(argb & 0xFF) / 255.0f,
+                                            (float)alpha / 255.0f);
+                    plutovg_canvas_new_path(cv);
+                    int base = 0;
+                    for (int sp = 0; sp < nsubs; sp++) {
+                        int n = counts[sp];
+                        if (n >= 3) {
+                            plutovg_canvas_move_to(cv, (pts[base * 2] - (float)x0) * sx,
+                                                   (pts[base * 2 + 1] - (float)y0) * sy);
+                            for (int i = 1; i < n; i++)
+                                plutovg_canvas_line_to(cv, (pts[(base + i) * 2] - (float)x0) * sx,
+                                                       (pts[(base + i) * 2 + 1] - (float)y0) * sy);
+                            plutovg_canvas_close_path(cv);
+                        }
+                        base += n;
+                    }
+                    plutovg_canvas_fill(cv);
+                    /* plutovg output is premultiplied; SDL's BLEND wants
+                     * straight alpha. Uniform paint colour: coverage is the
+                     * alpha byte and the un-premultiplied rgb is `rgb`. */
+                    const uint8_t* px = plutovg_surface_get_data(surf);
+                    int stride = plutovg_surface_get_stride(surf);
+                    for (int y = 0; y < th; y++) {
+                        const uint32_t* row = (const uint32_t*)(px + (size_t)y * stride);
+                        uint32_t* out = tpx + (size_t)y * tw;
+                        for (int x = 0; x < tw; x++)
+                            out[x] = (row[x] & 0xFF000000u) | rgb;
+                    }
+                    gfx->blit_fit_alpha(gfx->ud, tmp, 0, 0, w, h,
+                                        s, x0, y0, w, h, 0xFF);
+                    plutovg_canvas_destroy(cv);
+                    plutovg_surface_destroy(surf);
+                    gfx->surface_free(gfx->ud, tmp);
+                    return true;
+                }
+                if (surf)
+                    plutovg_surface_destroy(surf);
+            }
+            gfx->surface_free(gfx->ud, tmp);
+        }
+    }
+
     plutovg_surface_t* surf = plutovg_surface_create(w, h);
     if (!surf)
         return false;
@@ -465,7 +536,6 @@ static bool fill_polys_aa(eweb_surface_t* s, const eweb_gfx_t* gfx,
 
     const uint8_t* px = plutovg_surface_get_data(surf);
     int stride = plutovg_surface_get_stride(surf);
-    uint32_t rgb = argb & 0xFFFFFFu;
     for (int y = 0; y < h; y++) {
         const uint32_t* row = (const uint32_t*)(px + (size_t)y * stride);
         int run = -1;
