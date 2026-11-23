@@ -217,6 +217,18 @@ static const uint64_t kStyleBudgetIdleMs   = 25;
 static const int      kTaskPoolMax         = 32;
 static const uint32_t kTaskIdleExitMs      = 4000;
 
+/* Download claim priority (higher wins in getTaskLocked). Render-blocking
+ * documents/sheets/scripts/fonts and the images a reader can see must not
+ * queue behind the hundreds of fire-and-forget analytics beacons a page
+ * fires (taobao opens ~600 mmstat connections per visit); under a plain FIFO
+ * claim order those beacons held the majority of the worker pool and starved
+ * visible content, which is what made scrolling feel slow. */
+enum {
+    kTaskPrioLow    = 0,   /* analytics/tracking beacon: run only when idle */
+    kTaskPrioNormal = 1,   /* content image                                   */
+    kTaskPrioHigh   = 2,   /* html / css / script / font-face                 */
+};
+
 /* ------------------------------------------------------------------ */
 /* Download worker payload types                                       */
 /* ------------------------------------------------------------------ */
@@ -226,6 +238,7 @@ struct EWebTask {
     std::string url;
     int         type;
     bool        loading;
+    int         priority = kTaskPrioNormal;
 };
 
 /* A completed fetch. Image tasks carry a bitmap decoded on the worker thread
@@ -260,12 +273,13 @@ enum EWebCmdKind {
     ECMD_INPUT,
     ECMD_KEY,
     ECMD_SET_JS,
+    ECMD_EVAL,
     ECMD_SHUTDOWN,
 };
 
 struct EWebCmd {
     int          kind;   /* EWebCmdKind                                */
-    std::string  url;    /* NAVIGATE target                            */
+    std::string  url;    /* NAVIGATE target / EVAL script body         */
     int          x;      /* RESIZE w / SCROLL x                        */
     int          y;      /* RESIZE h / SCROLL y                        */
     bool         b;      /* SET_JS enabled                             */
@@ -326,6 +340,7 @@ public:
     void        scrollTo(int x, int y);              /* posts ECMD_SCROLL  */
     void        postInput(const eweb_event_t& ev);   /* posts ECMD_INPUT   */
     void        postKey(const eweb_key_event_t& ev); /* posts ECMD_KEY     */
+    void        evalJS(const char* js);              /* posts ECMD_EVAL    */
     /* UI-thread mirror of the visible page's URL (refreshed by EUET_URL). */
     const char* currentUrlUi() const { return m_uiCurrentUrl.c_str(); }
 
@@ -339,12 +354,16 @@ public:
 
     /* ---- EWebContainerHost (engine thread, called from litehtml) ---- */
     virtual bool queueImageTask(const std::string& url) override;
+    virtual bool queueIframeTask(const std::string& url) override;
+    virtual void drawIframe(const std::string& url, litehtml::uint_ptr hdc,
+                            const litehtml::position& pos, const litehtml::position* clip) override;
     virtual void loadCSS(const std::string& url) override;
     virtual void setCSSMedia(const std::string& url, const std::string& media) override;
     virtual void queueNavigation(const std::string& url) override;
     virtual bool buildAbortRequested() const override {
         return m_buildAbort && m_buildPhase != BUILD_IDLE;
     }
+    virtual float getDpr() const override { return m_dpr; }
 
     /* ---- small port accessors ----------------------------------------
      * ticMs: the monotonic millisecond clock (REQUIRED table).
@@ -369,6 +388,10 @@ public:
     void engineLoop();
     void engineStart();
     void engineStop();
+    /* Re-derive m_dpr from the port: a probe surface's device buffer size
+     * (surface_pixels) over its logical size (surface_dims). Runs on resize
+     * so a window moved between 1x/2x displays updates srcset selection. */
+    void engineUpdateDpr();
     void taskLoop();                                 /* one pool worker's body */
     /* Park on m_taskCond (m_taskMutex held on entry AND exit) until a task is
      * claimable, shutdown is raised or timeout_ms elapses; true = a task is
@@ -404,13 +427,25 @@ public:
      * uncached call would re-walk the whole tree per tick on non-skeleton
      * pages. Re-evaluate at most once per kJsSkeletonProbeTtlMs. */
     bool jsSkeletonProbeCached();
+    /* TTL-cached pageHasSkeletonAny(): same walk-cost reasoning as above. A
+     * classic-script CSR shell (jd.com) paints its static chrome (search bar,
+     * category sidebar, footer) at swap, so pageShowsSkeletonPlaceholder() says
+     * "real page"; yet its carousel / recommend / user columns are still
+     * skeleton-named placeholders that only the React bundle at the queue tail
+     * fills. Latching the post-swap skeleton budget on this weaker probe lets
+     * that bundle run - and lets a slow but legitimate anti-bot script ahead of
+     * it (pc-tk.js, ~10 s of software canvas/WebGL fingerprinting on this VM)
+     * finish defining getJsToken instead of being watchdog-cut at 3 s. */
+    bool jsSkeletonAnyProbeCached();
     void drawModuleNotice(eweb_surface_t* cache, int cacheW, int cacheH);
     void clampScrollLocked(int docWidth, int docHeight);
     void postScrollClamp();
     void requestBuildAbort();
 
     bool hasSeenCSS(const std::string& url) const;
+    bool hasLoadedCSS(const std::string& url) const;
     void rememberCSS(const std::string& url);
+    void rememberLoadedCSS(const std::string& url);
     void forgetCSS(const std::string& url);
 
     bool addTask(const EWebTask& task);
@@ -422,6 +457,16 @@ public:
     bool loadHtmlTask(const std::string& url);
     bool loadCSSTask(const std::string& url);
     bool loadImageTask(const std::string& url);
+    bool loadIframeTask(const std::string& url);
+    /* Static <iframe> rendering (engine thread): fetch lands raw HTML in
+     * m_iframeHtml; drawIframe lazily lays out/paints a sub-document into a
+     * cached surface at the frame's laid-out size. */
+    void renderIframeSurface(const std::string& url, int w, int h);
+    void clearIframeCaches();
+    /* Fix22: wheel/key paging inside a rendered sub-document. Returns true when
+     * an iframe under the pointer accepted the offset (browser scroll chaining
+     * lets edges fall through to the ancestors / main document). */
+    bool scrollIframeAt(int cx, int cy, int dy);
     bool loadFontFaceTask(const std::string& url);
     /* Scan raw CSS/HTML text for @font-face blocks and queue a FONT_FACE
      * fetch for every not-yet-seen src url (see ewebview.cc). baseUrl
@@ -444,6 +489,9 @@ public:
     void resetJsVm();
     bool runPageScripts();
     bool runNextPageScript();
+    /* First script that may execute now under the post-swap ordered/async
+     * rules, or m_jsScripts.size() when the queue has no ready candidate. */
+    size_t jsFindReadyPageScript() const;
     /* A <script> spliced into the tree by a DOM mutation (appendChild /
      * insertBefore / replaceChild) must fetch+run like a parser-inserted one:
      * append an ordered slot (external src fetched async, inline body ready)
@@ -523,8 +571,12 @@ public:
      * without this dispatch a CSS chunk never settles and every await on
      * __webpack_require__.e() strands. */
     void jsNoteDynamicStylesheet(const std::string& url, void* link_el);
-    /* Fire "load"/"error" on the tracked <link> for url (if any) and untrack it. */
+    /* Fire "load"/"error" on every tracked <link> for url and untrack them. */
     void jsFireLinkElEvent(const std::string& url, const char* type);
+    /* A sheet already applied before this link was inserted still needs load,
+     * but dispatching inside appendChild would re-enter the DOM mutation. */
+    void jsDeferLinkElEvent(const std::string& url, const char* type);
+    int  jsFlushLinkElEvents();
     /* Record an <img> whose src was set from script (url -> element) so its
      * load/error event can be fired when the image fetch settles. React's
      * preload pattern (new Image(); img.onload=...; img.src=...) parks the
@@ -538,6 +590,22 @@ public:
      * the public EWEB_MOUSE_x / EWEB_BUTTON_x values). Returns false when a
      * listener cancelled it. */
     bool jsDispatchMouseEvent(int mouseState, int button, int cx, int cy);
+    /* Dispatch "wheel" + legacy "mousewheel" at the element under the client
+     * point (lines: notches, positive = content down). Returns false when a
+     * listener cancelled the gesture, so the caller skips the default scroll. */
+    bool jsDispatchWheelEvent(int cx, int cy, int lines);
+    /* Clear a stale Angular 1.x $rootScope.$$phase left behind when an
+     * uncaught error interrupted a $digest mid-run (every later $apply then
+     * throws "inprog" forever). Throttled page-scope sweep between engine
+     * ticks, when no JS is on the stack so any set phase is leaked garbage;
+     * a cheap no-op on pages without the angular global. */
+    void jsRecoverAngularPhase();
+    /* Run an embedder-supplied script in the page's global scope on the
+     * engine thread (ECMD_EVAL). Same between-ticks safety as the phase
+     * sweep: skipped while a VM run is in flight. Results reach the embedder
+     * through the page's console (JSMIRROR) or DOM mutations. */
+    void jsEvalExternal(const std::string& js);
+    void jsMaybeRecoverPage();
     /* Fire a non-cancelable DOM event (focus/blur/focusin/focusout/...) at an
      * element. No-op without a VM. */
     void jsDispatchSimpleEvent(litehtml::element* el, const char* type, bool bubbles);
@@ -574,8 +642,22 @@ public:
     /* Map a hit element to the form control it belongs to (walks up ancestors),
      * or NULL. The pointer is an eweb_el_input* (see eweb_el_input.h). */
     void* widgetAt(litehtml::element* el) const;
-    /* Nearest focusable element at/above `el` (a form widget or an <a href>). */
+    /* Nearest focusable element at/above `el` (a form widget, an <a href>,
+     * or a contenteditable editing host). */
     litehtml::element* focusableAt(litehtml::element* el) const;
+    /* The contenteditable editing host `el` belongs to: the nearest
+     * ancestor-or-self carrying the attribute, unless that says "false". */
+    static litehtml::element* editableHostOf(litehtml::element* el);
+    /* Run one editing command against a focused editing host through the
+     * script-side editing model (see EWebEditingJs.h for the ops). Returns true
+     * when the host's content changed. False (no-op) without a VM. */
+    bool jsEditableCommand(litehtml::element* host, const char* op, const char* text);
+    /* Refresh the contenteditable caret rect from the script-side selection
+     * (hook op "caretrect"); viewport coordinates, valid only while the
+     * focused editable host keeps a collapsed selection. */
+    void jsUpdateCaret();
+    /* Paint the caret bar into the page cache (viewport coords + overscan). */
+    void drawCaret(eweb_surface_t* cache);
     /* The element under the given client coords (viewport-relative), or NULL.
      * Same hit test jsDispatchMouseEvent uses. */
     litehtml::element* hitElementAt(int cx, int cy);
@@ -615,6 +697,7 @@ public:
     static char* jsElGetAttr(void* ctx, void* el, const char* name);
     static void  jsElSetAttr(void* ctx, void* el, const char* name, const char* value);
     static char* jsElGetTag(void* ctx, void* el);
+    static void  jsElGetImageSize(void* ctx, void* el, int* w, int* h);
     static void* jsGetRoot(void* ctx);
     static void* jsGetBody(void* ctx);
     static void* jsGetHead(void* ctx);
@@ -635,7 +718,10 @@ public:
     static void* jsElCloneNode(void* ctx, void* el, int deep);
     static bool  jsElRemoveChild(void* ctx, void* parent, void* child);
     static void  jsElRemoveAttr(void* ctx, void* el, const char* name);
+    static int   jsElGetScriptAsync(void* ctx, void* el);
+    static void  jsElSetScriptAsync(void* ctx, void* el, bool async);
     static void  jsElGetRect(void* ctx, void* el, int* x, int* y, int* w, int* h);
+    static bool  jsElCaretRect(void* ctx, void* el, int offset, int* x, int* y, int* w, int* h);
     static void  jsElTransformRect(void* ctx, void* el, int* x, int* y, int* w, int* h);
     static void  jsElOffsetParentOrigin(void* ctx, void* el, int* x, int* y);
     static void* jsElFromPoint(void* ctx, int x, int y);
@@ -675,12 +761,19 @@ public:
     static char* jsElGetDataset(void* ctx, void* el);
     static char* jsElAttrSnapshot(void* ctx, void* el);
     static void  jsElScrollIntoView(void* ctx, void* el);
+    /* Element-level overflow scrolling (js_dom.h el_scroll_* hooks): live
+     * offset read, clamped write (true = moved, bridge fires "scroll") and
+     * the laid-out content extent behind scrollWidth/scrollHeight. */
+    static void  jsElScrollGet(void* ctx, void* el, int* x, int* y);
+    static bool  jsElScrollSet(void* ctx, void* el, int x, int y);
+    static void  jsElScrollExtent(void* ctx, void* el, int* w, int* h);
 
     /* Web/BOM bridge callbacks (js_web_callbacks_t signatures). */
     static bool  jsWebConfirm(void* ctx, const char* message);
     static char* jsWebPrompt(void* ctx, const char* message, const char* def);
     static void  jsWebGetViewport(void* ctx, int* w, int* h);
     static int   jsWebGetColorScheme(void* ctx);
+    static float jsWebGetDpr(void* ctx);
     static void  jsWebGetScreen(void* ctx, int* w, int* h, int* depth);
     static void  jsWebGetScroll(void* ctx, int* x, int* y);
     static void  jsWebScrollTo(void* ctx, int x, int y);
@@ -752,6 +845,11 @@ public:
     /* ---- Canvas 2D (EWebCanvasGlue.cc) ---- */
     void registerCanvasNatives(struct st_vm* vm);
     EWebCanvas* getOrCreateCanvas(const std::string& id, int w, int h);
+    /* True if `h` is one of the registered EWebCanvas* handles. The canvas
+     * bridge routes both EWebCanvas* and raw eweb_surface_t* (anonymous
+     * ImageData bitmaps) through set_pixel/get_pixel, so the glue must tell
+     * them apart before casting. */
+    bool isJsCanvas(void* h) const;
     void freeCanvases();
     void compositeCanvases(eweb_surface_t* g, int ox, int oy);
     static void* jsCanvasCreate(void* ctx, const char* id, int w, int h);
@@ -817,12 +915,19 @@ public:
     pthread_cond_t              m_taskCond;
     int                         m_clientWidth;
     int                         m_clientHeight;
+    /* Device pixels per logical (CSS) pixel, derived from the frame pool
+     * surfaces (device buffer size / logical size). The port rasterises at
+     * this ratio; media queries, srcset selection and devicePixelRatio all
+     * read it so a Retina display fetches the 2x image candidates. */
+    float                       m_dpr;
 
     std::vector<EWebTask>       m_taskQueue;
     /* Document the download worker judges cookies against (guarded by
      * m_taskMutex; the worker reads it on every fetch). */
     std::string                 m_taskPageUrl;
     std::vector<std::string>    m_seenCssUrls;
+    /* Successfully fetched/applied sheets; seen alone also includes in-flight. */
+    std::vector<std::string>    m_loadedCssUrls;
     /* @font-face bookkeeping (m_taskMutex-guarded): urls already queued or
      * fetched, and url -> CSS family name for in-flight font fetches. */
     std::vector<std::string>    m_seenFontUrls;
@@ -896,6 +1001,13 @@ public:
     bool                        m_cacheValid;
     bool                        m_contentDirty;
     uint64_t                    m_contentDirtySince;
+    /* Wall-clock deadline (ticMs) until which an imminent-timers repaint
+     * defer is overridden because the user just gave input. A click/wheel
+     * must show its visual feedback promptly even while a 0-ms macrotask
+     * chain (wx $digest / React scheduler) is still draining; otherwise the
+     * defer can hold the frame up to kRepaintDeferMaxMs and the gesture feels
+     * dead. Set on ECMD_INPUT; 0 = no recent input. */
+    uint64_t                    m_inputPaintUntil;
     /* True when the visible document's animation timeline has at least one
      * running entry. Set by the engine-loop animation tick; included in the
      * busy check so the loop polls at 4ms instead of parking for 200ms while
@@ -932,11 +1044,19 @@ public:
      * suspends into a dehydrated boundary (rokid #418). Flipped monotonically
      * with m_jsScriptDeferred at the run sites. */
     std::vector<char>           m_jsScriptAsync;
+    /* Dynamic HTMLScriptElement.async state, including the default
+     * force-async=true bit that cannot be represented by the attribute alone.
+     * Entries are erased with their nodes and cleared on document rebuild. */
+    std::map<void*, int>         m_jsScriptAsyncProps;
     /* Import-map specifier->URL pairs parsed from <script type="importmap">.
      * jsModuleResolve consults it for bare specifiers ("react-dom") that have
      * no relative/URL form; github.com ships react/react-dom/scheduler here. */
     std::vector<std::pair<std::string,std::string>> m_jsImportMap;
     std::vector<char>           m_jsScriptDone;
+    /* Parallel to m_jsScripts: whether this slot has already executed. Unlike
+     * m_jsNextScript (the first unfinished document-order slot), this also
+     * tracks ready async scripts that ran while an earlier fetch was pending. */
+    std::vector<char>           m_jsScriptRan;
     /* Parallel to m_jsScripts (kept the same length at every mutation):
      * the litehtml element of a dynamically inserted <script>, nullptr for
      * parser-extracted slots. The ordered run fires "load"/"error" on it so
@@ -950,6 +1070,7 @@ public:
      * fetch settles so Rspack's miniCss chunk loader (link.onload = resolve)
      * can settle its chunk promise. Validate with jsElIsLive before use. */
     std::vector<std::pair<std::string, void*>> m_jsLinkEls;
+    std::vector<std::pair<std::string, std::string>> m_jsDeferredLinkEvents;
     /* url -> element for <img> nodes whose src was set from script (see
      * jsNoteImageEl). The image's load/error event is fired when the fetch
      * settles so a script that parked work on img.onload (React's preload-
@@ -1030,6 +1151,8 @@ public:
     uint64_t                    m_jsRunDeadline;  /* wall clock at which the step hook cuts this run */
     uint64_t                    m_jsSkeletonProbeAt;   /* last jsSkeletonProbeCached() evaluation, 0 = never */
     bool                        m_jsSkeletonProbeVal;  /* cached result of the above */
+    uint64_t                    m_jsSkeletonAnyProbeAt;  /* last jsSkeletonAnyProbeCached() evaluation, 0 = never */
+    bool                        m_jsSkeletonAnyProbeVal; /* cached result of the above */
     uint64_t                    m_jsPrePaintAt;   /* pre-paint phase start (0 = not in it) */
     bool                        m_jsAbortPrePaint; /* last termination was the pre-paint budget */
     bool                        m_jsPrePaintCut;  /* pre-paint phase ended on the budget, not on completion */
@@ -1051,6 +1174,10 @@ public:
     uint32_t                    m_jsEnterGen;
     int                         m_jsAbortCount;
     bool                        m_jsPageDisabled;
+    /* ticMs() when the watchdog disabled the page's JS; user activity after
+     * a short cooldown re-enables it (jsMaybeRecoverPage) so a runaway body
+     * can never leave the page permanently deaf to input/eval. */
+    uint64_t                    m_jsDisabledAt;
     volatile bool               m_buildAbort;
     volatile uint32_t           m_buildAbortGen;
     std::vector<JsMutation>     m_jsMutations;
@@ -1067,6 +1194,12 @@ public:
 
     /* ---- keyboard / focus / form-control interaction (engine thread) ---- */
     void*                       m_focusElement;    /* focused litehtml::element* */
+    /* Contenteditable caret (viewport coords): refreshed on focus/edit/arrow
+     * keys, painted with a 530ms blink while the editable host is focused. */
+    litehtml::position          m_caretRect;
+    bool                        m_caretValid;
+    bool                        m_caretDirty;
+    bool                        m_caretBlinkOn;
     void*                       m_openSelect;      /* eweb_el_input* with its dropdown open */
     bool                        m_rangeDragging;   /* a range slider is being dragged */
     bool                        m_textDragging;    /* a text control selection is being dragged */
@@ -1077,6 +1210,32 @@ public:
 
     /* ---- Canvas 2D registry: one EWebCanvas per live <canvas> id ---- */
     std::vector<EWebCanvas*>    m_jsCanvases;
+
+    /* ---- Static <iframe> renders (Fix20) ---- */
+    struct EWebIframeRender {
+        int                     w;
+        int                     h;
+        int                     scrollY;        /* Fix22: sub-doc vertical offset */
+        int                     paintedScrollY; /* offset the surface currently shows */
+        int                     docH;           /* sub-doc full content height */
+        uint64_t                imgGen;   /* m_iframeImageGen at last paint */
+        eweb_surface_t*         surf;
+        litehtml::context*      ctx;      /* owns the sub-doc's stylesheet set */
+        litehtml::document::ptr doc;
+        EWebIframeRender() : w(0), h(0), scrollY(0), paintedScrollY(0), docH(0),
+            imgGen(0), surf(nullptr), ctx(nullptr) {}
+    };
+    std::unordered_map<std::string, std::string>      m_iframeHtml;
+    std::unordered_map<std::string, EWebIframeRender> m_iframeRenders;
+    /* UA sheet text for sub-documents (lazy copy of the default css). */
+    std::string                 m_iframeUaCss;
+    /* Bumped whenever an image mounts: cached iframe paints re-draw their
+     * sub-document so late-arriving article images appear without re-layout. */
+    uint64_t                    m_iframeImageGen;
+    /* Fix22: last pointer client coords, so key paging can route into the
+     * sub-document under the pointer just like the wheel gesture does. */
+    int                         m_lastClientX;
+    int                         m_lastClientY;
 };
 
 } /* namespace eweb */

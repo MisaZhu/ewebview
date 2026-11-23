@@ -127,22 +127,56 @@ void litehtml::style::parse_property( const tstring& txt, const tchar_t* baseurl
 
 		if(!name.empty() && !val.empty())
 		{
-			string_vector vals;
-			split_string(val, vals, _t("!"));
-			if(vals.size() == 1)
+			/* Only a top-level '!' starts the !important suffix. CDN URLs
+			 * commonly contain '!!' inside an unquoted url(...), and quoted
+			 * strings/data URIs may contain '!' as ordinary value text too. */
+			tstring::size_type bang = tstring::npos;
+			int paren = 0;
+			tchar_t quote = 0;
+			bool escaped = false;
+			for(tstring::size_type i = 0; i < val.length(); i++)
+			{
+				tchar_t c = val[i];
+				if(escaped)
+				{
+					escaped = false;
+					continue;
+				}
+				if(c == _t('\\'))
+				{
+					escaped = true;
+					continue;
+				}
+				if(quote)
+				{
+					if(c == quote) quote = 0;
+					continue;
+				}
+				if(c == _t('"') || c == _t('\''))
+				{
+					quote = c;
+					continue;
+				}
+				if(c == _t('(')) paren++;
+				else if(c == _t(')') && paren > 0) paren--;
+				else if(c == _t('!') && paren == 0)
+				{
+					bang = i;
+					break;
+				}
+			}
+			if(bang == tstring::npos)
 			{
 				add_property(name.c_str(), val.c_str(), baseurl, false);
-			} else if(vals.size() > 1)
+			}
+			else
 			{
-				trim(vals[0]);
-				lcase(vals[1]);
-				if(vals[1] == _t("important"))
-				{
-					add_property(name.c_str(), vals[0].c_str(), baseurl, true);
-				} else
-				{
-					add_property(name.c_str(), vals[0].c_str(), baseurl, false);
-				}
+				tstring main_val = val.substr(0, bang);
+				tstring priority = val.substr(bang + 1);
+				trim(main_val);
+				trim(priority);
+				lcase(priority);
+				add_property(name.c_str(), main_val.c_str(), baseurl, priority == _t("important"));
 			}
 		}
 	}

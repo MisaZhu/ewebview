@@ -158,6 +158,15 @@ typedef struct js_web_callbacks {
     bool  (*http_request_worker)(void* ctx, const char* method, const char* url,
                                  const char* headers, const char* body,
                                  int* status, char** out_body, char** out_headers);
+
+    /* ---- display density ----
+     * Device pixels per CSS pixel (window.devicePixelRatio and the
+     * device-pixel-ratio / resolution matchMedia features). Must agree with
+     * the CSS side's media_features.resolution / 96 or a page that picks
+     * retina assets through matchMedia fetches a different density than its
+     * <img srcset> selection. NULL reports 1.0. Appended last so embedders
+     * that memset the table keep working unchanged. */
+    float (*get_dpr)(void* ctx);
 } js_web_callbacks_t;
 
 /* Zero a callback struct. Handy for embedders that only fill a few hooks. */

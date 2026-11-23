@@ -45,6 +45,7 @@ namespace litehtml
 		virtual const tchar_t*		get_style_property(const tchar_t* name, bool inherited, const tchar_t* def = 0) override;
 		virtual void				parse_styles(bool is_reparse) override;
 		virtual int					get_base_line() override;
+		virtual bool					get_caret_rect(int offset, position& rect) override;
 		virtual void				draw(uint_ptr hdc, int x, int y, const position* clip) override;
 		virtual int					line_height() const override;
 		virtual uint_ptr			get_font(font_metrics* fm = 0) override;

@@ -19,6 +19,24 @@ class eweb_el_input;
 
 namespace eweb {
 
+/* Fetch destination of a plain resource GET. Kept separate from EWebTaskType
+ * so the lightweight container does not depend on the engine's task queue. */
+enum EWebRequestDestination {
+    EWEB_REQUEST_OTHER = 0,
+    EWEB_REQUEST_DOCUMENT,
+    EWEB_REQUEST_SCRIPT,
+    EWEB_REQUEST_STYLE,
+    EWEB_REQUEST_IMAGE,
+    EWEB_REQUEST_FONT,
+};
+
+/* Shared URL policy for resource and XHR/fetch request headers. The origin
+ * normalises scheme/host/default-port; Referer follows the browser default
+ * strict-origin-when-cross-origin policy. */
+std::string ewebRequestOrigin(const std::string& url);
+std::string ewebRequestFetchSite(const std::string& url, const std::string& pageUrl);
+std::string ewebRequestReferrer(const std::string& url, const std::string& pageUrl);
+
 /* The engine-side services a container needs while litehtml parses/lays out a
  * document. Implemented by the ewebview engine; every method runs on the
  * engine thread. */
@@ -27,6 +45,15 @@ public:
     /* Queue an async sub-resource fetch (returns false when the task table is
      * full; the caller then keeps the URL on its retry list). */
     virtual bool queueImageTask(const std::string& url) = 0;
+    /* Queue an <iframe> document fetch (raw HTML, rendered statically).
+     * Default: unsupported - the frame box stays empty. */
+    virtual bool queueIframeTask(const std::string& url) { (void)url; return false; }
+    /* Paint the static iframe render into the frame's content box on the
+     * given device surface. Default: nothing. */
+    virtual void drawIframe(const std::string& url, litehtml::uint_ptr hdc,
+                            const litehtml::position& pos, const litehtml::position* clip) {
+        (void)url; (void)hdc; (void)pos; (void)clip;
+    }
     virtual void loadCSS(const std::string& url) = 0;
     /* Record a <link rel=stylesheet> media attribute against its resolved URL
      * so a sheet whose media never matches can be dropped when it lands. */
@@ -35,6 +62,10 @@ public:
     virtual void queueNavigation(const std::string& url) = 0;
     /* Cross-thread build-abort flag polled by the hottest callbacks. */
     virtual bool buildAbortRequested() const = 0;
+    /* Device pixels per logical (CSS) pixel the port rasterises at (1.0 on a
+     * plain 1x display). Feeds media_features.resolution so srcset density
+     * selection and resolution media queries see the real display. */
+    virtual float getDpr() const { return 1.0f; }
 };
 
 /* A font handle plus the size it was requested at (the HAL font handle itself
@@ -66,6 +97,8 @@ public:
     virtual const litehtml::tchar_t*   get_default_font_name() const override;
     virtual void                       draw_list_marker(litehtml::uint_ptr hdc, const litehtml::list_marker& marker) override;
     virtual void                       load_image(const litehtml::tchar_t* src, const litehtml::tchar_t* baseurl, bool redraw_on_ready) override;
+    virtual void                       load_iframe(const litehtml::tchar_t* src, const litehtml::tchar_t* baseurl, bool redraw_on_ready) override;
+    virtual void                       draw_iframe(litehtml::uint_ptr hdc, const litehtml::tchar_t* src, const litehtml::tchar_t* baseurl, const litehtml::position& pos, const litehtml::position* clip) override;
     virtual void                       get_image_size(const litehtml::tchar_t* src, const litehtml::tchar_t* baseurl, litehtml::size& sz) override;
     virtual void                       draw_background(litehtml::uint_ptr hdc, const litehtml::background_paint& bg) override;
     virtual void                       draw_borders(litehtml::uint_ptr hdc, const litehtml::borders& borders, const litehtml::position& draw_pos, bool root) override;
@@ -124,12 +157,14 @@ public:
      * fetch and `topLevel` marks the main-document navigation itself; together
      * they decide which of the cookie jar's entries may go out on the request
      * (see EWebCookieJar::requestHeader). Both default to "no initiator
-     * known", which counts as same-site. Runs on the download worker thread. */
+     * known", which counts as same-site. `destination` controls the matching
+     * Accept and Fetch Metadata headers. Runs on the download worker thread. */
     static uint8_t*                    loadURL(const eweb_port_t* port,
                                                const std::string& url, int* sz,
                                                const std::string& pageUrl = std::string(),
                                                bool topLevel = false,
-                                               std::string* finalUrl = NULL);
+                                               std::string* finalUrl = NULL,
+                                               EWebRequestDestination destination = EWEB_REQUEST_OTHER);
     static std::string                 normalizeURL(const eweb_port_t* port,
                                                     const std::string& url,
                                                     const std::string& baseurl);

@@ -150,6 +150,11 @@ namespace litehtml
 		css_offsets				m_css_clip_path;
 
 		overflow				m_overflow;
+		/* Live scroll offset of this overflow container (CSS px). Painted
+		 * children shift by -m_scroll_x/y inside the padding-box clip; the
+		 * DOM bridge scrollTop/scrollLeft reads/writes these. */
+		int					m_scroll_x = 0;
+		int					m_scroll_y = 0;
 		visibility				m_visibility;
 		bool					m_pointer_events_none = false;
 		/* Own CSS 'opacity' (0..1, default 1) and the cumulative product with
@@ -275,6 +280,8 @@ namespace litehtml
 		 * those need to tell an auto margin apart from a resolved length. */
 		bool					margin_left_is_auto() const { return m_css_margins.left.is_predefined(); }
 		bool					margin_right_is_auto() const { return m_css_margins.right.is_predefined(); }
+		bool					margin_top_is_auto() const { return m_css_margins.top.is_predefined(); }
+		bool					margin_bottom_is_auto() const { return m_css_margins.bottom.is_predefined(); }
 
 		virtual void				set_attr(const tchar_t* name, const tchar_t* val) override;
 		virtual const tchar_t*		get_attr(const tchar_t* name, const tchar_t* def = 0) override;
@@ -297,6 +304,7 @@ namespace litehtml
 		virtual bool				is_body() const override;
 		virtual bool				is_break() const override;
 		virtual int					get_base_line() override;
+		virtual bool					get_caret_rect(int offset, position& rect) override;
 		virtual bool				on_mouse_over() override;
 		virtual bool				on_mouse_leave() override;
 		virtual bool				on_lbutton_down() override;
@@ -362,11 +370,22 @@ namespace litehtml
 		virtual bool				eweb_self_xform(float m[6]) const override;
 		virtual bool				eweb_transform_bounds(litehtml::position& bb) const override;
 		virtual bool				eweb_sticky_offset(int scroll_y, int view_h, int* dy) const override;
+		/* Element-level scrolling (overflow:auto/scroll): the stored offset
+		 * shifts child painting and hit-testing; the extent is the laid-out
+		 * content reach (never below the padding box). See element.h. */
+		virtual void				eweb_get_scroll(int* x, int* y) const override;
+		virtual bool				eweb_set_scroll(int x, int y) override;
+		virtual void				eweb_scroll_extent(int* w, int* h) const override;
+		void						eweb_clamp_scroll();
+		virtual void				eweb_clamp_scroll_tree() override;
 		virtual bool				eweb_hit_testable() const override {
 			/* EWEB_NOPE=1: diagnostic bypass to A/B whether a live-site hit miss
 			 * is caused by pointer-events filtering at all. */
 			static const bool bypass = getenv("EWEB_NOPE") != nullptr;
-			return bypass ? true : !m_pointer_events_none;
+			/* clip:rect() visually-hidden boxes (WebUploader's invisible file
+			 * input, sr-only spans) paint nothing, so they must not absorb
+			 * clicks/focus either - mirrors the paint-time gate. */
+			return bypass ? true : (!m_pointer_events_none && !css_clip_hides_all(0, 0));
 		}
 
 		virtual const tchar_t*		get_style_property_own(const tchar_t* name) const override;

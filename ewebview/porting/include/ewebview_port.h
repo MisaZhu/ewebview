@@ -41,6 +41,21 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Keep the HTTP identity aligned with js_web.c's navigator defaults.  A port
+ * that advertises a different OS (or appends a custom product token only on
+ * the wire) gives anti-bot code two contradictory browser fingerprints. */
+#if defined(__APPLE__)
+#define EWEB_PORT_HTTP_UA "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
+#define EWEB_PORT_HTTP_UA_PLATFORM "macOS"
+#elif defined(_WIN32)
+#define EWEB_PORT_HTTP_UA "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
+#define EWEB_PORT_HTTP_UA_PLATFORM "Windows"
+#else
+#define EWEB_PORT_HTTP_UA "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
+#define EWEB_PORT_HTTP_UA_PLATFORM "Linux"
+#endif
+#define EWEB_PORT_HTTP_CH_UA "\"Not-A.Brand\";v=\"99\", \"Google Chrome\";v=\"157\", \"Chromium\";v=\"157\""
+
 #ifdef __cplusplus
 extern "C" {
 #endif

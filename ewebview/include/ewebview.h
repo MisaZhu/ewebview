@@ -147,6 +147,7 @@ enum {
     EWEB_TASK_IMAGE,
     EWEB_TASK_SCRIPT,
     EWEB_TASK_FONT_FACE,   /* an @font-face src blob (TTF/OTF/WOFF bytes) */
+    EWEB_TASK_IFRAME,      /* an <iframe> src document (raw HTML, static render) */
 };
 
 /* ------------------------------------------------------------------ */
@@ -280,6 +281,13 @@ void ewebview_post_event(ewebview_t* v, const eweb_event_t* ev);
  * traversal). Send printable characters via SDL_TEXTINPUT-style
  * key==EWEB_KEY_CHAR events and every physical key via its own DOWN/UP. */
 void ewebview_post_key(ewebview_t* v, const eweb_key_event_t* ev);
+
+/* Run a script in the current page's global scope (embedder automation /
+ * diagnostics). Queued to the engine thread and executed between page tasks;
+ * dropped while a page script run is in flight or JS is disabled. Observe
+ * results through the page's console output or DOM state, not a return
+ * value. */
+void ewebview_eval_js(ewebview_t* v, const char* js);
 
 /* Scroll to an absolute document offset (the embedder clamps it to the last
  * known doc geometry first, moves its live offset for an immediate blit-shift,

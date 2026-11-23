@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* EWEB_IMGDBG (release-build image pipeline trace, default off): Pinterest's
  * "More winning ideas" carousel thumbs carry a valid i.pinimg.com/236x src yet
@@ -17,26 +18,155 @@ static bool eweb_imgdbg()
 	return v == 1;
 }
 
-/* Pick one URL from a srcset attribute: an exact 1x candidate wins, then the
- * narrowest w descriptor (this device is a low-density viewport), then the
- * first candidate. Descriptors other than x/w are ignored. */
+/* Parse a srcset/sizes length token ("100vw", "535px", "64em") into CSS px.
+ * Returns false for anything unparseable (calc() etc.): the caller then
+ * falls back to the full viewport width, the spec's default source size. */
 namespace litehtml {
-static tstring pick_srcset_candidate(const tstring& srcset)
+static bool srcset_source_size_px(const tstring& tok, int vw, int vh, int font_px, double& out)
 {
-	tstring first_url;
-	tstring best_url;
-	int best_w = 0;
-	bool have_w = false;
+	tstring s = tok;
+	trim(s);
+	if(s.empty())
+	{
+		return false;
+	}
+	char* end = NULL;
+	double v = t_strtod(s.c_str(), &end);
+	if(end == s.c_str())
+	{
+		return false;
+	}
+	tstring unit = end ? tstring(end) : tstring();
+	trim(unit);
+	if(unit.empty() || unit == _t("px"))
+	{
+		out = v;
+	} else if(unit == _t("vw"))
+	{
+		out = v * (double)vw / 100.0;
+	} else if(unit == _t("vh"))
+	{
+		out = v * (double)vh / 100.0;
+	} else if(unit == _t("em") || unit == _t("rem"))
+	{
+		out = v * (double)font_px;
+	} else
+	{
+		return false;
+	}
+	return out > 0.0;
+}
+
+/* HTML "select an image source": the source size is the first sizes entry
+ * whose media condition matches (a bare length is the unconditional default);
+ * without a sizes attribute it is 100vw. Commas inside calc()/media queries
+ * are protected by a paren depth counter. */
+static int srcset_sizes_width(const tstring& sizes, document* doc, const media_features& mf)
+{
+	int fallback = mf.width > 0 ? mf.width : 0;
+	if(sizes.empty())
+	{
+		return fallback;
+	}
+	int font_px = doc ? doc->container()->get_default_font_size() : 16;
 	size_t i = 0;
+	int depth = 0;
+	size_t start = 0;
+	while(i <= sizes.length())
+	{
+		if(i < sizes.length())
+		{
+			tchar_t c = sizes[i];
+			if(c == _t('(')) depth++;
+			else if(c == _t(')') && depth > 0) depth--;
+			else if(c != _t(',') || depth > 0) { i++; continue; }
+		}
+		tstring entry = sizes.substr(start, i - start);
+		start = i + 1;
+		i++;
+		trim(entry);
+		if(entry.empty())
+		{
+			continue;
+		}
+		/* Split the trailing <source-size-value> off the media condition at
+		 * the last top-level space ("(min-width: 900px) 480px"). */
+		size_t sp = entry.length();
+		int d2 = 0;
+		while(sp > 0)
+		{
+			sp--;
+			tchar_t c = entry[sp];
+			if(c == _t(')')) d2++;
+			else if(c == _t('(') && d2 > 0) d2--;
+			else if((c == _t(' ') || c == _t('\t')) && d2 == 0) break;
+		}
+		tstring cond, val;
+		if(sp > 0 && (entry[sp] == _t(' ') || entry[sp] == _t('\t')))
+		{
+			cond = entry.substr(0, sp);
+			val = entry.substr(sp + 1);
+		} else
+		{
+			val = entry;
+		}
+		trim(cond);
+		trim(val);
+		if(!cond.empty() && doc)
+		{
+			media_query_list::ptr mql = media_query_list::create_from_string(cond, doc);
+			if(!mql)
+			{
+				continue;
+			}
+			mql->apply_media_features(mf);
+			if(!mql->is_used())
+			{
+				continue;
+			}
+		}
+		double px = 0.0;
+		if(srcset_source_size_px(val, mf.width, mf.height, font_px, px))
+		{
+			return (int)(px + 0.5);
+		}
+	}
+	return fallback;
+}
+
+/* Pick one URL from a srcset attribute per the HTML density/width selection
+ * rules at the device's real pixel ratio: x candidates take the smallest
+ * density >= dpr (largest when all are below), w candidates take the smallest
+ * width >= dpr * source-size (largest when all are below). The old picker
+ * pinned 1x / narrowest-w, so a Retina viewport fetched next/image's 640w
+ * hero instead of the 2048w/3840w asset and painted it blurry. */
+static tstring pick_srcset_candidate(const tstring& srcset, const tstring& sizes,
+									 document* doc, const media_features& mf)
+{
+	double dpr = (mf.resolution > 0) ? (double)mf.resolution / 96.0 : 1.0;
+	int source_size = srcset_sizes_width(sizes, doc, mf);
+	double target_w = dpr * (double)source_size;
+
+	tstring first_url;
+	tstring best_x_url, best_w_url;
+	double best_x = 0.0, best_w = 0.0;
+	bool have_x = false, have_w = false;
+	size_t i = 0;
+	int depth = 0;
+	size_t start = 0;
 	while(i <= srcset.length())
 	{
-		size_t comma = srcset.find(_t(','), i);
-		if(comma == tstring::npos)
+		/* data: URLs carry commas - only split at top level. */
+		if(i < srcset.length())
 		{
-			comma = srcset.length();
+			tchar_t c = srcset[i];
+			if(c == _t('(')) depth++;
+			else if(c == _t(')') && depth > 0) depth--;
+			else if(c != _t(',') || depth > 0) { i++; continue; }
 		}
-		tstring cand = srcset.substr(i, comma - i);
-		i = comma + 1;
+		tstring cand = srcset.substr(start, i - start);
+		start = i + 1;
+		i++;
 		trim(cand);
 		if(cand.empty())
 		{
@@ -58,31 +188,73 @@ static tstring pick_srcset_candidate(const tstring& srcset)
 		{
 			first_url = url;
 		}
-		if(desc.empty())
+		double density = 1.0;	/* bare candidate: default 1x */
+		double width = 0.0;
+		bool is_w = false;
+		if(!desc.empty())
 		{
-			return url;	// bare candidate: default 1x
-		}
-		tchar_t last = desc[desc.length() - 1];
-		if(last == _t('x') || last == _t('X'))
-		{
-			if(t_atoi(desc.c_str()) == 1)
+			tchar_t last = desc[desc.length() - 1];
+			if(last == _t('x') || last == _t('X'))
 			{
-				return url;	// exact 1x match
+				density = t_strtod(desc.c_str(), NULL);
+				if(density <= 0.0)
+				{
+					continue;
+				}
+			} else if(last == _t('w') || last == _t('W'))
+			{
+				width = t_strtod(desc.c_str(), NULL);
+				if(width <= 0.0)
+				{
+					continue;
+				}
+				is_w = true;
+			} else
+			{
+				continue;	/* invalid descriptor (h etc.): skip candidate */
 			}
-		} else if(last == _t('w') || last == _t('W'))
+		}
+		if(is_w)
 		{
-			int w = t_atoi(desc.c_str());
-			if(w > 0 && (!have_w || w < best_w))
+			/* Smallest width covering the density-scaled source size; when
+			 * none covers it the largest available wins (spec fallback). */
+			bool covers = width >= target_w;
+			bool best_covers = have_w && best_w >= target_w;
+			if(covers && (!best_covers || width < best_w))
 			{
-				best_w = w;
-				best_url = url;
+				best_w = width;
+				best_w_url = url;
 				have_w = true;
+			} else if(!covers && !best_covers && (!have_w || width > best_w))
+			{
+				best_w = width;
+				best_w_url = url;
+				have_w = true;
+			}
+		} else
+		{
+			bool covers = density >= dpr;
+			bool best_covers = have_x && best_x >= dpr;
+			if(covers && (!best_covers || density < best_x))
+			{
+				best_x = density;
+				best_x_url = url;
+				have_x = true;
+			} else if(!covers && !best_covers && (!have_x || density > best_x))
+			{
+				best_x = density;
+				best_x_url = url;
+				have_x = true;
 			}
 		}
 	}
+	if(have_x)
+	{
+		return best_x_url;
+	}
 	if(have_w)
 	{
-		return best_url;
+		return best_w_url;
 	}
 	return first_url;
 }
@@ -96,6 +268,16 @@ void litehtml::el_image::resolve_effective_src()
 	m_src = get_attr(_t("src"), _t(""));
 	m_srcset = get_attr(_t("srcset"), _t(""));
 
+	document* doc = get_document();
+	media_features mf;
+	memset(&mf, 0, sizeof(mf));
+	mf.type = media_type_screen;
+	mf.resolution = 96;
+	if(doc && doc->container())
+	{
+		doc->container()->get_media_features(mf);
+	}
+
 	/* HTML spec: inside <picture>, the first <source> whose media attribute
 	 * matches the current viewport overrides the <img>'s own srcset/src.
 	 * Skipping this evaluation picks an asset with the wrong intrinsic
@@ -103,12 +285,6 @@ void litehtml::el_image::resolve_effective_src()
 	element::ptr p = parent();
 	if(p && p->get_tagName() && !t_strcasecmp(p->get_tagName(), _t("picture")))
 	{
-		document* doc = get_document();
-		media_features mf;
-		if(doc && doc->container())
-		{
-			doc->container()->get_media_features(mf);
-		}
 		int cnt = (int) p->get_children_count();
 		for(int k = 0; k < cnt; k++)
 		{
@@ -134,7 +310,7 @@ void litehtml::el_image::resolve_effective_src()
 			const tchar_t* ss = ch->get_attr(_t("srcset"));
 			if(ss && ss[0])
 			{
-				tstring cand = pick_srcset_candidate(ss);
+				tstring cand = pick_srcset_candidate(ss, ch->get_attr(_t("sizes"), _t("")), doc, mf);
 				if(!cand.empty())
 				{
 					m_src = cand;
@@ -151,7 +327,7 @@ void litehtml::el_image::resolve_effective_src()
 	}
 	if(!m_srcset.empty())
 	{
-		tstring cand = pick_srcset_candidate(m_srcset);
+		tstring cand = pick_srcset_candidate(m_srcset, get_attr(_t("sizes"), _t("")), doc, mf);
 		if(!cand.empty())
 		{
 			m_src = cand;
@@ -166,6 +342,7 @@ litehtml::el_image::el_image(litehtml::document* doc) : html_tag(doc)
 	m_attr_height = 0;
 	m_resolved_mw = -1;
 	m_resolved_mh = -1;
+	m_resolved_res = -1;
 	m_dbg_logged_loaded = false;
 }
 
@@ -223,17 +400,21 @@ int litehtml::el_image::render( int x, int y, int max_width, bool second_pass )
 	/* <picture>/srcset selection is media-dependent; the first style pass can
 	 * run while the client viewport is still 0x0 (max-height:775px then
 	 * matches and the wrong asset ratio sizes the box). Re-resolve whenever
-	 * the live viewport differs from the snapshot taken at resolve time. */
+	 * the live viewport differs from the snapshot taken at resolve time -
+	 * including the device resolution, since a display change (dpr 1 -> 2)
+	 * flips the srcset density winner without touching the CSS-px viewport. */
 	{
 		document* rdoc = get_document();
 		if(rdoc && rdoc->container())
 		{
 			media_features mf;
 			rdoc->container()->get_media_features(mf);
-			if(mf.width != m_resolved_mw || mf.height != m_resolved_mh)
+			if(mf.width != m_resolved_mw || mf.height != m_resolved_mh ||
+			   mf.resolution != m_resolved_res)
 			{
 				m_resolved_mw = mf.width;
 				m_resolved_mh = mf.height;
+				m_resolved_res = mf.resolution;
 				tstring old_src = m_src;
 				resolve_effective_src();
 				if(m_src != old_src && !m_src.empty())
@@ -452,6 +633,26 @@ void litehtml::el_image::parse_attributes()
 	if(attr_width)
 	{
 		m_attr_width = atoi(attr_width);
+	}
+}
+
+void litehtml::el_image::set_attr( const tchar_t* name, const tchar_t* val )
+{
+	html_tag::set_attr(name, val);
+	if(!name) return;
+	if(t_strcasecmp(name, _t("src")) != 0 && t_strcasecmp(name, _t("srcset")) != 0 &&
+	   t_strcasecmp(name, _t("width")) != 0 && t_strcasecmp(name, _t("height")) != 0)
+		return;
+	/* Refresh the cached effective src from the new attribute bag; render()'s
+	 * viewport-gated resolve would otherwise keep painting the stale src. */
+	tstring old_src = m_src;
+	parse_attributes();
+	resolve_effective_src();
+	document* doc = get_document();
+	if(doc && doc->container() && !m_src.empty() && m_src != old_src)
+	{
+		doc->container()->load_image(m_src.c_str(), 0,
+			!m_css_height.is_predefined() && !m_css_width.is_predefined());
 	}
 }
 

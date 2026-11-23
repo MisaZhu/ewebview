@@ -199,6 +199,35 @@ int litehtml::el_text::get_base_line()
 	return 0;
 }
 
+bool litehtml::el_text::get_caret_rect(int offset, position& rect)
+{
+	/* Insertion point inside this text run: measure the prefix up to the
+	 * DOM offset (UTF-16 code units; a non-BMP code point counts two).
+	 * Each el_text paints one line, so the run's own box gives the row.
+	 * The drawn text honours text-transform, so measure the same string
+	 * draw() uses. */
+	document* doc = get_document();
+	if(!doc || !doc->container()) return false;
+	const tstring& t = m_use_transformed ? m_transformed_text : m_text;
+	int units = 0;
+	size_t bytes = 0;
+	for(const tchar_t* s = t.c_str(); *s; )
+	{
+		if(units >= offset) break;
+		size_t L = utf8_seq_len((unsigned char)*s);
+		units += ((unsigned char)*s >= 0xF0) ? 2 : 1;
+		bytes += L;
+		s += L;
+	}
+	tstring prefix(t.c_str(), bytes);
+	element::ptr el_parent = parent();
+	uint_ptr font = el_parent ? el_parent->get_font() : get_font();
+	rect = get_placement_layout();
+	rect.x += doc->container()->text_width(prefix.c_str(), font);
+	rect.width = 0;
+	return true;
+}
+
 void litehtml::el_text::draw( uint_ptr hdc, int x, int y, const position* clip )
 {
 	if(is_white_space() && !m_draw_spaces)

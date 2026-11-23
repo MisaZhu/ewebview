@@ -8,6 +8,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <time.h>
 
 namespace eweb {
@@ -582,6 +583,7 @@ bool EWebCookieJar::store(const std::string& url, const std::string& header, boo
         if(found >= 0)
             m_cookies.erase(m_cookies.begin() + found);
         pthread_mutex_unlock(&m_mutex);
+        saveToDisk();
         return true;                                /* an expiry in the past deletes */
     }
     if(found >= 0) {
@@ -592,6 +594,7 @@ bool EWebCookieJar::store(const std::string& url, const std::string& header, boo
         m_cookies.push_back(c);
     }
     pthread_mutex_unlock(&m_mutex);
+    saveToDisk();
     return true;
 }
 
@@ -634,6 +637,147 @@ void EWebCookieJar::seedFromHeader(const std::string& url, const std::string& co
             break;
         pos = next + 1;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* optional disk persistence (EWEB_COOKIE_FILE)                       */
+/* ------------------------------------------------------------------ */
+
+void EWebCookieJar::saveToDisk() const
+{
+    const char* cf = getenv("EWEB_COOKIE_FILE");
+    if(cf == NULL || cf[0] == '\0')
+        return;
+
+    /* Netscape cookie-file layout, one TAB-separated row per cookie:
+     *   domain  hostOnlyFlag(FALSE/TRUE inverse)  path  secure  expires  name  value
+     * HttpOnly rows carry the "#HttpOnly_" domain prefix (curl convention).
+     * Session cookies are written with expires=0 and kept on disk: the whole
+     * point of the mirror is that a login survives a process restart. */
+    std::string out = "# Netscape HTTP Cookie File\n";
+    int64_t now = now_ms();
+    pthread_mutex_lock(&m_mutex);
+    for(size_t i = 0; i < m_cookies.size(); i++) {
+        const EWebCookie& c = m_cookies[i];
+        if(c.expiresMs >= 0 && c.expiresMs <= now)
+            continue;
+        if(c.httpOnly)
+            out += "#HttpOnly_";
+        out += c.hostOnly ? c.domain : ("." + c.domain);
+        out += '\t';
+        out += c.hostOnly ? "FALSE" : "TRUE";
+        out += '\t';
+        out += c.path;
+        out += '\t';
+        out += c.secure ? "TRUE" : "FALSE";
+        char num[32];
+        snprintf(num, sizeof(num), "%lld",
+                 (long long)(c.expiresMs < 0 ? 0 : c.expiresMs / 1000));
+        out += '\t';
+        out += num;
+        out += '\t';
+        out += c.name;
+        out += '\t';
+        out += c.value;
+        out += '\n';
+    }
+    pthread_mutex_unlock(&m_mutex);
+
+    /* Atomic replace: a crash mid-write must never leave a truncated jar. */
+    std::string tmp = std::string(cf) + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if(f == NULL)
+        return;
+    fwrite(out.data(), 1, out.size(), f);
+    fclose(f);
+    rename(tmp.c_str(), cf);
+}
+
+bool EWebCookieJar::loadFile(const std::string& url)
+{
+    const char* cf = getenv("EWEB_COOKIE_FILE");
+    if(cf == NULL || cf[0] == '\0')
+        return false;
+    FILE* f = fopen(cf, "rb");
+    if(f == NULL)
+        return false;
+    std::string data;
+    char buf[4096];
+    size_t n;
+    while((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        data.append(buf, n);
+    fclose(f);
+
+    if(data.compare(0, 10, "# Netscape") != 0) {
+        /* Legacy raw "Cookie:" header file: keep the old seeding semantics. */
+        seedFromHeader(url, data);
+        return count() > 0;
+    }
+
+    int64_t now = now_ms();
+    int loaded = 0;
+    size_t pos = 0;
+    while(pos < data.size()) {
+        size_t nl = data.find('\n', pos);
+        std::string line = data.substr(pos, (nl == std::string::npos) ? data.size() - pos
+                                                                       : nl - pos);
+        pos = (nl == std::string::npos) ? data.size() : nl + 1;
+        if(!line.empty() && line[line.size() - 1] == '\r')
+            line.erase(line.size() - 1);
+
+        bool httpOnly = false;
+        if(line.compare(0, 10, "#HttpOnly_") == 0) {
+            httpOnly = true;
+            line = line.substr(10);
+        } else if(line.empty() || line[0] == '#') {
+            continue;
+        }
+
+        /* Seven TAB-separated fields; anything else is not our format. */
+        std::vector<std::string> fld;
+        size_t p = 0;
+        while(fld.size() < 7) {
+            size_t t = line.find('\t', p);
+            if(t == std::string::npos) {
+                fld.push_back(line.substr(p));
+                break;
+            }
+            fld.push_back(line.substr(p, t - p));
+            p = t + 1;
+        }
+        if(fld.size() != 7)
+            continue;
+        const std::string& domain = fld[0];
+        bool hostOnly = (fld[1] == "FALSE");
+        const std::string& path = fld[2];
+        bool secure = (fld[3] == "TRUE");
+        int64_t expires = strtoll(fld[4].c_str(), NULL, 10);
+        if(domain.empty() || fld[5].empty())
+            continue;
+        if(expires > 0 && expires * 1000 <= now)
+            continue;                               /* expired on disk */
+
+        /* Re-enter through store() so every RFC 6265 rule still applies; the
+         * synthetic URL carries the row's own host so host-only rows stay
+         * host-only and Domain rows keep matching subdomains. */
+        std::string u = (secure ? "https://" : "http://") + domain + path;
+        std::string sc = fld[5] + "=" + fld[6] + "; Path=" + path;
+        if(!hostOnly)
+            sc += "; Domain=" + domain;
+        if(secure)
+            sc += "; Secure";
+        if(httpOnly)
+            sc += "; HttpOnly";
+        if(expires > 0) {
+            char ma[48];
+            snprintf(ma, sizeof(ma), "; Max-Age=%lld",
+                     (long long)((expires * 1000 - now) / 1000));
+            sc += ma;
+        }
+        if(store(u, sc, true))
+            loaded++;
+    }
+    return loaded > 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -719,6 +863,7 @@ void EWebCookieJar::clear()
     pthread_mutex_lock(&m_mutex);
     m_cookies.clear();
     pthread_mutex_unlock(&m_mutex);
+    saveToDisk();
 }
 
 size_t EWebCookieJar::count() const

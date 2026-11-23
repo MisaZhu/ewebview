@@ -23,6 +23,7 @@ extern "C" {
 #endif
 
 #include "js_dom.h"
+#include "js_event.h"
 #include "js_natives_priv.h"
 #include <string.h>
 #include <stdio.h>
@@ -677,6 +678,48 @@ static var_t* native_el_get_localName(vm_t* vm, var_t* env, void* data) {
     return adopt_cstr(vm, st->cb.el_get_tag(st->ctx, el));
 }
 
+/* DocumentFragment emulation. jQuery (and most batch-insert code paths) build
+ * a fragment via document.createDocumentFragment(), fill it, then mount it
+ * with a single appendChild/insertBefore; without the API the very first
+ * jQuery init statement throws and every downstream `$`-using bundle aborts
+ * (www.jd.com's home collapsed to its gray skeleton on exactly this). litehtml
+ * has no fragment node type, so a fragment is a DETACHED element carrying a
+ * sentinel tag: nodeType reports 11, and every tree-mutation native splices
+ * the fragment's children into the target in order instead of inserting the
+ * wrapper itself (the DOM-spec behaviour callers rely on). */
+#define JS_FRAG_TAG "#document-fragment"
+
+static int el_is_fragment(js_dom_state* st, js_element_t el) {
+    if(st == NULL || el == NULL || st->cb.el_get_tag == NULL) return 0;
+    char* t = st->cb.el_get_tag(st->ctx, el);
+    if(t == NULL) return 0;
+    int hit = (strcmp(t, JS_FRAG_TAG) == 0);
+    mario_free(t);
+    return hit;
+}
+
+/* Move every child of `frag` into `parent` (before `ref`, or at the end when
+ * ref==NULL); returns the count moved. Always takes child 0 because each move
+ * re-parents it out of the fragment. Bounded against a pathological cycle. */
+static int frag_splice_children(js_dom_state* st, js_element_t parent,
+                                js_element_t frag, js_element_t ref) {
+    int moved = 0;
+    if(st->cb.el_child_count == NULL || st->cb.el_child == NULL) return 0;
+    while(moved < 100000) {
+        if(st->cb.el_child_count(st->ctx, frag) <= 0) break;
+        js_element_t c = st->cb.el_child(st->ctx, frag, 0);
+        if(c == NULL) break;
+        if(st->cb.el_remove_child != NULL) st->cb.el_remove_child(st->ctx, frag, c);
+        if(ref != NULL && st->cb.el_insert_before != NULL)
+            st->cb.el_insert_before(st->ctx, parent, c, ref);
+        else if(st->cb.el_append_child != NULL)
+            st->cb.el_append_child(st->ctx, parent, c);
+        else break;
+        moved++;
+    }
+    return moved;
+}
+
 /* Node.nodeType. React's createRoot/hydrateRoot validate the container with
  * `node.nodeType` (1 element / 3 text / 9 document); without it every wrapper
  * reads undefined and hydration aborts with "Target container is not a DOM
@@ -688,6 +731,8 @@ static var_t* native_el_get_nodeType(vm_t* vm, var_t* env, void* data) {
     if(st == NULL || el == NULL)
         return var_new_int(vm, 1);
     int t;
+    if(el_is_fragment(st, el))
+        return var_new_int(vm, 11); /* DOCUMENT_FRAGMENT_NODE */
     if(st->cb.el_is_comment != NULL && st->cb.el_is_comment(st->ctx, el))
         t = 8; /* COMMENT_NODE */
     else if(st->cb.el_is_tag != NULL && !st->cb.el_is_tag(st->ctx, el))
@@ -1327,6 +1372,15 @@ static int js_add_timer(vm_t* vm, js_dom_state* st, var_t* cb, uint32_t ms, bool
     st->timer_next_id++;
     if(st->timer_next_id <= 0) st->timer_next_id = 1;
     js_timer_t* t = &st->timers[slot];
+    if(getenv("MARIO_TIMERDBG") != NULL && cb != NULL && cb->is_func) {
+        func_t* sf = (func_t*)cb->value;
+        const char* surl = NULL; int sln = 0, scl = 0;
+        int hasloc = (sf != NULL && sf->native == NULL)
+            ? (int)bc_srcmap_locate_v8(&vm->bc, sf->pc, &surl, &sln, &scl) : 0;
+        fprintf(stderr, "[timerdbg] sched id=%d ms=%u repeat=%d micro=%d idle=%d at %s:%d:%d\n",
+            st->timer_next_id, (unsigned)ms, repeat ? 1 : 0, microtask ? 1 : 0, idle ? 1 : 0,
+            hasloc && surl ? surl : "-", sln, scl);
+    }
     t->id           = st->timer_next_id;
     t->cb           = cb;
     t->microtask    = microtask;
@@ -1533,6 +1587,29 @@ static var_t* native_FontFace_load(vm_t* vm, var_t* env, void* data) {
     return (p != NULL) ? p : self;
 }
 
+/* new Audio([src]): HTMLAudioElement. Inert (nothing decodes or plays) but it
+ * must construct: autoplay probes and background-music modules do `new Audio`
+ * at module top level (jd.com webpack 5553 `f=new Audio`), and a missing
+ * global throws "there is no class: 'Audio'" which aborts the whole calling
+ * bundle. The media methods (play/pause/load/addEventListener) arrive from the
+ * Element prototype link installed at registration; the scalar media state
+ * lives here so reads report a paused, empty element. */
+static var_t* native_Audio_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = get_obj(env, THIS);
+    var_t* args = get_func_args(env);
+    node_t* sn = var_array_get(args, 0);
+    if(self == NULL) return NULL;
+    var_add(self, "src", var_new_str(vm, (sn != NULL && sn->var != NULL) ? var_get_str(sn->var) : ""));
+    var_add(self, "currentTime", var_new_int(vm, 0));
+    var_add(self, "duration", var_new_int(vm, 0));
+    var_add(self, "paused", var_new_bool(vm, true));
+    var_add(self, "volume", var_new_int(vm, 1));
+    var_add(self, "muted", var_new_bool(vm, false));
+    var_add(self, "readyState", var_new_int(vm, 0));
+    return NULL;
+}
+
 /* document.fonts: build the singleton once and root it on the bridge var so
  * the GC can not sweep it between script runs. */
 static var_t* native_document_get_fonts(vm_t* vm, var_t* env, void* data) {
@@ -1583,12 +1660,20 @@ static int js_fire_timer(vm_t* vm, js_dom_state* st, int idx) {
         t->cb = NULL;
     }
     if(cb == NULL || !cb->is_func) return 0;
+    func_t* cf = (func_t*)cb->value;
+    int timer_id = t->id;
+    bool microtask = t->microtask;
+    bool slow_dbg = (getenv("MARIO_TIMERSLOW") != NULL);
+    uint64_t cb_start = slow_dbg ? (uint64_t)js_dom_monotonic_ms() : 0;
     if(getenv("MARIO_TIMERDBG") != NULL) {
-        func_t* cf = (func_t*)cb->value;
-        fprintf(stderr, "[timerdbg] fire id=%d cb=%p micro=%d entrypc=%u native=%d scope_top=%d stack_top=%d call_depth=%d\n",
+        const char* turl = NULL; int tln = 0, tcl = 0;
+        int hasloc = (cf != NULL && cf->native == NULL)
+            ? (int)bc_srcmap_locate_v8(&vm->bc, cf->pc, &turl, &tln, &tcl) : 0;
+        fprintf(stderr, "[timerdbg] fire id=%d cb=%p micro=%d entrypc=%u native=%d scope_top=%d stack_top=%d call_depth=%d at %s:%d:%d\n",
             t->id, (void*)cb, t->microtask ? 1 : 0, (unsigned)(cf != NULL ? cf->pc : 0),
             (cf != NULL && cf->native != NULL) ? 1 : 0,
-            (int)vm->scope_stack_top, (int)vm->stack_top, (int)vm->call_depth);
+            (int)vm->scope_stack_top, (int)vm->stack_top, (int)vm->call_depth,
+            hasloc && turl ? turl : "-", tln, tcl);
     }
     var_t* args = var_new_array(vm);
     if(t->idle) {
@@ -1621,6 +1706,14 @@ static int js_fire_timer(vm_t* vm, js_dom_state* st, int idx) {
     if(vm->propagating_err != NULL)
         vm_report_uncaught(vm);
     var_t* r = call_m_func(vm, NULL, cb, args);
+    if(slow_dbg) {
+        uint64_t elapsed = (uint64_t)js_dom_monotonic_ms() - cb_start;
+        if(elapsed >= 50)
+            fprintf(stderr, "[timerslow] id=%d micro=%d entrypc=%u native=%d elapsed=%llu ms\n",
+                timer_id, microtask ? 1 : 0, (unsigned)(cf != NULL ? cf->pc : 0),
+                (cf != NULL && cf->native != NULL) ? 1 : 0,
+                (unsigned long long)elapsed);
+    }
     if(vm->propagating_err != NULL)
         vm_report_uncaught(vm);
     if(r != NULL) var_unref(r);
@@ -1662,17 +1755,30 @@ int js_dom_poll_timers(vm_t* vm, uint64_t now_ms) {
     int iters = 0;
     int n_micro = 0, n_macro = 0;
     const int ITER_CAP = 100000;
+    /* Wall-clock slice cap: a 0-ms self-rearming task chain (wx's $digest /
+     * evalAsync loop) otherwise drains forever inside one poll and starves
+     * the engine loop's command drain (input/eval) and repaint. Browser task
+     * semantics: run due tasks for one slice, leave the rest for the next
+     * loop iteration. Microtask-before-macrotask priority is preserved both
+     * inside the slice and across polls (the scan always picks micro first). */
+    const uint64_t slice_start = js_dom_monotonic_ms();
+    const uint64_t SLICE_MS = 40;
     while(iters++ < ITER_CAP) {
         int due = -1, best = 0;
         for(int i = 0; i < JS_TIMER_MAX; ++i)
             if(st->timers[i].active && st->timers[i].microtask && st->timers[i].remaining_ms <= 0 &&
                (due < 0 || st->timers[i].id < best)) { due = i; best = st->timers[i].id; }
-        if(due >= 0) { fired += js_fire_timer(vm, st, due); n_micro++; continue; }
+        if(due >= 0) {
+            fired += js_fire_timer(vm, st, due); n_micro++;
+            if(js_dom_monotonic_ms() - slice_start >= SLICE_MS) break;
+            continue;
+        }
         due = -1;
         for(int i = 0; i < JS_TIMER_MAX; ++i)
             if(st->timers[i].active && !st->timers[i].microtask && st->timers[i].remaining_ms <= 0) { due = i; break; }
         if(due < 0) break;
         fired += js_fire_timer(vm, st, due); n_macro++;
+        if(js_dom_monotonic_ms() - slice_start >= SLICE_MS) break;
     }
     /* DIAG (temp, MARIO_MTDRAIN): confirm/deny microtask starvation of the
      * macrotask queue. capHit means the drain loop ran to ITER_CAP without
@@ -2022,6 +2128,53 @@ static var_t* native_document_createComment(vm_t* vm, var_t* env, void* data) {
     if(st != NULL && st->cb.create_comment != NULL)
         el = st->cb.create_comment(st->ctx, text);
     mstr_free(s);
+    if(el == NULL) return var_new_null(vm);
+    return wrap_element(vm, el);
+}
+
+/* document.createRange(): jQuery++/rangy feature-detect through
+ * `document.createRange().compareBoundaryPoints`; with no Range the vendor
+ * bundle's module factory aborted once undefined member reads became
+ * Chrome-parity TypeErrors. The engine has no selection model, so Range is a
+ * well-shaped stub: boundary setters no-op, compare reports equal (0). */
+static var_t* native_range_compare(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    return var_new_int(vm, 0);
+}
+static var_t* native_range_clone(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* r = new_obj(vm, "Range", 0);
+    return (r != NULL) ? r : var_new_null(vm);
+}
+static var_t* native_range_noop(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)env; (void)data;
+    return NULL;   /* undefined */
+}
+static var_t* native_range_toString(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    return var_new_str(vm, "");
+}
+static var_t* native_document_createRange(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* r = new_obj(vm, "Range", 0);
+    if(r == NULL) return var_new_null(vm);
+    var_add(r, "collapsed", var_new_bool(vm, 1));
+    var_add(r, "startOffset", var_new_int(vm, 0));
+    var_add(r, "endOffset", var_new_int(vm, 0));
+    var_add(r, "startContainer", var_new_null(vm));
+    var_add(r, "endContainer", var_new_null(vm));
+    var_add(r, "commonAncestorContainer", var_new_null(vm));
+    return r;
+}
+
+/* document.createDocumentFragment(): a detached sentinel-tagged container
+ * (see JS_FRAG_TAG). jQuery's init calls this unconditionally, so its absence
+ * took down every `$`-dependent bundle on jd.com. */
+static var_t* native_document_createDocumentFragment(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = NULL;
+    if(st != NULL && st->cb.create_element != NULL)
+        el = st->cb.create_element(st->ctx, JS_FRAG_TAG);
     if(el == NULL) return var_new_null(vm);
     return wrap_element(vm, el);
 }
@@ -2449,6 +2602,21 @@ static var_t* style_prop_get(vm_t* vm, var_t* env, void* data) {
     if(idx < 0 || idx >= CSS_PROP_COUNT) return var_new_str(vm, "");
     js_dom_state* st = state_from_vm(vm);
     char* v = style_lookup(st, this_handle(env), kCssProps[idx].css);
+    /* Browsers serialise opacity canonically (".5" reads back as "0.5").
+     * jQuery's support probe does cssText="opacity:.5" then compares
+     * style.opacity==="0.5"; a raw ".5" readback flips it onto the IE
+     * filter hook, which this engine ignores - every jQuery .css({opacity:0})
+     * (WebUploader's invisible pick label) then silently never hides. */
+    if(v != NULL && v[0] != 0 && !strcmp(kCssProps[idx].css, "opacity")) {
+        char* endp = NULL;
+        double d = strtod(v, &endp);
+        if(endp != v && endp != NULL && *endp == 0) {
+            char norm[32];
+            snprintf(norm, sizeof(norm), "%.6g", d);
+            mario_free(v);
+            v = js_strdup(norm);
+        }
+    }
     var_t* r = var_new_str(vm, (v != NULL) ? v : "");
     if(v != NULL) mario_free(v);
     return r;
@@ -2733,12 +2901,138 @@ static const bool_prop_t kBoolProps[] = {
 };
 #define BOOL_PROP_COUNT ((int)(sizeof(kBoolProps) / sizeof(kBoolProps[0])))
 
+/* URL decomposition for href-bearing elements (a/link/area). jd.com's
+ * resolveURL() does createElement("a"); a.href=...; then reads protocol /
+ * host / pathname / search / hash off it; with only the raw href reflection
+ * those fields were undefined and the first .charAt/.replace on them aborted
+ * the bundle (home stayed on its gray skeleton). Resolve the (possibly
+ * relative) href against the document URL and split it per the URL spec. */
+enum { URLP_PROTOCOL, URLP_HOST, URLP_HOSTNAME, URLP_PORT,
+       URLP_PATHNAME, URLP_SEARCH, URLP_HASH, URLP_ORIGIN, URLP_COUNT };
+
+static int el_href_bearing(js_dom_state* st, js_element_t el) {
+    if(st == NULL || el == NULL || st->cb.el_get_tag == NULL) return 0;
+    char* t = st->cb.el_get_tag(st->ctx, el);
+    if(t == NULL) return 0;
+    int hit = (strcmp(t, "a") == 0 || strcmp(t, "link") == 0 || strcmp(t, "area") == 0);
+    mario_free(t);
+    return hit;
+}
+
+/* Resolve the (possibly relative) href attribute against the document URL
+ * into `full`. Browsers reflect a.href as the ABSOLUTE resolved URL; Angular's
+ * $sanitize urlResolve() reads exactly that to whitelist relative img srcs -
+ * with the raw relative string wx message images got prefixed "unsafe:" and
+ * never loaded (gray emoji/avatar placeholders). Scheme-bearing URLs
+ * (https:, javascript:, mailto:, data:) are kept verbatim. */
+static void el_href_resolved(js_dom_state* st, js_element_t el, char* full, int fullsz) {
+    full[0] = 0;
+    if(st == NULL || st->cb.el_get_attr == NULL) return;
+    char* href = st->cb.el_get_attr(st->ctx, el, "href");
+    if(href == NULL) return;
+    for(const char* c = href; *c && *c != '/' && *c != '?' && *c != '#'; c++) {
+        if(*c == ':') { snprintf(full, fullsz, "%s", href); mario_free(href); return; }
+    }
+    char base[512]; base[0] = 0;
+    if(st->cb.get_url != NULL) {
+        char* u = st->cb.get_url(st->ctx);
+        if(u != NULL) { snprintf(base, sizeof(base), "%s", u); mario_free(u); }
+    }
+    if(href[0] == '/' && href[1] == '/') {
+        const char* p = strstr(base, "://");
+        if(p != NULL) { int n = (int)(p - base) + 1; if(n > 64) n = 64;
+            snprintf(full, fullsz, "%.*s%s", n, base, href); }
+        else snprintf(full, fullsz, "https:%s", href);
+    } else if(href[0] == '/') {
+        const char* p = strstr(base, "://");
+        if(p != NULL) { const char* q2 = p + 3;
+            while(*q2 && *q2 != '/' && *q2 != '?' && *q2 != '#') q2++;
+            snprintf(full, fullsz, "%.*s%s", (int)(q2 - base), base, href); }
+        else snprintf(full, fullsz, "%s", href);
+    } else if(href[0] == '#' || href[0] == '?') {
+        for(char* c = base; *c; c++) if(*c == '?' || *c == '#') { *c = 0; break; }
+        snprintf(full, fullsz, "%s%s", base, href);
+    } else {
+        for(char* c = base; *c; c++) if(*c == '?' || *c == '#') { *c = 0; break; }
+        char* slash = strrchr(base, '/');
+        if(slash != NULL) { slash[1] = 0; snprintf(full, fullsz, "%s%s", base, href); }
+        else snprintf(full, fullsz, "%s/%s", base, href);
+    }
+    mario_free(href);
+}
+
+static void url_component(js_dom_state* st, js_element_t el, int which,
+                          char* out, int outsz) {
+    out[0] = 0;
+    char full[1024];
+    el_href_resolved(st, el, full, (int)sizeof(full));
+    if(full[0] == 0) return;
+    char* p = strstr(full, "://");
+    const char* auth = (p != NULL) ? p + 3 : full;
+    const char* q = auth;
+    while(*q && *q != '/' && *q != '?' && *q != '#') q++;
+    const char* path_start = q;
+    const char* qs = NULL; const char* hs = NULL;
+    for(const char* r2 = path_start; *r2; r2++) {
+        if(*r2 == '?' && qs == NULL) qs = r2;
+        else if(*r2 == '#') { hs = r2; break; }
+    }
+    const char* path_end = (qs != NULL) ? qs : ((hs != NULL) ? hs : path_start + strlen(path_start));
+    char hostport[300]; int hn = (int)(q - auth); if(hn > 299) hn = 299;
+    memcpy(hostport, auth, (size_t)hn); hostport[hn] = 0;
+    char host_full[300]; snprintf(host_full, sizeof(host_full), "%s", hostport);
+    char hostname[300]; const char* port = "";
+    char* colon = strrchr(hostport, ':');
+    if(colon != NULL) { *colon = 0; snprintf(hostname, sizeof(hostname), "%s", hostport); port = colon + 1; }
+    else snprintf(hostname, sizeof(hostname), "%s", hostport);
+    switch(which) {
+    case URLP_PROTOCOL:
+        if(p != NULL) snprintf(out, outsz, "%.*s:", (int)(p - full), full);
+        break;
+    case URLP_HOST:     snprintf(out, outsz, "%s", host_full); break;
+    case URLP_HOSTNAME: snprintf(out, outsz, "%s", hostname); break;
+    case URLP_PORT:     snprintf(out, outsz, "%s", port); break;
+    case URLP_PATHNAME:
+        if(path_end > path_start) snprintf(out, outsz, "%.*s", (int)(path_end - path_start), path_start);
+        else snprintf(out, outsz, "/");
+        break;
+    case URLP_SEARCH:
+        if(qs != NULL) { const char* e2 = (hs != NULL) ? hs : qs + strlen(qs);
+            snprintf(out, outsz, "%.*s", (int)(e2 - qs), qs); }
+        break;
+    case URLP_HASH:
+        if(hs != NULL) snprintf(out, outsz, "%s", hs);
+        break;
+    case URLP_ORIGIN:
+        if(p != NULL) snprintf(out, outsz, "%.*s%s", (int)(p - full) + 3, full, host_full);
+        break;
+    }
+}
+
+static var_t* url_prop_get(vm_t* vm, var_t* env, void* data) {
+    int which = (int)(intptr_t)data;
+    js_dom_state* st = state_from_vm(vm);
+    js_element_t el = this_handle(env);
+    /* Non href-bearing elements have no URL properties at all in a browser. */
+    if(!el_href_bearing(st, el)) return var_new_null(vm);
+    char out[1024];
+    url_component(st, el, which, out, (int)sizeof(out));
+    return var_new_str(vm, out);
+}
+
 static var_t* attr_prop_get(vm_t* vm, var_t* env, void* data) {
     int idx = (int)(intptr_t)data;
     if(idx < 0 || idx >= ATTR_PROP_COUNT) return var_new_str(vm, "");
     js_dom_state* st = state_from_vm(vm);
     js_element_t el = this_handle(env);
     if(st == NULL || el == NULL || st->cb.el_get_attr == NULL) return var_new_str(vm, "");
+    /* a/link/area .href reflects the resolved absolute URL, not the raw
+     * attribute (HTMLHyperlinkElementUtils); other elements keep raw reflection. */
+    if(strcmp(kAttrProps[idx].attr, "href") == 0 && el_href_bearing(st, el)) {
+        char full[1024];
+        el_href_resolved(st, el, full, (int)sizeof(full));
+        return var_new_str(vm, full);
+    }
     char* v = st->cb.el_get_attr(st->ctx, el, kAttrProps[idx].attr);
     var_t* r = var_new_str(vm, (v != NULL) ? v : "");
     if(v != NULL) mario_free(v);
@@ -2764,6 +3058,54 @@ static var_t* attr_prop_set(vm_t* vm, var_t* env, void* data) {
     st->cb.el_set_attr(st->ctx, el, kAttrProps[idx].attr, v);
     mstr_free(s);
     return NULL;
+}
+
+static bool image_natural_size(var_t* env, js_dom_state* st, int* w, int* h) {
+    *w = 0;
+    *h = 0;
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL || st->cb.el_get_image_size == NULL) return false;
+    st->cb.el_get_image_size(st->ctx, el, w, h);
+    return *w > 0 && *h > 0;
+}
+
+static var_t* native_image_get_complete(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    js_dom_state* st = state_from_vm(vm);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL) return var_new_bool(vm, false);
+    char* src = st->cb.el_get_attr != NULL
+        ? st->cb.el_get_attr(st->ctx, el, "src") : NULL;
+    bool empty = (src == NULL || src[0] == 0);
+    if(src != NULL) mario_free(src);
+    if(empty) return var_new_bool(vm, true);
+    int w, h;
+    return var_new_bool(vm, image_natural_size(env, st, &w, &h));
+}
+
+static var_t* native_image_get_natural_width(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    int w, h;
+    image_natural_size(env, state_from_vm(vm), &w, &h);
+    return var_new_int(vm, w);
+}
+
+static var_t* native_image_get_natural_height(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    int w, h;
+    image_natural_size(env, state_from_vm(vm), &w, &h);
+    return var_new_int(vm, h);
+}
+
+static var_t* native_image_get_current_src(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    js_dom_state* st = state_from_vm(vm);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL || st->cb.el_get_attr == NULL) return var_new_str(vm, "");
+    char* src = st->cb.el_get_attr(st->ctx, el, "src");
+    var_t* out = var_new_str(vm, src != NULL ? src : "");
+    if(src != NULL) mario_free(src);
+    return out;
 }
 
 /* Element.content: for a <template> this is the DocumentFragment holding the
@@ -2906,6 +3248,41 @@ static var_t* bool_prop_set(vm_t* vm, var_t* env, void* data) {
         st->cb.el_remove_attr(st->ctx, el, attr);
     } else if(st->cb.el_set_attr != NULL) {
         st->cb.el_set_attr(st->ctx, el, attr, "false");
+    }
+    return NULL;
+}
+
+/* script.async reflects the attribute for parser-created elements, but a
+ * dynamically-created script also has the HTML "force-async" flag. The host
+ * owns that bit so the insertion hook and the script scheduler observe the
+ * same value as JavaScript. */
+static var_t* script_async_get(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL) return var_new_bool(vm, false);
+    if(st->cb.el_get_script_async != NULL) {
+        int v = st->cb.el_get_script_async(st->ctx, el);
+        if(v >= 0) return var_new_bool(vm, v != 0);
+    }
+    if(st->cb.el_get_attr == NULL) return var_new_bool(vm, false);
+    char* v = st->cb.el_get_attr(st->ctx, el, "async");
+    bool on = (v != NULL);
+    if(v != NULL) mario_free(v);
+    return var_new_bool(vm, on);
+}
+
+static var_t* script_async_set(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL) return NULL;
+    bool on = js_truthy(js_arg(env, 0));
+    if(st->cb.el_set_script_async != NULL)
+        st->cb.el_set_script_async(st->ctx, el, on);
+    if(on) {
+        if(st->cb.el_set_attr != NULL)
+            st->cb.el_set_attr(st->ctx, el, "async", "async");
+    } else if(st->cb.el_remove_attr != NULL) {
+        st->cb.el_remove_attr(st->ctx, el, "async");
     }
     return NULL;
 }
@@ -3110,6 +3487,11 @@ static var_t* native_el_appendChild(vm_t* vm, var_t* env, void* data) {
     js_element_t ch = element_arg(vm, child);
     if(st == NULL || el == NULL || ch == NULL || st->cb.el_append_child == NULL)
         return var_new_null(vm);
+    if(el_is_fragment(st, ch)) {
+        frag_splice_children(st, el, ch, NULL);
+        mo_notify_childlist(vm, st, el, ch, NULL);
+        return (child != NULL) ? child : var_new_null(vm);
+    }
     int appok = st->cb.el_append_child(st->ctx, el, ch);
     /* EWEB_IMGDBG: does the cover-image <img src=1200x/control1> actually get
      * appended into a laid-out parent, and does the append succeed? */
@@ -3150,6 +3532,11 @@ static var_t* native_el_append(vm_t* vm, var_t* env, void* data) {
             mstr_free(tmp);
         }
         if(ch == NULL) continue;
+        if(el_is_fragment(st, ch)) {
+            frag_splice_children(st, el, ch, NULL);
+            mo_notify_childlist(vm, st, el, ch, NULL);
+            continue;
+        }
         int apok = st->cb.el_append_child(st->ctx, el, ch);
         /* EWEB_IMGDBG: cover-image mount via the variadic append() path, which
          * bypasses native_el_appendChild (and thus its probe). */
@@ -3191,6 +3578,11 @@ static var_t* native_el_prepend(vm_t* vm, var_t* env, void* data) {
             mstr_free(tmp);
         }
         if(ch == NULL) continue;
+        if(el_is_fragment(st, ch)) {
+            frag_splice_children(st, el, ch, ref);
+            mo_notify_childlist(vm, st, el, ch, NULL);
+            continue;
+        }
         if(ref == NULL) st->cb.el_append_child(st->ctx, el, ch);
         else            st->cb.el_insert_before(st->ctx, el, ch, ref);
         mo_notify_childlist(vm, st, el, ch, NULL);
@@ -3206,6 +3598,11 @@ static var_t* native_el_insertBefore(vm_t* vm, var_t* env, void* data) {
     js_element_t ref = element_arg(vm, js_arg(env, 1));   /* NULL => append */
     if(st == NULL || el == NULL || ch == NULL || st->cb.el_insert_before == NULL)
         return var_new_null(vm);
+    if(el_is_fragment(st, ch)) {
+        frag_splice_children(st, el, ch, ref);
+        mo_notify_childlist(vm, st, el, ch, NULL);
+        return (child != NULL) ? child : var_new_null(vm);
+    }
     int ibok = st->cb.el_insert_before(st->ctx, el, ch, ref);
     /* EWEB_IMGDBG: same cover-image trace on the insertBefore mount path. */
     {
@@ -3414,6 +3811,14 @@ static var_t* ce_catch(vm_t* vm, var_t* env, void* data);
 static var_t* native_el_media_noop(vm_t* vm, var_t* env, void* data) {
     (void)vm; (void)env; (void)data;
     return NULL;
+}
+
+static var_t* native_el_media_canPlayType(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    /* There is no media decoder behind this DOM surface. The WebIDL return is
+     * still a string: an empty result accurately reports no playable type and
+     * lets capability probes continue instead of throwing on a missing method. */
+    return var_new_str(vm, "");
 }
 
 /* Resolved-promise for play(). Prefer the real Promise.resolve(undefined) so
@@ -3772,6 +4177,25 @@ static var_t* native_el_getBoundingClientRect(vm_t* vm, var_t* env, void* data) 
     return r;
 }
 
+/* Internal caret probe for the embedder's contenteditable caret paint:
+ * el.__ewebCaretRect(offset) -> {x,y,width,height} in layout document
+ * coordinates, or null when the embedder reports no insertion point. */
+static var_t* native_el_caret_rect(vm_t* vm, var_t* env, void* data) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    int off = js_arg_int(env, 0);
+    int x = 0, y = 0, w = 0, h = 0;
+    if(st == NULL || st->cb.el_caret_rect == NULL ||
+       !st->cb.el_caret_rect(st->ctx, el, off, &x, &y, &w, &h))
+        return var_new_null(vm);
+    var_t* r = var_new_obj_no_proto(vm, NULL, NULL);
+    var_add(r, "x",      var_new_float(vm, (float)x));
+    var_add(r, "y",      var_new_float(vm, (float)y));
+    var_add(r, "width",  var_new_float(vm, (float)w));
+    var_add(r, "height", var_new_float(vm, (float)h));
+    return r;
+}
+
 /* The offset/client/scroll size family all comes from the one border box the
  * embedder can report. `data` selects the field:
  * 0=offsetWidth 1=offsetHeight 2=offsetLeft 3=offsetTop
@@ -3831,22 +4255,99 @@ static var_t* geom_get(vm_t* vm, var_t* env, void* data) {
                 st->cb.get_document_size(st->ctx, &dw, &dh);
                 return var_new_int(vm, (which == 6) ? dw : dh);
             }
+            /* Element scroll extent: an overflow container's laid-out
+             * content reach (wx reads scrollHeight to auto-scroll the chat
+             * pane and to detect the bottom of the message list). */
+            if(st != NULL && st->cb.el_scroll_extent != NULL) {
+                int sw = 0, sh = 0;
+                st->cb.el_scroll_extent(st->ctx, el, &sw, &sh);
+                return var_new_int(vm, (which == 6) ? sw : sh);
+            }
             return var_new_int(vm, (which == 6) ? w : h);
         }
         default: return var_new_int(vm, h);
     }
 }
 
-/* Element scrolling: the embedder scrolls the whole page, not individual
- * boxes, so these stay 0 and the setter is a no-op (reading them must not
- * throw, which is what real pages rely on). */
-static var_t* scroll_pos_get(vm_t* vm, var_t* env, void* data) {
-    (void)env; (void)data;
-    return var_new_int(vm, 0);
+/* Element scrolling: overflow:auto/scroll containers carry a live offset in
+ * the embedder (el_scroll_get/set); the scrolling element (html/body) routes
+ * to the whole-document scroll instead. Without the hooks the reads stay 0
+ * and writes no-op (reading them must not throw, which real pages rely on). */
+static var_t* scroll_pos_get_common(vm_t* vm, var_t* env, void* data, int which) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL) return var_new_int(vm, 0);
+    int sx = 0, sy = 0;
+    if(el == doc_node(st, 0) || el == doc_node(st, 2)) {
+        if(st->cb.get_scroll != NULL) st->cb.get_scroll(st->ctx, &sx, &sy);
+    } else if(st->cb.el_scroll_get != NULL) {
+        st->cb.el_scroll_get(st->ctx, el, &sx, &sy);
+    }
+    return var_new_int(vm, (which == 0) ? sy : sx);
 }
-static var_t* scroll_pos_set(vm_t* vm, var_t* env, void* data) {
-    (void)env; (void)data;
+
+/* The "scroll" event fires AFTER the setter returns (a browser queues it as a
+ * task), so a listener reading scrollTop sees the committed value and no JS
+ * re-enters the setter's caller. The element wrapper is kept alive across the
+ * 0-ms hop by an owning ref released in the trampoline. */
+typedef struct { js_element_t el; var_t* elvar; } scroll_ev_t;
+static var_t* native_scroll_ev_fire(vm_t* vm, var_t* env, void* data) {
+    (void)env;
+    scroll_ev_t* d = (scroll_ev_t*)data;
+    if(d == NULL) return NULL;
+    js_element_t el = d->el;
+    var_t* elvar = d->elvar;
+    mario_free(d);
+    if(el != NULL) js_event_dispatch_simple(vm, el, "scroll", false);
+    if(elvar != NULL) var_unref(elvar);
     return NULL;
+}
+static void scroll_queue_event(vm_t* vm, js_element_t el) {
+    var_t* elvar = js_dom_wrap_element(vm, el);
+    if(elvar == NULL) return;
+    scroll_ev_t* d = (scroll_ev_t*)mario_malloc(sizeof(scroll_ev_t));
+    if(d == NULL) { var_unref(elvar); return; }
+    d->el = el;
+    d->elvar = elvar;
+    var_ref(elvar);   /* owning ref across the timer hop */
+    var_t* tr = var_new_native_func(vm, native_scroll_ev_fire, d);
+    int id = js_dom_add_timer(vm, tr, 0, false);
+    if(id == 0) {
+        mario_free(d);
+        var_unref(elvar);
+        var_unref(tr);
+    }
+}
+
+static var_t* scroll_pos_set_common(vm_t* vm, var_t* env, void* data, int which) {
+    js_dom_state* st = state_any(vm, data);
+    js_element_t el = this_handle(env);
+    if(st == NULL || el == NULL) return NULL;
+    int v = js_arg_int(env, 0);
+    int sx = 0, sy = 0;
+    if(el == doc_node(st, 0) || el == doc_node(st, 2)) {
+        if(st->cb.get_scroll != NULL) st->cb.get_scroll(st->ctx, &sx, &sy);
+        if(which == 0) sy = v; else sx = v;
+        if(st->cb.scroll_to != NULL) st->cb.scroll_to(st->ctx, sx, sy);
+        return NULL;
+    }
+    if(st->cb.el_scroll_get != NULL) st->cb.el_scroll_get(st->ctx, el, &sx, &sy);
+    if(which == 0) sy = v; else sx = v;
+    if(st->cb.el_scroll_set != NULL && st->cb.el_scroll_set(st->ctx, el, sx, sy))
+        scroll_queue_event(vm, el);
+    return NULL;
+}
+static var_t* scroll_top_get(vm_t* vm, var_t* env, void* data) {
+    return scroll_pos_get_common(vm, env, data, 0);
+}
+static var_t* scroll_left_get(vm_t* vm, var_t* env, void* data) {
+    return scroll_pos_get_common(vm, env, data, 1);
+}
+static var_t* scroll_top_set(vm_t* vm, var_t* env, void* data) {
+    return scroll_pos_set_common(vm, env, data, 0);
+}
+static var_t* scroll_left_set(vm_t* vm, var_t* env, void* data) {
+    return scroll_pos_set_common(vm, env, data, 1);
 }
 
 static var_t* native_el_focus(vm_t* vm, var_t* env, void* data) {
@@ -4029,6 +4530,59 @@ static var_t* native_document_get_empty_str(vm_t* vm, var_t* env, void* data) {
 static var_t* native_document_get_charset(vm_t* vm, var_t* env, void* data) {
     (void)env; (void)data;
     return var_new_str(vm, "UTF-8");
+}
+
+/* document.domain (HTML "dom-document-domain"): the host of the document's
+ * origin, or a relaxed suffix previously assigned through the setter. Origins
+ * with no host (file:, about:, data:) yield "", exactly as the spec's null
+ * origin host does.
+ *
+ * Anti-bot SDKs derive the cookie Domain attribute from this. JD's setCookie
+ * does   o = document.domain.split(".").slice(-2).join(".")   -> "jd.com"
+ * then   document.cookie = "sdtoken=...;domain=." + o          -> ".jd.com".
+ * Returning "" here makes o "", so the attribute collapses to "domain=.": the
+ * store sees no usable domain, keeps sdtoken host-only on www.jd.com, and it
+ * never domain-matches api.m.jd.com - the sdtoken rides no XHR and every
+ * sensitive endpoint stays 403 with gray skeletons. */
+#define DOC_DOMAIN "@@domain"
+static var_t* native_document_get_domain(vm_t* vm, var_t* env, void* data) {
+    var_t* self = this_from_env(env);
+    /* An explicit relaxation (setter) wins over the URL-derived host. */
+    if(self != NULL) {
+        var_t* ov = get_obj(self, DOC_DOMAIN);
+        if(ov != NULL && ov->type != V_NULL && ov->type != V_UNDEF)
+            return var_new_str(vm, var_get_str(ov));
+    }
+    js_dom_state* st = state_any(vm, data);
+    if(st == NULL || st->cb.get_url == NULL) return var_new_str(vm, "");
+    char* u = st->cb.get_url(st->ctx);
+    if(u == NULL) return var_new_str(vm, "");
+    /* Strip scheme, then everything from the first '/', '?' or '#'; drop any
+     * "userinfo@" prefix and any ":port" suffix to leave the bare host. */
+    const char* p = strstr(u, "://");
+    const char* host = (p != NULL) ? p + 3 : u;
+    const char* end = host;
+    while(*end && *end != '/' && *end != '?' && *end != '#') end++;
+    for(const char* q = host; q < end; q++) if(*q == '@') host = q + 1;
+    for(const char* q = host; q < end; q++) if(*q == ':') { end = q; break; }
+    char buf[300];
+    int n = (int)(end - host); if(n > 299) n = 299; if(n < 0) n = 0;
+    memcpy(buf, host, (size_t)n); buf[n] = 0;
+    mario_free(u);
+    return var_new_str(vm, buf);
+}
+
+static var_t* native_document_set_domain(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = this_from_env(env);
+    var_t* args = get_func_args(env);
+    node_t* n = var_array_get(args, 0);
+    const char* s = (n != NULL) ? var_get_str(n->var) : "";
+    if(self != NULL && s != NULL) {
+        node_t* dn = var_add(self, DOC_DOMAIN, var_new_str(vm, s));
+        if(dn != NULL) { dn->invisable = 1; dn->be_unenumerable = 1; }
+    }
+    return NULL;
 }
 
 /* Element.innerText is treated as an alias of textContent: this engine has no
@@ -5036,6 +5590,17 @@ static var_t* native_image_ctor(vm_t* vm, var_t* env, void* data) {
     return wrap_element(vm, el);
 }
 
+/* `Window()` / `new Window()`: browsers reject direct construction of the
+ * Window interface ("Illegal constructor"). The global `Window` binding exists
+ * so feature detection and environment fingerprinting can REFERENCE it
+ * (`typeof Window`, `Window.toString()`), not so user code can instantiate it,
+ * so the ctor throws exactly like Chrome's. */
+static var_t* native_window_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    vm_throw_type_native(vm, "TypeError", "Illegal constructor");
+    return NULL;
+}
+
 /* ------------------------------------------------------------------ */
 /* customElements                                                      */
 /*                                                                     */
@@ -5700,6 +6265,32 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     vm_reg_native(vm, doc_cls, "createElement(tag)", native_document_createElement, bridge);
     vm_reg_native(vm, doc_cls, "createTextNode(text)", native_document_createTextNode, bridge);
     vm_reg_native(vm, doc_cls, "createComment(text)", native_document_createComment, bridge);
+    /* Range stub class (see native_document_createRange): constants live on
+     * the constructor (window.Range.START_TO_START), methods on instances. */
+    var_t* range_cls = vm_new_class(vm, "Range");
+    var_add(range_cls, "START_TO_START", var_new_int(vm, 0));
+    var_add(range_cls, "START_TO_END", var_new_int(vm, 1));
+    var_add(range_cls, "END_TO_END", var_new_int(vm, 2));
+    var_add(range_cls, "END_TO_START", var_new_int(vm, 3));
+    vm_reg_native(vm, range_cls, "compareBoundaryPoints(how,src)", native_range_compare, bridge);
+    vm_reg_native(vm, range_cls, "cloneRange()", native_range_clone, bridge);
+    vm_reg_native(vm, range_cls, "toString()", native_range_toString, bridge);
+    vm_reg_native(vm, range_cls, "setStart(n,o)", native_range_noop, bridge);
+    vm_reg_native(vm, range_cls, "setEnd(n,o)", native_range_noop, bridge);
+    vm_reg_native(vm, range_cls, "setStartBefore(n)", native_range_noop, bridge);
+    vm_reg_native(vm, range_cls, "setStartAfter(n)", native_range_noop, bridge);
+    vm_reg_native(vm, range_cls, "setEndBefore(n)", native_range_noop, bridge);
+    vm_reg_native(vm, range_cls, "setEndAfter(n)", native_range_noop, bridge);
+    vm_reg_native(vm, range_cls, "selectNode(n)", native_range_noop, bridge);
+    vm_reg_native(vm, range_cls, "selectNodeContents(n)", native_range_noop, bridge);
+    vm_reg_native(vm, range_cls, "collapse(toStart)", native_range_noop, bridge);
+    vm_reg_native(vm, range_cls, "deleteContents()", native_range_noop, bridge);
+    vm_reg_native(vm, range_cls, "extractContents()", native_range_noop, bridge);
+    vm_reg_native(vm, range_cls, "cloneContents()", native_range_noop, bridge);
+    vm_reg_native(vm, range_cls, "surroundContents(n)", native_range_noop, bridge);
+    vm_reg_native(vm, range_cls, "detach()", native_range_noop, bridge);
+    vm_reg_native(vm, doc_cls, "createRange()", native_document_createRange, bridge);
+    vm_reg_native(vm, doc_cls, "createDocumentFragment()", native_document_createDocumentFragment, bridge);
     vm_reg_native(vm, doc_cls, "createElementNS(ns,tag)", native_document_createElementNS, bridge);
     vm_reg_native(vm, doc_cls, "elementFromPoint(x,y)", native_document_elementFromPoint, bridge);
     /* title / body as accessor properties so `document.title` and
@@ -5726,7 +6317,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     /* Node.baseURI: with no <base> support the document URL is the base. */
     reg_accessor(vm, doc_cls, "baseURI", native_document_get_url, NULL, bridge);
     reg_accessor(vm, doc_cls, "readyState", native_document_get_readyState, NULL, bridge);
-    reg_accessor(vm, doc_cls, "domain", native_document_get_empty_str, NULL, bridge);
+    reg_accessor(vm, doc_cls, "domain", native_document_get_domain, native_document_set_domain, bridge);
     reg_accessor(vm, doc_cls, "referrer", native_document_get_empty_str, NULL, bridge);
     reg_accessor(vm, doc_cls, "characterSet", native_document_get_charset, NULL, bridge);
     reg_accessor(vm, doc_cls, "fonts", native_document_get_fonts, NULL, bridge);
@@ -5796,6 +6387,19 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
         var_t* canvas_cls = vm_new_class(vm, "HTMLCanvasElement");
         if(canvas_cls != NULL)
             var_set_prototype(var_get_prototype(canvas_cls), el_proto);
+    }
+    /* Audio / HTMLAudioElement: see native_Audio_ctor. The prototype joins the
+     * Element chain so play()/pause()/load()/addEventListener resolve; without
+     * the global, `new Audio` throws and kills the calling module. */
+    {
+        var_t* audio_cls = vm_new_class(vm, "Audio");
+        if(audio_cls != NULL) {
+            vm_reg_native(vm, audio_cls, "constructor(src)", native_Audio_ctor, bridge);
+            var_set_prototype(var_get_prototype(audio_cls), el_proto);
+        }
+        var_t* haudio_cls = vm_new_class(vm, "HTMLAudioElement");
+        if(haudio_cls != NULL)
+            var_set_prototype(var_get_prototype(haudio_cls), el_proto);
     }
     /* FontFace: see the FontFaceSet note above - constructible and inert, but
      * `new FontFace(...).load()` has to resolve instead of throwing. */
@@ -5878,6 +6482,12 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
         var_set_prototype(var_get_prototype(script_cls), var_get_prototype(htmlel_cls));
         js_acc_cls(vm, script_cls, "src", attr_prop_get, attr_prop_set,
                    (void*)(intptr_t)1); /* kAttrProps: src */
+        /* HTMLScriptElement.text is the script body (textContent alias per
+         * HTML spec). Angular's text/ng-template directive registers inline
+         * templates via `t[0].text`; without it web.wechat.com's 30 inline
+         * <script type="text/ng-template"> islands cached undefined and every
+         * ui.router view fell back to a doomed templateUrl XHR. */
+        js_acc_cls(vm, script_cls, "text", native_el_get_textContent, native_el_set_textContent, bridge);
     }
     var_t* ro_cls = vm_new_class(vm, "ResizeObserver");
     vm_reg_native(vm, ro_cls, "constructor(cb)", native_observer_ctor, bridge);
@@ -5916,9 +6526,21 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     for(int i = 0; i < ATTR_PROP_COUNT; ++i)
         js_acc_cls(vm, el_cls, kAttrProps[i].js, attr_prop_get, attr_prop_set,
                    (void*)(intptr_t)i);
+    {
+        static const char* kUrlProps[URLP_COUNT] = { "protocol", "host",
+            "hostname", "port", "pathname", "search", "hash", "origin" };
+        for(int i = 0; i < URLP_COUNT; ++i)
+            js_acc_cls(vm, el_cls, kUrlProps[i], url_prop_get, NULL,
+                       (void*)(intptr_t)i);
+    }
     for(int i = 0; i < BOOL_PROP_COUNT; ++i)
         js_acc_cls(vm, el_cls, kBoolProps[i].js, bool_prop_get, bool_prop_set,
                    (void*)(intptr_t)i);
+    js_acc_cls(vm, el_cls, "complete", native_image_get_complete, NULL, bridge);
+    js_acc_cls(vm, el_cls, "naturalWidth", native_image_get_natural_width, NULL, bridge);
+    js_acc_cls(vm, el_cls, "naturalHeight", native_image_get_natural_height, NULL, bridge);
+    js_acc_cls(vm, el_cls, "currentSrc", native_image_get_current_src, NULL, bridge);
+    js_acc_cls(vm, el_cls, "async", script_async_get, script_async_set, bridge);
 
     /* `content` is special-cased (template -> DocumentFragment, else the
      * reflected attribute), so it is registered here rather than in kAttrProps. */
@@ -5971,6 +6593,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     vm_reg_native(vm, el_cls, "load()", native_el_media_noop, bridge);
     vm_reg_native(vm, el_cls, "play()", native_el_media_play, bridge);
     vm_reg_native(vm, el_cls, "pause()", native_el_media_noop, bridge);
+    vm_reg_native(vm, el_cls, "canPlayType(type)", native_el_media_canPlayType, bridge);
 
     /* Real DOM hangs the mutation + tree-walking surface off Node.prototype, so
      * EVERY node kind (Document, DocumentFragment, Element, ...) inherits it.
@@ -6032,6 +6655,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
                 vm_reg_native(vm, nc, "load()", native_el_media_noop, bridge);
                 vm_reg_native(vm, nc, "play()", native_el_media_play, bridge);
                 vm_reg_native(vm, nc, "pause()", native_el_media_noop, bridge);
+                vm_reg_native(vm, nc, "canPlayType(type)", native_el_media_canPlayType, bridge);
             }
             /* Query surface: DocumentFragment/HTMLElement support querySelector
              * in the real DOM. A template's `.content` fragment
@@ -6062,6 +6686,7 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
 
     /* Geometry + focus. */
     vm_reg_native(vm, el_cls, "getBoundingClientRect()", native_el_getBoundingClientRect, bridge);
+    vm_reg_native(vm, el_cls, "__ewebCaretRect(offset)", native_el_caret_rect, bridge);
     vm_reg_native(vm, el_cls, "focus()", native_el_focus, bridge);
     vm_reg_native(vm, el_cls, "blur()", native_el_blur, bridge);
     /* Text-control selection surface. */
@@ -6078,8 +6703,8 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
     };
     for(int i = 0; i < (int)(sizeof(kGeomProps) / sizeof(kGeomProps[0])); ++i)
         js_acc_on(vm, el_proto, kGeomProps[i], geom_get, NULL, (void*)(intptr_t)i);
-    js_acc_on(vm, el_proto, "scrollTop", scroll_pos_get, scroll_pos_set, bridge);
-    js_acc_on(vm, el_proto, "scrollLeft", scroll_pos_get, scroll_pos_set, bridge);
+    js_acc_on(vm, el_proto, "scrollTop", scroll_top_get, scroll_top_set, bridge);
+    js_acc_on(vm, el_proto, "scrollLeft", scroll_left_get, scroll_left_set, bridge);
 
     /* CSSStyleDeclaration: element.style. The camelCase accessors share two
      * natives dispatched by their index into kCssProps. */
@@ -6149,10 +6774,43 @@ bool js_register_dom_natives(vm_t* vm, void* ctx, const js_dom_callbacks_t* cb) 
         node_t* wtn = var_add(window, SYMKEY_TOSTRINGTAG, var_new_str(vm, "Window"));
         if(wtn != NULL) { wtn->invisable = 1; wtn->be_unenumerable = 1; }
     }
+    /* Global `Window` interface object. A browser exposes a callable `Window`
+     * on the global scope: `typeof Window === "function"`, `Window.name ===
+     * "Window"`, `Window.prototype` is the interface prototype, and
+     * `Window.toString() === "function Window() { [native code] }"`. jd.com's
+     * h5st signing VMP (js_security_v3 / js-security-v3-rac) fingerprints the
+     * environment by pushing the bare `Window` reference onto its operand
+     * stack (`case 64: j.push(Window)`) and hashing
+     * `TXFCI(Window.toString(),'$') + Window.toString.toString.toString()`.
+     * With no global `Window` binding the VMP opcode threw "'Window'
+     * undefined!", the fingerprint computation failed, and `PSign.sign(...)`
+     * never settled -> colorRequestWithRetry hung at `await PSign.sign`
+     * (case9), never reaching getDeviceFingerprint/makeRequestWithRetry ->
+     * pchome_firstScreenSoa never fired -> the home main area stayed on its
+     * grey skeleton. Register Window exactly like Image: a class
+     * (vm_new_class gives typeof/name/prototype/@@fname) made callable via
+     * var_make_native_func so Function.prototype.toString reports
+     * "[native code]" (browser parity), with a ctor that throws "Illegal
+     * constructor" like Chrome's. */
+    var_t* win_cls = vm_new_class(vm, "Window");
+    vm_reg_native(vm, win_cls, "constructor()", native_window_ctor, bridge);
+    var_make_native_func(vm, win_cls, native_window_ctor, bridge);
     /* window.document / document.defaultView: both directions of the pair
      * pages use to hop between the global and the document. */
     var_add(window, "document", document);
     var_add(document, "defaultView", window);
+    /* document.location / URL / documentURI: jd.com's early loader reads
+     * document.location.href.indexOf("__clsData="); with only window.location
+     * defined the chain yielded a non-string and the script aborted before any
+     * content injection (the home stayed on its gray skeleton). */
+    var_add(document, "location", location);
+    {
+        js_dom_state* lst = state_any(vm, bridge);
+        if(lst != NULL && lst->cb.get_url != NULL) {
+            var_add(document, "URL", adopt_cstr(vm, lst->cb.get_url(lst->ctx)));
+            var_add(document, "documentURI", adopt_cstr(vm, lst->cb.get_url(lst->ctx)));
+        }
+    }
 
     /* customElements: github.com's <react-partial> and friends are SSR'd
      * custom elements whose content only appears once the registry upgrades

@@ -70,16 +70,25 @@ extern "C" {
  * platform substring and navigator.platform from the real OS, and bot
  * detectors cross-check them against other signals. A Linux UA on a macOS
  * build (or a bespoke product token like "MyEwokoBrowser") is an immediate
- * headless/custom-engine tell, so pick the Chrome-shaped string per host. */
+ * headless/custom-engine tell, so pick the Chrome-shaped string per host.
+ * The product token is plain "Chrome/<ver>": the "HeadlessChrome" token is
+ * emitted ONLY by legacy automation-driven headless shells and by no real
+ * (headed or new-headless) Chrome nor Safari, and it directly contradicts
+ * this engine's own navigator.webdriver===false + window.chrome presence -
+ * a self-inconsistency risk SDKs match on. A standard non-automated browser
+ * reports the ordinary Chrome token. */
 #if defined(__APPLE__)
-#define DEFAULT_UA      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+#define DEFAULT_UA      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
 #define DEFAULT_PLATFORM "MacIntel"
+#define DEFAULT_UA_PLATFORM "macOS"
 #elif defined(_WIN32)
-#define DEFAULT_UA      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+#define DEFAULT_UA      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
 #define DEFAULT_PLATFORM "Win32"
+#define DEFAULT_UA_PLATFORM "Windows"
 #else
-#define DEFAULT_UA      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+#define DEFAULT_UA      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
 #define DEFAULT_PLATFORM "Linux x86_64"
+#define DEFAULT_UA_PLATFORM "Linux"
 #endif
 #define DEFAULT_LANG    "en-US"
 
@@ -436,13 +445,8 @@ static var_t* uri_decode(vm_t* vm, var_t* env, bool component) {
             }
             p += 3;
         }
-        else if(p[0] == '+' && component) {
-            /* Only the component decoder treats '+' as a space, matching what
-             * application/x-www-form-urlencoded producers emit. */
-            mstr_add(out, ' ');
-            p += 1;
-        }
         else {
+            /* Unlike form decoding, decodeURIComponent preserves '+'. */
             mstr_add(out, *p);
             p += 1;
         }
@@ -680,17 +684,32 @@ static var_t* si_pending_of(vm_t* vm, var_t* bridge, bool create) {
 static void si_unanchor(vm_t* vm, var_t* bridge, var_t* pair) {
     var_t* pend = si_pending_of(vm, bridge, false);
     if(pend == NULL) return;
+    /* Do not delete an element in place: array storage is keyed by its numeric
+     * index while var_array_add uses the element COUNT as the next key. Removing
+     * [0] from [fired, pending] leaves pending at key 1 with count 1, so the next
+     * setImmediate replaces key 1 and silently drops the still-pending callback.
+     * Its timer later fires with a recycled non-function pair and React's root
+     * retry never runs. Rebuild a compact anchor, as the timer and MessageChannel
+     * roots already do, preserving every callback that has not dispatched. */
+    vm->gc.gc_defer++;
+    var_t* fresh = var_new_array(vm);
     uint32_t sz = var_array_size(pend);
     for(uint32_t i = 0; i < sz; ++i) {
         node_t* nd = var_array_get(pend, (int32_t)i);
-        if(nd != NULL && nd->var == pair) { var_array_del(pend, (int32_t)i); return; }
+        if(nd != NULL && nd->var != NULL && nd->var != pair)
+            var_array_add(fresh, nd->var);
     }
+    node_t* n = var_add(bridge, SI_PENDING, fresh);
+    if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+    vm->gc.gc_defer--;
 }
 
 static var_t* native_si_dispatch(vm_t* vm, var_t* env, void* data) {
     (void)env;
     si_disp_t* d = (si_disp_t*)data;
     if(d == NULL) return NULL;
+    if(getenv("EWEB_TBERRDBG") != NULL)
+        fprintf(stderr, "[SICHED] dispatch enter pair=%p\n", (void*)d->pair);
     var_t* pair = d->pair;
     var_t* bridge = d->bridge;
     mario_free(d);
@@ -703,7 +722,11 @@ static var_t* native_si_dispatch(vm_t* vm, var_t* env, void* data) {
     var_ref(f);
     if(args != NULL) var_ref(args);
     si_unanchor(vm, bridge, pair);   /* pair (and its refs) may die here */
+    if(getenv("EWEB_TBERRDBG") != NULL)
+        fprintf(stderr, "[SICHED] callback before fn=%p\n", (void*)f);
     var_t* r = call_m_func(vm, NULL, f, args);
+    if(getenv("EWEB_TBERRDBG") != NULL)
+        fprintf(stderr, "[SICHED] callback after fn=%p\n", (void*)f);
     if(r != NULL) var_unref(r);
     var_unref(f);
     if(args != NULL) var_unref(args);
@@ -739,6 +762,8 @@ static var_t* native_setImmediate(vm_t* vm, var_t* env, void* data) {
     d->bridge = bridge;
     var_t* tr = var_new_native_func(vm, native_si_dispatch, d);
     int id = js_dom_add_timer(vm, tr, 0, false);
+    if(getenv("EWEB_TBERRDBG") != NULL)
+        fprintf(stderr, "[SICHED] add id=%d fn=%p tr=%p\n", id, (void*)fn, (void*)tr);
     if(id == 0) {
         mario_free(d);
         var_unref(tr);          /* not anchored: release the trampoline */
@@ -1862,12 +1887,12 @@ static void ua_brand_list(vm_t* vm, var_t* arr, const char* ver) {
     vm->gc.gc_defer++;
     for(int i = 0; i < 3; ++i) {
         var_t* b = var_new_obj_no_proto(vm, NULL, NULL);
-        var_add(b, "brand", var_new_str(vm, (i == 1) ? "Chromium" : "Not A(Brand"));
-        /* Chromium's fixed greasing pattern: the minor is "0.0.0" for the
-         * grease entry and "<major>.0.0" for the real ones. */
+        var_add(b, "brand", var_new_str(vm,
+                (i == 0) ? "Not-A.Brand" : ((i == 1) ? "Google Chrome" : "Chromium")));
+        /* Match the current Chrome reference's low-entropy brand list. */
         char v[32];
-        if(i == 1) snprintf(v, sizeof(v), "%s.0.0", ver);
-        else       snprintf(v, sizeof(v), "%d.0.0", (i == 0) ? 8 : 24);
+        if(i != 0) snprintf(v, sizeof(v), "%s.0.0", ver);
+        else       snprintf(v, sizeof(v), "99.0.0");
         var_add(b, "version", var_new_str(vm, v));
         var_array_add(arr, b);
     }
@@ -1881,7 +1906,7 @@ static void ua_major(char* out, size_t cap, const char* ua) {
         p += 7;
         while(*p >= '0' && *p <= '9' && n + 1 < cap) out[n++] = *p++;
     }
-    if(n == 0 && cap >= 4) { out[n++] = '1'; out[n++] = '5'; out[n++] = '2'; }
+    if(n == 0 && cap >= 4) { out[n++] = '1'; out[n++] = '5'; out[n++] = '7'; }
     out[n] = 0;
 }
 
@@ -1903,7 +1928,7 @@ static var_t* nav_ua_values(vm_t* vm, int full) {
     var_add(o, "brands", brands);
     var_add(o, "mobile", var_new_bool(vm, false));
     var_add(o, "platform", var_new_str(vm,
-            (plat != NULL && plat[0] != 0) ? plat : DEFAULT_PLATFORM));
+            (plat != NULL && plat[0] != 0) ? plat : DEFAULT_UA_PLATFORM));
     if(full) {
         var_t* full_list = var_new_array(vm);
         ua_brand_list(vm, full_list, major);
@@ -2079,6 +2104,19 @@ static int web_color_scheme(vm_t* vm) {
     return 1;   /* no hook: light, the CSS-side default */
 }
 
+/* Device pixels per CSS pixel. Must agree with the CSS side
+ * (media_features.resolution / 96): a page that gates retina assets on
+ * matchMedia while its <img srcset> selection reads the media features
+ * would otherwise fetch two different densities. */
+static float web_dpr(vm_t* vm) {
+    js_web_state* st = web_state(vm);
+    if(st != NULL && st->cb.get_dpr != NULL) {
+        float r = st->cb.get_dpr(web_ctx(vm));
+        if(r >= 0.5f && r <= 8.0f) return r;
+    }
+    return 1.0f;   /* no hook: 1 CSS px == 1 device px */
+}
+
 static void web_scroll_pos(vm_t* vm, int* x, int* y) {
     js_web_state* st = web_state(vm);
     *x = 0; *y = 0;
@@ -2106,7 +2144,7 @@ static var_t* win_metric_get(vm_t* vm, var_t* env, void* data) {
     int which = (int)(intptr_t)data;
     switch(which) {
         case 4: case 5: return var_new_int(vm, 0);      /* no window-manager hook */
-        case 10: return var_new_float(vm, 1.0f);        /* 1 CSS px == 1 device px */
+        case 10: return var_new_float(vm, web_dpr(vm)); /* real display density */
         case 11: return var_new_int(vm, 0);             /* no frames, no workers */
         default: break;
     }
@@ -2283,10 +2321,30 @@ static bool mq_cond_match(vm_t* vm, const char* c, int vw, int vh) {
     if(js_ascii_casecmp(name, "height") == 0)     return vh == n;
     if(js_ascii_casecmp(name, "orientation") == 0)
         return (js_ascii_casecmp(val, "landscape") == 0) ? (vw >= vh) : (vh > vw);
-    /* device-pixel-ratio is pinned to 1, so only "1"/"<=1"/">=1" can match. */
-    if(js_ascii_casecmp(name, "device-pixel-ratio") == 0)      return (n == 1);
-    if(js_ascii_casecmp(name, "min-device-pixel-ratio") == 0)  return (1 >= n);
-    if(js_ascii_casecmp(name, "max-device-pixel-ratio") == 0)  return (1 <= n);
+    /* Display density: compare against the real device pixel ratio (the
+     * hook the CSS media features read too), not a pinned 1. Fractional
+     * ratios (1.25/1.5 Windows scaling) need the double, not the int. */
+    {
+        float dpr = web_dpr(vm);
+        if(js_ascii_casecmp(name, "device-pixel-ratio") == 0)      return (dpr == (float)dv);
+        if(js_ascii_casecmp(name, "min-device-pixel-ratio") == 0)  return (dpr >= (float)dv);
+        if(js_ascii_casecmp(name, "max-device-pixel-ratio") == 0)  return (dpr <= (float)dv);
+        if(js_ascii_casecmp(name, "resolution") == 0 ||
+           js_ascii_casecmp(name, "min-resolution") == 0 ||
+           js_ascii_casecmp(name, "max-resolution") == 0) {
+            /* Normalise the query value to dppx: 1dppx == 1x == 96dpi ==
+             * 37.795dpcm, then compare against the device ratio. */
+            double q = dv;
+            if(unit != NULL) {
+                if(js_ascii_casecmp(unit, "dpi") == 0)       q = dv / 96.0;
+                else if(js_ascii_casecmp(unit, "dpcm") == 0) q = dv / 2.54 / 96.0;
+                /* dppx / x / bare number: already dppx */
+            }
+            if(js_ascii_casecmp(name, "resolution") == 0)     return (dpr == (float)q);
+            if(js_ascii_casecmp(name, "min-resolution") == 0) return (dpr >= (float)q);
+            return (dpr <= (float)q);
+        }
+    }
     /* Interaction media features, pinned like litehtml's media_query: the
      * shell is mouse-driven desktop (fine/hover/browser). w3.org gates its
      * advanced stylesheet bootstrap on matchMedia("... (pointer: fine) ...");
@@ -2595,16 +2653,62 @@ static var_t* nav_cred_settle(vm_t* vm, var_t* env, void* data) {
     return (p != NULL) ? p : var_new(vm);
 }
 
+/* ---- XHR EventTarget listener registry ----------------------------
+ * addEventListener callbacks live in a hidden @@listeners array of {type,fn}
+ * records on the instance. web_fire_handler dispatches them right after the
+ * inline on* property, so `xhr.addEventListener("load",f)` fires alongside
+ * `xhr.onload=f`, matching the DOM EventTarget contract. */
+#define XHR_LISTENERS "@@listeners"
+
+static var_t* xhr_listeners(vm_t* vm, var_t* self, bool create) {
+    var_t* arr = get_obj(self, XHR_LISTENERS);
+    if(arr != NULL && arr->is_array) return arr;
+    if(!create) return NULL;
+    vm->gc.gc_defer++;
+    arr = var_new_array(vm);
+    node_t* n = var_add(self, XHR_LISTENERS, arr);
+    if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+    vm->gc.gc_defer--;
+    return arr;
+}
+
+/* Call every listener registered for `type`, passing `ev` (NULL for the
+ * zero-argument inline-handler path). A neutralised record (fn set to null by
+ * removeEventListener) is skipped. */
+static void xhr_dispatch_listeners(vm_t* vm, var_t* self, const char* type, var_t* ev) {
+    var_t* arr = xhr_listeners(vm, self, false);
+    if(arr == NULL) return;
+    int n = (int)var_array_size(arr);
+    for(int i = 0; i < n; ++i) {
+        node_t* nd = var_array_get(arr, i);
+        if(nd == NULL || nd->var == NULL) continue;
+        var_t* tv = get_obj(nd->var, "type");
+        var_t* fv = get_obj(nd->var, "fn");
+        if(fv == NULL || !fv->is_func) continue;
+        const char* ts = (tv != NULL) ? var_get_str(tv) : NULL;
+        if(ts == NULL || strcmp(ts, type) != 0) continue;
+        var_t* args = var_new_array(vm);
+        if(ev != NULL) var_array_add(args, ev);
+        var_t* ret = call_m_func(vm, self, fv, args);
+        var_unref(args);
+        if(ret != NULL) var_unref(ret);
+    }
+}
+
 /* Invoke a zero-argument `on*` handler stored on `self` with `this` bound to
- * it. Same release contract js_event.c uses for listener calls. */
+ * it, then any addEventListener callbacks for the same event type. Same release
+ * contract js_event.c uses for listener calls. */
 static void web_fire_handler(vm_t* vm, var_t* self, const char* prop) {
     if(self == NULL) return;
     var_t* fn = get_obj(self, prop);
-    if(fn == NULL || !fn->is_func) return;
-    var_t* args = var_new_array(vm);
-    var_t* ret = call_m_func(vm, self, fn, args);
-    var_unref(args);
-    if(ret != NULL) var_unref(ret);
+    if(fn != NULL && fn->is_func) {
+        var_t* args = var_new_array(vm);
+        var_t* ret = call_m_func(vm, self, fn, args);
+        var_unref(args);
+        if(ret != NULL) var_unref(ret);
+    }
+    if(prop[0] == 'o' && prop[1] == 'n' && prop[2] != 0)
+        xhr_dispatch_listeners(vm, self, prop + 2, NULL);
 }
 
 static void web_set_int(vm_t* vm, var_t* self, const char* name, int v) {
@@ -2618,16 +2722,316 @@ static void web_set_str(vm_t* vm, var_t* self, const char* name, const char* v) 
 /* ------------------------------------------------------------------ */
 /* XMLHttpRequest                                                     */
 /*                                                                    */
-/* Synchronous by construction: the embedder's http_request hook blocks */
-/* until the response is complete, so send() walks readyState 1 -> 4 in */
-/* one call and fires every event before returning. That is exactly the */
-/* async == false path a browser supports, and it keeps the bridge free */
-/* of a worker thread (there is no JS thread to yield to anyway).       */
+/* The embedder's http_request hook blocks until the response is       */
+/* complete, so the network leg is synchronous. The EVENT dispatch     */
+/* honours open()'s async flag: async==false fires readyState 1->4 and */
+/* every handler inline before send() returns (responseText is usable  */
+/* immediately); async==true (the default) sets the response fields    */
+/* inline but defers the completion events to a 0-ms macrotask, so a   */
+/* page handler wrapped in Angular's $rootScope.$apply runs outside    */
+/* the digest that was active during send() instead of re-entering it  */
+/* ([$rootScope:inprog]). No worker thread is needed either way.       */
 /* ------------------------------------------------------------------ */
 
 #define XHR_METHOD "@@method"
 #define XHR_URL    "@@url"
 #define XHR_READY  "@@readyState"
+#define XHR_ASYNC  "@@async"
+
+/* ---- Standard XMLHttpRequest prototype surface --------------------
+ * A browser exposes ~32 own property names on XMLHttpRequest.prototype: the
+ * WebIDL attributes as accessors, the event handlers, the EventTarget methods
+ * and the readyState constants. Anti-bot SDKs such as JD's h5st xhrProxy walk
+ * them with Object.getOwnPropertyNames() and ABANDON the XHR hook when fewer
+ * than 20 are present (their shouldAbandonHook / PROPS_TOO_FEW guard), which
+ * silently disables all of their response post-processing - including reading
+ * the `x-rp-sdtoken` header off a 403 to set the sdtoken cookie and retry. A
+ * thin prototype therefore leaves the page stuck on 403 with gray skeletons.
+ * Exposing the full standard shape lets the hook install.
+ *
+ * Each attribute is a prototype accessor backed by a hidden @@ field. An
+ * instance that already keeps a live own data property for it (status,
+ * responseText, the on* handlers, ...) simply shadows the accessor, so the
+ * existing request/response path is untouched; attributes with no own property
+ * (timeout, withCredentials, upload) round-trip through the accessor. Invoking
+ * a getter on the prototype itself - which the SDK's `typeof` probe does to
+ * classify each member - reads an absent @@ field and returns the WebIDL
+ * default, so it can never recurse into itself. */
+#define XA_INT  0
+#define XA_STR  1
+#define XA_BOOL 2
+#define XA_OBJ  3
+typedef struct { const char* back; int kind; } xhr_attr_t;
+
+static const xhr_attr_t kXA_status             = {"@@status",             XA_INT};
+static const xhr_attr_t kXA_statusText         = {"@@statusText",         XA_STR};
+static const xhr_attr_t kXA_responseType       = {"@@responseType",       XA_STR};
+static const xhr_attr_t kXA_response           = {"@@response",           XA_STR};
+static const xhr_attr_t kXA_responseText       = {"@@responseText",       XA_STR};
+static const xhr_attr_t kXA_responseXML        = {"@@responseXML",        XA_OBJ};
+static const xhr_attr_t kXA_responseURL        = {"@@responseURL",        XA_STR};
+static const xhr_attr_t kXA_timeout            = {"@@timeout",            XA_INT};
+static const xhr_attr_t kXA_withCredentials    = {"@@withCredentials",    XA_BOOL};
+static const xhr_attr_t kXA_upload             = {"@@upload",             XA_OBJ};
+static const xhr_attr_t kXA_onreadystatechange = {"@@onreadystatechange", XA_OBJ};
+static const xhr_attr_t kXA_onloadstart        = {"@@onloadstart",        XA_OBJ};
+static const xhr_attr_t kXA_onprogress         = {"@@onprogress",         XA_OBJ};
+static const xhr_attr_t kXA_onabort            = {"@@onabort",            XA_OBJ};
+static const xhr_attr_t kXA_onerror            = {"@@onerror",            XA_OBJ};
+static const xhr_attr_t kXA_onload             = {"@@onload",             XA_OBJ};
+static const xhr_attr_t kXA_ontimeout          = {"@@ontimeout",          XA_OBJ};
+static const xhr_attr_t kXA_onloadend          = {"@@onloadend",          XA_OBJ};
+
+static var_t* native_xhr_attr_get(vm_t* vm, var_t* env, void* data) {
+    const xhr_attr_t* d = (const xhr_attr_t*)data;
+    var_t* self = js_this(env);
+    int kind = (d != NULL) ? d->kind : XA_OBJ;
+    var_t* b = (self != NULL && d != NULL && kind != XA_OBJ) ? get_obj(self, d->back) : NULL;
+    switch(kind) {
+        case XA_INT:  return var_new_int(vm, (b != NULL) ? var_get_int(b) : 0);
+        case XA_BOOL: return var_new_bool(vm, (b != NULL) ? var_get_bool(b) : false);
+        case XA_STR:  return var_new_str(vm, (b != NULL) ? var_get_str(b) : "");
+        default:      return var_new_null(vm);   /* object / handler attributes */
+    }
+}
+
+static var_t* native_xhr_attr_set(vm_t* vm, var_t* env, void* data) {
+    const xhr_attr_t* d = (const xhr_attr_t*)data;
+    var_t* self = js_this(env);
+    if(self == NULL || d == NULL || d->kind == XA_OBJ) return NULL;
+    var_t* v = js_arg(env, 0);
+    switch(d->kind) {
+        case XA_INT:
+            web_set_int(vm, self, d->back, (v != NULL) ? var_get_int(v) : 0);
+            break;
+        case XA_BOOL:
+            var_add(self, d->back, var_new_bool(vm, (v != NULL) ? var_get_bool(v) : false));
+            break;
+        case XA_STR: {
+            mstr_t* s = mstr_new("");
+            const char* cs = js_arg_cstr(env, 0, s);
+            web_set_str(vm, self, d->back, (cs != NULL) ? cs : "");
+            mstr_free(s);
+            break;
+        }
+        default: break;
+    }
+    return NULL;
+}
+
+/* EventTarget methods. The DOM bridge owns element listeners; XMLHttpRequest
+ * is not an element, so it keeps the small registry above. */
+static var_t* native_xhr_addEventListener(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    mstr_t* ts = mstr_new("");
+    const char* type = js_arg_cstr(env, 0, ts);
+    var_t* fn = js_arg(env, 1);
+    if(type != NULL && type[0] != 0 && fn != NULL && fn->is_func) {
+        var_t* arr = xhr_listeners(vm, self, true);
+        if(arr != NULL) {
+            vm->gc.gc_defer++;
+            var_t* rec = var_new_obj(vm, NULL, NULL, NULL);
+            var_add(rec, "type", var_new_str(vm, type));
+            var_add(rec, "fn", fn);
+            var_array_add(arr, rec);
+            vm->gc.gc_defer--;
+        }
+    }
+    mstr_free(ts);
+    return NULL;
+}
+
+static var_t* native_xhr_removeEventListener(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    var_t* arr = xhr_listeners(vm, self, false);
+    if(arr == NULL) return NULL;
+    mstr_t* ts = mstr_new("");
+    const char* type = js_arg_cstr(env, 0, ts);
+    var_t* fn = js_arg(env, 1);
+    int n = (int)var_array_size(arr);
+    for(int i = 0; i < n; ++i) {
+        node_t* nd = var_array_get(arr, i);
+        if(nd == NULL || nd->var == NULL) continue;
+        var_t* tv = get_obj(nd->var, "type");
+        var_t* fv = get_obj(nd->var, "fn");
+        const char* tstr = (tv != NULL) ? var_get_str(tv) : NULL;
+        if(tstr != NULL && type != NULL && strcmp(tstr, type) == 0 && fv == fn)
+            var_add(nd->var, "fn", var_new_null(vm));   /* neutralise in place */
+    }
+    mstr_free(ts);
+    return NULL;
+}
+
+static var_t* native_xhr_dispatchEvent(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return var_new_bool(vm, true);
+    var_t* ev = js_arg(env, 0);
+    char type[64]; type[0] = 0;
+    if(ev != NULL) {
+        var_t* tv = get_obj(ev, "type");
+        const char* t = (tv != NULL) ? var_get_str(tv) : NULL;
+        if(t != NULL) snprintf(type, sizeof(type), "%s", t);
+    }
+    if(type[0] != 0) {
+        char onname[72];
+        snprintf(onname, sizeof(onname), "on%s", type);
+        var_t* fn = get_obj(self, onname);
+        if(fn != NULL && fn->is_func) {
+            var_t* args = var_new_array(vm);
+            var_array_add(args, ev);
+            var_t* ret = call_m_func(vm, self, fn, args);
+            var_unref(args);
+            if(ret != NULL) var_unref(ret);
+        }
+        xhr_dispatch_listeners(vm, self, type, ev);
+    }
+    return var_new_bool(vm, true);
+}
+
+/* ---- BroadcastChannel (WHATWG Messaging) ----------------------------
+ * A real same-VM same-origin channel: postMessage() arms a 0-ms task that
+ * dispatches a "message" event (data/origin/lastEventId/source/ports) on
+ * every OTHER open channel with the same name; close() stops delivery and
+ * a postMessage() after close throws InvalidStateError per spec. The
+ * structured clone is approximated by sharing the posted var (the VM is
+ * single-threaded and senders post fresh objects). The EventTarget surface
+ * reuses the XHR listener registry helpers. GitHub's app-runtime runs
+ * `new BroadcastChannel("shared-worker-error").addEventListener("message",
+ * ...)` at module top level: with the old inert placeholder class that call
+ * threw uncaught, aborting the bundle and leaving react-partial lists on
+ * skeleton cards. */
+#define BC_CLOSED   "@@bc_closed"
+#define BC_REGISTRY "@@bc_registry"
+
+static var_t* bc_registry(vm_t* vm, bool create) {
+    var_t* arr = get_obj(vm->root, BC_REGISTRY);
+    if(arr != NULL && arr->is_array) return arr;
+    if(!create) return NULL;
+    vm->gc.gc_defer++;
+    arr = var_new_array(vm);
+    node_t* n = var_add(vm->root, BC_REGISTRY, arr);
+    if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+    vm->gc.gc_defer--;
+    return arr;
+}
+
+static bool bc_is_open(var_t* ch) {
+    var_t* c = (ch != NULL) ? get_obj(ch, BC_CLOSED) : NULL;
+    return !(c != NULL && var_get_bool(c));
+}
+
+typedef struct { var_t* ch; var_t* ev; } bc_disp_t;
+
+/* 0-ms task: fire onmessage + addEventListener("message") on the target
+ * channel, then release the refs the dispatch record took. */
+static var_t* native_bc_deliver(vm_t* vm, var_t* env, void* data) {
+    (void)env;
+    bc_disp_t* d = (bc_disp_t*)data;
+    if(d != NULL) {
+        if(d->ch != NULL && bc_is_open(d->ch)) {
+            var_t* on = get_obj(d->ch, "onmessage");
+            if(on != NULL && on->is_func) {
+                var_t* args = var_new_array(vm);
+                var_array_add(args, d->ev);
+                var_t* ret = call_m_func(vm, d->ch, on, args);
+                var_unref(args);
+                if(ret != NULL) var_unref(ret);
+            }
+            xhr_dispatch_listeners(vm, d->ch, "message", d->ev);
+        }
+        var_unref(d->ev);
+        var_unref(d->ch);
+        mario_free(d);
+    }
+    return NULL;
+}
+
+static var_t* native_bc_ctor(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    mstr_t* ns = mstr_new("");
+    const char* nm = js_arg_cstr(env, 0, ns);
+    var_add(self, "name", var_new_str(vm, (nm != NULL) ? nm : ""));
+    mstr_free(ns);
+    var_add(self, "onmessage", var_new_null(vm));
+    node_t* cn = var_add(self, BC_CLOSED, var_new_bool(vm, false));
+    if(cn != NULL) { cn->invisable = 1; cn->be_unenumerable = 1; }
+    var_t* reg = bc_registry(vm, true);
+    if(reg != NULL) {
+        vm->gc.gc_defer++;
+        var_array_add(reg, self);
+        vm->gc.gc_defer--;
+    }
+    return self;
+}
+
+static var_t* native_bc_postMessage(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    if(!bc_is_open(self)) {
+        vm_throw_type_native(vm, "InvalidStateError",
+                             "BroadcastChannel: postMessage on a closed channel");
+        return NULL;
+    }
+    var_t* msg = js_arg(env, 0);
+    var_t* reg = bc_registry(vm, false);
+    if(reg == NULL) return NULL;
+    var_t* nv = get_obj(self, "name");
+    const char* my = (nv != NULL) ? var_get_str(nv) : "";
+    int n = (int)var_array_size(reg);
+    for(int i = 0; i < n; ++i) {
+        node_t* nd = var_array_get(reg, i);
+        var_t* ch = (nd != NULL) ? nd->var : NULL;
+        if(ch == NULL || ch == self || !bc_is_open(ch)) continue;
+        var_t* cv = get_obj(ch, "name");
+        const char* cn = (cv != NULL) ? var_get_str(cv) : "";
+        if(my == NULL || cn == NULL || strcmp(my, cn) != 0) continue;
+        vm->gc.gc_defer++;
+        var_t* ev = var_new_obj(vm, NULL, NULL, NULL);
+        var_add(ev, "type", var_new_str(vm, "message"));
+        var_add(ev, "data", (msg != NULL) ? msg : var_new_null(vm));
+        var_add(ev, "origin", var_new_str(vm, ""));
+        var_add(ev, "lastEventId", var_new_str(vm, ""));
+        var_add(ev, "source", var_new_null(vm));
+        var_add(ev, "ports", var_new_array(vm));
+        bc_disp_t* d = (bc_disp_t*)mario_malloc(sizeof(bc_disp_t));
+        if(d == NULL) {
+            var_unref(ev);
+            vm->gc.gc_defer--;
+            continue;
+        }
+        var_ref(ch);
+        var_ref(ev);
+        d->ch = ch;
+        d->ev = ev;
+        var_t* tr = var_new_native_func(vm, native_bc_deliver, d);
+        int id = js_dom_add_timer(vm, tr, 0, false);
+        if(id == 0) {   /* timer table full/dead: drop this delivery cleanly */
+            var_unref(tr);
+            var_unref(ch);
+            var_unref(ev);
+            mario_free(d);
+        }
+        vm->gc.gc_defer--;
+    }
+    return NULL;
+}
+
+static var_t* native_bc_close(vm_t* vm, var_t* env, void* data) {
+    (void)vm;
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    var_add(self, BC_CLOSED, var_new_bool(vm, true));
+    return NULL;
+}
 
 /* Case-insensitive "Name: value" lookup inside a "\r\n"-joined header block.
  * Returns a mario_malloc'd copy of the value, or NULL when absent. */
@@ -2692,6 +3096,7 @@ static var_t* native_xhr_ctor(vm_t* vm, var_t* env, void* data) {
     var_add(self, "onabort", var_new_null(vm));
     var_add(self, "ontimeout", var_new_null(vm));
     var_add(self, "onloadstart", var_new_null(vm));
+    var_add(self, "onprogress", var_new_null(vm));
     var_add(self, "onloadend", var_new_null(vm));
     xhr_req_headers(vm, self);
     var_add(self, XHR_RESP_HDRS, var_new_str(vm, ""));
@@ -2726,6 +3131,14 @@ static var_t* native_xhr_open(vm_t* vm, var_t* env, void* data) {
     const char* url    = js_arg_cstr(env, 1, u);
     web_set_str(vm, self, XHR_METHOD, (method[0] != 0) ? method : "GET");
     web_set_str(vm, self, XHR_URL, url);
+    /* open(method, url, async): the third arg defaults to true. Record it so
+     * send() knows whether to defer the completion events (async) or fire them
+     * inline (sync). */
+    var_t* av = (js_arg_count(env) > 2) ? js_arg(env, 2) : NULL;
+    bool is_async = (av == NULL || av->type == V_UNDEF || av->type == V_NULL)
+                    ? true : var_get_bool(av);
+    node_t* an = var_add(self, XHR_ASYNC, var_new_bool(vm, is_async));
+    if(an != NULL) { an->invisable = 1; an->be_unenumerable = 1; }
     /* open() discards the previous response and any pending request headers. */
     web_set_int(vm, self, "status", 0);
     web_set_str(vm, self, "statusText", "");
@@ -2738,6 +3151,38 @@ static var_t* native_xhr_open(vm_t* vm, var_t* env, void* data) {
     xhr_set_ready(vm, self, 1);
     mstr_free(u);
     mstr_free(m);
+    return NULL;
+}
+
+/* Completion event sequence shared by the synchronous and deferred paths:
+ * walk readyState to DONE, fire onload (or onerror for a network failure),
+ * then onloadend. Each readyState transition fires onreadystatechange. */
+static void xhr_fire_completion(vm_t* vm, var_t* self, bool ok) {
+    if(ok) {
+        xhr_set_ready(vm, self, 2);
+        xhr_set_ready(vm, self, 3);
+        xhr_set_ready(vm, self, 4);
+        web_fire_handler(vm, self, "onload");
+    } else {
+        xhr_set_ready(vm, self, 4);
+        web_fire_handler(vm, self, "onerror");
+    }
+    web_fire_handler(vm, self, "onloadend");
+}
+
+/* Deferred async-XHR completion record. Holds a ref on the instance so it
+ * survives until the 0-ms task fires even if the page dropped its reference;
+ * mirrors the BroadcastChannel delivery record (native_bc_deliver). */
+typedef struct { var_t* self; bool ok; } xhr_disp_t;
+
+static var_t* native_xhr_deliver(vm_t* vm, var_t* env, void* data) {
+    (void)env;
+    xhr_disp_t* d = (xhr_disp_t*)data;
+    if(d == NULL) return NULL;
+    if(d->self != NULL)
+        xhr_fire_completion(vm, d->self, d->ok);
+    var_unref(d->self);
+    mario_free(d);
     return NULL;
 }
 
@@ -2824,6 +3269,11 @@ static var_t* native_xhr_abort(vm_t* vm, var_t* env, void* data) {
     return NULL;
 }
 
+/* Defined after the fetch worker machinery below (C declaration order). */
+static bool xhr_spawn_async(vm_t* vm, var_t* self, js_web_state* st,
+                            const char* method, const char* url,
+                            const char* hdrs, const char* body);
+
 static var_t* native_xhr_send(vm_t* vm, var_t* env, void* data) {
     (void)data;
     js_web_state* st = web_state(vm);
@@ -2867,6 +3317,24 @@ static var_t* native_xhr_send(vm_t* vm, var_t* env, void* data) {
     web_fire_handler(vm, self, "onloadstart");
     xhr_set_ready(vm, self, 1);
 
+    /* Async XHR: run the blocking network leg on a fetch worker thread so the
+     * engine loop keeps draining input/eval commands while wx's CGI chain
+     * (webwxinit / batchgetcontact / synccheck long-poll) is in flight. The
+     * old inline http_request hook blocked the engine thread for every RTT -
+     * profiler samples showed ~92% of the busy time inside recvfrom under
+     * jsPollTimers, which starved clicks/wheel of any feedback and stretched
+     * the contact-list load. MARIO_XHR_SYNC=1 restores the blocking path for
+     * A/B. Completion is delivered by js_web_fetch_poll on the VM thread. */
+    var_t* asv = get_obj(self, XHR_ASYNC);
+    bool is_async = (asv == NULL) ? true : var_get_bool(asv);
+    if(is_async && getenv("MARIO_XHR_SYNC") == NULL &&
+       xhr_spawn_async(vm, self, st, method, url,
+                       (hdrs->len > 0) ? hdrs->cstr : NULL, bs)) {
+        mstr_free(body);
+        mstr_free(hdrs);
+        return NULL;
+    }
+
     int status = 0;
     char* out_body = NULL;
     char* out_hdrs = NULL;
@@ -2899,10 +3367,6 @@ static var_t* native_xhr_send(vm_t* vm, var_t* env, void* data) {
         web_set_str(vm, self, "responseText", (out_body != NULL) ? out_body : "");
         web_set_str(vm, self, "response",     (out_body != NULL) ? out_body : "");
         web_set_str(vm, self, "responseURL", url);
-        xhr_set_ready(vm, self, 2);
-        xhr_set_ready(vm, self, 3);
-        xhr_set_ready(vm, self, 4);
-        web_fire_handler(vm, self, "onload");
     }
     else {
         /* Failed request: readyState 4 with status 0, per the XHR spec. */
@@ -2911,10 +3375,37 @@ static var_t* native_xhr_send(vm_t* vm, var_t* env, void* data) {
         web_set_str(vm, self, "statusText", "");
         web_set_str(vm, self, "responseText", "");
         web_set_str(vm, self, "response", "");
-        xhr_set_ready(vm, self, 4);
-        web_fire_handler(vm, self, "onerror");
     }
-    web_fire_handler(vm, self, "onloadend");
+
+    /* Async XHR defers the completion events to a 0-ms macrotask so the page's
+     * handler runs outside any $digest active during send(). Firing inline (the
+     * old behaviour) made Angular $http's $apply-wrapped onload re-enter the
+     * digest -> [$rootScope:inprog] uncaught, which halted webwxinit and left
+     * the chat/contact list on Loading forever. Sync XHR (async==false) keeps
+     * the inline fire. If the timer table is full/dead, fall back to inline so
+     * the response is never silently lost. */
+    bool deferred = false;
+    if(is_async) {
+        xhr_disp_t* d = (xhr_disp_t*)mario_malloc(sizeof(xhr_disp_t));
+        if(d != NULL) {
+            vm->gc.gc_defer++;
+            var_ref(self);
+            d->self = self;
+            d->ok   = ok;
+            var_t* tr = var_new_native_func(vm, native_xhr_deliver, d);
+            int id = js_dom_add_timer(vm, tr, 0, false);
+            if(id != 0) {
+                deferred = true;
+            } else {
+                var_unref(tr);
+                var_unref(self);
+                mario_free(d);
+            }
+            vm->gc.gc_defer--;
+        }
+    }
+    if(!deferred)
+        xhr_fire_completion(vm, self, ok);
 
     if(out_body != NULL) mario_free(out_body);
     if(out_hdrs != NULL) mario_free(out_hdrs);
@@ -3142,6 +3633,11 @@ typedef struct fetch_job {
     /* Promise settlement handles (owned refs, VM-thread only) */
     var_t*  resolve;
     var_t*  reject;
+    /* Async-XHR instance (owned ref, VM-thread only). Non-NULL marks a job
+     * spawned by xhr_spawn_async: poll delivers the response + fires the
+     * completion events instead of settling a promise; purge_vm drops the
+     * ref on navigation. resolve/reject stay NULL for these jobs. */
+    var_t*  xhr_self;
     vm_t*   vm;          /* borrowed: for response_new in poll */
 } fetch_job_t;
 
@@ -3195,7 +3691,7 @@ static void fetch_job_free(fetch_job_t* j) {
     if(j->body)    mario_free(j->body);
     if(j->rbody)   mario_free(j->rbody);
     if(j->rhdrs)   mario_free(j->rhdrs);
-    /* resolve/reject are unref'd by the poll function before free */
+    /* resolve/reject and xhr_self are unref'd by poll/purge before free */
     mario_free(j);
 }
 
@@ -3224,6 +3720,56 @@ static void* fetch_worker_main(void* arg) {
     j->done = 1;
     pthread_mutex_unlock(&g_fetch_mtx);
     return NULL;
+}
+
+/* Async XHR on the fetch worker pool: same detached-pthread shape as
+ * native_fetch's async path, but the job carries the XHR instance (owned
+ * ref) instead of promise closures. Returns true when the worker owns the
+ * request; false means the caller must fall back to the blocking hook. */
+static bool xhr_spawn_async(vm_t* vm, var_t* self, js_web_state* st,
+                            const char* method, const char* url,
+                            const char* hdrs, const char* body) {
+    if(st->cb.http_request_worker == NULL) return false;
+    fetch_job_t* j = (fetch_job_t*)mario_malloc(sizeof(fetch_job_t));
+    if(j == NULL) return false;
+    memset(j, 0, sizeof(*j));
+    j->method    = fetch_strdup(method);
+    j->url       = fetch_strdup(url);
+    j->headers   = fetch_strdup(hdrs);
+    j->body      = fetch_strdup(body);
+    j->ctx       = web_ctx(vm);
+    j->worker_fn = st->cb.http_request_worker;
+    j->vm        = vm;
+    vm->gc.gc_defer++;
+    var_ref(self);
+    vm->gc.gc_defer--;
+    j->xhr_self  = self;   /* owned ref; poll settles / purge drops */
+    pthread_mutex_lock(&g_fetch_mtx);
+    j->next = g_fetch_head;
+    g_fetch_head = j;
+    pthread_mutex_unlock(&g_fetch_mtx);
+    if(FETCHDBG())
+        fprintf(stderr, "[fetchdbg] %.1f XHR-SPAWN url=%s\n",
+                fetch_dbg_ms(), j->url ? j->url : "-");
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    /* Same 8 MB stack as fetch: BearSSL TLS recurses deep. */
+    pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+    int rc = pthread_create(&tid, &attr, fetch_worker_main, j);
+    pthread_attr_destroy(&attr);
+    if(rc != 0) {
+        /* Spawn failed: unlink, drop the ref, let the caller block inline. */
+        pthread_mutex_lock(&g_fetch_mtx);
+        fetch_job_t** pp = &g_fetch_head;
+        while(*pp) { if(*pp == j) { *pp = j->next; break; } pp = &(*pp)->next; }
+        pthread_mutex_unlock(&g_fetch_mtx);
+        var_unref(self);
+        fetch_job_free(j);
+        return false;
+    }
+    return true;
 }
 
 static var_t* native_fetch(vm_t* vm, var_t* env, void* data) {
@@ -3435,6 +3981,7 @@ void js_web_fetch_purge_vm(vm_t* vm) {
             if(d->resolve != NULL) var_unref(d->resolve);
             if(d->reject  != NULL) var_unref(d->reject);
             d->resolve = NULL; d->reject = NULL;
+            if(d->xhr_self != NULL) { var_unref(d->xhr_self); d->xhr_self = NULL; }
             fetch_job_free(d);
         } else {
             d->next = g_fetch_done;   /* belongs to another live VM: keep */
@@ -3451,6 +3998,7 @@ void js_web_fetch_purge_vm(vm_t* vm) {
             if(h->resolve != NULL) var_unref(h->resolve);
             if(h->reject  != NULL) var_unref(h->reject);
             h->resolve = NULL; h->reject = NULL;
+            if(h->xhr_self != NULL) { var_unref(h->xhr_self); h->xhr_self = NULL; }
             h->vm = NULL;
         }
     }
@@ -3475,7 +4023,7 @@ int js_web_fetch_poll(vm_t* vm) {
     {
         static uint64_t s_defer_since = 0;
         static uint64_t s_gate_open_at = 0;
-        int have_done;
+        int have_done, have_xhr = 0;
         /* A/B switch: settle fetches immediately (browser-like) instead of waiting for
          * the first hydration commit. Used to test whether the deferred settlement is
          * what lets React clear suspendedLanes / commit the fallback before the
@@ -3507,9 +4055,14 @@ int js_web_fetch_poll(vm_t* vm) {
         if(s_host_nogate == 1) { g_eweb_first_commit = 1; s_pin_nogate = 1; }
         pthread_mutex_lock(&g_fetch_mtx);
         have_done = (g_fetch_done != NULL);
+        for(fetch_job_t* q = g_fetch_done; q != NULL; q = q->next)
+            if(q->xhr_self != NULL) { have_xhr = 1; break; }
         pthread_mutex_unlock(&g_fetch_mtx);
         uint64_t now = (uint64_t)js_dom_monotonic_ms();
-        if(have_done && !g_eweb_first_commit) {
+        /* Async XHR bypasses the hydration gate entirely: it serves Angular
+         * CGI chains (wx) whose completion events must land promptly, and the
+         * gate's react-query/SSR rationale does not apply to XHR. */
+        if(have_done && !have_xhr && !g_eweb_first_commit) {
             if(s_defer_since == 0) s_defer_since = now;
             if(now - s_defer_since < 60000) return 0;   /* wait for first commit */
         }
@@ -3520,7 +4073,7 @@ int js_web_fetch_poll(vm_t* vm) {
          * flips the query cache mid-flush and yields hydration mismatch #519,
          * so hold settlement a moment longer - still seconds earlier than the
          * old 60 s deadline. */
-        if(g_eweb_first_commit && have_done && !s_pin_nogate) {
+        if(g_eweb_first_commit && have_done && !have_xhr && !s_pin_nogate) {
             if(s_gate_open_at == 0) s_gate_open_at = now;
             if(now - s_gate_open_at < 2000) return 0;
         }
@@ -3537,6 +4090,37 @@ int js_web_fetch_poll(vm_t* vm) {
         fetch_job_t* j = batch;
         batch = j->next;
         j->next = NULL;
+
+        /* Async XHR job: write the response fields on the VM thread and fire
+         * the completion events. xhr_self holds the owned ref taken at spawn;
+         * purge_vm unrefs+nulls it on navigation, so a purged job falls into
+         * the abandoned branch below. */
+        if(j->xhr_self != NULL) {
+            if(j->vm == vm) {
+                var_t* self = j->xhr_self;
+                if(vm->propagating_err != NULL) vm_report_uncaught(vm);
+                if(j->ok) {
+                    web_set_str(vm, self, XHR_RESP_HDRS, (j->rhdrs != NULL) ? j->rhdrs : "");
+                    web_set_int(vm, self, "status", j->status);
+                    web_set_str(vm, self, "statusText", "");
+                    web_set_str(vm, self, "responseText", (j->rbody != NULL) ? j->rbody : "");
+                    web_set_str(vm, self, "response",     (j->rbody != NULL) ? j->rbody : "");
+                    web_set_str(vm, self, "responseURL", j->url);
+                } else {
+                    web_set_str(vm, self, XHR_RESP_HDRS, "");
+                    web_set_int(vm, self, "status", 0);
+                    web_set_str(vm, self, "statusText", "");
+                    web_set_str(vm, self, "responseText", "");
+                    web_set_str(vm, self, "response", "");
+                }
+                xhr_fire_completion(vm, self, j->ok);
+                if(vm->propagating_err != NULL) vm_report_uncaught(vm);
+                var_unref(self);
+            }
+            fetch_job_free(j);
+            settled++;
+            continue;
+        }
 
         /* Abandoned job: js_web_fetch_purge_vm() closed out its owning VM (a
          * navigation freed the VM that held these closures) and dropped the
@@ -4911,9 +5495,41 @@ static var_t* native_url_get_searchParams(vm_t* vm, var_t* env, void* data) {
     return new_obj(vm, CLS_URLSP, 0);
 }
 
+/* blob: URL registry. A Worker built from URL.createObjectURL(blob) has to be
+ * able to get the script text back from the URL it was handed, so each URL
+ * maps to its blob payload instead of every blob sharing the literal "blob:"
+ * (with the literal, the worker source was unrecoverable and the thread could
+ * never start, silently stalling any SDK that awaits a worker reply). */
+typedef struct bloburl { char* url; char* text; } bloburl;
+static bloburl* g_bloburl = NULL;
+static int      g_bloburl_n = 0, g_bloburl_cap = 0;
+static const char* bloburl_lookup(const char* url) {
+    if(url == NULL) return NULL;
+    for(int i = 0; i < g_bloburl_n; ++i)
+        if(g_bloburl[i].url != NULL && strcmp(g_bloburl[i].url, url) == 0)
+            return g_bloburl[i].text;
+    return NULL;
+}
 static var_t* native_url_createObjectURL(vm_t* vm, var_t* env, void* data) {
-    (void)env; (void)data;
-    return var_new_str(vm, "blob:");
+    (void)data;
+    var_t* b = js_arg(env, 0);
+    const char* text = "";
+    if(b != NULL && web_has_hidden(b, BLOB_TEXT)) {
+        var_t* t = get_obj(b, BLOB_TEXT);
+        if(t != NULL && var_get_str(t) != NULL) text = var_get_str(t);
+    }
+    if(g_bloburl_n == g_bloburl_cap) {
+        int nc = g_bloburl_cap ? g_bloburl_cap * 2 : 8;
+        bloburl* na = (bloburl*)realloc(g_bloburl, (size_t)nc * sizeof(bloburl));
+        if(na == NULL) return var_new_str(vm, "blob:");
+        g_bloburl = na; g_bloburl_cap = nc;
+    }
+    char url[64];
+    snprintf(url, sizeof url, "blob:eweb/%d", g_bloburl_n);
+    g_bloburl[g_bloburl_n].url = strdup(url);
+    g_bloburl[g_bloburl_n].text = strdup(text);
+    g_bloburl_n++;
+    return var_new_str(vm, url);
 }
 static var_t* native_url_revokeObjectURL(vm_t* vm, var_t* env, void* data) {
     (void)vm; (void)env; (void)data;
@@ -5002,15 +5618,34 @@ static uint32_t web_rand_next(void) {
 static var_t* native_crypto_getRandomValues(vm_t* vm, var_t* env, void* data) {
     (void)data;
     var_t* arr = js_arg(env, 0);
-    if(arr == NULL || !arr->is_array) return arr;
+    if(arr == NULL) return arr;
+    /* WebCrypto fills the view's backing buffer with random bytes. A TypedArray
+     * is NOT is_array (its elements live in the buffer, not the hidden _ARRAY_
+     * member), so the old `!is_array -> return unfilled` path handed back an
+     * all-zero Uint8/Uint32Array. JD's h5st risk SDK seeds a jsbn RNG pool via
+     * `crypto.getRandomValues(new Uint32Array(256))`; an all-zero pool made the
+     * generated token degenerate (long runs of a single base64 char), so the
+     * server rejected the signature -> api.m.jd.com 403 -> home-page gray
+     * skeletons. Fill the full element width for TypedArrays (one 32-bit draw
+     * per element; set_at truncates to the view's own width). */
+    if(var_is_typedarray(arr)) {
+        int n = var_get_int(var_find_own_member_var(arr, "length"));
+        for(int i = 0; i < n; ++i) {
+            uint32_t r = web_rand_next();
+            var_typedarray_set_at(vm, arr, (int64_t)i,
+                var_new_int64(vm, (int64_t)(uint64_t)r));
+        }
+        return arr;
+    }
+    if(!arr->is_array) return arr;
     int n = (int)var_array_size(arr);
     for(int i = 0; i < n; ++i) {
         node_t* nd = var_array_get(arr, i);
         uint32_t r = web_rand_next();
         if(nd != NULL && nd->var != NULL)
-            node_replace(nd, var_new_int(vm, (int)(r & 0xFF)));
+            node_replace(nd, var_new_int(vm, (int)(r & 0xff)));
         else
-            var_array_add(arr, var_new_int(vm, (int)(r & 0xFF)));
+            var_array_add(arr, var_new_int(vm, (int)(r & 0xff)));
     }
     return arr;
 }
@@ -5684,11 +6319,115 @@ static var_t* native_fr_read(vm_t* vm, var_t* env, void* data) {
 }
 
 static var_t* native_worker_ctor(vm_t* vm, var_t* env, void* data) {
-    (void)vm; (void)data;
+    (void)data;
     var_t* self = js_this(env);
     if(self == NULL) return NULL;
+    var_t* args = get_func_args(env);
+    node_t* n0 = args ? var_array_get(args, 0) : NULL;
+    var_t* a0 = (n0 != NULL) ? n0->var : NULL;
+    const char* url = (a0 != NULL && a0->type == V_STRING) ? var_get_str(a0) : NULL;
+    if(getenv("EWEB_WKDBG") != NULL)
+        fprintf(stderr, "[wkdbg] new Worker(%s)\n", url ? url : "?");
+    var_add(self, "url", var_new_str(vm, url ? url : ""));
+    /* Recover the blob script text so postMessage can actually start the
+     * worker; a classic (http) URL has no inline source and stays inert. */
+    const char* src = bloburl_lookup(url);
+    if(src != NULL) var_add(self, "@@wsrc", var_new_str(vm, src));
     var_add(self, "onmessage", var_new_null(vm));
     var_add(self, "onerror",   var_new_null(vm));
+    return NULL;
+}
+
+/* ---- Same-thread Web Worker --------------------------------------
+ * A real browser runs the worker script on its own thread; this engine has no
+ * JS thread pool, so the blob script is executed on the main VM inside a
+ * wrapper function whose parameters supply the worker globals (self,
+ * postMessage, importScripts) and whose body declares a local `onmessage`, so
+ * the script's bare `onmessage = fn` assignment is captured instead of landing
+ * on the page global.  Messages are delivered by invoking the peer handler
+ * with a {data} event, which runs the worker's REAL code - including its
+ * XMLHttpRequests - rather than silently dropping them the way the old noop
+ * postMessage did.  That drop was a hard stall: fingerprint/token SDKs hand the
+ * request to a blob worker and await its onmessage reply forever. */
+static var_t* worker_self_post(vm_t* vm, var_t* env, void* data) {
+    var_t* worker = (var_t*)data;
+    if(worker == NULL) return NULL;
+    var_t* cb = var_find_own_member_var(worker, "onmessage");
+    if(cb == NULL || !cb->is_func) return NULL;
+    var_t* msg = js_arg(env, 0);
+    var_t* ev = var_new_obj_no_proto(vm, NULL, NULL);
+    if(ev == NULL) return NULL;
+    var_add(ev, "data", (msg != NULL) ? var_ref(msg) : var_new_null(vm));
+    var_t* cargs = var_new_array(vm);
+    var_array_add(cargs, ev);
+    var_t* r = call_m_func(vm, worker, cb, cargs);
+    if(r != NULL) var_unref(r);
+    var_unref(cargs);
+    return NULL;
+}
+static var_t* worker_noop(vm_t* vm, var_t* env, void* data) {
+    (void)vm; (void)env; (void)data; return NULL;
+}
+#define WORKER_EVAL_RET "__$mario_worker_fn$__"
+static void worker_boot(vm_t* vm, var_t* self) {
+    var_t* srcv = get_obj(self, "@@wsrc");
+    if(srcv == NULL || var_get_str(srcv) == NULL) return;
+    mstr_t* w = mstr_new("(function(self,postMessage,importScripts){var onmessage;try{\n");
+    mstr_append(w, var_get_str(srcv));
+    mstr_append(w, "\n}catch(e){}\nreturn (typeof onmessage!=='undefined')?onmessage:null;})");
+    mstr_t* code = mstr_new(WORKER_EVAL_RET " = (");
+    mstr_append(code, w->cstr);
+    mstr_append(code, "\n);");
+    mstr_free(w);
+    extern void js_compile_set_quiet(bool quiet);
+    js_compile_set_quiet(true);
+    bool ok = vm_load_run_native(vm, code->cstr);
+    js_compile_set_quiet(false);
+    mstr_free(code);
+    if(!ok) return;
+    var_t* fn = var_find_own_member_var(vm->root, WORKER_EVAL_RET);
+    if(fn == NULL || !fn->is_func) return;
+    var_ref(fn);
+    var_t* shim = var_new_obj_no_proto(vm, NULL, NULL);
+    var_add(shim, "postMessage", var_new_native_func(vm, worker_self_post, (void*)var_ref(self)));
+    var_add(shim, "close",       var_new_native_func(vm, worker_noop, NULL));
+    var_add(shim, "addEventListener",    var_new_native_func(vm, worker_noop, NULL));
+    var_add(shim, "removeEventListener", var_new_native_func(vm, worker_noop, NULL));
+    var_add(shim, "onmessage", var_new_null(vm));
+    var_t* cargs = var_new_array(vm);
+    var_array_add(cargs, shim);
+    var_array_add(cargs, var_new_native_func(vm, worker_self_post, (void*)var_ref(self)));
+    var_array_add(cargs, var_new_native_func(vm, worker_noop, NULL));
+    var_t* r = call_m_func(vm, shim, fn, cargs);
+    var_add(self, "@@whandler", (r != NULL) ? r : var_new_null(vm));
+    var_unref(cargs);
+    var_unref(fn);
+    if(getenv("EWEB_WKDBG") != NULL)
+        fprintf(stderr, "[wkdbg] booted handler=%d\n", (r != NULL && r->is_func) ? 1 : 0);
+}
+static var_t* native_worker_postMessage(vm_t* vm, var_t* env, void* data) {
+    (void)data;
+    var_t* self = js_this(env);
+    if(self == NULL) return NULL;
+    if(get_obj(self, "@@wdead") != NULL) return NULL;
+    if(get_obj(self, "@@whandler") == NULL) worker_boot(vm, self);
+    var_t* h = get_obj(self, "@@whandler");
+    if(h == NULL || !h->is_func) return NULL;
+    var_t* msg = js_arg(env, 0);
+    var_t* ev = var_new_obj_no_proto(vm, NULL, NULL);
+    if(ev == NULL) return NULL;
+    var_add(ev, "data", (msg != NULL) ? var_ref(msg) : var_new_null(vm));
+    var_t* cargs = var_new_array(vm);
+    var_array_add(cargs, ev);
+    var_t* r = call_m_func(vm, self, h, cargs);
+    if(r != NULL) var_unref(r);
+    var_unref(cargs);
+    return NULL;
+}
+static var_t* native_worker_terminate(vm_t* vm, var_t* env, void* data) {
+    (void)env; (void)data;
+    var_t* self = js_this(env);
+    if(self != NULL) var_add(self, "@@wdead", var_new_int(vm, 1));
     return NULL;
 }
 
@@ -6088,6 +6827,28 @@ static var_t* native_start_rendering(vm_t* vm, var_t* env, void* data) {
 
     var_t* buf = make_audio_buffer(vm, 1, length, sr, samples);
     free(samples);
+    /* Spec (OfflineAudioContext): when rendering finishes the context fires a
+     * `complete` event (the oncomplete handler) carrying renderedBuffer, IN
+     * ADDITION to resolving the startRendering() promise. Fingerprint SDKs
+     * (JD rac / baxia audio fingerprint) park their continuation on
+     * oncomplete, so resolving the promise alone strands them and their init
+     * promise never settles -> the signed first-screen request is never
+     * issued and the page keeps its grey skeleton. Fire oncomplete with an
+     * event object exposing renderedBuffer/target. */
+    {
+        var_t* fn = get_obj(ctx, "oncomplete");
+        if(fn != NULL && fn->is_func) {
+            var_t* ev = var_new_obj_no_proto(vm, NULL, NULL);
+            var_add(ev, "type", var_new_str(vm, "complete"));
+            var_add(ev, "renderedBuffer", buf ? buf : var_new_null(vm));
+            var_add(ev, "target", ctx);
+            var_t* args = var_new_array(vm);
+            var_array_add(args, ev);
+            var_t* r = call_m_func(vm, ctx, fn, args);
+            if(r != NULL) var_unref(r);
+            var_unref(args);
+        }
+    }
     return promise_new_resolved(vm, buf ? buf : var_new_null(vm));
 }
 
@@ -6640,6 +7401,32 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
         vm_reg_native(vm, cls, "getResponseHeader(k)",      native_xhr_getResponseHeader,     bridge);
         vm_reg_native(vm, cls, "getAllResponseHeaders()",   native_xhr_getAllResponseHeaders, bridge);
         vm_reg_native(vm, cls, "overrideMimeType(m)",       native_xhr_overrideMimeType,      bridge);
+        /* Full standard WebIDL attribute surface (see the xhr_attr_t block):
+         * prototype accessors so Object.getOwnPropertyNames reports the ~32-name
+         * shape a real browser presents, which anti-bot XHR hooks require before
+         * they will wrap the request and read response headers like x-rp-sdtoken. */
+        js_acc_cls(vm, cls, "status",             native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_status);
+        js_acc_cls(vm, cls, "statusText",         native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_statusText);
+        js_acc_cls(vm, cls, "response",           native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_response);
+        js_acc_cls(vm, cls, "responseText",       native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_responseText);
+        js_acc_cls(vm, cls, "responseURL",        native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_responseURL);
+        js_acc_cls(vm, cls, "responseType",       native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_responseType);
+        js_acc_cls(vm, cls, "responseXML",        native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_responseXML);
+        js_acc_cls(vm, cls, "timeout",            native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_timeout);
+        js_acc_cls(vm, cls, "withCredentials",    native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_withCredentials);
+        js_acc_cls(vm, cls, "upload",             native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_upload);
+        js_acc_cls(vm, cls, "onreadystatechange", native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_onreadystatechange);
+        js_acc_cls(vm, cls, "onloadstart",        native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_onloadstart);
+        js_acc_cls(vm, cls, "onprogress",         native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_onprogress);
+        js_acc_cls(vm, cls, "onabort",            native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_onabort);
+        js_acc_cls(vm, cls, "onerror",            native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_onerror);
+        js_acc_cls(vm, cls, "onload",             native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_onload);
+        js_acc_cls(vm, cls, "ontimeout",          native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_ontimeout);
+        js_acc_cls(vm, cls, "onloadend",          native_xhr_attr_get, native_xhr_attr_set, (void*)&kXA_onloadend);
+        /* EventTarget methods (XMLHttpRequest is an EventTarget). */
+        vm_reg_native(vm, cls, "addEventListener(t, f)",    native_xhr_addEventListener,    bridge);
+        vm_reg_native(vm, cls, "removeEventListener(t, f)", native_xhr_removeEventListener, bridge);
+        vm_reg_native(vm, cls, "dispatchEvent(e)",          native_xhr_dispatchEvent,       bridge);
         vm_reg_var(vm, cls, "UNSENT",           var_new_int(vm, 0), true);
         vm_reg_var(vm, cls, "OPENED",           var_new_int(vm, 1), true);
         vm_reg_var(vm, cls, "HEADERS_RECEIVED", var_new_int(vm, 2), true);
@@ -6661,6 +7448,19 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
     cls = vm_new_class(vm, CLS_MSGCHAN);
     if(cls != NULL)
         vm_reg_native(vm, cls, "constructor()", native_mc_ctor, bridge);
+
+    /* ---- BroadcastChannel: real messaging surface (see the bc_* block).
+     * Registered before the inert WebIDL placeholder loop below so the
+     * placeholder skip sees a live binding and leaves this class alone. ---- */
+    cls = vm_new_class(vm, "BroadcastChannel");
+    if(cls != NULL) {
+        vm_reg_native(vm, cls, "constructor(n)",             native_bc_ctor,    bridge);
+        vm_reg_native(vm, cls, "postMessage(m)",             native_bc_postMessage, bridge);
+        vm_reg_native(vm, cls, "close()",                    native_bc_close,   bridge);
+        vm_reg_native(vm, cls, "addEventListener(t, f)",     native_xhr_addEventListener,    bridge);
+        vm_reg_native(vm, cls, "removeEventListener(t, f)",  native_xhr_removeEventListener, bridge);
+        vm_reg_native(vm, cls, "dispatchEvent(e)",           native_xhr_dispatchEvent,       bridge);
+    }
 
     /* ---- DOMException: core-js's polyfill feature-tests the global; a missing
      * DOMException makes its probe IIFE return undefined and every `new O()`
@@ -6840,8 +7640,8 @@ bool js_register_web_natives(vm_t* vm, const js_web_callbacks_t* cb) {
     cls = vm_new_class(vm, "Worker");
     if(cls != NULL) {
         vm_reg_native(vm, cls, "constructor(u, o)",     native_worker_ctor, bridge);
-        vm_reg_native(vm, cls, "postMessage(m, t)",     native_ws_noop,     bridge);
-        vm_reg_native(vm, cls, "terminate()",           native_ws_noop,     bridge);
+        vm_reg_native(vm, cls, "postMessage(m, t)",     native_worker_postMessage, bridge);
+        vm_reg_native(vm, cls, "terminate()",           native_worker_terminate,  bridge);
         vm_reg_native(vm, cls, "addEventListener(t, f)",    native_ws_noop, bridge);
         vm_reg_native(vm, cls, "removeEventListener(t, f)", native_ws_noop, bridge);
     }

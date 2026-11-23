@@ -121,6 +121,25 @@ int main(int argc, char** argv) {
 
 	while(port.clock.tic_ms(port.clock.ud) < deadline) {
 		ewebview_tick(view);
+		/* Test-only wheel injection (HL_WHEEL_AT_MS/_X/_Y/_NOTCHES): posts one
+		 * EWEB_MOUSE_WHEEL gesture so the headless ASan gate can exercise the
+		 * DOM wheel dispatch + default scroll without a window system. */
+		{
+			static bool s_wheelDone = false;
+			const char* wat = getenv("HL_WHEEL_AT_MS");
+			if(wat != NULL && !s_wheelDone &&
+			   port.clock.tic_ms(port.clock.ud) - start >= (uint64_t)atoi(wat)) {
+				s_wheelDone = true;
+				eweb_event_t wev;
+				memset(&wev, 0, sizeof(wev));
+				wev.mouse_state = EWEB_MOUSE_WHEEL;
+				wev.button = EWEB_BUTTON_NONE;
+				wev.cx = getenv("HL_WHEEL_X") ? atoi(getenv("HL_WHEEL_X")) : 100;
+				wev.cy = getenv("HL_WHEEL_Y") ? atoi(getenv("HL_WHEEL_Y")) : 100;
+				wev.wheel = getenv("HL_WHEEL_NOTCHES") ? atoi(getenv("HL_WHEEL_NOTCHES")) : -3;
+				ewebview_post_event(view, &wev);
+			}
+		}
 		if(getenv("HL_LOG_STAT") != NULL) {
 			uint64_t now = port.clock.tic_ms(port.clock.ud);
 			if(now - last_log >= 5000) {

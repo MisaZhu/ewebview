@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strncasecmp: javascript: scheme test in queueNavigation */
 #include <errno.h>      /* errno: fopen failure diagnostics in loadHtmlContent */
 
 namespace eweb {
@@ -1275,6 +1276,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_task_ended(false)
     , m_clientWidth(640)
     , m_clientHeight(480)
+    , m_dpr(1.0f)
     , m_engineThread(0)
     , m_engineStarted(false)
     , m_engineStop(false)
@@ -1311,6 +1313,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_cacheValid(false)
     , m_contentDirty(false)
     , m_contentDirtySince(0)
+    , m_inputPaintUntil(0)
     , m_animActive(false)
     , m_jsVm(nullptr)
     , m_jsPrefetch(nullptr)
@@ -1341,6 +1344,8 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_jsRunDeadline(0)
     , m_jsSkeletonProbeAt(0)
     , m_jsSkeletonProbeVal(false)
+    , m_jsSkeletonAnyProbeAt(0)
+    , m_jsSkeletonAnyProbeVal(false)
     , m_jsPrePaintAt(0)
     , m_jsAbortPrePaint(false)
     , m_jsPrePaintCut(false)
@@ -1348,15 +1353,22 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_jsEnterGen(0)
     , m_jsAbortCount(0)
     , m_jsPageDisabled(false)
+    , m_jsDisabledAt(0)
     , m_buildAbort(false)
     , m_buildAbortGen(0)
     , m_jsScrollPending(false)
     , m_jsHoverElement(nullptr)
     , m_focusElement(nullptr)
+    , m_caretValid(false)
+    , m_caretDirty(false)
+    , m_caretBlinkOn(true)
     , m_openSelect(nullptr)
     , m_rangeDragging(false)
     , m_textDragging(false)
     , m_dragWidget(nullptr)
+    , m_iframeImageGen(0)
+    , m_lastClientX(0)
+    , m_lastClientY(0)
 {
     eweb_listener_init(&m_listener);
     m_container = new EWebContainer(&m_port, this);
@@ -1747,7 +1759,7 @@ void EWebEngine::engineLoop()
         /* 2. deferred deletions parked by the last BUILD_SWAP_DOC (freeing
          * them inside the swap would re-enter the container while it is still
          * live). */
-        if(m_pendingDeleteDoc) { delete m_pendingDeleteDoc; m_pendingDeleteDoc = nullptr; }
+        if(m_pendingDeleteDoc) { fprintf(stderr, "[VMLIFE] flush delete doc=%p\n", (void*)m_pendingDeleteDoc); delete m_pendingDeleteDoc; m_pendingDeleteDoc = nullptr; }
         if(m_pendingDeleteContainer) { delete m_pendingDeleteContainer; m_pendingDeleteContainer = nullptr; }
 
         /* 3. download results. Drain everything that has landed; stop early
@@ -1795,11 +1807,22 @@ void EWebEngine::engineLoop()
 
         /* 5. build state machine (one phase step per iteration).
          * m_deferBuildStep skips a step right after a result drove the build,
-         * so the results settle first. */
+         * so the results settle first. A currently runnable script is the
+         * exception: processResults has already drained the result queue, and
+         * spending another tick on layout/timers lets application work overtake
+         * a body that a real browser would execute as soon as its fetch lands.
+         * This covers both ordered SDKs (AWSC/fireye) and async JSONP callbacks
+         * (wu.json), while jsFindReadyPageScript preserves ordered-script
+         * blocking and gives a ready ordered script the same priority as the
+         * actual runner. */
+        bool readyPageScript = false;
+        if(m_buildPhase == BUILD_RUN_JS && m_jsPostSwapRun)
+            readyPageScript = (jsFindReadyPageScript() != m_jsScripts.size());
         if(m_buildPhase != BUILD_IDLE) {
-            if(m_deferBuildStep) {
+            if(m_deferBuildStep && !readyPageScript) {
                 m_deferBuildStep = false;
             } else {
+                m_deferBuildStep = false;
                 advanceBuildStep();
             }
         } else if(m_deferBuildStep) {
@@ -1842,15 +1865,34 @@ void EWebEngine::engineLoop()
          * script is honoured once that step unwinds. */
         jsRunPendingNavigation();
 
-        /* 7. setInterval()/setTimeout(). jsPollTimers returns how many fired;
-         * a callback may have drawn (canvas) without touching layout, so any
-         * firing marks the content dirty to force a full re-render. A fresh
-         * termination abort unwinds a runaway callback via the jsOnVmStep
-         * generation check, so polling never has to be skipped here - and
-         * MUST not be skipped on a stale flag, or the visible page's timers
-         * would freeze after a STOP on an idle page. */
-        bool jsRanThisTick = false;
-        if(jsPollTimers() > 0) {
+        /* Contenteditable caret blink: flip the bar every 530ms and repaint
+         * only on the flip (an idle page otherwise stays parked). */
+        if(m_caretValid) {
+            bool on = ((ticMs() / 530) % 2) == 0;
+            if(on != m_caretBlinkOn) {
+                m_caretBlinkOn = on;
+                markContentDirty();
+            }
+        }
+
+        /* 7. setInterval()/setTimeout(). Drain the currently runnable script
+         * queue before application timers. The build step above runs only one
+         * script per tick; polling here while another downloaded body is ready
+         * lets a timer observe the intermediate state between two network
+         * callbacks. On taobao that made the main feed read an empty umid after
+         * wu.json had landed but before its JSONP body ran. Re-evaluate the live
+         * queue after the build step (not the pre-step readyPageScript flag),
+         * and never gate an idle page on a stale flag. jsPollTimers returns how
+         * many fired; a callback may have drawn without touching layout. */
+        bool readyScriptBeforeTimers = false;
+        if(m_buildPhase == BUILD_RUN_JS && m_jsPostSwapRun)
+            readyScriptBeforeTimers = (jsFindReadyPageScript() != m_jsScripts.size());
+        /* Cached stylesheet links appended by the script above receive load
+         * now, outside its appendChild stack. In-flight links are fired by
+         * processResults only after their sheet has been applied. */
+        bool jsRanThisTick = jsFlushLinkElEvents() > 0;
+        if(jsRanThisTick) markContentDirty();
+        if(!readyScriptBeforeTimers && jsPollTimers() > 0) {
             markContentDirty();
             jsRanThisTick = true;
         }
@@ -1961,6 +2003,7 @@ void EWebEngine::engineLoop()
          * a perpetual ~0-ms macrotask chain cannot starve the surface of
          * content the DOM already committed. */
         bool deferPaint = jsHasImminentTimers() &&
+                          ticMs() >= m_inputPaintUntil &&
                           (m_contentDirtySince == 0 ||
                            (ticMs() - m_contentDirtySince) < kRepaintDeferMaxMs);
         if(m_doc && (!m_cacheValid || scrollMoved ||
@@ -2038,13 +2081,18 @@ void EWebEngine::engineLoop()
 
 /* Convert a viewport-relative client point (cx,cy) into a form control's
  * BORDER-box local coordinates, using the control's document placement and the
- * engine's scroll offset. Shared by every mouse-driven widget interaction. */
+ * engine's scroll offset. Shared by every mouse-driven widget interaction.
+ * m_pos is the CONTENT box (same convention as html_tag/el_image), so shift
+ * the origin back over padding+border to land on the border-box corner. */
 static void widgetLocalCoords(eweb_el_input* w, int cx, int cy,
                               int scrollX, int scrollY, int& lx, int& ly)
 {
-    litehtml::position pl = ((litehtml::element*)w)->get_placement();
-    lx = cx + scrollX - pl.x;
-    ly = cy + scrollY - pl.y;
+    litehtml::element* e = (litehtml::element*)w;
+    litehtml::position pl = e->get_placement();
+    litehtml::margins pad = e->get_paddings();
+    litehtml::margins brd = e->get_borders();
+    lx = cx + scrollX - pl.x + pad.left + brd.left;
+    ly = cy + scrollY - pl.y + pad.top + brd.top;
 }
 
 /* Collect every form control (eweb_el_input) in the subtree under `e`, in
@@ -2107,6 +2155,7 @@ bool EWebEngine::engineHandleCommand(const EWebCmd& cmd)
     case ECMD_RESIZE: {
         /* The viewport changed size. The engine owns the client size, the
          * container, the document and window.onresize (which runs JS). */
+        engineUpdateDpr();   /* display may have changed ratio (1x <-> Retina) */
         if(cmd.x > 0) m_clientWidth = cmd.x;
         if(cmd.y > 0) m_clientHeight = cmd.y;
         if(m_container) m_container->set_client_size(m_clientWidth, m_clientHeight);
@@ -2147,6 +2196,15 @@ bool EWebEngine::engineHandleCommand(const EWebCmd& cmd)
          * A local copy is taken because the dispatch may outlive `cmd`. */
         eweb_event_t ev = cmd.ev;
         int cx = cmd.x, cy = cmd.y;
+        m_lastClientX = cx;
+        m_lastClientY = cy;
+
+        /* Discrete gestures (press/release/wheel) arm a short repaint-defer
+         * override so their visual feedback lands promptly even while a 0-ms
+         * macrotask chain is still draining. Hover moves don't arm it, so the
+         * hydration-defer optimization stays intact when the pointer is idle. */
+        if(ev.mouse_state != EWEB_MOUSE_MOVE)
+            m_inputPaintUntil = ticMs() + 400;
 
         /* An open <select> popup floats above the page and is NOT part of the
          * litehtml tree, so it captures the pointer before the page hit-test. */
@@ -2197,6 +2255,47 @@ bool EWebEngine::engineHandleCommand(const EWebCmd& cmd)
             /* wheel / other states fall through to the page dispatch below */
         }
 
+        /* A stale Angular $$phase from an interrupted $digest blocks every
+         * later $apply; sweep it before this gesture's handlers run. */
+        jsRecoverAngularPhase();
+
+        if(ev.mouse_state == EWEB_MOUSE_WHEEL) {
+            /* Wheel: dispatch wheel+mousewheel to the page first; unless a
+             * listener preventDefault()'d, run the default scroll. ev.wheel
+             * is notches, positive = content down. */
+            bool wheelAllowed = jsDispatchWheelEvent(cx, cy, ev.wheel);
+            if(wheelAllowed && ev.wheel != 0) {
+                int dy = ev.wheel * 48;   /* SCROLL_STEP logical px per notch */
+                /* Nearest SCROLLABLE overflow container under the pointer
+                 * (wx's contact/chat lists are inner overflow boxes, not the
+                 * document). Browser scroll chaining: an overflow ancestor
+                 * that cannot move (clamped edge, or overflow:hidden with
+                 * fitting content - wx's session/contact items) is skipped
+                 * and the walk continues to the next one; only when none
+                 * accepts does the gesture chain to the document. Stopping
+                 * at the first overflow box pinned wx's lists: the item's
+                 * overflow:hidden swallowed the wheel and the document
+                 * fallback had nothing to scroll. */
+                /* Fix22: a rendered sub-document under the pointer pages its
+                 * own content first (the wx reader article lives in an iframe
+                 * whose body is taller than the frame box). */
+                bool scrolled = scrollIframeAt(cx, cy, dy);
+                litehtml::element* target = hitElementAt(cx, cy);
+                for(litehtml::element* e = target; e != nullptr && !scrolled; e = e->parent()) {
+                    if(e->get_overflow() <= litehtml::overflow_visible) continue;
+                    int sx = 0, sy = 0;
+                    e->eweb_get_scroll(&sx, &sy);
+                    if(e->eweb_set_scroll(sx, sy + dy)) {
+                        markContentDirty();
+                        jsDispatchSimpleEvent(e, "scroll", false);
+                        scrolled = true;
+                    }
+                }
+                if(!scrolled) scrollByKey(0, dy);
+            }
+            return true;
+        }
+
         bool allowed = jsDispatchMouseEvent(ev.mouse_state, ev.button, cx, cy);
 
         if(ev.mouse_state == EWEB_MOUSE_DOWN && ev.button == EWEB_BUTTON_LEFT) {
@@ -2208,6 +2307,12 @@ bool EWebEngine::engineHandleCommand(const EWebCmd& cmd)
              * click). */
             litehtml::element* target = hitElementAt(cx, cy);
             setFocus(target != nullptr ? focusableAt(target) : nullptr);
+            /* A press inside an editing host refreshes the caret even when
+             * focus did not move (setFocus early-returns on the same element),
+             * so click handlers that save the selection see a live range. */
+            litehtml::element* eh = (target != nullptr) ? editableHostOf(target) : nullptr;
+            if(eh != nullptr && (litehtml::element*)m_focusElement == eh)
+                jsEditableCommand(eh, "focus", "");
             /* Caret placement + drag start for text fields and range sliders. */
             void* wv = (target != nullptr) ? widgetAt(target) : nullptr;
             if(wv != nullptr) {
@@ -2311,6 +2416,12 @@ bool EWebEngine::engineHandleCommand(const EWebCmd& cmd)
             resetJsVm();
         return true;
 
+    case ECMD_EVAL:
+        /* Embedder-supplied script, run in the page's global scope on this
+         * thread where the VM lives (see jsEvalExternal). */
+        jsEvalExternal(cmd.url);
+        return true;
+
     case ECMD_SHUTDOWN:
         return false;   /* break the loop; engineTeardown runs on the way out */
 
@@ -2331,6 +2442,35 @@ void EWebEngine::engineNavigate(const std::string& url)
      * The visible page (m_doc) is deliberately NOT freed here - it stays on
      * screen under the build overlay until BUILD_SWAP_DOC replaces it and
      * defers its deletion to a later loop iteration. */
+
+    /* The build container's srcset/media selection reads m_dpr: refresh it
+     * here too so embedders that load without a prior resize still pick the
+     * right density candidates. */
+    engineUpdateDpr();
+
+    /* Same-document / blocked navigations must never tear the page down.
+     * Angular's $sanitize rewrites untrusted anchor hrefs to "unsafe:<href>"
+     * in the DOM; a real browser refuses to navigate those, and wx's tab bar
+     * is full of such anchors - following one used to reset the logged-in VM
+     * (and trip the vm_close teardown crash). A fragment-only change against
+     * the current URL is a same-document navigation: no refetch, no teardown.
+     * A reload passes the identical current URL string, so it still proceeds. */
+    if(strncasecmp(url.c_str(), "unsafe:", 7) == 0) {
+        EWEB_LOG("[ewebview] navigate blocked (angular-sanitized href) -> %.60s\n", url.c_str());
+        return;
+    }
+    if(!url.empty() && url[0] == '#') {
+        EWEB_LOG("[ewebview] fragment-only navigation ignored -> %.60s\n", url.c_str());
+        return;
+    }
+    {
+        std::string a = url.substr(0, url.find('#'));
+        std::string b = m_currentHtmlUrl.substr(0, m_currentHtmlUrl.find('#'));
+        if(!a.empty() && a == b && url != m_currentHtmlUrl) {
+            EWEB_LOG("[ewebview] same-document fragment navigation ignored -> %.60s\n", url.c_str());
+            return;
+        }
+    }
     {
         static int imgdbg9 = -1;
         if(imgdbg9 < 0) { const char* e = getenv("EWEB_IMGDBG"); imgdbg9 = (e && e[0] == '1') ? 1 : 0; }
@@ -2339,6 +2479,7 @@ void EWebEngine::engineNavigate(const std::string& url)
     }
     engineDropPendingWork();
     cleanupBuildResources();
+    fprintf(stderr, "[VMLIFE] engineNavigate cleaned -> %.60s\n", url.c_str());
 
     m_engineScrollX = 0;
     m_engineScrollY = 0;
@@ -2449,6 +2590,7 @@ void EWebEngine::engineTeardown()
      * requires releasing adopted frames before ewebview_destroy(). */
     engineDropPendingWork();
     cleanupBuildResources();   /* frees VM, canvases, detached nodes, build doc */
+    clearIframeCaches();       /* static frame renders belong to the old page */
 
     if(m_doc) { delete m_doc; m_doc = nullptr; }
     if(m_container) { delete m_container; m_container = nullptr; }
@@ -2456,6 +2598,30 @@ void EWebEngine::engineTeardown()
     if(m_pendingDeleteContainer) { delete m_pendingDeleteContainer; m_pendingDeleteContainer = nullptr; }
 
     engineFreeFramePool();
+}
+
+void EWebEngine::engineUpdateDpr()
+{
+    /* ENGINE-THREAD ONLY. The HAL has no dpr query, but a HiDPI port allocates
+     * surface_new(w,h) at w*dpr x h*dpr DEVICE pixels while surface_dims keeps
+     * reporting the logical size - so one probe surface reveals the ratio the
+     * port rasterises at. A port without surface_pixels (or a 1x port) leaves
+     * m_dpr at 1.0, numerically identical to the old fixed-resolution path. */
+    if(m_port.gfx.surface_new == nullptr || m_port.gfx.surface_pixels == nullptr ||
+       m_port.gfx.surface_dims == nullptr || m_port.gfx.surface_free == nullptr)
+        return;
+    eweb_surface_t* probe = m_port.gfx.surface_new(m_port.gfx.ud, 64, 64);
+    if(probe == nullptr)
+        return;
+    int dw = 0, dh = 0, lw = 0, lh = 0;
+    m_port.gfx.surface_pixels(m_port.gfx.ud, probe, &dw, &dh);
+    m_port.gfx.surface_dims(m_port.gfx.ud, probe, &lw, &lh);
+    m_port.gfx.surface_free(m_port.gfx.ud, probe);
+    if(dw > 0 && lw > 0) {
+        float r = (float)dw / (float)lw;
+        if(r >= 0.5f && r <= 8.0f)
+            m_dpr = r;
+    }
 }
 
 void EWebEngine::engineEnsureFramePool()
@@ -2788,6 +2954,18 @@ void EWebEngine::reload()
     postCommand(cmd);
 }
 
+void EWebEngine::evalJS(const char* js)
+{
+    /* Asynchronous like the input gestures: queue the script and let the
+     * engine thread run it between page tasks. */
+    if(js == nullptr || js[0] == 0)
+        return;
+    EWebCmd cmd;
+    cmd.kind = ECMD_EVAL;
+    cmd.url = js;
+    postCommand(cmd);
+}
+
 void EWebEngine::scrollTo(int x, int y)
 {
     /* The embedder has already clamped (x,y) to the last-known doc geometry
@@ -2876,6 +3054,57 @@ void EWebEngine::handleKeyDefault(const eweb_key_event_t& kev, const char* domKe
 
     litehtml::element* focusEl = (litehtml::element*)m_focusElement;
     eweb_el_input* w = (focusEl != nullptr) ? (eweb_el_input*)widgetAt(focusEl) : nullptr;
+
+    /* contenteditable editing host: the script-side editing model owns the
+     * caret and the DOM mutations (EWebEditingJs.h); the engine only forwards
+     * the key and fires `input` when the content changed. */
+    if(w == nullptr && focusEl != nullptr && editableHostOf(focusEl) == focusEl) {
+        const bool meta = (kev.mods & EWEB_MOD_META) != 0;
+        auto ceChord = [&](char c) {
+            return ctrl && !alt && !meta &&
+                (kev.key == c || kev.key == c - 32 ||
+                 (kev.key == EWEB_KEY_CHAR &&
+                  (kev.text[0] == c || kev.text[0] == c - 32)));
+        };
+        const char* op = nullptr;
+        const char* txt = "";
+        if(ceChord('a')) op = "selall";
+        else if(ceChord('v')) {
+            if(m_port.sys.clipboard_get != nullptr) {
+                char* clip = m_port.sys.clipboard_get(m_port.sys.ud);
+                if(clip != nullptr) {
+                    if(jsEditableCommand(focusEl, "text", clip))
+                        fireWidgetEvent(focusEl, "input");
+                    free(clip);   /* port contract: core releases it */
+                    markContentDirty();
+                    m_caretDirty = true;
+                }
+            }
+            return;
+        }
+        else switch(kev.key) {
+        case EWEB_KEY_CHAR:
+            if(!ctrl && !alt && !meta) { op = "text"; txt = kev.text; }
+            break;
+        case EWEB_KEY_BACKSPACE: op = "back";  break;
+        case EWEB_KEY_DELETE:    op = "del";   break;
+        case EWEB_KEY_LEFT:      op = "left";  break;
+        case EWEB_KEY_RIGHT:     op = "right"; break;
+        case EWEB_KEY_HOME:      op = "home";  break;
+        case EWEB_KEY_END:       op = "end";   break;
+        case EWEB_KEY_ENTER:     op = "enter"; break;
+        default: break;
+        }
+        if(op != nullptr) {
+            litehtml::element* before = (litehtml::element*)m_focusElement;
+            if(jsEditableCommand(focusEl, op, txt) &&
+                    (litehtml::element*)m_focusElement == before)
+                fireWidgetEvent(focusEl, "input");
+            markContentDirty();
+            m_caretDirty = true;
+        }
+        return;
+    }
 
     /* Text editing on the focused field. */
     if(w != nullptr && w->isTextEditing()) {
@@ -3026,9 +3255,24 @@ void EWebEngine::handleKeyDefault(const eweb_key_event_t& kev, const char* domKe
     if(space) { scrollByKey(0, shift ? -page : page); return; }
 }
 
-/* Collect the focusable elements (form widgets + <a href>) under `e` in
- * document order. Widgets are recognised through the litehtml hook so a
- * disabled/hidden control is skipped; anchors are matched by tag + href. */
+/* contenteditable="false" (any ASCII case) opts a subtree out of editing;
+ * every other value - including the empty string - means editable. */
+static bool ceAttrIsFalse(const litehtml::tchar_t* v)
+{
+    const char* f = "false";
+    int i = 0;
+    for(; v[i] != 0 && f[i] != 0; ++i) {
+        litehtml::tchar_t c = v[i];
+        if(c >= 'A' && c <= 'Z') c = (litehtml::tchar_t)(c + 32);
+        if(c != f[i]) return false;
+    }
+    return v[i] == 0 && f[i] == 0;
+}
+
+/* Collect the focusable elements (form widgets + <a href> + contenteditable
+ * hosts) under `e` in document order. Widgets are recognised through the
+ * litehtml hook so a disabled/hidden control is skipped; anchors are matched
+ * by tag + href. */
 static void collectFocusable(litehtml::element* e, std::vector<litehtml::element*>& out)
 {
     if(e == nullptr) return;
@@ -3041,6 +3285,8 @@ static void collectFocusable(litehtml::element* e, std::vector<litehtml::element
         if(tag != nullptr && tag[0] == 'a' && tag[1] == 0 &&
                 href != nullptr && href[0] != 0)
             out.push_back(e);
+        const litehtml::tchar_t* ce = e->get_attr("contenteditable", nullptr);
+        if(ce != nullptr && !ceAttrIsFalse(ce)) out.push_back(e);
     }
     size_t n = e->get_children_count();
     for(size_t i = 0; i < n; ++i) {
@@ -3086,6 +3332,22 @@ litehtml::element* EWebEngine::focusableAt(litehtml::element* el) const
         if(tag != nullptr && tag[0] == 'a' && tag[1] == 0 &&
                 href != nullptr && href[0] != 0)
             return e;
+        const litehtml::tchar_t* ce = e->get_attr("contenteditable", nullptr);
+        if(ce != nullptr)
+            return ceAttrIsFalse(ce) ? nullptr : e;
+    }
+    return nullptr;
+}
+
+litehtml::element* EWebEngine::editableHostOf(litehtml::element* el)
+{
+    /* The editing host is the nearest ancestor-or-self carrying a
+     * contenteditable attribute; an explicit "false" makes the subtree
+     * non-editable even when a higher ancestor is editable. */
+    for(litehtml::element* e = el; e != nullptr; e = e->parent()) {
+        const litehtml::tchar_t* ce = e->get_attr("contenteditable", nullptr);
+        if(ce != nullptr)
+            return ceAttrIsFalse(ce) ? nullptr : e;
     }
     return nullptr;
 }
@@ -3171,11 +3433,19 @@ void EWebEngine::setFocus(litehtml::element* el)
         jsDispatchSimpleEvent(old, "focusout", true);
     }
     m_focusElement = (void*)el;
+    /* The painted caret belongs to the focused editable host: leaving one
+     * drops the bar, entering one refreshes it on the next paint. */
+    m_caretValid = false;
+    m_caretDirty = true;
     if(el != nullptr) {
         void* w = widgetAt(el);
         if(w != nullptr) ((eweb_el_input*)w)->setFocused(true);
         jsDispatchSimpleEvent(el, "focus", false);
         jsDispatchSimpleEvent(el, "focusin", true);
+        /* A focused editing host gets a caret through the script-side editing
+         * model (EWebEditingJs.h) so page handlers that read the selection on
+         * focus already see one. */
+        if(editableHostOf(el) == el) jsEditableCommand(el, "focus", "");
     }
     /* Toggle the CSS :focus pseudo-class on both chains so pages that style
      * :focus / :focus-visible / :focus-within actually see the state change.
@@ -3371,6 +3641,14 @@ bool EWebEngine::selectPopupRect(litehtml::position& out, int& rowH, int& visibl
     rowH = w->popupRowHeight();
 
     litehtml::position pl = ((litehtml::element*)w)->get_placement();
+    /* m_pos is the content box: expand to the border box so the popup aligns
+     * with the control's outer edge (same convention as html_tag/el_image). */
+    litehtml::margins pad = ((litehtml::element*)w)->get_paddings();
+    litehtml::margins brd = ((litehtml::element*)w)->get_borders();
+    pl.x -= pad.left + brd.left;
+    pl.y -= pad.top + brd.top;
+    pl.width += pad.left + pad.right + brd.left + brd.right;
+    pl.height += pad.top + pad.bottom + brd.top + brd.bottom;
     int px = pl.x - m_engineScrollX;
     int py = pl.y - m_engineScrollY + pl.height + kFrameOverscan;   /* just below the control, in cache coords (overscan-adjusted) */
     int h = visibleRows * rowH + 2;
@@ -3379,6 +3657,22 @@ bool EWebEngine::selectPopupRect(litehtml::position& out, int& rowH, int& visibl
     if(py < 0) py = 0;
     out.x = px; out.y = py; out.width = pl.width; out.height = h;
     return true;
+}
+
+void EWebEngine::drawCaret(eweb_surface_t* cache)
+{
+    /* ENGINE-THREAD ONLY: the focused contenteditable host's insertion bar.
+     * Refresh lazily here (focus/edit/arrow keys raise m_caretDirty) so the
+     * rect always tracks the live selection and layout. */
+    if(m_caretDirty) jsUpdateCaret();
+    if(!m_caretValid || !m_caretBlinkOn) return;
+    if(m_port.gfx.fill_rect == nullptr) return;
+    int h = m_caretRect.height;
+    if(h < 1) h = 1;
+    int x = m_caretRect.x;
+    int y = m_caretRect.y + kFrameOverscan;
+    if(x < 0 || y < 0 || x >= surfaceW(cache) || y >= surfaceH(cache)) return;
+    m_port.gfx.fill_rect(m_port.gfx.ud, cache, x, y, 2, h, 0xFF000000u);
 }
 
 void EWebEngine::drawSelectPopup(eweb_surface_t* cache)
@@ -3393,6 +3687,10 @@ void EWebEngine::scrollByKey(int dx, int dy)
     /* ENGINE-THREAD ONLY. Adopt the stepped offset, repaint, fire the page's
      * scroll handlers and republish the authoritative offset to the embedder
      * (postScrollClamp clamps to the doc geometry and snaps the UI's offset). */
+    /* Fix22: key paging over a rendered sub-document pages the article, not
+     * the (already fitting) reader shell around it. */
+    if(dy != 0 && scrollIframeAt(m_lastClientX, m_lastClientY, dy))
+        return;
     m_engineScrollX += dx;
     m_engineScrollY += dy;
     markContentDirty();
@@ -3407,12 +3705,17 @@ void EWebEngine::cleanupBuildResources()
      * vm_close() frees the VM and resetJsVm() nulls the pointer. Also drop
      * the extracted scripts and reset the document.write reparse guard. */
     resetJsVm();
+    m_caretValid = false;
+    m_caretDirty = false;
     m_jsScripts.clear();
     m_jsScriptSrcs.clear();
     m_jsScriptIds.clear();
     m_jsScriptDeferred.clear();
+    m_jsScriptAsync.clear();
+    m_jsScriptAsyncProps.clear();
     m_jsImportMap.clear();
     m_jsScriptDone.clear();
+    m_jsScriptRan.clear();
     m_jsScriptEls.clear();
     m_jsHasInlineHandlers = false;
     m_jsCurScriptEl = nullptr;
@@ -3440,6 +3743,8 @@ void EWebEngine::cleanupBuildResources()
     m_jsAbortCount = 0;
     m_jsSkeletonProbeAt = 0;   /* new document: re-probe the skeleton state */
     m_jsSkeletonProbeVal = false;
+    m_jsSkeletonAnyProbeAt = 0;
+    m_jsSkeletonAnyProbeVal = false;
     m_jsPageDisabled = false;
     m_jsMutations.clear();
     /* Nodes removeChild() parked belong to the page being torn down, so they
@@ -3485,6 +3790,8 @@ void EWebEngine::cleanupBuildResources()
     m_layoutDirtySince = 0;
     m_buildLayoutDirtySince = 0;
     m_seenCssUrls.clear();
+    m_loadedCssUrls.clear();
+    m_jsDeferredLinkEvents.clear();
     m_buildPhase = BUILD_IDLE;
     /* The abort (if any) is what brought us here: consumed. */
     m_buildAbort = false;
@@ -3556,12 +3863,26 @@ bool EWebEngine::hasSeenCSS(const std::string& url) const
     return false;
 }
 
+bool EWebEngine::hasLoadedCSS(const std::string& url) const
+{
+    for(const auto& loaded_url : m_loadedCssUrls) {
+        if(loaded_url == url) return true;
+    }
+    return false;
+}
+
 void EWebEngine::rememberCSS(const std::string& url)
 {
     if(url.empty() || hasSeenCSS(url)) {
         return;
     }
     m_seenCssUrls.push_back(url);
+}
+
+void EWebEngine::rememberLoadedCSS(const std::string& url)
+{
+    if(url.empty() || hasLoadedCSS(url)) return;
+    m_loadedCssUrls.push_back(url);
 }
 
 void EWebEngine::forgetCSS(const std::string& url)
@@ -3585,6 +3906,20 @@ bool EWebEngine::queueImageTask(const std::string& url)
     EWebTask task;
     task.url = url;
     task.type = EWEB_TASK_IMAGE;
+    task.loading = false;
+    return addTask(task);
+}
+
+bool EWebEngine::queueIframeTask(const std::string& url)
+{
+    /* EWebContainer::load_iframe -> here: the payload is an HTML document
+     * rendered statically into the frame box (Fix20). Already-fetched frames
+     * are not re-queued; a src change resolves to a different URL. */
+    if(m_iframeHtml.find(url) != m_iframeHtml.end())
+        return true;
+    EWebTask task;
+    task.url = url;
+    task.type = EWEB_TASK_IFRAME;
     task.loading = false;
     return addTask(task);
 }
@@ -3630,6 +3965,33 @@ void EWebEngine::queueNavigation(const std::string& url)
 {
     if(url.empty())
         return;
+    /* Blocked / same-document targets must be dropped BEFORE any abort is
+     * raised: requestBuildAbort() lets the engine loop tear the live VM down
+     * (advanceBuildStep's abort branch), and engineNavigate's matching guard
+     * then refuses the navigation - leaving the page permanently JS-dead.
+     * wx.qq.com's tab bar is full of Angular-$sanitize'd "unsafe:" hrefs whose
+     * real action is the ng-click DOM handler; following one used to kill the
+     * logged-in session. The guards mirror engineNavigate's. */
+    if(strncasecmp(url.c_str(), "unsafe:", 7) == 0)
+        return;
+    if(url[0] == '#')
+        return;
+    {
+        std::string a = url.substr(0, url.find('#'));
+        std::string b = m_currentHtmlUrl.substr(0, m_currentHtmlUrl.find('#'));
+        if(!a.empty() && a == b && url != m_currentHtmlUrl)
+            return;
+    }
+    if(url.size() >= 11 && strncasecmp(url.c_str(), "javascript:", 11) == 0) {
+        /* javascript: hrefs (wx.qq.com's <a class="btn_send"
+         * href="javascript:;">) execute in the CURRENT page, they are not a
+         * navigation: keep the raw URL pending and let
+         * jsRunPendingNavigation run the body once the click dispatch
+         * unwinds. No build abort - the page stays. */
+        m_jsPendingNav = url;
+        EWEB_LOG("[ewebview] javascript: URL queued -> %.60s\n", url.c_str());
+        return;
+    }
     /* ENGINE-THREAD ONLY: an <a href> click (EWebContainer::on_anchor_click)
      * or a script's location.href routes here. Resolve the target against the
      * page on screen and record it as pending; the engine loop acts on it
@@ -3739,6 +4101,8 @@ void EWebEngine::taskLoop()
                 res = loadCSSTask(task.url);
             } else if(task.type == EWEB_TASK_IMAGE) {
                 res = loadImageTask(task.url);
+            } else if(task.type == EWEB_TASK_IFRAME) {
+                res = loadIframeTask(task.url);
             } else if(task.type == EWEB_TASK_SCRIPT) {
                 res = loadScriptTask(task.url);
             } else if(task.type == EWEB_TASK_FONT_FACE) {
@@ -3784,6 +4148,28 @@ void EWebEngine::taskLoop()
     pthread_mutex_unlock(&m_taskMutex);
 }
 
+/* Classify a queued fetch into a claim priority (see kTaskPrio* in
+ * EWebInternal.h). The authority is matched against a short list of analytics
+ * hosts whose responses never contribute pixels to the page; they still run,
+ * but only once nothing render-useful is waiting. */
+static int taskPriorityFor(const std::string& url, int type)
+{
+    if(type == EWEB_TASK_HTML || type == EWEB_TASK_CSS ||
+       type == EWEB_TASK_SCRIPT || type == EWEB_TASK_FONT_FACE ||
+       type == EWEB_TASK_IFRAME)
+        return kTaskPrioHigh;
+    size_t scheme = url.find("://");
+    size_t a = (scheme == std::string::npos) ? 0 : scheme + 3;
+    size_t slash = url.find('/', a);
+    std::string host = url.substr(a, (slash == std::string::npos ? url.size() : slash) - a);
+    static const char* const kBeaconHosts[] = { "mmstat.com", "aplus.", "mediav.com" };
+    for(size_t i = 0; i < sizeof(kBeaconHosts)/sizeof(kBeaconHosts[0]); i++) {
+        if(host.find(kBeaconHosts[i]) != std::string::npos)
+            return kTaskPrioLow;
+    }
+    return kTaskPrioNormal;
+}
+
 bool EWebEngine::addTask(const EWebTask& task)
 {
     pthread_mutex_lock(&m_taskMutex);
@@ -3799,7 +4185,9 @@ bool EWebEngine::addTask(const EWebTask& task)
         }
     }
 
-    m_taskQueue.push_back(task);
+    EWebTask queued = task;
+    queued.priority = taskPriorityFor(task.url, task.type);
+    m_taskQueue.push_back(queued);
     if(task.type == EWEB_TASK_IMAGE) {
         EWEB_LOG("[ewebview] queue image added: pending=%d threads=%d busy=%d\n",
             (int)m_taskQueue.size(), m_taskThreads, m_taskBusy);
@@ -3883,20 +4271,22 @@ bool EWebEngine::getTaskLocked(EWebTask& task)
         return false;
     }
 
-    // Get task from queue
+    // Get task from queue: highest priority first; FIFO within a priority
+    // (the strictly-greater comparison keeps the earliest maximum).
+    int best = -1;
     for(size_t i = 0; i < m_taskQueue.size(); i++) {
-        if(!m_taskQueue[i].loading) {
-            task = m_taskQueue[i];
-            m_taskQueue[i].loading = true;
-            if(task.type == EWEB_TASK_IMAGE) {
-                EWEB_LOG("[ewebview] take image task: queue=%d\n",
-                    (int)m_taskQueue.size());
-            }
-            return true;
-        }
+        if(m_taskQueue[i].loading) continue;
+        if(best < 0 || m_taskQueue[i].priority > m_taskQueue[best].priority)
+            best = (int)i;
     }
-
-    return false;
+    if(best < 0) return false;
+    task = m_taskQueue[best];
+    m_taskQueue[best].loading = true;
+    if(task.type == EWEB_TASK_IMAGE) {
+        EWEB_LOG("[ewebview] take image task: queue=%d prio=%d\n",
+            (int)m_taskQueue.size(), task.priority);
+    }
+    return true;
 }
 
 bool EWebEngine::getTask(EWebTask& task)
@@ -3916,7 +4306,7 @@ bool EWebEngine::loadHtmlTask(const std::string& url)
      * initiator is another site, Strict ones may not. */
     std::string final_url;
     uint8_t* content = EWebContainer::loadURL(&m_port, url, &sz, taskPageUrl(), true,
-                                              &final_url);
+                                              &final_url, EWEB_REQUEST_DOCUMENT);
     if(content != NULL) {
         if(sz > 0)
             result.content.assign((char*)content, sz);
@@ -3946,7 +4336,8 @@ bool EWebEngine::loadCSSTask(const std::string& url)
     /* Subresource of the document being built: not a top-level navigation, so
      * Lax/Strict cookies both stay home when the sheet comes from another
      * site. */
-    uint8_t* content = EWebContainer::loadURL(&m_port, url, &sz, taskPageUrl(), false);
+    uint8_t* content = EWebContainer::loadURL(&m_port, url, &sz, taskPageUrl(), false,
+                                              NULL, EWEB_REQUEST_STYLE);
     if(content != NULL) {
         if(sz > 0)
             result.content.assign((char*)content, sz);
@@ -3973,7 +4364,12 @@ static bool ewebIsFontMagic(const uint8_t* d, int n)
     if(d[0] == 'O' && d[1] == 'T' && d[2] == 'T' && d[3] == 'O') return true;      /* sfnt OTF */
     if(d[0] == 't' && d[1] == 't' && d[2] == 'c' && d[3] == 'f') return true;      /* TTC */
     if(d[0] == 'w' && d[1] == 'O' && d[2] == 'F' && d[3] == 'F') return true;      /* WOFF */
-    if(d[0] == 'w' && d[1] == 'O' && d[2] == 'F' && d[3] == '2') return true;      /* WOFF2 */
+    /* WOFF2 deliberately NOT accepted: FreeType needs brotli to open it, so a
+     * registered woff2 blob resolves the family to a face that never opens -
+     * every measurement returns NULL and all its text collapses to zero width
+     * (Pinterest's Pin Sans is woff2-only; registering it blanked the whole
+     * page). Skipping registration keeps the family unresolved so the port's
+     * system-font fallback renders the text. */
     return false;
 }
 
@@ -4054,8 +4450,8 @@ void EWebEngine::scanFontFaces(const std::string& text, const std::string& baseU
                                  lc.compare(lc.size()-4, 4, ".otf") == 0 ||
                                  lc.compare(lc.size()-4, 4, ".ttc") == 0)) score = 0;
             else if(lc.size() > 5 && lc.compare(lc.size()-5, 5, ".woff") == 0) score = 1;
-            else if(lc.size() > 6 && lc.compare(lc.size()-6, 6, ".woff2") == 0) score = 2;
-            else score = 3;
+            else if(lc.size() > 6 && lc.compare(lc.size()-6, 6, ".woff2") == 0) score = 3;
+            else score = 2;
             if(score < best) { best = score; rel = cand; }
             if(best == 0) break;
         }
@@ -4089,7 +4485,8 @@ bool EWebEngine::loadFontFaceTask(const std::string& url)
     int sz = 0;
     uint64_t fetch_start = ticMs();
     /* Subresource, same cookie reasoning as loadCSSTask(). */
-    uint8_t* content = EWebContainer::loadURL(&m_port, url, &sz, taskPageUrl(), false);
+    uint8_t* content = EWebContainer::loadURL(&m_port, url, &sz, taskPageUrl(), false,
+                                              NULL, EWEB_REQUEST_FONT);
     if(content != NULL && sz > 4 && ewebIsFontMagic(content, sz)) {
         pthread_mutex_lock(&m_taskMutex);
         std::unordered_map<std::string, std::string>::iterator it = m_fontFaceFamily.find(url);
@@ -4115,7 +4512,8 @@ bool EWebEngine::loadScriptTask(const std::string& url)
     uint64_t fetch_start = ticMs();
     /* Subresource of the document being built (a classic <script src>): not a
      * top-level navigation, so Lax/Strict cookies both stay home cross-site. */
-    uint8_t* content = EWebContainer::loadURL(&m_port, url, &sz, taskPageUrl(), false);
+    uint8_t* content = EWebContainer::loadURL(&m_port, url, &sz, taskPageUrl(), false,
+                                              NULL, EWEB_REQUEST_SCRIPT);
     if(content != NULL) {
         if(sz > 0)
             result.content.assign((char*)content, sz);
@@ -4126,6 +4524,11 @@ bool EWebEngine::loadScriptTask(const std::string& url)
     }
     pushResult(result);
     removeTask(url);
+    if(getenv("EWEB_SCRIPTDBG") != nullptr &&
+       (url.find("fireyejs") != std::string::npos ||
+        url.find("et_f.js") != std::string::npos))
+        fprintf(stderr, "[scripttime] fetch-done t=%llu ok=%d bytes=%d url=%s\n",
+                (unsigned long long)ticMs(), result.ok ? 1 : 0, sz, url.c_str());
     EWEB_LOG("[ewebview] fetched script: url=%s ok=%d size=%d cost=%u ms\n",
         url.c_str(), result.ok ? 1 : 0, sz, (uint32_t)(ticMs() - fetch_start));
     return result.ok;
@@ -4137,7 +4540,8 @@ bool EWebEngine::loadImageTask(const std::string& url)
     int sz = 0;
     uint64_t fetch_start = ticMs();
     /* Subresource, same reasoning as loadCSSTask(). */
-    uint8_t* content = EWebContainer::loadURL(&m_port, url, &sz, taskPageUrl(), false);
+    uint8_t* content = EWebContainer::loadURL(&m_port, url, &sz, taskPageUrl(), false,
+                                              NULL, EWEB_REQUEST_IMAGE);
     if(content != NULL && sz > 0) {
         /* Decode on this worker thread (pure heap work): the engine thread
          * then only mounts the finished surface in O(1) instead of burning
@@ -4164,6 +4568,324 @@ bool EWebEngine::loadImageTask(const std::string& url)
     return result.ok;
 }
 
+bool EWebEngine::loadIframeTask(const std::string& url)
+{
+    /* Worker thread: fetch the frame document as raw HTML (no decode). The
+     * engine thread stores it and a later draw lays out the static render. */
+    EWebResult result = {url, EWEB_TASK_IFRAME, false, "", nullptr, ""};
+    int sz = 0;
+    uint8_t* content = EWebContainer::loadURL(&m_port, url, &sz, taskPageUrl(), false,
+                                              NULL, EWEB_REQUEST_DOCUMENT);
+    if(content != NULL && sz > 0) {
+        result.content.assign((const char*)content, (size_t)sz);
+        free(content);
+        result.ok = true;
+    }
+    if(getenv("EWEB_IFRAMEDBG") != nullptr)
+        fprintf(stderr, "[IFRAMEDBG] fetch done url=%.100s sz=%d ok=%d\n",
+            url.c_str(), sz, result.ok ? 1 : 0);
+    pushResult(result);
+    removeTask(url);
+    return result.ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* Static <iframe> rendering (Fix20)                                   */
+/* ------------------------------------------------------------------ */
+/* The engine has no nested scripting/document lifecycle, so a frame is
+ * rendered as a static sub-document snapshot painted into its box: fetch
+ * the HTML, strip scripting/external sheets, lay out with the same font /
+ * image services and blit the result. wx.qq.com's reader pane (subscription
+ * articles in iframe#reader) is exactly this shape - server-rendered article
+ * markup whose visibility gate and lazy images need a nudge to show. */
+
+static size_t iframeTagFind(const std::string& h, const char* needle, size_t from)
+{
+    size_t nl = strlen(needle);
+    if(h.size() < nl) return std::string::npos;
+    for(size_t i = from; i + nl <= h.size(); i++) {
+        if(strncasecmp(h.c_str() + i, needle, nl) == 0)
+            return i;
+    }
+    return std::string::npos;
+}
+
+static std::string preprocessIframeHtml(const std::string& in)
+{
+    std::string out;
+    out.reserve(in.size());
+    size_t i = 0;
+    while(i < in.size()) {
+        if(in[i] != '<') {
+            out.push_back(in[i++]);
+            continue;
+        }
+        /* <script>...</script>: drop the whole block (no nested VM). */
+        if(strncasecmp(in.c_str() + i, "<script", 7) == 0) {
+            size_t close = iframeTagFind(in, "</script", i + 7);
+            if(close == std::string::npos) { i = in.size(); break; }
+            size_t gt = in.find('>', close);
+            i = (gt == std::string::npos) ? in.size() : gt + 1;
+            continue;
+        }
+        /* <link>/<base>: external sheets would leak into the host page's
+         * stylesheet pipeline and <base> would rewrite the host base URL. */
+        if(strncasecmp(in.c_str() + i, "<link", 5) == 0 ||
+           strncasecmp(in.c_str() + i, "<base", 5) == 0) {
+            size_t gt = in.find('>', i);
+            i = (gt == std::string::npos) ? in.size() : gt + 1;
+            continue;
+        }
+        out.push_back(in[i++]);
+    }
+    /* Lazy images: wx article <img data-src=...> carries the real URL only
+     * in data-src (the src is a placeholder or absent). Promote it. */
+    {
+        std::string tmp;
+        tmp.reserve(out.size());
+        size_t p = 0;
+        while(p < out.size()) {
+            size_t hit = iframeTagFind(out, "data-src=", p);
+            if(hit == std::string::npos) { tmp.append(out, p, out.size() - p); break; }
+            tmp.append(out, p, hit - p);
+            tmp.append("src=");
+            p = hit + 9;
+        }
+        out.swap(tmp);
+    }
+    /* Visibility gates the page's own JS would lift: mp.weixin.qq.com ships
+     * #js_content style="visibility: hidden; opacity: 0;" until scripts run.
+     * A static render must show the content, so lift both spellings. */
+    static const char* lifts[][2] = {
+        {"visibility: hidden", "visibility: visible"},
+        {"visibility:hidden",  "visibility:visible"},
+        {"opacity: 0;",        "opacity: 1;"},
+        {"opacity:0;",         "opacity:1;"},
+        {"opacity: 0}",        "opacity: 1}"},
+    };
+    for(size_t k = 0; k < sizeof(lifts) / sizeof(lifts[0]); k++) {
+        std::string tmp;
+        tmp.reserve(out.size());
+        size_t p = 0;
+        size_t nl = strlen(lifts[k][0]);
+        while(p < out.size()) {
+            size_t hit = iframeTagFind(out, lifts[k][0], p);
+            if(hit == std::string::npos) { tmp.append(out, p, out.size() - p); break; }
+            tmp.append(out, p, hit - p);
+            tmp.append(lifts[k][1]);
+            p = hit + nl;
+        }
+        out.swap(tmp);
+    }
+    /* @import inside kept <style> blocks would queue CSS into the host
+     * document's pipeline: drop the statements. */
+    {
+        std::string tmp;
+        tmp.reserve(out.size());
+        size_t p = 0;
+        while(p < out.size()) {
+            size_t hit = iframeTagFind(out, "@import", p);
+            if(hit == std::string::npos) { tmp.append(out, p, out.size() - p); break; }
+            tmp.append(out, p, hit - p);
+            size_t semi = out.find(';', hit);
+            p = (semi == std::string::npos) ? out.size() : semi + 1;
+        }
+        out.swap(tmp);
+    }
+    return out;
+}
+
+void EWebEngine::clearIframeCaches()
+{
+    for(auto& kv : m_iframeRenders) {
+        EWebIframeRender& r = kv.second;
+        r.doc = nullptr;
+        if(r.surf != nullptr && m_port.gfx.surface_free != nullptr)
+            m_port.gfx.surface_free(m_port.gfx.ud, r.surf);
+        r.surf = nullptr;
+        delete r.ctx;
+        r.ctx = nullptr;
+    }
+    m_iframeRenders.clear();
+    m_iframeHtml.clear();
+}
+
+void EWebEngine::renderIframeSurface(const std::string& url, int w, int h)
+{
+    /* ENGINE-THREAD ONLY (draw path). Lay out the cached frame HTML at the
+     * iframe's laid-out content size and paint it into an offscreen surface.
+     * The surface is capped: a long article renders its first screenfuls -
+     * there is no nested scroll yet, and an unbounded bitmap would pin tens
+     * of MB per frame. */
+    auto hit = m_iframeHtml.find(url);
+    if(hit == m_iframeHtml.end() || w <= 0 || h <= 0)
+        return;
+    if(w > 4096) w = 4096;
+    if(h > 4096) h = 4096;
+    EWebIframeRender& r = m_iframeRenders[url];
+    if(r.surf != nullptr && r.w == w && r.h == h)
+        return;
+    if(r.surf != nullptr && m_port.gfx.surface_free != nullptr)
+        m_port.gfx.surface_free(m_port.gfx.ud, r.surf);
+    r.surf = nullptr;
+    r.doc = nullptr;
+    delete r.ctx;
+    r.ctx = nullptr;
+
+    uint64_t t0 = ticMs();
+    std::string html = preprocessIframeHtml(hit->second);
+    /* Sub-documents need the same UA defaults as the main page (div/p block
+     * flow, head/title hidden): without them every unstyled tag renders
+     * inline and the <title> text leaks into the frame. */
+    if(m_iframeUaCss.empty() && !m_defaultCSSUrl.empty()) {
+        int usz = 0;
+        uint8_t* ub = EWebContainer::loadURL(&m_port, m_defaultCSSUrl, &usz);
+        if(ub != nullptr) {
+            m_iframeUaCss.assign((const char*)ub, (size_t)usz);
+            free(ub);
+        }
+    }
+    r.ctx = new litehtml::context();
+    if(!m_iframeUaCss.empty())
+        r.ctx->load_master_stylesheet(m_iframeUaCss.c_str());
+    r.doc = litehtml::document::createFromString(html.c_str(), m_container, r.ctx);
+    if(!r.doc)
+        return;
+    r.doc->render(w);
+    int docH = r.doc->height();
+    /* Fix22: remember the full extent and keep the live offset inside it; the
+     * surface stays viewport-sized and is re-painted at the offset on scroll. */
+    r.docH = docH;
+    int maxScroll = docH - h;
+    if(maxScroll < 0) maxScroll = 0;
+    if(r.scrollY > maxScroll) r.scrollY = maxScroll;
+    if(r.scrollY < 0) r.scrollY = 0;
+    int sh = (docH > 0 && docH < h) ? docH : h;
+    if(sh < 1) sh = 1;
+    r.surf = m_port.gfx.surface_new(m_port.gfx.ud, w, sh);
+    r.w = w;
+    r.h = h;
+    r.imgGen = m_iframeImageGen;
+    if(r.surf == nullptr)
+        return;
+    if(m_port.gfx.fill_rect != nullptr)
+        m_port.gfx.fill_rect(m_port.gfx.ud, r.surf, 0, 0, w, sh, 0xFFFFFFFFu);
+    litehtml::position clip(0, 0, w, sh);
+    r.doc->set_draw_vp_origin_y(0);
+    r.doc->draw((litehtml::uint_ptr)r.surf, 0, -r.scrollY, &clip);
+    r.paintedScrollY = r.scrollY;
+    if(getenv("EWEB_IFRAMEDBG") != nullptr)
+        fprintf(stderr, "[IFRAMEDBG] render url=%.80s box=%dx%d docH=%d cost=%u ms\n",
+            url.c_str(), w, h, docH, (uint32_t)(ticMs() - t0));
+
+    /* Bound the cache: a reader session flips through articles; keep the
+     * three most recent renders and drop the rest. */
+    while(m_iframeRenders.size() > 3) {
+        auto victim = m_iframeRenders.begin();
+        if(victim->first == url)
+            ++victim;
+        if(victim == m_iframeRenders.end())
+            break;
+        EWebIframeRender& vr = victim->second;
+        vr.doc = nullptr;
+        if(vr.surf != nullptr && m_port.gfx.surface_free != nullptr)
+            m_port.gfx.surface_free(m_port.gfx.ud, vr.surf);
+        delete vr.ctx;
+        m_iframeRenders.erase(victim);
+    }
+}
+
+void EWebEngine::drawIframe(const std::string& url, litehtml::uint_ptr hdc,
+                            const litehtml::position& pos, const litehtml::position* clip)
+{
+    /* ENGINE-THREAD ONLY (el_iframe::draw -> container -> here). */
+    eweb_surface_t* target = (eweb_surface_t*)hdc;
+    if(target == nullptr || pos.width <= 0 || pos.height <= 0)
+        return;
+    if(m_port.gfx.blit == nullptr)
+        return;
+    renderIframeSurface(url, pos.width, pos.height);
+    auto it = m_iframeRenders.find(url);
+    if(it == m_iframeRenders.end() || it->second.surf == nullptr)
+        return;
+    EWebIframeRender& r = it->second;
+    int sw = surfaceW(r.surf);
+    int sh = surfaceH(r.surf);
+    if(sw <= 0 || sh <= 0)
+        return;
+    /* Late-arriving article images or a Fix22 scroll offset change: re-paint
+     * the kept sub-document into the same surface (layout is unchanged, only
+     * the bitmap cache grew or the visible band moved). */
+    if((r.imgGen != m_iframeImageGen || r.paintedScrollY != r.scrollY) && r.doc) {
+        if(m_port.gfx.fill_rect != nullptr)
+            m_port.gfx.fill_rect(m_port.gfx.ud, r.surf, 0, 0, sw, sh, 0xFFFFFFFFu);
+        litehtml::position c(0, 0, sw, sh);
+        r.doc->set_draw_vp_origin_y(0);
+        r.doc->draw((litehtml::uint_ptr)r.surf, 0, -r.scrollY, &c);
+        r.imgGen = m_iframeImageGen;
+        r.paintedScrollY = r.scrollY;
+    }
+    /* Confine the blit to the frame box AND the incoming draw clip (strip /
+     * ancestor overflow): source sub-rect matches the intersected dest. */
+    int dx = pos.x, dy = pos.y, dw = pos.width, dh = pos.height;
+    if(clip != nullptr) {
+        int cx = clip->x, cy = clip->y;
+        int cr = clip->x + clip->width, cb = clip->y + clip->height;
+        if(dx < cx) { dw -= cx - dx; dx = cx; }
+        if(dy < cy) { dh -= cy - dy; dy = cy; }
+        if(dx + dw > cr) dw = cr - dx;
+        if(dy + dh > cb) dh = cb - dy;
+    }
+    if(dw <= 0 || dh <= 0)
+        return;
+    int sx = dx - pos.x, sy = dy - pos.y;
+    if(sx >= sw || sy >= sh)
+        return;
+    if(sx + dw > sw) dw = sw - sx;
+    if(sy + dh > sh) dh = sh - sy;
+    if(dw <= 0 || dh <= 0)
+        return;
+    m_port.gfx.blit(m_port.gfx.ud, r.surf, sx, sy, dw, dh, target, dx, dy, dw, dh);
+}
+
+bool EWebEngine::scrollIframeAt(int cx, int cy, int dy)
+{
+    /* ENGINE-THREAD ONLY (Fix22). Walk the hit chain for a rendered iframe and
+     * move its sub-document offset. A frame pinned at its edge (or shorter
+     * than its box) does not consume the gesture: the walk continues so the
+     * browser scroll chaining reaches overflow ancestors / the main document. */
+    for(litehtml::element* e = hitElementAt(cx, cy); e != nullptr; e = e->parent()) {
+        const char* tag = e->get_tagName();
+        if(tag == nullptr || strcmp(tag, "iframe") != 0)
+            continue;
+        const char* src = e->get_attr("src", "");
+        if(src == nullptr || src[0] == 0)
+            continue;
+        std::string full = EWebContainer::getFullURL(&m_port, std::string(src), taskPageUrl());
+        auto it = m_iframeRenders.find(full);
+        if(it == m_iframeRenders.end())
+            continue;
+        EWebIframeRender& r = it->second;
+        int maxScroll = r.docH - r.h;
+        if(maxScroll <= 0)
+            continue;
+        int ns = r.scrollY + dy;
+        if(ns < 0) ns = 0;
+        if(ns > maxScroll) ns = maxScroll;
+        if(ns == r.scrollY)
+            continue;
+        r.scrollY = ns;
+        markContentDirty();
+        /* Key paging does not arm the gesture paint window elsewhere; keep the
+         * sub-document's new band prompt even under a 0-ms macrotask chain. */
+        m_inputPaintUntil = ticMs() + 400;
+        if(getenv("EWEB_IFRAMEDBG") != nullptr)
+            fprintf(stderr, "[IFRAMEDBG] scroll url=%.60s y=%d/%d\n", full.c_str(), ns, maxScroll);
+        return true;
+    }
+    return false;
+}
+
 bool EWebEngine::loadCSSContent(const std::string& url, const std::string& content)
 {
     /* ENGINE-THREAD ONLY (called from processResults). The engine exclusively
@@ -4172,6 +4894,9 @@ bool EWebEngine::loadCSSContent(const std::string& url, const std::string& conte
     if(m_pendingCss > 0) {
         m_pendingCss--;
     }
+    /* processResults calls this only for a successful fetch. Keep this state
+     * separate from m_seenCssUrls, which is marked before the request starts. */
+    rememberLoadedCSS(url);
     bool res = false;
     if(!content.empty()) {
         /* @font-face blocks live in this sheet: queue their src blobs before
@@ -4335,6 +5060,7 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
      * exclusively owns the documents; the loop renders frames and posts them
      * to the UI. */
     cleanupBuildResources();
+    clearIframeCaches();   /* a new main document invalidates all frame renders */
     /* Inline <style> blocks can carry @font-face too: scan the raw document
      * text (relative src urls resolve against the document url) before the
      * script-stripping rewrite so the fetches start during the build. */
@@ -4351,8 +5077,10 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
     m_jsScriptIds.clear();
     m_jsScriptDeferred.clear();
     m_jsScriptAsync.clear();
+    m_jsScriptAsyncProps.clear();
     m_jsImportMap.clear();
     m_jsScriptDone.clear();
+    m_jsScriptRan.clear();
     m_jsScriptEls.clear();
     m_jsHasInlineHandlers = false;
     m_jsOrigHtmlHadNoJs = false;
@@ -4462,6 +5190,7 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
      * is filled when its EWEB_TASK_SCRIPT fetch lands; inline bodies are ready
      * now. extract_scripts keeps m_jsScriptSrcs the same length as m_jsScripts. */
     m_jsScriptDone.assign(m_jsScripts.size(), 1);
+    m_jsScriptRan.assign(m_jsScripts.size(), 0);
     for(size_t i = 0; i < m_jsScriptSrcs.size() && i < m_jsScriptDone.size(); ++i) {
         if(!m_jsScriptSrcs[i].empty()) m_jsScriptDone[i] = 0;
     }
@@ -4563,7 +5292,10 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
             /* Split parts inherit the parent tag's defer/module flavour. */
             m_jsScriptDeferred.insert(m_jsScriptDeferred.begin() + (long)(i + k),
                                       (i < m_jsScriptDeferred.size()) ? m_jsScriptDeferred[i] : false);
+            m_jsScriptAsync.insert(m_jsScriptAsync.begin() + (long)(i + k),
+                                   (i < m_jsScriptAsync.size()) ? m_jsScriptAsync[i] : 0);
             m_jsScriptDone.insert(m_jsScriptDone.begin() + (long)(i + k), 0);
+            m_jsScriptRan.insert(m_jsScriptRan.begin() + (long)(i + k), 0);
         }
         i += parts.size() - 1;
         for(size_t k = 0; k < parts.size(); ++k) {
@@ -4682,15 +5414,33 @@ bool EWebEngine::processResults()
          * failed fetch still marks the slot done with an empty body, so a
          * classic-script run never wedges behind a script that 404'd. Handled
          * before the ok/!ok split so both outcomes reach it. */
+        bool filled = false;
         for(size_t i = 0; i < m_jsScriptSrcs.size(); ++i) {
             if(i < m_jsScriptDone.size() && !m_jsScriptDone[i] && m_jsScriptSrcs[i] == result.url) {
                 if(i < m_jsScripts.size())
                     m_jsScripts[i] = result.ok ? result.content : std::string();
                 m_jsScriptDone[i] = 1;
+                filled = true;
+                if(getenv("EWEB_SCRIPTDBG") != nullptr &&
+                   (result.url.find("fireyejs") != std::string::npos ||
+                    result.url.find("et_f.js") != std::string::npos))
+                    fprintf(stderr, "[scripttime] ready t=%llu slot=%zu url=%s\n",
+                            (unsigned long long)ticMs(), i, result.url.c_str());
             }
         }
         EWEB_LOG("[ewebview] script result: url=%s ok=%d size=%d\n",
             result.url.c_str(), result.ok ? 1 : 0, (int)result.content.size());
+        /* A force-async dynamic <script> (browser default) does not block the
+         * ordered queue, so the build may already be BUILD_IDLE when its fetch
+         * lands (web.wechat.com's ~25s checkLogin long-poll). Re-arm the run
+         * phase so the late body executes and fires load; otherwise the login
+         * retry loop never sees the 408 and stalls. */
+        if(filled && m_buildPhase == BUILD_IDLE && m_jsVm != nullptr) {
+            m_jsPostSwapRun = true;
+            m_jsPostSwapAt = ticMs();
+            m_postSwapSkelLatch = false;
+            m_buildPhase = BUILD_RUN_JS;
+        }
         m_deferBuildStep = true;   /* resume BUILD_RUN_JS past the filled slot */
         pthread_mutex_lock(&m_resultMutex);
         bool has_more_scripts = !m_resultQueue.empty();
@@ -4765,6 +5515,17 @@ bool EWebEngine::processResults()
          * on onload (Rspack miniCss): the sheet is now applied. */
         jsFireLinkElEvent(result.url, "load");
     }
+    else if(result.type == EWEB_TASK_IFRAME) {
+        /* Raw frame HTML landed: cache it and repaint so the next draw can
+         * lay out the static sub-document at the frame's laid-out size. */
+        if(result.ok && !result.content.empty()) {
+            m_iframeHtml[result.url] = result.content;
+            if(getenv("EWEB_IFRAMEDBG") != nullptr)
+                fprintf(stderr, "[IFRAMEDBG] html cached url=%.100s sz=%d\n",
+                    result.url.c_str(), (int)result.content.size());
+            markContentDirty();
+        }
+    }
     else if(result.type == EWEB_TASK_IMAGE) {
         static int imgdbg4 = -1;
         if(imgdbg4 < 0) { const char* e = getenv("EWEB_IMGDBG"); imgdbg4 = (e && e[0] == '1') ? 1 : 0; }
@@ -4809,6 +5570,13 @@ bool EWebEngine::processResults()
              * append waits on it; see jsMaybePreloadImage). No-op when no script
              * set this src (a parser-path image never registers a waiter). */
             jsFireImgElEvent(result.url, "load");
+            /* A newly mounted bitmap may belong to a cached static iframe
+             * render: bump the generation so its next paint re-draws the
+             * sub-document (article images arrive after the first render). */
+            if(!m_iframeRenders.empty()) {
+                m_iframeImageGen++;
+                markContentDirty();
+            }
         }
     }
     EWEB_LOG("[ewebview] process result total: type=%d cost=%u ms\n",
@@ -5338,6 +6106,7 @@ void EWebEngine::advanceBuildStep()
         // re-entrant corruption (the engine loop flushes these at its top).
         if(m_pendingDeleteDoc) delete m_pendingDeleteDoc;
         if(m_pendingDeleteContainer) delete m_pendingDeleteContainer;
+        fprintf(stderr, "[VMLIFE] swap park old_doc=%p\n", (void*)old_doc);
         m_pendingDeleteDoc = old_doc;
         m_pendingDeleteContainer = old_container;
 
@@ -5368,6 +6137,25 @@ void EWebEngine::advanceBuildStep()
 }
 
 static void ewebDumpLayoutFile(FILE* f, litehtml::element* el, int depth);
+
+/* Deterministic per-frame paint profiler (EWEB_DRAWPROF=1): counts full-page
+ * cache repaints and sums their wall-clock cost, reporting the average at
+ * exit. Noise-free A/B signal for paint-path changes (viewport cull etc.). */
+static uint64_t g_drawprof_frames = 0, g_drawprof_ms = 0, g_drawprof_max = 0;
+static void drawprof_report(void)
+{
+    if(g_drawprof_frames == 0) return;
+    fprintf(stderr, "[drawprof] frames=%llu total_ms=%llu avg_ms=%.1f max_ms=%llu\n",
+            (unsigned long long)g_drawprof_frames, (unsigned long long)g_drawprof_ms,
+            (double)g_drawprof_ms / (double)g_drawprof_frames,
+            (unsigned long long)g_drawprof_max);
+}
+static int drawprof_enabled(void)
+{
+    static int s = -1;
+    if(s < 0) { s = (getenv("EWEB_DRAWPROF") != NULL) ? 1 : 0; if(s) atexit(drawprof_report); }
+    return s;
+}
 
 void EWebEngine::drawPageToCacheLocked(int stripY, int stripH)
 {
@@ -5425,6 +6213,9 @@ void EWebEngine::drawPageToCacheLocked(int stripY, int stripH)
      * offset as m_doc->draw so canvases track scroll; the clip confines them
      * to the strip. litehtml itself draws nothing for <canvas>. */
     compositeCanvases(cache, drawOfsX, drawOfsY);
+    /* The contenteditable caret rides above the laid-out text (viewport
+     * coordinates; the overscan shift matches the viewport origin). */
+    drawCaret(cache);
     /* An open <select> dropdown floats above the page: draw it last so it is
      * never covered by the laid-out document. No-op unless one is open. */
     drawSelectPopup(cache);
@@ -5487,6 +6278,11 @@ void EWebEngine::drawPageToCacheLocked(int stripY, int stripH)
         if(lf != nullptr) { ewebDumpLayoutFile(lf, m_doc->root(), 0); fclose(lf); }
     }
     uint32_t draw_ms = (uint32_t)(ticMs() - draw_start);
+    if(drawprof_enabled() && stripY == 0) {
+        g_drawprof_frames++;
+        g_drawprof_ms += draw_ms;
+        if(draw_ms > g_drawprof_max) g_drawprof_max = draw_ms;
+    }
     if(m_container != NULL && draw_ms >= 20) {
         uint32_t text_width_calls = 0, text_width_ms = 0, draw_text_calls = 0, draw_text_ms = 0;
         uint32_t text_width_hits = 0, text_width_misses = 0;
@@ -5696,6 +6492,16 @@ bool EWebEngine::jsSkeletonProbeCached()
     return m_jsSkeletonProbeVal;
 }
 
+bool EWebEngine::jsSkeletonAnyProbeCached()
+{
+    uint64_t now = ticMs();
+    if(m_jsSkeletonAnyProbeAt == 0 || (now - m_jsSkeletonAnyProbeAt) >= kJsSkeletonProbeTtlMs) {
+        m_jsSkeletonAnyProbeAt = now;
+        m_jsSkeletonAnyProbeVal = pageHasSkeletonAny();
+    }
+    return m_jsSkeletonAnyProbeVal;
+}
+
 /* Layout dump (EWEB_LAYOUTDUMP=<path>): one line per element with its tag,
  * id, class, computed display/position and the ABSOLUTE laid-out box, written
  * after every paint (last paint wins). Text nodes print their first words.
@@ -5709,6 +6515,14 @@ static void ewebDumpLayoutFile(FILE* f, litehtml::element* el, int depth)
     const litehtml::tchar_t* tag = el->get_tagName();
     litehtml::position p = el->get_placement();
     if(tag == nullptr || *tag == 0) {
+        if(el->is_html_tag()) {
+            /* anonymous table box: layout artifact, recurse for diagnosis */
+            fprintf(f, "<anonymous> disp=%d [%d,%d %dx%d]\n", (int)el->get_display(), p.x, p.y, p.width, p.height);
+            size_t ac = el->get_children_count();
+            for(size_t i = 0; i < ac; ++i)
+                ewebDumpLayoutFile(f, el->get_child((int)i), depth + 1);
+            return;
+        }
         litehtml::tstring txt;
         el->get_text(txt);
         for(char& ch : txt) if(ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
@@ -6029,6 +6843,12 @@ void ewebview_post_key(ewebview_t* v, const eweb_key_event_t* ev)
 {
     if(v != NULL && ev != NULL)
         v->engine.postKey(*ev);
+}
+
+void ewebview_eval_js(ewebview_t* v, const char* js)
+{
+    if(v != NULL && js != NULL)
+        v->engine.evalJS(js);
 }
 
 void ewebview_scroll(ewebview_t* v, int x, int y)

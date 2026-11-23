@@ -29,6 +29,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <set>
 
 #include <plutovg.h>
 
@@ -835,6 +836,122 @@ static std::string url_origin(const std::string& url) {
     return url.substr(0, path_start);
 }
 
+static std::string lower_ascii(std::string s)
+{
+    for(size_t i = 0; i < s.size(); ++i) {
+        if(s[i] >= 'A' && s[i] <= 'Z') s[i] = (char)(s[i] - 'A' + 'a');
+    }
+    return s;
+}
+
+static int request_url_port(const std::string& url, const std::string& scheme)
+{
+    size_t begin = url.find("://");
+    if(begin == std::string::npos) return -1;
+    begin += 3;
+    size_t end = url.find_first_of("/?#", begin);
+    std::string authority = (end == std::string::npos) ? url.substr(begin)
+                                                       : url.substr(begin, end - begin);
+    size_t at = authority.find_last_of('@');
+    if(at != std::string::npos) authority = authority.substr(at + 1);
+    std::string port;
+    if(!authority.empty() && authority[0] == '[') {
+        size_t close = authority.find(']');
+        if(close != std::string::npos && close + 1 < authority.size() &&
+           authority[close + 1] == ':')
+            port = authority.substr(close + 2);
+    } else {
+        size_t colon = authority.find_last_of(':');
+        if(colon != std::string::npos) port = authority.substr(colon + 1);
+    }
+    if(!port.empty()) {
+        for(size_t i = 0; i < port.size(); ++i)
+            if(port[i] < '0' || port[i] > '9') return -1;
+        return atoi(port.c_str());
+    }
+    if(scheme == "http") return 80;
+    if(scheme == "https") return 443;
+    return -1;
+}
+
+std::string ewebRequestOrigin(const std::string& url)
+{
+    size_t scheme_end = url.find("://");
+    if(scheme_end == std::string::npos) return std::string();
+    std::string scheme = lower_ascii(url.substr(0, scheme_end));
+    std::string host = EWebCookieJar::hostOf(url);
+    if((scheme != "http" && scheme != "https") || host.empty()) return std::string();
+    int port = request_url_port(url, scheme);
+    std::string origin = scheme + "://" + host;
+    if((scheme == "http" && port != 80) || (scheme == "https" && port != 443)) {
+        if(port > 0) origin += ":" + std::to_string(port);
+    }
+    return origin;
+}
+
+std::string ewebRequestFetchSite(const std::string& url, const std::string& pageUrl)
+{
+    if(pageUrl.empty()) return "none";
+    std::string origin = ewebRequestOrigin(url);
+    std::string page_origin = ewebRequestOrigin(pageUrl);
+    if(origin.empty() || page_origin.empty()) return "none";
+    if(origin == page_origin) return "same-origin";
+    size_t scheme_end = origin.find("://");
+    size_t page_scheme_end = page_origin.find("://");
+    if(origin.substr(0, scheme_end) != page_origin.substr(0, page_scheme_end))
+        return "cross-site";
+    std::string host = EWebCookieJar::hostOf(url);
+    std::string page_host = EWebCookieJar::hostOf(pageUrl);
+    return EWebCookieJar::siteOf(host) == EWebCookieJar::siteOf(page_host)
+           ? "same-site" : "cross-site";
+}
+
+std::string ewebRequestReferrer(const std::string& url, const std::string& pageUrl)
+{
+    if(ewebRequestOrigin(pageUrl).empty()) return std::string();
+    if(ewebRequestOrigin(url) != ewebRequestOrigin(pageUrl))
+        return ewebRequestOrigin(pageUrl) + "/";
+    size_t fragment = pageUrl.find('#');
+    return (fragment == std::string::npos) ? pageUrl : pageUrl.substr(0, fragment);
+}
+
+static const char* request_accept(EWebRequestDestination destination)
+{
+    switch(destination) {
+        case EWEB_REQUEST_DOCUMENT:
+            return "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8";
+        case EWEB_REQUEST_STYLE:
+            return "text/css,*/*;q=0.1";
+        case EWEB_REQUEST_IMAGE:
+            return "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8";
+        case EWEB_REQUEST_SCRIPT:
+        case EWEB_REQUEST_FONT:
+        case EWEB_REQUEST_OTHER:
+        default:
+            return "*/*";
+    }
+}
+
+static const char* request_destination_name(EWebRequestDestination destination)
+{
+    switch(destination) {
+        case EWEB_REQUEST_DOCUMENT: return "document";
+        case EWEB_REQUEST_SCRIPT:   return "script";
+        case EWEB_REQUEST_STYLE:    return "style";
+        case EWEB_REQUEST_IMAGE:    return "image";
+        case EWEB_REQUEST_FONT:     return "font";
+        case EWEB_REQUEST_OTHER:
+        default:                    return "empty";
+    }
+}
+
+static const char* request_mode(EWebRequestDestination destination)
+{
+    if(destination == EWEB_REQUEST_DOCUMENT) return "navigate";
+    if(destination == EWEB_REQUEST_FONT || destination == EWEB_REQUEST_OTHER) return "cors";
+    return "no-cors";
+}
+
 const std::string EWebContainer::getFullURL(const eweb_port_t* port, const std::string& src, const std::string& baseurl) {
     std::string clean_src = trim_request_url(src);
     std::string clean_baseurl = trim_request_url(baseurl);
@@ -888,8 +1005,22 @@ const std::string EWebContainer::getFullURL(const eweb_port_t* port, const std::
         clean_src.erase(0, 2);
 
     if (!clean_baseurl.empty()) {
-        size_t slash = clean_baseurl.find_last_of('/');
-        std::string base_dir = slash == std::string::npos ? clean_baseurl : clean_baseurl.substr(0, slash + 1);
+        /* The base directory is the URL up to the last '/' of its PATH. A
+         * bare origin ("https://web.wechat.com") has an empty path that
+         * browsers normalize to "/", and a query/hash takes no part in the
+         * join - otherwise find_last_of('/') lands on the scheme's "//" and
+         * "navChat.html" resolves to "https://navChat.html" (web.wechat.com's
+         * Angular template XHRs died exactly there). */
+        std::string base_path = clean_baseurl;
+        size_t qh = base_path.find_first_of("?#");
+        if(qh != std::string::npos)
+            base_path.erase(qh);
+        size_t scheme_end = base_path.find("://");
+        size_t path_start = (scheme_end == std::string::npos) ? 0 : scheme_end + 3;
+        size_t slash = base_path.find_last_of('/');
+        std::string base_dir = (slash == std::string::npos || slash < path_start)
+            ? base_path + "/"
+            : base_path.substr(0, slash + 1);
         if(!base_dir.empty())
             path = base_dir + clean_src;
     }
@@ -903,7 +1034,7 @@ std::string EWebContainer::normalizeURL(const eweb_port_t* port, const std::stri
 
 uint8_t* EWebContainer::loadURL(const eweb_port_t* port, const std::string& url, int* sz,
                                 const std::string& pageUrl, bool topLevel,
-                                std::string* finalUrl)
+                                std::string* finalUrl, EWebRequestDestination destination)
 {
     uint8_t* ret = NULL;
     if(sz != NULL)
@@ -914,30 +1045,22 @@ uint8_t* EWebContainer::loadURL(const eweb_port_t* port, const std::string& url,
     std::string full_url = getFullURL(port, url, "");
     EWEB_LOG("[ewebview] loadURL: %s -> %s\n", url.c_str(), full_url.c_str());
 
-    /* One-time seed of an externally supplied browser session (login +
-     * anti-bot cookies) for parity validation. EWEB_COOKIE_FILE names a file
-     * holding a raw "Cookie:" header; its pairs are filed under the target's
-     * registrable domain so the subdomain MTOP APIs receive them. Runs before
-     * the first requestHeader() below, so the very first navigation already
-     * carries the injected session. */
+    /* One-time restore of a persisted / externally supplied browser session.
+     * EWEB_COOKIE_FILE names either a Netscape cookie file (written back by
+     * the jar itself after every store, so a login survives a restart) or a
+     * legacy raw "Cookie:" header (pairs filed under the target's registrable
+     * domain so subdomain APIs receive them). Runs before the first
+     * requestHeader() below, so the very first navigation already carries the
+     * restored session. */
     {
         static bool s_cookieSeeded = false;
         if(!s_cookieSeeded) {
             s_cookieSeeded = true;
             const char* cf = getenv("EWEB_COOKIE_FILE");
             if(cf != NULL && cf[0] != '\0') {
-                FILE* f = fopen(cf, "rb");
-                if(f != NULL) {
-                    std::string hdr;
-                    char buf[4096];
-                    size_t n;
-                    while((n = fread(buf, 1, sizeof(buf), f)) > 0)
-                        hdr.append(buf, n);
-                    fclose(f);
-                    EWebCookieJar::instance().seedFromHeader(full_url, hdr);
-                    EWEB_LOG("[ewebview] seeded cookies from %s: jar=%d\n",
-                             cf, (int)EWebCookieJar::instance().count());
-                }
+                bool ok = EWebCookieJar::instance().loadFile(full_url);
+                EWEB_LOG("[ewebview] loaded cookies from %s: ok=%d jar=%d\n",
+                         cf, ok ? 1 : 0, (int)EWebCookieJar::instance().count());
             }
         }
     }
@@ -975,20 +1098,46 @@ uint8_t* EWebContainer::loadURL(const eweb_port_t* port, const std::string& url,
              * and only what the jar's domain/path/Secure/SameSite rules allow
              * for this URL. */
             std::string cookie_header = EWebCookieJar::instance().requestHeader(cur_url, pageUrl, topLevel);
-            eweb_http_header_t req_hdr;
-            req_hdr.key = "Cookie";
-            req_hdr.value = cookie_header.c_str();
-            const eweb_http_header_t* req_hdrs = cookie_header.empty() ? NULL : &req_hdr;
-            int req_hdr_count = cookie_header.empty() ? 0 : 1;
             if(!cookie_header.empty()) {
                 EWEB_LOG("[ewebview] cookie header: url=%s page=%s top=%d len=%d\n",
                     cur_url.c_str(), pageUrl.c_str(), topLevel ? 1 : 0, (int)cookie_header.size());
             }
 
+            /* Match the request context a real browser puts on each resource
+             * type. MTOP JSONP is a classic script (no-cors), not an XHR; its
+             * Referer/Accept/Fetch Metadata must therefore follow script rules. */
+            EWebRequestDestination dest = (topLevel && destination == EWEB_REQUEST_OTHER)
+                                          ? EWEB_REQUEST_DOCUMENT : destination;
+            std::string referrer = ewebRequestReferrer(cur_url, pageUrl);
+            std::string fetch_site = ewebRequestFetchSite(cur_url, pageUrl);
+            std::vector<std::pair<std::string, std::string> > req_storage;
+            if(!cookie_header.empty()) req_storage.push_back(std::make_pair("Cookie", cookie_header));
+            if(!referrer.empty()) req_storage.push_back(std::make_pair("Referer", referrer));
+            req_storage.push_back(std::make_pair("Accept", request_accept(dest)));
+            req_storage.push_back(std::make_pair("Accept-Language", "en-US,en;q=0.9"));
+            req_storage.push_back(std::make_pair("Sec-Fetch-Dest", request_destination_name(dest)));
+            req_storage.push_back(std::make_pair("Sec-Fetch-Mode", request_mode(dest)));
+            req_storage.push_back(std::make_pair("Sec-Fetch-Site", fetch_site));
+            if(topLevel) req_storage.push_back(std::make_pair("Sec-Fetch-User", "?1"));
+            std::vector<eweb_http_header_t> req_hdrs;
+            for(size_t i = 0; i < req_storage.size(); ++i) {
+                eweb_http_header_t h;
+                h.key = req_storage[i].first.c_str();
+                h.value = req_storage[i].second.c_str();
+                req_hdrs.push_back(h);
+            }
+            if(getenv("EWEB_NETDBG") != NULL &&
+               cur_url.find("h5api.m.taobao.com") != std::string::npos) {
+                fprintf(stderr, "[netdbg] resource context dest=%s mode=%s site=%s referer=%s\n",
+                        request_destination_name(dest), request_mode(dest), fetch_site.c_str(),
+                        referrer.empty() ? "(none)" : referrer.c_str());
+            }
+
             eweb_http_response_t resp;
             /* Resource loads are always plain GETs with no body. */
             if(!port->net.request(port->net.ud, cur_url.c_str(), "GET", NULL, 0,
-                                  req_hdrs, req_hdr_count, &resp)) {
+                                  req_hdrs.empty() ? NULL : &req_hdrs[0],
+                                  (int)req_hdrs.size(), &resp)) {
                 EWEB_LOG("[ewebview] loadURL http: request failed url=%s cost=%u ms\n",
                     cur_url.c_str(), (uint32_t)(port->clock.tic_ms(port->clock.ud) - start_ms));
                 return NULL;
@@ -1097,8 +1246,31 @@ void EWebContainer::load_image(const litehtml::tchar_t* src, const litehtml::tch
         return;
 
     auto it = m_images.find(full_url);
+    if(getenv("EWEB_BGDBG") != nullptr) {
+        static std::set<std::string> logged;
+        std::string key = full_url + (it != m_images.end() ? "|cached" : (m_defer_image_load ? "|deferred" : "|queue"));
+        if(logged.insert(key).second) {
+            fprintf(stderr, "[BGDBG] load url=%s state=%s\n", full_url.c_str(),
+                it != m_images.end() ? "cached" : (m_defer_image_load ? "deferred" : "queue"));
+        }
+    }
     if (it != m_images.end()) {
         it->second.ref_count++;
+        return;
+    }
+
+    /* data: URLs carry their payload inline - there is no network round-trip to
+     * parallelise, so decode synchronously instead of queueing the async image
+     * worker. Queuing leaves the get_image_size() that jsMaybePreloadImage does
+     * immediately after load_image() at 0x0, so the script's onload strands for
+     * a detached new Image() whose waiter is gone before the worker lands. */
+    if(full_url.compare(0, 5, "data:") == 0) {
+        int dsz = 0;
+        uint8_t* bytes = loadURL(m_port, full_url, &dsz);
+        if(bytes != nullptr) {
+            loadImageData(full_url, bytes, dsz);
+            free(bytes);
+        }
         return;
     }
 
@@ -1114,6 +1286,42 @@ void EWebContainer::load_image(const litehtml::tchar_t* src, const litehtml::tch
 
     if(m_host)
         m_host->queueImageTask(full_url);
+}
+
+void EWebContainer::load_iframe(const litehtml::tchar_t* src, const litehtml::tchar_t* baseurl, bool redraw_on_ready)
+{
+    (void)redraw_on_ready;
+    if(src == NULL || src[0] == 0)
+        return;
+    if(m_abort)
+        return;
+    std::string base_url = baseurl ? std::string(baseurl) : std::string();
+    if(base_url.empty())
+        base_url = m_base_url;
+    std::string full_url = getFullURL(m_port, std::string(src), base_url);
+    if(full_url.empty())
+        return;
+    /* Only http(s) frames: javascript:/data: payloads have no static document
+     * lifecycle here, and about:blank carries nothing to render. */
+    if(strncasecmp(full_url.c_str(), "http://", 7) != 0 &&
+       strncasecmp(full_url.c_str(), "https://", 8) != 0)
+        return;
+    if(m_host)
+        m_host->queueIframeTask(full_url);
+}
+
+void EWebContainer::draw_iframe(litehtml::uint_ptr hdc, const litehtml::tchar_t* src, const litehtml::tchar_t* baseurl,
+                                const litehtml::position& pos, const litehtml::position* clip)
+{
+    if(src == NULL || src[0] == 0 || m_host == NULL)
+        return;
+    std::string base_url = baseurl ? std::string(baseurl) : std::string();
+    if(base_url.empty())
+        base_url = m_base_url;
+    std::string full_url = getFullURL(m_port, std::string(src), base_url);
+    if(full_url.empty())
+        return;
+    m_host->drawIframe(full_url, hdc, pos, clip);
 }
 
 void EWebContainer::setDeferImageLoad(bool defer)
@@ -1919,6 +2127,30 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
         return;
     }
 
+    if(getenv("EWEB_BGDBG") != nullptr && !bg.image.empty() &&
+       !eweb_starts_with_ci(bg.image, "linear-gradient(") &&
+       !eweb_starts_with_ci(bg.image, "conic-gradient(")) {
+        std::string debug_url = getFullURL(m_port, bg.image, m_base_url);
+        auto debug_it = m_images.find(debug_url);
+        int cached_w = 0, cached_h = 0;
+        if(debug_it != m_images.end() && debug_it->second.image && gfx->surface_dims) {
+            gfx->surface_dims(gfx->ud, debug_it->second.image, &cached_w, &cached_h);
+        }
+        static std::set<std::string> logged;
+        char geometry[160];
+        snprintf(geometry, sizeof(geometry), "|%dx%d|%d,%d,%dx%d|%dx%d",
+            bg.image_size.width, bg.image_size.height,
+            bg.clip_box.x, bg.clip_box.y, bg.clip_box.width, bg.clip_box.height,
+            cached_w, cached_h);
+        std::string key = debug_url + geometry;
+        if(logged.insert(key).second) {
+            fprintf(stderr, "[BGDBG] draw url=%s resolved=%dx%d cached=%dx%d clip=%d,%d,%dx%d pos=%d,%d\n",
+                debug_url.c_str(), bg.image_size.width, bg.image_size.height, cached_w, cached_h,
+                bg.clip_box.x, bg.clip_box.y, bg.clip_box.width, bg.clip_box.height,
+                bg.position_x, bg.position_y);
+        }
+    }
+
     bool do_image = false;
     if (!bg.image.empty() && bg.image_size.width > 0 && bg.image_size.height > 0) {
         std::string full_url = getFullURL(m_port, bg.image, m_base_url);
@@ -2061,6 +2293,13 @@ void EWebContainer::draw_background(litehtml::uint_ptr hdc, const litehtml::back
                                     gfx->blit(gfx->ud, img, sx, sy, sw, sh, s, dx, dy, sw, sh);
                                 }
                             }
+                        }
+                    }
+                    if(getenv("EWEB_BGDBG") != nullptr) {
+                        static std::set<std::string> logged;
+                        if(logged.insert(full_url).second) {
+                            fprintf(stderr, "[BGDBG] painted url=%s native=%dx%d tile=%dx%d\n",
+                                full_url.c_str(), iw, ih, tw, th);
                         }
                     }
                     return;
@@ -2664,7 +2903,13 @@ void EWebContainer::get_media_features(litehtml::media_features& media) const
     media.color     = 8;
     media.monochrome  = 0;
     media.color_index = 256;
-    media.resolution  = 96;
+    /* DPI of the output device: 96 per CSS reference pixel times the port's
+     * rasterisation ratio. On a Retina display (dpr 2) this reports 192, so
+     * (min-resolution: 2dppx) media queries match and el_image's srcset
+     * selection fetches the 2x candidates instead of pinning 1x. */
+    float dpr = (m_host != NULL) ? m_host->getDpr() : 1.0f;
+    if(dpr < 0.5f) dpr = 1.0f;
+    media.resolution  = (int)(96.0f * dpr + 0.5f);
     /* Preferred color scheme, "dark;light" encoding (0 = dark, 1 = light).
      * The shell seeds EWEB_COLOR_SCHEME from the OS appearance at startup;
      * an explicit value always wins so pages can be forced either way. */

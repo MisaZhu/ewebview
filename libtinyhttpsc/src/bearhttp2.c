@@ -523,13 +523,18 @@ void h2_hpack_dec_free(H2HpackDec *d) {
         free(d->dyn[i].name);
         free(d->dyn[i].value);
     }
+    for(int i = 0; i < d->header_count; i++) {
+        free(d->headers[i].name);
+        free(d->headers[i].value);
+    }
     free(d->headers);
     free(d->pool);
     memset(d, 0, sizeof(*d));
 }
 
-/* Append a copy of (name,value) to the decoded header list, strings stored in
- * the decoder pool so they outlive the frame payload. */
+/* Append a copy of (name,value) to the decoded header list. Each string owns
+ * its allocation: growing either the header array or a later string must not
+ * invalidate pointers retained by earlier entries. */
 static int hpack_dec_push(H2HpackDec *d, const char *name, size_t nlen,
                           const char *value, size_t vlen) {
     if(d->header_count >= d->header_cap) {
@@ -538,20 +543,11 @@ static int hpack_dec_push(H2HpackDec *d, const char *name, size_t nlen,
         if(!nh) return -1;
         d->headers = nh; d->header_cap = nc;
     }
-    /* reserve pool space for both strings + NUL terminators */
-    size_t need = nlen + 1 + vlen + 1;
-    if(d->pool_len + need > d->pool_cap) {
-        size_t nc = d->pool_cap ? d->pool_cap : 512;
-        while(nc < d->pool_len + need) nc *= 2;
-        char *np = (char *)realloc(d->pool, nc);
-        if(!np) return -1;
-        d->pool = np; d->pool_cap = nc;
-    }
-    char *ns = d->pool + d->pool_len;
+    char *ns = (char *)malloc(nlen + 1);
+    char *vs = (char *)malloc(vlen + 1);
+    if(!ns || !vs) { free(ns); free(vs); return -1; }
     memcpy(ns, name, nlen); ns[nlen] = '\0';
-    char *vs = ns + nlen + 1;
     memcpy(vs, value, vlen); vs[vlen] = '\0';
-    d->pool_len += need;
     d->headers[d->header_count].name = ns;
     d->headers[d->header_count].value = vs;
     d->header_count++;
@@ -1049,7 +1045,7 @@ int h2_conn_request(H2Conn *c,
 
     /* --- read the response --- */
     H2Buf hblk; h2_buf_init(&hblk);   /* accumulated HEADERS/CONTINUATION payload */
-    int headers_done = 0, stream_done = 0, saw_rst = 0;
+    int headers_done = 0, stream_done = 0, saw_rst = 0, end_stream_seen = 0;
     const char *h2dbg = getenv("EWEB_H2DBG");
     int dbg = (h2dbg && h2dbg[0] && h2dbg[0] != '0');
     while(!stream_done) {
@@ -1086,7 +1082,7 @@ int h2_conn_request(H2Conn *c,
                 }
                 headers_done = 1;
             }
-            if(flags & H2_FLAG_END_STREAM) stream_done = 1;
+            if(flags & H2_FLAG_END_STREAM) { end_stream_seen = 1; stream_done = 1; }
         } else if(type == H2_FRAME_DATA) {
             const unsigned char *pl = c->rbuf;
             size_t pl_len = c->rbuf_len;
@@ -1106,13 +1102,20 @@ int h2_conn_request(H2Conn *c,
                 c->peer_window += (int)pl_len;
                 c->stream_window += (int)pl_len;
             }
-            if(flags & H2_FLAG_END_STREAM) stream_done = 1;
+            if(flags & H2_FLAG_END_STREAM) { end_stream_seen = 1; stream_done = 1; }
         }
         /* PRIORITY / PUSH_PROMISE / unknown: ignored */
     }
     h2_buf_free(&hblk);
 
     if(!headers_done) return saw_rst ? -2 : -1; /* no response headers received */
+    /* A RST_STREAM that arrives BEFORE END_STREAM means the peer aborted the
+     * response mid-body: out_body holds only a prefix (jd.com's ??combo script
+     * came back as just its first member under h2). Returning success here made
+     * callers silently consume a truncated script (jQuery/event.js half-loaded,
+     * cascading '$'/'each'/'on' misses and a dead React root). Fail the exchange
+     * instead so the upper layer can retry / fall back, never serve a partial. */
+    if(saw_rst && !end_stream_seen) return -2;
 
     /* --- synthesise an HTTP/1.1-style header block from the decoded fields --- */
     const char *st = "200";

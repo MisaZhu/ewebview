@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #ifdef LITEHTML_LIFETIME_DEBUG
 /* Authoritative, non-dereferencing liveness lookup for html_tag objects,
@@ -137,6 +138,7 @@ static inline void dump_create_node_profile()
 #include "el_space.h"
 #include "el_body.h"
 #include "el_image.h"
+#include "el_iframe.h"
 #include "el_svg.h"
 #include "el_table.h"
 #include "el_td.h"
@@ -327,6 +329,7 @@ void litehtml::profile_color_parse(uint64_t start_ms)
 
 litehtml::document::~document()
 {
+	fprintf(stderr, "[VMLIFE] ~document this=%p\n", (void*)this);
 	m_over_element = 0;
 	if(m_container)
 	{
@@ -458,20 +461,35 @@ void litehtml::document::create_fragment(const tchar_t* html, elements_vector& o
 	{
 		return;
 	}
-	/* innerHTML semantics: parse `html` as body content. gumbo is a whole-
-	 * document parser, so it wraps the fragment in <html><head><body>; walk to
-	 * the body and build each of its children through the same create_node path
-	 * a full parse uses. The nodes are owned by THIS document (create_element /
-	 * litehtml_alloc take `this`), so the caller can parent + style them exactly
-	 * like a parser-built subtree. */
+	/* innerHTML semantics: parse `html` as body content via gumbo's fragment
+	 * algorithm (see frag_opts below) and build each resulting node through the
+	 * same create_node path a full parse uses. The nodes are owned by THIS
+	 * document (create_element / litehtml_alloc take `this`), so the caller can
+	 * parent + style them exactly like a parser-built subtree. */
 	std::string utf(html);
-	GumboOutput* output = gumbo_parse_with_options(&kGumboDefaultOptions,
+	/* Parse as a BODY-context fragment, not a whole document. A whole-document
+	 * parse runs the "before html"/"in head" insertion modes first, so leading
+	 * whitespace and comments before the first element land in <head> (or are
+	 * ignored) and never reach <body> - they vanish from the fragment. A real
+	 * browser's innerHTML uses the fragment algorithm ("in body" mode for a div
+	 * context), which PRESERVES that leading whitespace/comment. The drift mattered:
+	 * Angular compiles a templateUrl via direct innerHTML but links clones via a
+	 * wrapped buildFragment; the two parses disagreed on the leading text/comment
+	 * nodes, so compileNodes' child pair count no longer matched the link-time
+	 * childNodes snapshot and childLinkFn indexed undefined (web.wechat.com chat
+	 * bubble crash). Fragment mode makes both paths agree. */
+	GumboOptions frag_opts = kGumboDefaultOptions;
+	frag_opts.fragment_context = GUMBO_TAG_BODY;
+	frag_opts.fragment_namespace = GUMBO_NAMESPACE_HTML;
+	GumboOutput* output = gumbo_parse_with_options(&frag_opts,
 								utf.c_str(), (uint32_t)utf.length());
 	if(!output)
 	{
 		return;
 	}
-	GumboNode* body = nullptr;
+	/* In fragment mode gumbo creates a bare <html> root and appends the fragment
+	 * nodes DIRECTLY to it (the BODY context only sets the insertion mode; no
+	 * <head>/<body> wrapper is built). Take the root's children. */
 	GumboNode* root = output->root;
 	if(root && root->type == GUMBO_NODE_ELEMENT)
 	{
@@ -479,24 +497,11 @@ void litehtml::document::create_fragment(const tchar_t* html, elements_vector& o
 		for(unsigned int i = 0; i < kids->length; i++)
 		{
 			GumboNode* c = static_cast<GumboNode*>(kids->data[i]);
-			if(c && c->type == GUMBO_NODE_ELEMENT && c->v.element.tag == GUMBO_TAG_BODY)
-			{
-				body = c;
-				break;
-			}
-		}
-	}
-	if(body)
-	{
-		GumboVector* kids = &body->v.element.children;
-		for(unsigned int i = 0; i < kids->length; i++)
-		{
-			GumboNode* c = static_cast<GumboNode*>(kids->data[i]);
 			if(!c) continue;
 			create_node(c, out, 0);
 		}
 	}
-	gumbo_destroy_output(&kGumboDefaultOptions, output);
+	gumbo_destroy_output(&frag_opts, output);
 }
 
 litehtml::uint_ptr litehtml::document::add_font( const tchar_t* name, int size, const tchar_t* weight, const tchar_t* style, const tchar_t* decoration, font_metrics* fm )
@@ -734,6 +739,9 @@ int litehtml::document::render( int max_width, render_type rt )
 			m_size.width	= 0;
 			m_size.height	= 0;
 			m_root->calc_document_size(m_size);
+			/* A re-layout may have shrunk an overflow container's content
+			 * extent; pull any live element scroll offset back inside it. */
+			m_root->eweb_clamp_scroll_tree();
 		}
 	}
 	return ret;
@@ -748,6 +756,23 @@ void litehtml::document::draw( uint_ptr hdc, int x, int y, const position* clip 
 	 * scroll regardless of tree depth. */
 	m_draw_scroll_x = -x;
 	m_draw_scroll_y = m_draw_vp_origin_y - y;
+	/* Derive the vertical viewport-cull band in DOCUMENT coordinates. A cache
+	 * row R maps to document Y = R - y (y is the draw offset, vp_origin -
+	 * scroll), and the clip rect is in cache rows, so the visible document
+	 * span is [clip.y - y, clip.y + clip.height - y]. A generous margin keeps
+	 * box-shadows/outlines/small overflow-visible bleed just outside the box
+	 * from being culled. NULL clip = whole-document draw: cull disabled. */
+	if(clip)
+	{
+		const int kCullMargin = 256;
+		m_draw_cull_top    = clip->y - y - kCullMargin;
+		m_draw_cull_bottom = clip->y + clip->height - y + kCullMargin;
+		m_draw_cull_active = true;
+	}
+	else
+	{
+		m_draw_cull_active = false;
+	}
 	if(m_root)
 	{
 		m_root->draw(hdc, x, y, clip);
@@ -1293,6 +1318,9 @@ litehtml::element::ptr litehtml::document::create_element(const tchar_t* tag_nam
 		} else if(!t_strcmp(tag_name, _t("img")))
 		{
 			newTag = litehtml_alloc<litehtml::el_image>("el_image", this);
+		} else if(!t_strcmp(tag_name, _t("iframe")))
+		{
+			newTag = litehtml_alloc<litehtml::el_iframe>("el_iframe", this);
 		} else if(!t_strcmp(tag_name, _t("video")))
 		{
 			newTag = litehtml_alloc<litehtml::el_video>("el_video", this);
@@ -1454,6 +1482,8 @@ void litehtml::document::style_step_stamp(element* el)
 
 bool litehtml::document::update_master_styles_step(uint64_t deadline_ms)
 {
+	if(getenv("EWEB_BGDBG") != nullptr)
+		fprintf(stderr, "[BGDBG] master-enter phase=%d fast=%d\n", m_step_phase, is_fast_mode() ? 1 : 0);
 	if(!m_root || !m_context)
 	{
 		return true;
@@ -1514,6 +1544,9 @@ bool litehtml::document::update_master_styles_step(uint64_t deadline_ms)
 			return false;
 		}
 	}
+	if(getenv("EWEB_BGDBG") != nullptr)
+		fprintf(stderr, "[BGDBG] master-done visits=%llu stamped=%llu\n",
+			(unsigned long long)m_step_visits, (unsigned long long)m_step_stamped);
 	m_step_phase = 0;
 	/* Computed displays may have flipped (a late sheet hiding table cells, a
 	 * media flip): table grids were built in init() against the old values. */
@@ -2000,9 +2033,14 @@ void litehtml::document::fix_table_children(element::ptr& el_ptr, style_display 
 		}
 		style st;
 		st.add_property(_t("display"), disp_str, 0, false);
+		annon_tag->set_attr(_t("style"), (tstring(_t("display:")) + disp_str).c_str());
 		annon_tag->add_style(st);
 		annon_tag->parent(el_ptr);
-		annon_tag->parse_styles();
+		/* is_reparse=true bypasses the chunked style-phase early return: an
+		 * anonymous wrapper left at the ctor default display_inline makes
+		 * fix_table_parent re-wrap it on every later dirty pass (the wx
+		 * header grew six nested wrappers) and stacks the cells. */
+		annon_tag->parse_styles(true);
 		std::for_each(tmp.begin(), tmp.end(),
 			[&annon_tag](element::ptr& el)
 			{
@@ -2149,9 +2187,12 @@ void litehtml::document::fix_table_parent(element::ptr& el_ptr, style_display di
 			}
 			style st;
 			st.add_property(_t("display"), disp_str, 0, false);
+			annon_tag->set_attr(_t("style"), (tstring(_t("display:")) + disp_str).c_str());
 			annon_tag->add_style(st);
 			annon_tag->parent(parent);
-			annon_tag->parse_styles();
+			/* Synchronous styling, see fix_table_children: the wrapper's
+			 * display must be final before the next fixup pass inspects it. */
+			annon_tag->parse_styles(true);
 			std::for_each(move_set.begin(), move_set.end(),
 				[&annon_tag](element::ptr& el)
 				{

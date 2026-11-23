@@ -134,6 +134,16 @@ bool js_event_dispatch_simple(vm_t* vm, js_element_t el, const char* type, bool 
 bool js_event_dispatch_mouse(vm_t* vm, js_element_t el, const char* type,
                              int x, int y, int scroll_x, int scroll_y,
                              int button, int click_count);
+
+/* Wheel gesture: dispatches the modern "wheel" event (deltaX/deltaY in CSS
+ * px, deltaMode 0) AND the legacy "mousewheel" event (wheelDelta in 120-per-
+ * notch units) at `el`, both cancelable + bubbling, and returns false when
+ * EITHER was preventDefault()'d (the embedder then skips its default scroll).
+ * jQuery-era sites (web.wechat.com) read e.originalEvent.wheelDelta, which is
+ * this event object itself once jQuery.Event wraps it. */
+bool js_event_dispatch_wheel(vm_t* vm, js_element_t el, int x, int y,
+                             int scroll_x, int scroll_y,
+                             int delta_x, int delta_y, int wheel_delta);
 bool js_event_dispatch_key(vm_t* vm, js_element_t el, const char* type,
                            const char* key, int key_code, unsigned mods);
 bool js_event_dispatch_custom(vm_t* vm, js_element_t el, const char* type,

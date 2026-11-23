@@ -2,8 +2,11 @@
 //
 // One jar per process, shared by every ewebview instance and by both sides of
 // the cookie API: the download worker thread (Cookie:/Set-Cookie headers) and
-// the JS thread (document.cookie). Nothing is persisted to disk, so the jar
-// dies with the process; session cookies additionally die with... the jar.
+// the JS thread (document.cookie). By default nothing is persisted to disk;
+// when the embedder sets EWEB_COOKIE_FILE the jar is mirrored to that path in
+// Netscape cookie-file format (full attributes incl. HttpOnly) after every
+// store, and reloaded from it on the next launch - a logged-in session then
+// survives a restart without re-authenticating.
 //
 // Ported verbatim from widget++'s CookieJar: deliberately free of any
 // platform headers - the logic is pure string/date work over libc + pthread.
@@ -78,6 +81,18 @@ public:
      * normal Set-Cookie response path. A leading "Cookie:" prefix is
      * tolerated. */
     void seedFromHeader(const std::string& url, const std::string& cookieHeader);
+
+    /* ---- optional disk persistence (EWEB_COOKIE_FILE) ----
+     * loadFile reads the file named by EWEB_COOKIE_FILE: a Netscape cookie
+     * file restores every attribute (domain/host-only, path, Secure, HttpOnly,
+     * expiry; expires=0 rows are kept as session cookies), while any other
+     * content falls back to seedFromHeader() against `url` (legacy raw-header
+     * seeding). Returns true when at least one cookie was loaded. */
+    bool loadFile(const std::string& url);
+    /* Mirror the whole jar to EWEB_COOKIE_FILE (atomic tmp+rename). No-op when
+     * the env var is unset. Called automatically after every successful
+     * store()/clear(); safe to call from either thread. */
+    void saveToDisk() const;
 
     void   clear();
     size_t count() const;

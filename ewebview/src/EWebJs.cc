@@ -26,6 +26,7 @@
  */
 
 #include "EWebInternal.h"
+#include "EWebEditingJs.h"
 #include "EWebLog.h"
 #include "EWebCookies.h"
 #include <algorithm>   /* std::find (runaway/requeue bookkeeping) */
@@ -45,6 +46,7 @@ extern "C" void bc_dump_window(bytecode_t* bc, PC center, PC radius);
 /* el_text is not pulled in by <litehtml.h>; createTextNode and the text
  * setters build one directly (malloc + placement-new, matching litehtml_alloc). */
 #include <litehtml/el_text.h>
+#include <litehtml/el_space.h>
 #include <litehtml/el_comment.h>
 
 #include <string>
@@ -310,6 +312,21 @@ static void mutdbg_log(const char* op, litehtml::element* p, litehtml::element* 
  * delete-in-place behaviour is kept. The new el_text is built like
  * litehtml_alloc, appended (which sets its parent), then measured via
  * parse_styles so it renders. ENGINE-THREAD ONLY (the exclusive doc owner). */
+/* Pure-whitespace character data must become el_space, exactly like the
+ * parser's create_node path: el_space::is_white_space() lets line_box drop it
+ * under normal white-space handling, while a plain el_text renders a phantom
+ * line box (Angular ngIf injections of ' '/'\n' stretched wx tab items from
+ * 42px to 92px). */
+static bool js_text_all_space(const char* s)
+{
+    if(s == nullptr || s[0] == 0) return false;
+    for(const unsigned char* p = (const unsigned char*)s; *p != 0; ++p) {
+        if(*p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' && *p != '\f')
+            return false;
+    }
+    return true;
+}
+
 static void js_set_element_text(litehtml::element* e, const char* text,
                                 std::vector<litehtml::element*>* park)
 {
@@ -361,6 +378,17 @@ static void js_set_element_text(litehtml::element* e, const char* text,
         }
     }
     if(doc == nullptr || text == nullptr || text[0] == 0) return;
+    if(js_text_all_space(text)) {
+        void* smem = malloc(sizeof(litehtml::el_space));
+        if(smem == nullptr) return;
+        litehtml::el_space* sp = new (smem) litehtml::el_space(text, doc);
+        if(e->appendChild(sp)) {
+            sp->parse_styles(false);
+        } else {
+            delete sp;
+        }
+        return;
+    }
     void* mem = malloc(sizeof(litehtml::el_text));
     if(mem == nullptr) return;
     litehtml::el_text* t = new (mem) litehtml::el_text(text, doc);
@@ -441,6 +469,7 @@ void EWebEngine::initJsVm()
     int vcSize = (getenv("EWEB_NOVCACHE") != nullptr) ? 0 : VAR_CACHE_MAX_DEF;
     int ncSize = (getenv("EWEB_NOLNCACHE") != nullptr) ? 0 : LOAD_NCACHE_MAX_DEF;
     m_jsVm = vm_new(js_compile, vcSize, ncSize);
+    fprintf(stderr, "[VMLIFE] vm_new vm=%p\n", (void*)m_jsVm);
     if(m_jsVm == nullptr) {
         EWEB_LOG("[ewebview] js: vm_new failed\n");
         return;
@@ -477,6 +506,9 @@ void EWebEngine::initJsVm()
     cb.el_get_attr       = jsElGetAttr;
     cb.el_set_attr       = jsElSetAttr;
     cb.el_get_tag        = jsElGetTag;
+    cb.el_get_image_size = jsElGetImageSize;
+    cb.el_get_script_async = jsElGetScriptAsync;
+    cb.el_set_script_async = jsElSetScriptAsync;
     /* Element.id needs no dedicated callback: the DOM bridge reads it through
      * el_get_attr(ctx, el, "id"), which is wired up just above. */
     /* Document structure, selector queries and node construction. They resolve
@@ -506,6 +538,7 @@ void EWebEngine::initJsVm()
     cb.el_clone_node     = jsElCloneNode;
     cb.el_remove_attr    = jsElRemoveAttr;
     cb.el_get_rect       = jsElGetRect;
+    cb.el_caret_rect     = jsElCaretRect;
     cb.el_transform_rect = jsElTransformRect;
     cb.el_offset_parent_origin = jsElOffsetParentOrigin;
     cb.el_from_point = jsElFromPoint;
@@ -523,6 +556,11 @@ void EWebEngine::initJsVm()
     cb.el_get_dataset    = jsElGetDataset;
     cb.el_attr_snapshot  = jsElAttrSnapshot;
     cb.el_scroll_into_view = jsElScrollIntoView;
+    cb.el_scroll_get     = jsElScrollGet;
+    cb.el_scroll_set     = jsElScrollSet;
+    cb.el_scroll_extent  = jsElScrollExtent;
+    /* scrollTop/Left writes on html/body route to the document scroll. */
+    cb.scroll_to         = jsWebScrollTo;
     if(!js_register_dom_natives(m_jsVm, this, &cb)) {
         EWEB_LOG("[ewebview] js: DOM native registration failed\n");
     }
@@ -538,11 +576,36 @@ void EWebEngine::initJsVm()
     /* WebAssembly: registers the WebAssembly namespace + Module/Instance/
      * Memory/Table/Global on the VM. Registered last so window/DOM exist. */
     js_register_wasm_natives(m_jsVm);
+    /* Selection / Range / contenteditable editing model (EWebEditingJs.h):
+     * one prelude run per VM before any page script. The hook binding is then
+     * hidden from page script; the C side still resolves it by name. */
+    m_jsVm->terminated = false;
+    m_jsVm->abort_run = false;
+    m_jsVm->propagating_err = nullptr;
+    m_jsVm->call_depth = 0;
+    jsVmEnter();
+    vm_load_run(m_jsVm, kEwebEditingPrelude);
+    if(m_jsVm->propagating_err != nullptr) vm_report_uncaught(m_jsVm);
+    jsVmExit();
+    node_t* ceHook = var_find_own_member(m_jsVm->root, EWEB_CE_HOOK);
+    if(ceHook != nullptr) {
+        /* Move the hook to an internal slot: invisable alone only drops a
+         * binding from for-in/Object.keys, script reads would still see it.
+         * Hold a ref across the delete so the function cannot die in between. */
+        var_t* ceFn = ceHook->var;
+        var_ref(ceFn);
+        var_delete_own_member(m_jsVm->root, EWEB_CE_HOOK);
+        var_add(m_jsVm->root, EWEB_CE_SLOT, ceFn);
+        var_unref(ceFn);
+        node_t* slot = var_find_own_member(m_jsVm->root, EWEB_CE_SLOT);
+        if(slot != nullptr) { slot->invisable = 1; slot->be_unenumerable = 1; }
+    }
 }
 
 void EWebEngine::resetJsVm()
 {
     if(m_jsVm == nullptr) return;
+    fprintf(stderr, "[VMLIFE] resetJsVm close vm=%p\n", (void*)m_jsVm);
     /* Abandon async-fetch jobs created on this VM before freeing it: their
      * __resolve/__reject closures live inside the VM, and the global fetch
      * queues outlive it, so the next js_web_fetch_poll() (on the fresh
@@ -550,6 +613,7 @@ void EWebEngine::resetJsVm()
      * closures - a heap-use-after-free on the freed VM region. */
     js_web_fetch_purge_vm(m_jsVm);
     vm_close(m_jsVm);      /* frees the VM and everything it owns */
+    fprintf(stderr, "[VMLIFE] vm_close done\n");
     m_jsVm = nullptr;
 }
 
@@ -637,6 +701,405 @@ static std::string jsScriptModPatch(const std::string& url, const std::string& i
      * Matched structurally (by boundaryName) so github bundle redeployments
      * (which rename the minified identifiers) cannot silently disable it. */
     std::string out = in;
+    /* EWEB_SEARCHDBG: trace the site's real RecommendPlugin without changing
+     * its response, gates or DOM writes. The placeholder is a sibling label,
+     * not the native input.placeholder attribute. */
+    if(getenv("EWEB_SEARCHDBG") != nullptr &&
+       url.find("/new-search-suggest/") != std::string::npos &&
+       url.find("/bundle.js") != std::string::npos) {
+        auto patch = [&out](const char* find, const char* repl, const char* tag) {
+            size_t pos = out.find(find);
+            if(pos == std::string::npos) {
+                fprintf(stderr, "[modpatch] SEARCHDBG miss %s\n", tag);
+                return;
+            }
+            out.replace(pos, strlen(find), repl);
+            fprintf(stderr, "[modpatch] SEARCHDBG applied %s\n", tag);
+        };
+        patch("p()(this,t),this._config=this._getConfig(e)",
+              "p()(this,t),this._config=this._getConfig(e),(window.__searchCfgDbg=window.__searchCfgDbg||[]).push('default='+Object.keys(this.constructor.Default||{}).join(',')+' assigned='+Object.keys(this._config||{}).join(',')+' ctorDefault='+!!(this.constructor&&this.constructor.Default)),window.__awscDbg&&window.__awscDbg('[SEARCHDBG] config-assigned keys='+Object.keys(this._config||{}).join(',')+' enabled='+(this._config&&this._config.enableItemValueList)+' hook='+typeof(this._config&&this._config.hotDataListFilterHook))",
+              "config-assigned");
+        patch("return ur(ur({},this.constructor.Default),t)",
+              "return function(r){(window.__searchCfgDbg=window.__searchCfgDbg||[]).push('getConfig default='+Object.keys(this.constructor.Default||{}).join(',')+' result='+Object.keys(r).join(','));window.__awscDbg&&window.__awscDbg('[SEARCHDBG] get-config default='+Object.keys(this.constructor.Default||{}).join(',')+' arg='+Object.keys(t||{}).join(',')+' result='+Object.keys(r).join(',')+' enabled='+r.enableItemValueList+' hook='+typeof r.hotDataListFilterHook);return r}.call(this,ur(ur({},this.constructor.Default),t))",
+              "get-config");
+        patch("n=y()(r,gr()?Reflect.construct(o,i||[],_()(r).constructor):o.apply(r,i)),I()(n,\"itemDataList\",[])",
+              "n=y()(r,gr()?Reflect.construct(o,i||[],_()(r).constructor):o.apply(r,i)),(window.__searchSuperDbg=window.__searchSuperDbg||[]).push('native='+gr()+' hasConfig='+!!n._config+' keys='+Object.keys(n._config||{}).join(',')+' same='+(n===r)+' targetBase='+(o===_()(e))+' newTarget='+(_()(r).constructor===e)+' applyNative='+(o.apply===Function.prototype.apply)+' applyObj='+(o.apply===Object.prototype.apply)+' fnEqObj='+(Function.prototype.apply===Object.prototype.apply)+' ownApply='+Object.prototype.hasOwnProperty.call(o,'apply')+' protoOwnApply='+Object.prototype.hasOwnProperty.call(o.prototype,'apply')+' protoFn='+(Object.getPrototypeOf(o)===Function.prototype)+' applyType='+typeof o.apply+' applySrc='+String(o.apply).slice(0,80)+' fnApplySrc='+String(Function.prototype.apply).slice(0,80)+' objApplySrc='+String(Object.prototype.apply).slice(0,80)),window.__awscDbg&&window.__awscDbg('[SEARCHDBG] super='+window.__searchSuperDbg[window.__searchSuperDbg.length-1]),I()(n,\"itemDataList\",[]) ",
+              "super-result");
+        patch("this.label=A('[data-sg-type=\"placeholder\"]',this.sug._element),this._initialize()",
+              "this.label=A('[data-sg-type=\"placeholder\"]',this.sug._element),window.__awscDbg&&window.__awscDbg('[SEARCHDBG] apply label='+!!this.label+' type='+this.sug._searchType),this._initialize()",
+              "apply");
+        patch("case 2:if(this.label.style.maxWidth=",
+              "case 2:window.__awscDbg&&window.__awscDbg('[SEARCHDBG] initialize label='+!!this.label+' type='+(this.sug&&this.sug._searchType));if(this.label.style.maxWidth=",
+              "initialize");
+        patch("return t.prev=8,t.next=11,Se();case 11:null!=(f=t.sent)",
+              "return window.__awscDbg&&window.__awscDbg('[SEARCHDBG] await-start'),t.prev=8,t.next=11,Se();case 11:f=t.sent,window.__awscDbg&&window.__awscDbg('[SEARCHDBG] await-resume f='+!!f+' res='+!!(f&&f.res)+' data='+!!(f&&f.res&&f.res.data)+' words='+(f&&f.res&&f.res.data&&f.res.data.shadingWords?f.res.data.shadingWords.length:-1)),null!=(f)",
+              "await-response");
+        patch("case 15:t.prev=15,t.t0=t.catch(8);case 17:if(this._instanseId)",
+              "case 15:t.prev=15,t.t0=t.catch(8),window.__awscDbg&&window.__awscDbg('[SEARCHDBG] await-catch '+t.t0);case 17:(function(x){var a='',b='';try{a=String(x.constructor)}catch(e){a='ERR:'+e}try{b=String(Object.getPrototypeOf(x.constructor))}catch(e){b='ERR:'+e}window.__searchCtorSrc=a;window.__searchBaseSrc=b;window.__awscDbg&&window.__awscDbg('[SEARCHDBG] ctor-shape len='+a.length+' reflect='+a.indexOf('Reflect.construct')+' apply='+a.indexOf('.apply')+' config='+a.indexOf('_getConfig')+' baseLen='+b.length+' baseConfig='+b.indexOf('_getConfig'))})(this),window.__awscDbg&&window.__awscDbg('[SEARCHDBG] gates instance='+this._instanseId+' items='+(this.itemDataList?this.itemDataList.length:-1)+' type='+(this.sug&&this.sug._searchType)+' enabled='+(this._config&&this._config.enableItemValueList)+' ctorDefault='+!!(this.constructor&&this.constructor.Default)+' defaultEnabled='+(this.constructor&&this.constructor.Default&&this.constructor.Default.enableItemValueList)+' protoCtor='+((Object.getPrototypeOf(this)&&Object.getPrototypeOf(this).constructor)===this.constructor)+' defaultDesc='+!!Object.getOwnPropertyDescriptor(this.constructor,'Default')+' configKeys='+Object.keys(this._config||{}).join(',')+' freshKeys='+Object.keys(this._getConfig({})).join(',')+' freshEnabled='+this._getConfig({}).enableItemValueList+' history='+(window.__searchCfgDbg||[]).join('|')+' super='+(window.__searchSuperDbg||[]).join('|'));if(this._instanseId)",
+              "gates");
+        patch("case 21:(null===(c=this.itemDataList)",
+              "case 21:window.__awscDbg&&window.__awscDbg('[SEARCHDBG] render-gate-pass items='+(this.itemDataList?this.itemDataList.length:-1)),(null===(c=this.itemDataList)",
+              "render-gate");
+        patch("case 0:if(t.prev=0,this.label&&this.itemDataList||e)",
+              "case 0:if(window.__awscDbg&&window.__awscDbg('[SEARCHDBG] rerender label='+!!this.label+' items='+(this.itemDataList?this.itemDataList.length:-1)+' arg='+e),t.prev=0,this.label&&this.itemDataList||e)",
+              "rerender");
+        patch("this.sug=t||{},t.on(\"initialized\",function(t){e.hotWordDom=",
+              "this.sug=t||{},window.__awscDbg&&window.__awscDbg('[SEARCHDBG] hotword-apply'),t.on(\"initialized\",function(t){e.hotWordDom=",
+              "hotword-apply");
+        patch("e.sug._element.appendChild(e.hotWordDom),e._renderHotWord()",
+              "window.__awscDbg&&window.__awscDbg('[SEARCHDBG] hotword-initialized dom='+!!e.hotWordDom+' hook='+typeof(e._config&&e._config.hotDataListFilterHook)+' ctorDefault='+!!(e.constructor&&e.constructor.Default)+' defaultHook='+typeof(e.constructor&&e.constructor.Default&&e.constructor.Default.hotDataListFilterHook)+' freshHook='+typeof e._getConfig({}).hotDataListFilterHook+' history='+(window.__searchCfgDbg||[]).join('|')),e.sug._element.appendChild(e.hotWordDom),e._renderHotWord()",
+              "hotword-initialized");
+        patch("case 3:if(null==(n=t.sent)||null===(e=n.res)",
+              "case 3:n=t.sent,window.__awscDbg&&window.__awscDbg('[SEARCHDBG] hotword-response res='+!!(n&&n.res)+' hot='+(n&&n.res&&n.res.data&&n.res.data.hotWords?n.res.data.hotWords.length:-1)+' shading='+(n&&n.res&&n.res.data&&n.res.data.shadingWords?n.res.data.shadingWords.length:-1)+' dom='+!!this.hotWordDom+' hook='+typeof(this._config&&this._config.hotDataListFilterHook)+' ctorDefault='+!!(this.constructor&&this.constructor.Default));if(null==(n)||null===(e=n.res)",
+              "hotword-response");
+    }
+    /* Baxia 2.5.37 still treats only the legacy UMID placeholders as not ready.
+     * Its FY adapter instead uses defaultFY/default_not_ prefixes until wu.json has
+     * supplied the real umid. Let the site's own preRequest retry wait for that
+     * callback instead of sending the main request with a placeholder token. */
+    if(url.find("baxiaCommon.js") != std::string::npos) {
+        const char* before = "return!(e&&(-1!==t.indexOf(\"defaultToken1\")||-1!==t.indexOf(\"defaultToken3\"))||!getStore(\"getFYModule\")&&!getStore(\"postFYModule\"))";
+        const char* after = "return!(e&&(-1!==t.indexOf(\"defaultToken1\")||-1!==t.indexOf(\"defaultToken3\")||-1!==t.indexOf(\"defaultFY\")||-1!==t.indexOf(\"default_not_\"))||!getStore(\"getFYModule\")&&!getStore(\"postFYModule\"))";
+        size_t p = out.find(before);
+        if(p != std::string::npos) {
+            out.replace(p, strlen(before), after);
+            fprintf(stderr, "[modpatch] applied baxia-fy-readiness\n");
+        } else {
+            fprintf(stderr, "[modpatch] miss baxia-fy-readiness\n");
+        }
+        /* The JSONP src setter is synchronous, but preRequest is not. Its slow
+         * path updates only a local string after the setter has already applied
+         * fast-load, so the real FY token never reaches that script. Keep the
+         * site's fast-load attempt, then retry the original URL through its own
+         * preRequest once FY reports loaded. */
+        const char* jsonp_before = "hookProperty(e,\"src\",function(e){isEffectUrl(e,\"script\")&&(preRequest({url:e,method:\"get\",request:{},isAppend:function(){return e&&e.indexOf(\"bx-ua\")>-1},process:function(t){e=t.url}}),e.indexOf(\"bx-ua\")>-1||(e=addQueryString(e,\"bx-ua\",\"fast-load\")));return e})";
+        const char* jsonp_after = "hookProperty(e,\"src\",function(e){var el=this,original=e,pending=isEffectUrl(e,\"script\")&&!isAwscReady(),retried=!1,retry=function(t){pending&&!retried&&isAwscReady()&&(retried=!0,window.__awscDbg&&window.__awscDbg('baxia deferred JSONP retry'),el.src=t.url)};isEffectUrl(e,\"script\")&&(preRequest({url:e,method:\"get\",request:{},isAppend:function(){return e&&e.indexOf(\"bx-ua\")>-1},process:function(t){e=t.url,retry(t)}}),pending&&window.AWSC&&window.AWSC.use(\"fy\",function(t){\"loaded\"===t&&preRequest({url:original,method:\"get\",request:{},isAppend:function(){return!1},process:function(t){retry(t)}})}),e.indexOf(\"bx-ua\")>-1||(e=addQueryString(e,\"bx-ua\",\"fast-load\")));return e})";
+        size_t jsonp_pos = out.find(jsonp_before);
+        if(jsonp_pos != std::string::npos) {
+            out.replace(jsonp_pos, strlen(jsonp_before), jsonp_after);
+            fprintf(stderr, "[modpatch] applied baxia-jsonp-fy-retry\n");
+        } else {
+            fprintf(stderr, "[modpatch] miss baxia-jsonp-fy-retry\n");
+        }
+    }
+    /* EWEB_AWSCDBG: observe the FY module state machine without changing its
+     * timeout, registration or exception behaviour. The stock loader reports
+     * callback failures only through a sampled beacon, which hides the
+     * difference between a missing register, a late register and init throwing. */
+    if(getenv("EWEB_AWSCDBG") != nullptr &&
+       url.find("/AWSC/AWSC/awsc.js") != std::string::npos) {
+        auto patch = [&out](const char* find, const char* repl, const char* tag) {
+            size_t p = out.find(find);
+            if(p == std::string::npos) {
+                fprintf(stderr, "[modpatch] AWSCDBG miss %s\n", tag);
+                return;
+            }
+            out.replace(p, strlen(find), repl);
+            fprintf(stderr, "[modpatch] AWSCDBG applied %s\n", tag);
+        };
+        patch("var m=[],y=\"loading\",h=\"loaded\"",
+              "window.__awscDbg=window.__awscDbg||(function(l,c){return function(s){try{l.call(c,'[AWSCDBG] '+s)}catch(z){}}})(console.log,console);var m=[],y=\"loading\",h=\"loaded\"",
+              "transport");
+        patch("function T(e,o,t){var n=x(e);",
+              "function T(e,o,t){window.__awscDbg('use name='+e+' t='+Date.now());var n=x(e);",
+              "use");
+        patch("c.timeoutTimer=setTimeout(function(){c.state=j,_(c,t&&t.throwExceptionInCallback)},r)",
+              "c.timeoutTimer=setTimeout(function(){window.__awscDbg('timeout name='+e+' state='+c.state+' t='+Date.now()),c.state=j,_(c,t&&t.throwExceptionInCallback)},r)",
+              "timeout");
+        patch("function F(e,o,t){var n=!1;",
+              "function F(e,o,t){window.__awscDbg('register module='+e+' feature='+o+' export='+typeof t+' t='+Date.now());var n=!1;",
+              "register-entry");
+        patch("i=r,clearTimeout(i.timeoutTimer),delete i.timeoutTimer,i.exportObj=t,r.state===y||r.state===j?",
+              "i=r,window.__awscDbg('register match feature='+o+' prior='+r.state+' callbacks='+r.callbacks.length+' t='+Date.now()),clearTimeout(i.timeoutTimer),delete i.timeoutTimer,i.exportObj=t,r.state===y||r.state===j?",
+              "register-match");
+        patch("e.AWSC.use(\"fy\",function(e,o){\"loaded\"===e?",
+              "e.AWSC.use(\"fy\",function(e,o){window.__awscDbg('fy callback state='+e+' export='+typeof o+' t='+Date.now());\"loaded\"===e?",
+              "fy-callback");
+        patch("s.fyObj=o,o.init(n,function(e){",
+              "s.fyObj=o,window.__awscDbg('fy init call init='+typeof o.init+' t='+Date.now()),o.init(n,function(e){window.__awscDbg('fy init callback status='+e+' t='+Date.now());",
+              "fy-init");
+        patch("s.getUidToken=function(){return this.fyObj.getUidToken(n)},l()",
+              "s.getUidToken=function(){return this.fyObj.getUidToken(n)},window.__awscDbg('fy uid at init='+String(s.getUidToken()).slice(0,24)+' t='+Date.now()),l()",
+              "fy-uid-init");
+        patch("catch(a){if(o)throw a;O(e.name,a.message,a.stack)}",
+              "catch(a){window.__awscDbg('callback throw name='+e.name+' state='+e.state+' msg='+a.message+' stack='+a.stack);if(o)throw a;O(e.name,a.message,a.stack)}",
+              "callback-throw");
+        patch("catch(l){if(n)throw l;O(\"awsc_error\",l.message,l.stack)}",
+              "catch(l){window.__awscDbg('register throw msg='+l.message+' stack='+l.stack);if(n)throw l;O(\"awsc_error\",l.message,l.stack)}",
+              "register-throw");
+    }
+    if(getenv("EWEB_AWSCDBG") != nullptr &&
+       url.find("/AWSC/fireyejs/") != std::string::npos) {
+        auto patch = [&out](const char* find, const char* repl, const char* tag) {
+            size_t p = out.find(find);
+            if(p == std::string::npos) {
+                fprintf(stderr, "[modpatch] AWSCDBG miss fireye-%s\n", tag);
+                return;
+            }
+            out.replace(p, strlen(find), repl);
+            fprintf(stderr, "[modpatch] AWSCDBG applied fireye-%s\n", tag);
+        };
+        patch("dl=0;try{a[23]=ml[xl],",
+              "dl=0;try{window.__awscDbg&&window.__awscDbg('fy apply probe xl='+xl+' Sl='+Sl+' l52='+l[52]+' ml='+typeof ml+' mx='+typeof ml[xl]+' ms='+typeof ml[Sl]);a[23]=ml[xl],",
+              "apply-probe");
+        patch("a[23]=a[24].apply,a[26]=ml[xl],",
+              "window.__awscDbg&&window.__awscDbg('fy apply callee type='+typeof a[24]+' apply='+typeof a[24].apply+' set='+typeof a[27]),a[23]=a[24].apply,a[26]=ml[xl],",
+              "apply-callee");
+        patch("}catch(l){dl=0}a[22]=dl",
+              "}catch(l){window.__awscDbg&&window.__awscDbg('fy apply throw msg='+l.message+' callee='+typeof a[24]+' apply='+typeof a[23]);dl=0}a[22]=dl",
+              "apply-throw");
+    }
+    if(getenv("EWEB_AWSCDBG") != nullptr &&
+       url.find("baxiaCommon.js") != std::string::npos) {
+        auto patch = [&out](const char* find, const char* repl, const char* tag) {
+            size_t p = out.find(find);
+            if(p == std::string::npos) {
+                fprintf(stderr, "[modpatch] AWSCDBG miss baxia-%s\n", tag);
+                return;
+            }
+            out.replace(p, strlen(find), repl);
+            fprintf(stderr, "[modpatch] AWSCDBG applied baxia-%s\n", tag);
+        };
+        patch("function initPostAWSC(e){var t=window.AWSC",
+              "function initPostAWSC(e){window.__awscDbg&&window.__awscDbg('baxia initPost');var t=window.AWSC",
+              "post-entry");
+        patch("function initGetAWSC(e){var t=window.AWSC",
+              "function initGetAWSC(e){window.__awscDbg&&window.__awscDbg('baxia initGet');var t=window.AWSC",
+              "get-entry");
+        patch("t.configFYEx(function(e){setStore(\"postFYModule\",e)}",
+              "t.configFYEx(function(e){window.__awscDbg&&window.__awscDbg('baxia post callback'),setStore(\"postFYModule\",e)}",
+              "post-callback");
+        patch("t.configFYEx(function(e){setStore(\"getFYModule\",e)}",
+              "t.configFYEx(function(e){window.__awscDbg&&window.__awscDbg('baxia get callback'),setStore(\"getFYModule\",e)}",
+              "get-callback");
+        patch("function preRequest(e){var t=getStore(\"options\",{}),r=t.asac",
+              "function preRequest(e){window.__awscDbg&&window.__awscDbg('preRequest url='+String(e.url).slice(-120));var t=getStore(\"options\",{}),r=t.asac",
+              "pre-request");
+        patch("if(!isAwscReady()&&!s){var c=setInterval",
+              "if(!isAwscReady()&&!s){window.__awscDbg&&window.__awscDbg('preRequest defer: AWSC not ready');var c=setInterval",
+              "pre-request-defer");
+        patch("function isAwscReady(){var e=getStore(\"options\",{}).needUmidToken,t=getUmidToken();",
+              "function isAwscReady(){var e=getStore(\"options\",{}).needUmidToken,t=getUmidToken();window.__awscDbg&&window.__awscDbg('ready probe need='+e+' umid='+String(t).slice(0,24)+' get='+!!getStore('getFYModule')+' post='+!!getStore('postFYModule'));",
+              "ready-probe");
+        patch("r=getUA$1(t,e.url),n=getUmidToken(),o=getStore(\"options\",{})",
+              "r=function(){var r=getUA$1(t,e.url);window.__awscDbg&&window.__awscDbg('request UA len='+String(r).length+' head='+String(r).slice(0,12));return r}(),n=function(){var n=getUmidToken();window.__awscDbg&&window.__awscDbg('request umid='+String(n).slice(0,24));return n}(),o=getStore(\"options\",{})",
+              "request-token-values");
+    }
+    /* EWEB_TBERRDBG: the home page reports component failures only through a
+     * sampled tracker. Preserve each ErrorBoundary fallback, but expose the
+     * actual exception that selected it (notably UserInfo/BusinessEntry/Picks). */
+    if(getenv("EWEB_TBERRDBG") != nullptr &&
+       url.find("/pegasus-project-tbhome-2024/") != std::string::npos) {
+        const char* kBoundary = "onError:function(e){t(e,\"[pages][index][";
+        const char* kLogged = "onError:function(e){try{console.error('[TBERR] name='+e.name+' msg='+e.message+' stack='+e.stack);}catch(z){}t(e,\"[pages][index][";
+        size_t p = out.find(kBoundary);
+        int count = 0;
+        while(p != std::string::npos) {
+            out.replace(p, strlen(kBoundary), kLogged);
+            ++count;
+            p = out.find(kBoundary, p + strlen(kLogged));
+        }
+        if(count > 0)
+            fprintf(stderr, "[modpatch] TBERRDBG instrumented %d boundaries in %s\n",
+                    count, url.c_str());
+        if(url.find("/js/954.js") != std::string::npos) {
+            auto patch = [&out](const char* find, const char* repl, const char* tag) {
+                size_t pos = out.find(find);
+                if(pos == std::string::npos) {
+                    fprintf(stderr, "[modpatch] TBUSERDBG miss %s\n", tag);
+                    return;
+                }
+                out.replace(pos, strlen(find), repl);
+                fprintf(stderr, "[modpatch] TBUSERDBG applied %s\n", tag);
+            };
+            patch("Lt=n(30915),xt=function(t){t.AldResourceMap;",
+                  "Lt=n(30915),xt=function(t){window.__awscDbg&&window.__awscDbg('[TBUSER] render'),t.AldResourceMap;",
+                  "render");
+            patch("(0,p.useEffect)((function(){(0,Z.oA)((0,w.bg)())?(K(o.WEAK),U(\"profile\",\"nick\")):K(o.NONE),function(){Tt.apply(this,arguments)}()}),[]);",
+                  "(0,p.useEffect)((function(){window.__awscDbg&&window.__awscDbg('[TBUSER] effect'),(0,Z.oA)((0,w.bg)())?(K(o.WEAK),U(\"profile\",\"nick\")):K(o.NONE),function(){Tt.apply(this,arguments)}()}),[]);",
+                  "effect");
+            patch("19954:function(t,e,n){n.r(e),",
+                  "19954:function(t,e,n){window.__awscDbg&&window.__awscDbg('[TBMOD] right module factory'),n.r(e),",
+                  "right-module-factory");
+            patch("case 0:return s.trys.push([0,2,,3]),i=[yt()],[4,(0,A.L)(i)];",
+                  "case 0:return window.__awscDbg&&window.__awscDbg('[TBUSER] await-start'),s.trys.push([0,2,,3]),i=[yt()],[4,(0,A.L)(i)];",
+                  "await-start");
+            patch("case 1:return a=c._.apply(void 0,[s.sent(),1]),r=a[0],z(!1),",
+                  "case 1:return a=c._.apply(void 0,[s.sent(),1]),r=a[0],window.__awscDbg&&window.__awscDbg('[TBUSER] await-resume result='+JSON.stringify(r)),window.__awscDbg&&window.__awscDbg('[TBUSER] loading-false status='+(r&&r.status)),z(!1),",
+                  "await-resume");
+            patch("case 2:return w=s.sent(),it({}),Gt({}),Jt({remindsList:[]}),z(!1),",
+                  "case 2:return w=s.sent(),window.__awscDbg&&window.__awscDbg('[TBUSER] catch='+JSON.stringify(w)),it({}),Gt({}),Jt({remindsList:[]}),z(!1),",
+                  "catch");
+        }
+        if(url.find("/js/444.js") != std::string::npos) {
+            auto patch = [&out](const char* find, const char* repl, const char* tag) {
+                size_t pos = out.find(find);
+                if(pos == std::string::npos) {
+                    fprintf(stderr, "[modpatch] TBMODDBG miss %s\n", tag);
+                    return;
+                }
+                out.replace(pos, strlen(find), repl);
+                fprintf(stderr, "[modpatch] TBMODDBG applied %s\n", tag);
+            };
+            patch("var l=function(e){var t=e.childRender,n=e.pageCode,s=e.moduleCode,l=",
+                  "var l=function(e){var t=e.childRender,n=e.pageCode,s=e.moduleCode;window.__awscDbg&&s==='homeRight'&&window.__awscDbg('[TBMOD] provider render');var l=",
+                  "provider-render");
+            patch("return d({pageCode:n,moduleCode:s}).then((function(e){\"SUCCESS\"===e.errorCode&&e.value?",
+                  "return d({pageCode:n,moduleCode:s}).then((function(e){window.__awscDbg&&s==='homeRight'&&window.__awscDbg('[TBMOD] response code='+e.errorCode+' value='+!!e.value+' hookEq='+(window.React?a.useState===window.React.useState:'no-react')+' version='+a.version+' setter='+String(f).slice(0,140));\"SUCCESS\"===e.errorCode&&e.value?(",
+                  "provider-response");
+            patch("})).catch((function(e){f({status:r.ERROR,moduleInfo:{moduleCode:s},",
+                  "})).catch((function(e){window.__awscDbg&&s==='homeRight'&&window.__awscDbg('[TBMOD] request catch='+JSON.stringify(e)),f({status:r.ERROR,moduleInfo:{moduleCode:s},",
+                  "provider-catch");
+            patch("components:e.value.components}):(f({status:r.ERROR",
+                  "components:e.value.components}),window.__awscDbg&&s==='homeRight'&&window.__awscDbg('[TBMOD] success setState returned')):(f({status:r.ERROR",
+                  "provider-success-setstate");
+            patch("case 1:return(t=o.sent()).success&&",
+                  "case 1:return(t=o.sent(),window.__awscDbg&&window.__awscDbg('[TBFEED] ab-resume success='+t.success+' ab='+(t.data&&t.data[0]&&t.data[0].abId)),t.success)&&",
+                  "feed-ab-resume");
+            patch("Y(r.abId||\"\")),H(!0),[3,3]",
+                  "Y(r.abId||\"\")),window.__awscDbg&&window.__awscDbg('[TBFEED] ab-before-ready setter='+String(H).slice(0,140)),H(!0),window.__awscDbg&&window.__awscDbg('[TBFEED] ab-after-ready'),[3,3]",
+                  "feed-ab-ready");
+            patch("[4,window.lib.privacysdk.getSwitchStatus(\"TB_PC_Guess\")]",
+                  "[4,window.lib.privacysdk.getSwitchStatus(\"TB_PC_Guess\").then((function(e){return window.__awscDbg&&window.__awscDbg('[TBFEED] privacy-resolved status='+e.switchStatus+' error='+e.inError),e}),(function(e){throw window.__awscDbg&&window.__awscDbg('[TBFEED] privacy-rejected='+String(e)),e}))]",
+                  "feed-privacy-settled");
+            patch("case 0:return[4,Ne()];case 1:if(A.sent(),Ae(),!z.isReady)return[2];",
+                  "case 0:return window.__awscDbg&&window.__awscDbg('[TBFEED] init-before-privacy ready='+z.isReady),[4,Ne()];case 1:if(A.sent(),window.__awscDbg&&window.__awscDbg('[TBFEED] init-after-privacy ready='+z.isReady),Ae(),window.__awscDbg&&window.__awscDbg('[TBFEED] init-after-cna ready='+z.isReady),!z.isReady)return[2];",
+                  "feed-init-privacy");
+            patch("if(!z.isReady)return[2];",
+                  "if(window.__awscDbg&&window.__awscDbg('[TBFEED] load-gate ready='+z.isReady+' ab='+z.abId),!z.isReady)return[2];",
+                  "feed-load-gate");
+            patch("case 0:if(t.customFetchData&&!t.useTpp)",
+                  "case 0:if(window.__awscDbg&&window.__awscDbg('[TBFEED] main-strategy tpp='+t.tppId+' frontAb='+(t.extraParams&&t.extraParams.frontAbId)),t.customFetchData&&!t.useTpp)",
+                  "feed-main-strategy");
+            patch("return(0,w._)((0,a._)({},te),{updateApiConfig:function(e){K((function(t){return(0,a._)({},t,e)}))},isReady:W,abId:Q})",
+                  "return window.__awscDbg&&window.__awscDbg('[TBFEED] component render ready='+W+' ab='+Q),(0,w._)((0,a._)({},te),{updateApiConfig:function(e){K((function(t){return(0,a._)({},t,e)}))},isReady:W,abId:Q})",
+                  "feed-component-render");
+            patch("return(0,o.tZ)(u.Provider,{value:p,children:t(p)})},",
+                  "return(0,o.tZ)(u.Provider,{value:p,children:(window.__awscDbg&&s==='homeRight'&&window.__awscDbg('[TBMOD] child status='+p.status+' components='+p.components.length),t(p))})},",
+                  "provider-child");
+            patch("Ru=(n(5247),(0,u.lazy)((function(){return Promise.all([n.e(131),n.e(954),n.e(327)]).then(n.bind(n,19954))})))",
+                  "Ru=(n(5247),(0,u.lazy)((function(){var __tbLog=window.__awscDbg,__tbPs=[n.e(131),n.e(954),n.e(327)];__tbLog&&__tbLog('[TBMOD] lazy chunks created');__tbPs.forEach(function(e,t){e.then(function(){__tbLog&&__tbLog('[TBMOD] chunk '+t+' fulfilled')},function(e){__tbLog&&__tbLog('[TBMOD] chunk '+t+' rejected='+JSON.stringify(e))})});return Promise.all(__tbPs).then(function(e){__tbLog&&__tbLog('[TBMOD] aggregate fulfilled');return n.bind(n,19954)(e)},function(e){__tbLog&&__tbLog('[TBMOD] aggregate rejected='+JSON.stringify(e));throw e})})))",
+                  "right-lazy");
+        }
+        if(url.find("/js/main.js") != std::string::npos) {
+            auto patch = [&out](const char* find, const char* repl, const char* tag) {
+                size_t pos = out.find(find);
+                if(pos == std::string::npos) {
+                    fprintf(stderr, "[modpatch] TBCSSDBG miss %s\n", tag);
+                    return;
+                }
+                out.replace(pos, strlen(find), repl);
+                fprintf(stderr, "[modpatch] TBCSSDBG applied %s\n", tag);
+            };
+            patch("return new Promise((function(t,r){var o=n.miniCssF(e),u=n.p+o;",
+                  "return new Promise((function(t,r){window.__awscDbg&&window.__awscDbg('[TBCSS] promise chunk='+e);var o=n.miniCssF(e),u=n.p+o;",
+                  "promise");
+            patch("o.onerror=o.onload=function(u){if(o.onerror=o.onload=null,\"load\"===u.type)n();else{",
+                  "o.onerror=o.onload=function(u){window.__awscDbg&&window.__awscDbg('[TBCSS] event chunk='+e+' type='+u.type);if(o.onerror=o.onload=null,\"load\"===u.type){window.__awscDbg&&window.__awscDbg('[TBCSS] resolve-before chunk='+e),n(),window.__awscDbg&&window.__awscDbg('[TBCSS] resolve-after chunk='+e)}else{",
+                  "event");
+            patch(".then((function(){e[t]=0}),(function(n){throw delete e[t],n})))",
+                  ".then((function(){window.__awscDbg&&window.__awscDbg('[TBCSS] fulfilled chunk='+t),e[t]=0}),(function(n){throw window.__awscDbg&&window.__awscDbg('[TBCSS] rejected chunk='+t),delete e[t],n})))",
+                  "settled");
+            patch("n.o(e,u)&&e[u]&&e[u][0](),e[u]=0;return n.O(d)",
+                  "n.o(e,u)&&e[u]&&((u===131||u===954||u===327)&&window.__awscDbg&&window.__awscDbg('[TBCSS] js-resolve-before chunk='+u),e[u][0](),(u===131||u===954||u===327)&&window.__awscDbg&&window.__awscDbg('[TBCSS] js-resolve-after chunk='+u)),e[u]=0;return n.O(d)",
+                  "js-resolve");
+        }
+    }
+    if(getenv("EWEB_TBERRDBG") != nullptr &&
+       url.find("/pegasus-project-tbhome-2024/") != std::string::npos &&
+       url.find("/js/framework.js") != std::string::npos) {
+        auto patch = [&out](const char* find, const char* repl, const char* tag) {
+            size_t pos = out.find(find);
+            if(pos == std::string::npos) {
+                fprintf(stderr, "[modpatch] TBREACTDBG miss %s\n", tag);
+                return;
+            }
+            out.replace(pos, strlen(find), repl);
+            fprintf(stderr, "[modpatch] TBREACTDBG applied %s\n", tag);
+        };
+        patch("function Jl(e,t,n){var r=es(e),a=",
+              "function Jl(e,t,n){var __tbAction=n===!0||n==='427503'||(n&&n.components);__tbAction&&window.__awscDbg&&window.__awscDbg('[TBREACT] dispatch action='+String(n).slice(0,100)+' state='+String(t.lastRenderedState).slice(0,100)+' fiberLanes='+e.lanes);var r=es(e),a=",
+              "dispatch");
+        patch("null!==(n=Mo(e,t,a,r))&&(ts(n,e,r,a=Zu()),Xl(n,t,r))",
+              "null===(n=Mo(e,t,a,r))?(__tbAction&&window.__awscDbg&&window.__awscDbg('[TBREACT] dispatch no-root')):(__tbAction&&window.__awscDbg&&window.__awscDbg('[TBREACT] dispatch root lane='+r),ts(n,e,r,a=Zu()),Xl(n,t,r))",
+              "dispatch-root");
+        patch("function M(e){C=e,_||(_=!0,E())}",
+              "function M(e){window.__awscDbg&&window.__awscDbg('[TBSCHED] request running='+_+' performing='+v+' queued='+m+' native='+(w===setImmediate)+' scheduler='+String(w).slice(0,100));C=e,_||(_=!0,E());window.__awscDbg&&window.__awscDbg('[TBSCHED] request-posted running='+_)}",
+              "scheduler-request");
+        patch("function D(){if(null!==C){var e=t.unstable_now();R=e;var n=!0;try{n=C(!0,e)}finally{n?E():(_=!1,C=null)}}else _=!1}",
+              "function D(){if(window.__awscDbg&&window.__awscDbg('[TBSCHED] deadline enter running='+_+' hasCallback='+(null!==C)),null!==C){var e=t.unstable_now();R=e;var n=!0;try{window.__awscDbg&&window.__awscDbg('[TBSCHED] callback-before'),n=C(!0,e),window.__awscDbg&&window.__awscDbg('[TBSCHED] callback-after more='+n)}finally{window.__awscDbg&&window.__awscDbg('[TBSCHED] deadline finally more='+n),n?E():(_=!1,C=null)}}else _=!1}",
+              "scheduler-deadline");
+        patch("function x(e,n){m=!1,",
+              "function x(e,n){window.__awscDbg&&window.__awscDbg('[TBSCHED] work enter timeout='+e+' queued='+m+' performing='+v);m=!1,",
+              "scheduler-work");
+        patch("return u}finally{p=null,h=r,v=!1}}",
+              "return window.__awscDbg&&window.__awscDbg('[TBSCHED] work return more='+u+' remaining='+(null!==p)),u}finally{window.__awscDbg&&window.__awscDbg('[TBSCHED] work finally'),p=null,h=r,v=!1}}",
+              "scheduler-work-finally");
+        patch("function rs(e,t){if(Xu=-1,Gu=0,",
+              "function rs(e,t){window.__awscDbg&&window.__awscDbg('[TBREACT] root callback lanes='+e.pendingLanes+' priority='+e.callbackPriority);if(Xu=-1,Gu=0,",
+              "root-callback");
+        patch("function vs(e,t){var n=Pu;Pu|=2;",
+              "function vs(e,t){window.__awscDbg&&window.__awscDbg('[TBREACT] render-root lanes='+t);var n=Pu;Pu|=2;",
+              "render-root");
+        patch("function ds(e,t){for(;;){var n=Ru;try{",
+              "function ds(e,t){window.__awscDbg&&window.__awscDbg('[TBREACT] render-catch then='+(t&&typeof t.then)+' msg='+String(t&&t.message||t).slice(0,300));for(;;){var n=Ru;try{",
+              "render-catch");
+        patch("function ws(e,t,n){var r=bt,a=Cu.transition;try{",
+              "function ws(e,t,n){window.__awscDbg&&window.__awscDbg('[TBREACT] commit-root');var r=bt,a=Cu.transition;try{",
+              "commit-root");
+    }
+    /* EWEB_TBERRDBG: trace React 18's asynchronous update path after the
+     * homepage's real responses arrive. The probes only report queueing,
+     * root scheduling and scheduler dispatch; they do not force a render or
+     * alter lanes, state values, callback priorities or promise settlement. */
+    if(getenv("EWEB_TBERRDBG") != nullptr &&
+       url.find("/react/18.2.0/umd/react.production.min.js") != std::string::npos) {
+        auto patch = [&out](const char* find, const char* repl, const char* tag) {
+            size_t pos = out.find(find);
+            if(pos == std::string::npos) {
+                fprintf(stderr, "[modpatch] TBSCHEDDBG miss %s\n", tag);
+                return;
+            }
+            out.replace(pos, strlen(find), repl);
+            fprintf(stderr, "[modpatch] TBSCHEDDBG applied %s\n", tag);
+        };
+        patch("function R(a){G=a;H||(H=!0,I())}",
+              "function R(a){window.__awscDbg&&window.__awscDbg('[TBSCHED] request fn='+typeof a+' H='+H);G=a;H||(H=!0,I())}",
+              "request");
+        patch("-1,U=function(){if(null!==G){",
+              "-1,U=function(){window.__awscDbg&&window.__awscDbg('[TBSCHED] fire G='+typeof G+' H='+H);if(null!==G){",
+              "fire");
+        patch("b?I():(H=!1,G=null)",
+              "b?(window.__awscDbg&&window.__awscDbg('[TBSCHED] continue'),I()):(window.__awscDbg&&window.__awscDbg('[TBSCHED] drained'),H=!1,G=null)",
+              "settled");
+    }
+    if(getenv("EWEB_TBERRDBG") != nullptr &&
+       url.find("/react-dom/18.2.0/umd/react-dom.production.min.js") != std::string::npos) {
+        auto patch = [&out](const char* find, const char* repl, const char* tag) {
+            size_t pos = out.find(find);
+            if(pos == std::string::npos) {
+                fprintf(stderr, "[modpatch] TBSTATEDBG miss %s\n", tag);
+                return;
+            }
+            out.replace(pos, strlen(find), repl);
+            fprintf(stderr, "[modpatch] TBSTATEDBG applied %s\n", tag);
+        };
+        patch("function pk(a,b,c){var d=hb(a),e=",
+              "function pk(a,b,c){var d=hb(a);window.__awscDbg&&window.__awscDbg('[TBSTATE] dispatch tag='+a.tag+' lane='+d+' fiberLanes='+a.lanes+' mode='+a.mode);var e=",
+              "dispatch");
+        patch("if(ua(h,g)){var k=b.interleaved;",
+              "if(window.__awscDbg&&window.__awscDbg('[TBSTATE] eager tag='+a.tag+' same='+ua(h,g)+' oldType='+typeof g+' newType='+typeof h),ua(h,g)){var k=b.interleaved;",
+              "eager");
+        patch("c=Ch(a,b,e,d);null!==c&&(e=Z(),ya(c,a,d,e),gi(c,b,d))",
+              "c=Ch(a,b,e,d);window.__awscDbg&&window.__awscDbg('[TBSTATE] queued tag='+a.tag+' lane='+d+' root='+!!c);null!==c&&(e=Z(),ya(c,a,d,e),gi(c,b,d))",
+              "queued");
+        patch("function ia(a,b){var c=a.callbackNode;",
+              "function ia(a,b){window.__awscDbg&&window.__awscDbg('[TBSTATE] ensure rootTag='+a.tag+' eventTime='+b+' callbackPriority='+a.callbackPriority+' callbackNode='+typeof a.callbackNode);var c=a.callbackNode;",
+              "ensure");
+        patch("function Oi(a,b){Kd=-1;",
+              "function Oi(a,b){window.__awscDbg&&window.__awscDbg('[TBSTATE] concurrent-start rootTag='+a.tag+' sync='+b+' context='+p);Kd=-1;",
+              "concurrent-start");
+    }
     /* EWEB_RERRDBG: instrument React's production error decoder so the
      * minified #418/#423 throws carry their arguments AND a JS stack: the
      * decoder is the single funnel every React error passes through, so one
@@ -1392,6 +1855,63 @@ static std::string jsScriptModPatch(const std::string& url, const std::string& i
         }
         fprintf(stderr, "[modpatch] SAPPLIED needle#%zu x%d to %s\n", pi, nrep, url.c_str());
     }
+    /* ce23: permanent childLinkFn missing-node guard (see patch_ce23.py). The
+     * bridge's dynamic text-run coalescing can shrink the link-time childNodes
+     * snapshot below the compile-time pair count after ngIf/ngSwitch removes a
+     * separator; skip undefined node pairs in BOTH the nodeLinkFn and the
+     * recursive childLinkFn branch so a drifted whitespace/comment/case node
+     * cannot abort the whole link/$apply. */
+    if(url.find("vendor_") != std::string::npos) {
+        const std::string clfGuardFind = R"JS(a?(a.scope?(u=e.$new(),Yt.data(l,"$scope",u)):u=e,a(s,u,l,i,a.transcludeOnThisElement?D(e,a.transclude,o):!a.templateOnThisElement&&o?o:!o&&t?D(e,t):null)):s&&s(e,l.childNodes,n,o))JS";
+        const std::string clfGuardRepl = R"JS(a?(l==null?null:(a.scope?(u=e.$new(),Yt.data(l,"$scope",u)):u=e,a(s,u,l,i,a.transcludeOnThisElement?D(e,a.transclude,o):!a.templateOnThisElement&&o?o:!o&&t?D(e,t):null))):s&&(l&&s(e,l.childNodes,n,o)))JS";
+        size_t cg = out.find(clfGuardFind);
+        if(cg != std::string::npos) {
+            out.replace(cg, clfGuardFind.size(), clfGuardRepl);
+            fprintf(stderr, "[clfdbg] ce23 permanent childLinkFn guard applied to %s\n", url.c_str());
+        }
+    }
+    /* TEMP DIAG (EWEB_CLFDBG): guard the Angular childLinkFn crash site to log
+     * the compiled-pair count vs the live clone childNodes count. */
+    if(getenv("EWEB_CLFDBG") != nullptr && url.find("vendor_") != std::string::npos) {
+        /* ce15: name the element at every nodeLinkFn -> childLinkFn handoff. */
+        const std::string clfCall = R"JS(e&&e(A,s.childNodes,n,c))JS";
+        const std::string clfCallRepl = R"JS(e&&(window.__clfLog&&window.__clfLog(s,t),e(A,s.childNodes,n,c)))JS";
+        size_t cp2 = out.find(clfCall);
+        if(cp2 != std::string::npos) {
+            out.replace(cp2, clfCall.size(), clfCallRepl);
+            fprintf(stderr, "[clfdbg] instrumented nodeLinkFn call in %s\n", url.c_str());
+        } else {
+            fprintf(stderr, "[clfdbg] miss nodeLinkFn call pattern in %s\n", url.c_str());
+        }
+        /* ce16: the deferred-queue and direct link calls in templateUrl success. */
+        const std::string clfQ = R"JS(u(c,S,M,r,w))JS";
+        const std::string clfQRepl = R"JS(window.__clfLog2&&window.__clfLog2("Q",M,S),u(c,S,M,r,w))JS";
+        size_t cp3 = out.find(clfQ);
+        if(cp3 != std::string::npos) {
+            out.replace(cp3, clfQ.size(), clfQRepl);
+            fprintf(stderr, "[clfdbg] instrumented deferred queue call in %s\n", url.c_str());
+        } else {
+            fprintf(stderr, "[clfdbg] miss deferred queue pattern in %s\n", url.c_str());
+        }
+        const std::string clfD = R"JS(u(c,t,n,r,o))JS";
+        const std::string clfDRepl = R"JS(window.__clfLog2&&window.__clfLog2("D",n,t),u(c,t,n,r,o))JS";
+        size_t cp4 = out.find(clfD);
+        if(cp4 != std::string::npos) {
+            out.replace(cp4, clfD.size(), clfDRepl);
+            fprintf(stderr, "[clfdbg] instrumented direct link call in %s\n", url.c_str());
+        } else {
+            fprintf(stderr, "[clfdbg] miss direct link pattern in %s\n", url.c_str());
+        }
+        const std::string clfFind = R"JS(s&&s(e,l.childNodes,n,o))JS";
+        const std::string clfRepl = R"JS(s&&(l?s(e,l.childNodes,n,o):console.log("[CLF] p="+p+" d="+d+" h="+h.length+" r="+r.length+" sid="+(e&&e.$id)+" trans="+(e&&e.$$transcluded)+" stack="+String(new Error().stack).slice(0,1200))))JS";
+        size_t cp = out.find(clfFind);
+        if(cp != std::string::npos) {
+            out.replace(cp, clfFind.size(), clfRepl);
+            fprintf(stderr, "[clfdbg] guarded childLinkFn in %s\n", url.c_str());
+        } else {
+            fprintf(stderr, "[clfdbg] miss childLinkFn pattern in %s\n", url.c_str());
+        }
+    }
     return out;
 }
 
@@ -1452,11 +1972,12 @@ bool EWebEngine::runPageScripts()
          * 404, so the build cannot wedge. */
         if(i < m_jsScriptDone.size() && !m_jsScriptDone[i]) {
             if(m_jsScriptWaitSince == 0) m_jsScriptWaitSince = ticMs();
-            if(ticMs() - m_jsScriptWaitSince < 10000) return false;
+            if(ticMs() - m_jsScriptWaitSince < 45000) return false;
             m_jsScriptDone[i] = 1;
             if(i < m_jsScripts.size()) m_jsScripts[i].clear();
         }
         m_jsScriptWaitSince = 0;
+        if(i < m_jsScriptRan.size()) m_jsScriptRan[i] = 1;
         m_jsNextScript++;
         /* Copy by value: a script that injects another (appendChild of a
          * <script>) push_backs to m_jsScripts, which can realloc and dangle a
@@ -1503,9 +2024,22 @@ bool EWebEngine::runPageScripts()
             m_jsCurScriptUrl.clear();
             continue;
         }
-        jsVmEnter(true);
+        /* Attribute the run BEFORE jsVmEnter: its retry-budget check reads
+         * m_jsCurScriptSrc to recognise a requeued second-chance body. */
         m_jsCurScriptSrc = &src;
         m_jsCurScriptUrl = (i < m_jsScriptSrcs.size()) ? m_jsScriptSrcs[i] : std::string();
+        /* TEMP DIAG: dump live script source for stack-column alignment. */
+        {
+            const char* dj = getenv("EWEB_DUMPJS");
+            if(dj != nullptr && dj[0] != 0 && m_jsCurScriptUrl.find(dj) != std::string::npos) {
+                char dp[256];
+                snprintf(dp, sizeof(dp), "/Users/mingmingzhu/work/ewebview/.tmp_repro/dumpjs_%d.js", (int)i);
+                FILE* df = fopen(dp, "wb");
+                if(df != nullptr) { fwrite(src.data(), 1, src.size(), df); fclose(df);
+                    fprintf(stderr, "[dumpjs] %s -> %s (%zu bytes)\n", m_jsCurScriptUrl.c_str(), dp, src.size()); }
+            }
+        }
+        jsVmEnter(true);
         jsSetModuleBase(true);
         {   /* Tag uncaught VM errors with the script index so a failing
              * minified bundle can be matched to its EWEB_DUMP_SCRIPTS file. */
@@ -1545,10 +2079,12 @@ bool EWebEngine::runPageScripts()
         }
         eweb_segv_disarm();
         m_jsVm->dbg_tag = nullptr;
+        jsSetModuleBase(false);
+        /* jsVmExit reads m_jsCurScriptSrc (retry-cut detection, runaway mark),
+         * so clear the attribution only after it returns. */
+        bool terminated = jsVmExit();
         m_jsCurScriptSrc = nullptr;
         m_jsCurScriptUrl.clear();
-        jsSetModuleBase(false);
-        bool terminated = jsVmExit();
         if(getenv("EWEB_SCRIPTDBG") != NULL)
             fprintf(stderr, "[ewebview] jsdbg: pc_range script %d = [%u,%u)\n", (int)i,
                     (unsigned)jsBasePc, (unsigned)m_jsVm->bc.cindex);
@@ -1615,6 +2151,34 @@ static bool jsIsTelemetryUrl(const std::string& url) {
             return true;
     }
     return false;
+}
+
+size_t EWebEngine::jsFindReadyPageScript() const
+{
+    /* Async fetches hold no execution-order slot. An ordered (async=false)
+     * script is ordered only against other ordered scripts: it may pass both
+     * pending and ready async JSONP work, but not an earlier ordered script
+     * whose fetch is still pending. Keep this selection in one helper so the
+     * engine loop can prioritize exactly the script runNextPageScript will
+     * pick, without letting timers overtake an already-downloaded callback. */
+    const size_t none = m_jsScripts.size();
+    size_t firstOrdered = none;
+    for(size_t j = m_jsNextScript; j < none; ++j) {
+        bool unrun = (j >= m_jsScriptRan.size() || !m_jsScriptRan[j]);
+        bool isAsync = (j < m_jsScriptAsync.size() && m_jsScriptAsync[j]);
+        if(unrun && !isAsync) { firstOrdered = j; break; }
+    }
+    if(firstOrdered < none && firstOrdered < m_jsScriptDone.size() &&
+       m_jsScriptDone[firstOrdered])
+        return firstOrdered;
+
+    for(size_t j = m_jsNextScript; j < none; ++j) {
+        bool unrun = (j >= m_jsScriptRan.size() || !m_jsScriptRan[j]);
+        bool isAsync = (j < m_jsScriptAsync.size() && m_jsScriptAsync[j]);
+        if(unrun && isAsync && j < m_jsScriptDone.size() && m_jsScriptDone[j])
+            return j;
+    }
+    return none;
 }
 
 bool EWebEngine::runNextPageScript()
@@ -1714,7 +2278,17 @@ bool EWebEngine::runNextPageScript()
     }
 
     while(m_jsNextScript < m_jsScripts.size()) {
-        size_t i = m_jsNextScript;
+        while(m_jsNextScript < m_jsScripts.size() &&
+              m_jsNextScript < m_jsScriptRan.size() && m_jsScriptRan[m_jsNextScript])
+            m_jsNextScript++;
+        if(m_jsNextScript >= m_jsScripts.size()) break;
+        size_t i = jsFindReadyPageScript();
+        if(i == m_jsScripts.size()) i = m_jsNextScript;
+        if(i != m_jsNextScript && getenv("EWEB_SCRIPTDBG") != NULL) {
+            bool isAsync = (i < m_jsScriptAsync.size() && m_jsScriptAsync[i]);
+            fprintf(stderr, "[ewebview] jsdbg: script schedule head=%d pick=%d async=%d\n",
+                    (int)m_jsNextScript, (int)i, isAsync ? 1 : 0);
+        }
         /* Streaming-SSR early load: once the parser-extracted prefix recorded
          * at swap has run, fire DOMContentLoaded/load now even though dynamic
          * lazy chunks are still queued - a real browser does not let those
@@ -1754,15 +2328,36 @@ bool EWebEngine::runNextPageScript()
          * (pinterest.com: exhausted at script 60 of 74, dropping the lazy chunk
          * that registers the feed's module -> require miss -> the app dies
          * before it ever fetches the feed). Server-rendered portals have content
-         * at swap, never latch, and keep the short live budget. */
-        if(m_jsPostSwapAt != 0 && pageShowsSkeletonPlaceholder())
+         * at swap, never latch, and keep the short live budget.
+         * SKELETON-ANY LATCH (jd.com): a classic-script CSR shell paints its
+         * static chrome (search bar, category sidebar, footer icons) at swap, so
+         * pageShowsSkeletonPlaceholder() reports a real page and the blank-shell
+         * latch above never fires - yet the carousel / recommend / user columns
+         * are still skeleton-named placeholders that ONLY the React bundle at the
+         * queue tail fills, and a slow but legitimate anti-bot script ahead of it
+         * (pc-tk.js, ~10 s of software canvas/WebGL fingerprinting on this VM)
+         * needs the long per-run budget just to finish defining getJsToken before
+         * the bundle can fetch real data. Latch on the weaker pageHasSkeletonAny()
+         * probe so BOTH the phase budget here and the per-run budget in
+         * jsVmEnter stay long for the whole content-bearing tail. A server-
+         * rendered portal ships no skeleton-named placeholder, so it still never
+         * latches and keeps the short budget; the guard skips re-probing once
+         * latched. */
+        if(m_jsPostSwapAt != 0 && !m_postSwapSkelLatch &&
+           (pageShowsSkeletonPlaceholder() || jsSkeletonAnyProbeCached()))
             m_postSwapSkelLatch = true;
         uint32_t postBudget = (m_postSwapSkelLatch ||
                                m_jsStreamingSsr ||
                                (m_jsBuildHasModules && pageHasSkeletonAny()))
                                   ? kJsPostSwapSkeletonBudgetMs
                                   : kJsPostSwapBudgetMs;
-        if(m_jsPostSwapAt != 0 && (ticMs() - m_jsPostSwapAt) > postBudget) {
+        /* DIAG: EWEB_JS_NOBUDGET lifts the per-run watchdog (jsOnVmStep); also
+         * skip the phase drop so a slow-but-legitimate tail can be proven end
+         * to end without either budget cutting it. */
+        static int s_nobudgetPhase = -1;
+        if(s_nobudgetPhase < 0)
+            s_nobudgetPhase = (getenv("EWEB_JS_NOBUDGET") != nullptr) ? 1 : 0;
+        if(!s_nobudgetPhase && m_jsPostSwapAt != 0 && (ticMs() - m_jsPostSwapAt) > postBudget) {
             /* Past the live budget. If the next unrun slot is a dynamically-
              * inserted <script> (m_jsScriptEls[i] != nullptr; parser-extracted
              * slots are nullptr - see the assign in queueBuild) it is an app-
@@ -1779,12 +2374,24 @@ bool EWebEngine::runNextPageScript()
              * extracted tail (the ad-portal case the budget guards) still drops
              * at the live budget. */
             bool nextIsDynamic = (i < m_jsScriptEls.size() && m_jsScriptEls[i] != nullptr);
-            if(nextIsDynamic && postBudget != kJsPostSwapSkeletonBudgetMs) {
+            /* A requeued watchdog-cut retry is in the same boat: it is the
+             * second chance of a body the live budget could not finish, and
+             * dropping it at the phase cap defeats the requeue (web.wechat.com:
+             * the wcinfo CHAOS VM retry legitimately runs ~40 s before it
+             * throws, consuming the 8 s live phase clock ahead of the Angular
+             * entry's retry). Its src sits in m_jsRequeuedSrcs; the original
+             * slot already ran, so an UNRUN slot with that src is the retry. */
+            /* m_jsRequeuedSrcs stores script BODIES (the requeue pushes src),
+             * so compare the slot's body, not its URL (m_jsScriptSrcs). */
+            bool nextIsRetry = (i < m_jsScripts.size() && !m_jsScripts[i].empty() &&
+                std::find(m_jsRequeuedSrcs.begin(), m_jsRequeuedSrcs.end(),
+                          m_jsScripts[i]) != m_jsRequeuedSrcs.end());
+            if((nextIsDynamic || nextIsRetry) && postBudget != kJsPostSwapSkeletonBudgetMs) {
                 m_postSwapSkelLatch = true;
                 postBudget = kJsPostSwapSkeletonBudgetMs;
             }
         }
-        if(m_jsPostSwapAt != 0 && (ticMs() - m_jsPostSwapAt) > postBudget) {
+        if(!s_nobudgetPhase && m_jsPostSwapAt != 0 && (ticMs() - m_jsPostSwapAt) > postBudget) {
             if(getenv("EWEB_SCRIPTDBG") != NULL)
                 fprintf(stderr, "[ewebview] jsdbg: post budget %u ms exhausted at script %d of %d\n",
                         (unsigned)postBudget, (int)i, (int)m_jsScripts.size());
@@ -1816,7 +2423,7 @@ bool EWebEngine::runNextPageScript()
                 fprintf(stderr, "[ewebview] jsdbg: post wait script %d (%llu ms) src=%.80s\n",
                         (int)i, (unsigned long long)(ticMs() - m_jsScriptWaitSince),
                         (i < m_jsScriptSrcs.size() ? m_jsScriptSrcs[i].c_str() : "?"));
-            if(ticMs() - m_jsScriptWaitSince < 10000) return true;
+            if(ticMs() - m_jsScriptWaitSince < 45000) return true;
             EWEB_LOG("[ewebview] js: post-swap script %d fetch never resolved (src=%.80s) - skipping past deadline\n",
                 (int)i, (i < m_jsScriptSrcs.size() ? m_jsScriptSrcs[i].c_str() : "?"));
             m_jsScriptDone[i] = 1;
@@ -1839,7 +2446,11 @@ bool EWebEngine::runNextPageScript()
          * element for every queued external script so the DOM script list is
          * populated BEFORE any SDK reads it (see jsScriptStandInEl). */
         if(m_jsNextScript == 0) jsMaterializeScriptStandIns();
-        m_jsNextScript++;
+        if(i < m_jsScriptRan.size()) m_jsScriptRan[i] = 1;
+        if(i == m_jsNextScript) m_jsNextScript++;
+        while(m_jsNextScript < m_jsScripts.size() &&
+              m_jsNextScript < m_jsScriptRan.size() && m_jsScriptRan[m_jsNextScript])
+            m_jsNextScript++;
         /* Copy by value: this script may inject another (appendChild of a
          * <script>), which push_backs to m_jsScripts and can realloc - a
          * reference held across vm_load_run below would then dangle. */
@@ -1900,9 +2511,22 @@ bool EWebEngine::runNextPageScript()
             m_jsProgressiveActive = false;
             continue;
         }
-        jsVmEnter(true);
+        /* Attribute the run BEFORE jsVmEnter: its retry-budget check reads
+         * m_jsCurScriptSrc to recognise a requeued second-chance body. */
         m_jsCurScriptSrc = &src;
         m_jsCurScriptUrl = (i < m_jsScriptSrcs.size()) ? m_jsScriptSrcs[i] : std::string();
+        /* TEMP DIAG: dump live script source for stack-column alignment. */
+        {
+            const char* dj = getenv("EWEB_DUMPJS");
+            if(dj != nullptr && dj[0] != 0 && m_jsCurScriptUrl.find(dj) != std::string::npos) {
+                char dp[256];
+                snprintf(dp, sizeof(dp), "/Users/mingmingzhu/work/ewebview/.tmp_repro/dumpjs_%d.js", (int)i);
+                FILE* df = fopen(dp, "wb");
+                if(df != nullptr) { fwrite(src.data(), 1, src.size(), df); fclose(df);
+                    fprintf(stderr, "[dumpjs] %s -> %s (%zu bytes)\n", m_jsCurScriptUrl.c_str(), dp, src.size()); }
+            }
+        }
+        jsVmEnter(true);
         jsSetModuleBase(true);
         m_jsLastFlushAt = run_start;
         {
@@ -1911,8 +2535,8 @@ bool EWebEngine::runNextPageScript()
             m_jsVm->dbg_tag = s_jsDbgTag;
         }
         if(getenv("EWEB_SCRIPTDBG") != NULL)
-            fprintf(stderr, "[ewebview] jsdbg: post run script %d len=%u url=%.80s\n", (int)i,
-                     (unsigned)src.size(), m_jsCurScriptUrl.c_str());
+            fprintf(stderr, "[ewebview] jsdbg: post run script %d t=%llu len=%u url=%.80s\n", (int)i,
+                     (unsigned long long)run_start, (unsigned)src.size(), m_jsCurScriptUrl.c_str());
         if(getenv("MARIO_FLIGHTDBG") != NULL && src.find("__next_f") != std::string::npos)
             fprintf(stderr, "[flightdbg] post script %d inline flight row:\n%s\n", (int)i, src.c_str());
         /* A prior script may have ended abnormally INSIDE the VM (runaway
@@ -1944,10 +2568,12 @@ bool EWebEngine::runNextPageScript()
         }
         eweb_segv_disarm();
         m_jsVm->dbg_tag = nullptr;
+        jsSetModuleBase(false);
+        /* jsVmExit reads m_jsCurScriptSrc (retry-cut detection, runaway mark),
+         * so clear the attribution only after it returns. */
+        bool terminated = jsVmExit();
         m_jsCurScriptSrc = nullptr;
         m_jsCurScriptUrl.clear();
-        jsSetModuleBase(false);
-        bool terminated = jsVmExit();
         if(getenv("EWEB_SCRIPTDBG") != NULL)
             fprintf(stderr, "[ewebview] jsdbg: pc_range script %d = [%u,%u)\n", (int)i,
                     (unsigned)jsBasePc, (unsigned)m_jsVm->bc.cindex);
@@ -1965,8 +2591,10 @@ bool EWebEngine::runNextPageScript()
          * it burns the budget (taobao's telemetry SDK spins for minutes ahead
          * of the mtop/React bundles that render the page). Requeue the cut
          * body ONCE at the tail of the queue so the app chain gets its turn
-         * first; the slow body retries last and, cut again, stays marked
-         * runaway exactly as before. */
+         * first; the slow body retries last with the long second-chance run
+         * budget (jsVmEnter) and, cut again, stays marked runaway - but its
+         * second cut no longer charges the page-wide abort counter (jsVmExit),
+         * so one slow SDK cannot disable the whole page's JS. */
         if(terminated &&
            std::find(m_jsRequeuedSrcs.begin(), m_jsRequeuedSrcs.end(), src) ==
                m_jsRequeuedSrcs.end()) {
@@ -1978,7 +2606,10 @@ bool EWebEngine::runNextPageScript()
                                        ? m_jsScriptIds[i] : std::string());
             m_jsScriptDeferred.push_back(i < m_jsScriptDeferred.size()
                                             ? m_jsScriptDeferred[i] : false);
+            m_jsScriptAsync.push_back(i < m_jsScriptAsync.size()
+                                         ? m_jsScriptAsync[i] : 0);
             m_jsScriptDone.push_back(1);
+            m_jsScriptRan.push_back(0);
             m_jsScriptEls.push_back(nullptr);   /* keep the vectors aligned */
             for(auto it = m_jsRunawaySrcs.begin(); it != m_jsRunawaySrcs.end(); ++it) {
                 if(*it == src) { m_jsRunawaySrcs.erase(it); break; }
@@ -2094,9 +2725,13 @@ void EWebEngine::jsFireScriptElEvent(size_t i, const char* type)
         fprintf(stderr, "[ewebview] jsdbg: fire script %zu %s el=%p live=%d\n",
                 i, type, el, (el != nullptr && jsElIsLive(this, el)) ? 1 : 0);
     if(el == nullptr || !jsElIsLive(this, el)) return;
+    uint64_t event_start = ticMs();
     jsVmEnter();
     js_event_dispatch_simple(m_jsVm, el, type, false);
     jsVmExit();
+    if(getenv("EWEB_SCRIPTDBG") != NULL)
+        fprintf(stderr, "[scriptstep] script %zu %s listeners=%u ms\n",
+                i, type, (unsigned)(ticMs() - event_start));
 }
 
 void EWebEngine::jsNoteDynamicStylesheet(const std::string& url, void* link_el)
@@ -2110,26 +2745,53 @@ void EWebEngine::jsNoteDynamicStylesheet(const std::string& url, void* link_el)
 void EWebEngine::jsFireLinkElEvent(const std::string& url, const char* type)
 {
     if(m_jsVm == nullptr || url.empty()) return;
-    void* el = nullptr;
-    for(size_t i = 0; i < m_jsLinkEls.size(); ++i) {
+    std::vector<void*> els;
+    for(size_t i = 0; i < m_jsLinkEls.size(); ) {
         if(m_jsLinkEls[i].first == url) {
-            el = m_jsLinkEls[i].second;
+            els.push_back(m_jsLinkEls[i].second);
             m_jsLinkEls.erase(m_jsLinkEls.begin() + (long)i);
-            break;
+        } else {
+            ++i;
         }
     }
     if(getenv("EWEB_MODPATCH_DBG") != nullptr) {
-        fprintf(stderr, "[csslink] FIRE %s url=%s found=%d pending=%zu\n",
-                type, url.c_str(), el != nullptr ? 1 : 0, m_jsLinkEls.size());
-        if(el == nullptr)
+        fprintf(stderr, "[csslink] FIRE %s url=%s found=%zu pending=%zu\n",
+                type, url.c_str(), els.size(), m_jsLinkEls.size());
+        if(els.empty())
             for(size_t i = 0; i < m_jsLinkEls.size(); ++i)
                 fprintf(stderr, "[csslink]   pending[%zu]=%s\n", i, m_jsLinkEls[i].first.c_str());
     }
-    if(el == nullptr || !jsElIsLive(this, el)) return;
-    EWEB_LOG("[ewebview] jsdbg: fire link %s url=%.60s\n", type, url.c_str());
-    jsVmEnter();
-    js_event_dispatch_simple(m_jsVm, el, type, false);
-    jsVmExit();
+    for(size_t i = 0; i < els.size(); ++i) {
+        void* el = els[i];
+        bool live = el != nullptr && jsElIsLive(this, el);
+        if(getenv("EWEB_MODPATCH_DBG") != nullptr)
+            fprintf(stderr, "[csslink] TARGET %s index=%zu live=%d\n", type, i, live ? 1 : 0);
+        if(!live) continue;
+        EWEB_LOG("[ewebview] jsdbg: fire link %s url=%.60s\n", type, url.c_str());
+        if(getenv("EWEB_MODPATCH_DBG") != nullptr)
+            fprintf(stderr, "[csslink] DISPATCH-BEGIN %s url=%s\n", type, url.c_str());
+        jsVmEnter();
+        js_event_dispatch_simple(m_jsVm, el, type, false);
+        jsVmExit();
+        if(getenv("EWEB_MODPATCH_DBG") != nullptr)
+            fprintf(stderr, "[csslink] DISPATCH-END %s url=%s\n", type, url.c_str());
+    }
+}
+
+void EWebEngine::jsDeferLinkElEvent(const std::string& url, const char* type)
+{
+    if(url.empty() || type == nullptr) return;
+    m_jsDeferredLinkEvents.push_back(std::make_pair(url, std::string(type)));
+}
+
+int EWebEngine::jsFlushLinkElEvents()
+{
+    if(m_jsVm == nullptr || m_jsDeferredLinkEvents.empty()) return 0;
+    std::vector<std::pair<std::string, std::string>> pending = m_jsDeferredLinkEvents;
+    m_jsDeferredLinkEvents.clear();
+    for(size_t i = 0; i < pending.size(); ++i)
+        jsFireLinkElEvent(pending[i].first, pending[i].second.c_str());
+    return (int)pending.size();
 }
 
 void EWebEngine::jsNoteImageEl(const std::string& url, void* img_el)
@@ -2198,12 +2860,16 @@ void EWebEngine::jsDynamicScriptInserted(void* script_el)
             }
         }
     }
+    int dynamicAsync = jsElGetScriptAsync(this, script_el);
+    if(dynamicAsync < 0)
+        dynamicAsync = (sc->get_attr("async", nullptr) != nullptr) ? 1 : 0;
     /* TEMP DIAGNOSTIC (taobao): webpack loads route chunks by splicing
      * <script src> into <head>; log every such insert so a missing async chunk
      * (e.g. fdabd03d.js) is visible. Remove with the other temp probes. */
     if(getenv("EWEB_SCRIPTDBG") != nullptr) {
         const char* sa = sc->get_attr("src", nullptr);
-        fprintf(stderr, "[ewebview] jsdbg: dynScript insert src=%s\n",
+        fprintf(stderr, "[ewebview] jsdbg: dynScript insert t=%llu slot=%zu async=%d src=%s\n",
+                (unsigned long long)ticMs(), m_jsScripts.size(), dynamicAsync,
                 (sa != nullptr && sa[0] != 0) ? sa : "(inline)");
     }
 
@@ -2253,7 +2919,12 @@ void EWebEngine::jsDynamicScriptInserted(void* script_el)
          * parsing is over unless a defer/module script has run yet, so the
          * readyState flag stays untouched here (matches the classic case). */
         m_jsScriptDeferred.push_back(false);
+        /* Dynamic scripts are force-async by default. AWSC clears .async on
+         * fireye to request ordered execution, so preserve the element state
+         * instead of flattening every dynamically inserted script to async. */
+        m_jsScriptAsync.push_back(dynamicAsync ? 1 : 0);
         m_jsScriptDone.push_back(external ? 0 : 1);
+        m_jsScriptRan.push_back(0);
         /* Remember the element so the ordered run can fire load/error on it
          * (see m_jsScriptEls). Only part 0 of a split combo owns the element;
          * its load fires when that first part runs. */
@@ -2348,6 +3019,9 @@ void EWebEngine::jsProgressiveFlush(bool force)
     m_jsLastFlushAt = ticMs();
     EWEB_LOG("[ewebview] js progressive flush: %u ms force=%d\n",
         m_jsFlushCostMs, force ? 1 : 0);
+    if(getenv("EWEB_SCRIPTDBG") != NULL && m_jsFlushCostMs >= 50)
+        fprintf(stderr, "[scriptstep] progressive flush=%u ms force=%d\n",
+                m_jsFlushCostMs, force ? 1 : 0);
 }
 
 void EWebEngine::jsDropWriteBuffer()
@@ -2494,15 +3168,34 @@ void EWebEngine::jsVmEnter(bool appScript)
      * keep the long budget and are not watchdog-cut mid-bundle, while timer
      * callbacks / event handlers stay on the short one for input. Gated on
      * m_jsPostSwapRun so the latch never leaks into IDLE-time runs. */
+    /* A requeued retry (its src was watchdog-cut once and moved to the queue
+     * tail, see runNextPageScript) gets the long skeleton budget as a second
+     * chance: the first cut only proved it cannot finish within the SHORT live
+     * window, which on this interpreter also catches legitimate multi-second
+     * app boots. web.wechat.com's Angular entry needs far more than 3 s to
+     * compile the whole app; cutting its retry too left the ng-cloak login
+     * panel hidden forever. A genuinely hostile body still terminates at the
+     * ceiling and stays dropped (it already requeued once), and jsVmExit does
+     * not charge its second cut to the page-wide abort counter. */
+    bool retryRun = (m_jsCurScriptSrc != nullptr && !m_jsCurScriptSrc->empty() &&
+        std::find(m_jsRequeuedSrcs.begin(), m_jsRequeuedSrcs.end(),
+                  *m_jsCurScriptSrc) != m_jsRequeuedSrcs.end());
     m_jsRunDeadline = m_jsEnterAt +
         ((m_jsPrePaintAt != 0) ? kJsRunBudgetMs
                                : (jsSkeletonProbeCached() ||
                                   (m_jsPostSwapRun && m_postSwapSkelLatch && appScript) ||
                                   m_jsBuildHasModules ||
                                   m_jsStreamingSsr ||
+                                  retryRun ||
                                   s_forceSkelBudget)
                                       ? kJsRunBudgetSkeletonMs
                                       : kJsRunBudgetLiveMs);
+    if(getenv("EWEB_SCRIPTRANDBG") != nullptr)
+        fprintf(stderr, "[budgetdbg] enter app=%d retry=%d skel=%d latch=%d mods=%d budget=%u url=%.60s\n",
+            (int)appScript, (int)retryRun, (int)jsSkeletonProbeCached(),
+            (int)m_postSwapSkelLatch, (int)m_jsBuildHasModules,
+            (unsigned)(m_jsRunDeadline - m_jsEnterAt),
+            (m_jsCurScriptSrc != nullptr ? m_jsCurScriptSrc->c_str() : "(cb)"));
     m_jsEnterGen = m_buildAbortGen;
     m_jsAbortPrePaint = false;
     m_jsInScript = true;
@@ -2547,17 +3240,39 @@ bool EWebEngine::jsVmExit()
      * timeout does. A stale flag (STOP consumed while this page sat idle) has
      * the same generation as the snapshot, so runs after it count normally. */
     if(m_buildAbortGen == m_jsEnterGen) {
-        m_jsAbortCount++;
-        EWEB_LOG("[ewebview] js: script run aborted by watchdog (%d/%d)\n",
-             m_jsAbortCount, kJsRunAbortMax);
+        /* A requeued retry already ran with the long second-chance budget
+         * (jsVmEnter): cutting it again proves a genuine runaway, so the body
+         * stays dropped (runaway mark below) - but it must not charge the
+         * page-wide abort counter a second time. web.wechat.com's wcinfo
+         * CHAOS VM spins ahead of the Angular entry: charging both its cuts
+         * plus the entry's own cut reached kJsRunAbortMax and disabled the
+         * whole page's JS, leaving the ng-cloak login panel hidden forever. */
+        bool retryCut = (m_jsCurScriptSrc != nullptr && !m_jsCurScriptSrc->empty() &&
+            std::find(m_jsRequeuedSrcs.begin(), m_jsRequeuedSrcs.end(),
+                      *m_jsCurScriptSrc) != m_jsRequeuedSrcs.end());
+        if(!retryCut) {
+            m_jsAbortCount++;
+            EWEB_LOG("[ewebview] js: script run aborted by watchdog (%d/%d)\n",
+                 m_jsAbortCount, kJsRunAbortMax);
+        }
         /* Remember the body so its mirrors/replicas are not run again: one
          * terminated run already proved it cannot finish on this engine. */
         if(m_jsCurScriptSrc != nullptr && !m_jsCurScriptSrc->empty())
             m_jsRunawaySrcs.push_back(*m_jsCurScriptSrc);
-        if(m_jsAbortCount >= kJsRunAbortMax) {
+        if(!retryCut && m_jsAbortCount >= kJsRunAbortMax) {
             EWEB_LOG("[ewebview] js: too many aborted runs - dropping this page's JS\n");
             m_jsPageDisabled = true;
+            m_jsDisabledAt = ticMs();
+            /* Always visible (EWEB_LOG is compiled out in release): a disabled
+             * page looks exactly like a hung one from the outside. */
+            fprintf(stderr, "[jsdbg] PAGE JS DISABLED by watchdog (%d cuts) - input cooldown armed\n",
+                    m_jsAbortCount);
         }
+        if(getenv("EWEB_SCRIPTRANDBG") != nullptr)
+            fprintf(stderr, "[abortdbg] cut retry=%d count=%d dis=%d requeued=%zu src=%.50s\n",
+                (int)retryCut, m_jsAbortCount, (int)m_jsPageDisabled,
+                m_jsRequeuedSrcs.size(),
+                (m_jsCurScriptSrc != nullptr ? m_jsCurScriptSrc->c_str() : "(null)"));
     }
     return true;
 }
@@ -2601,6 +3316,7 @@ int EWebEngine::jsPumpAwaitScript()
     size_t i = m_jsNextScript;
     if(i >= m_jsScriptDone.size() || !m_jsScriptDone[i]) return 0;
     std::string src = m_jsScripts[i];
+    if(i < m_jsScriptRan.size()) m_jsScriptRan[i] = 1;
     m_jsNextScript++;
     if(src.empty()) { jsFireScriptElEvent(i, "error"); return 1; }
     if(getenv("EWEB_SCRIPTDBG") != NULL)
@@ -2633,6 +3349,17 @@ int EWebEngine::jsPumpAwaitScript()
     m_jsVm->dbg_tag = s_pumpTag;
     m_jsCurScriptSrc = &src;
     m_jsCurScriptUrl = (i < m_jsScriptSrcs.size()) ? m_jsScriptSrcs[i] : std::string();
+    /* TEMP DIAG: dump live script source for stack-column alignment. */
+    {
+        const char* dj = getenv("EWEB_DUMPJS");
+        if(dj != nullptr && dj[0] != 0 && m_jsCurScriptUrl.find(dj) != std::string::npos) {
+            char dp[256];
+            snprintf(dp, sizeof(dp), "/Users/mingmingzhu/work/ewebview/.tmp_repro/dumpjs_%d.js", (int)i);
+            FILE* df = fopen(dp, "wb");
+            if(df != nullptr) { fwrite(src.data(), 1, src.size(), df); fclose(df);
+                fprintf(stderr, "[dumpjs] %s -> %s (%zu bytes)\n", m_jsCurScriptUrl.c_str(), dp, src.size()); }
+        }
+    }
     jsSetModuleBase(true);
     bool deferredHere = (i < m_jsScriptDeferred.size() && m_jsScriptDeferred[i]);
     if(deferredHere)
@@ -2701,10 +3428,26 @@ void EWebEngine::jsOnVmStep(struct st_vm* vm)
             uint64_t t = ticMs();
             if(t - s_spin_last >= 400) {
                 s_spin_last = t;
-                fprintf(stderr, "[spindbg] t=%llu pc=%u depth=%d tag=%s\n",
+                const char* surl = nullptr; int sln = 0, scl = 0;
+                bc_srcmap_locate_v8(&vm->bc, vm->pc, &surl, &sln, &scl);
+                fprintf(stderr, "[spindbg] t=%llu pc=%u depth=%d tag=%s at %s:%d:%d\n",
                         (unsigned long long)t, (unsigned)vm->pc,
                         (int)vm->call_depth,
-                        vm->dbg_tag != nullptr ? vm->dbg_tag : "-");
+                        vm->dbg_tag != nullptr ? vm->dbg_tag : "-",
+                        surl != nullptr ? surl : "-", sln, scl);
+                /* Walk the func-scope stack so the JS call chain of the hot pc
+                 * is visible as source positions (nfe_name + fpc->srcmap). */
+                for(int si = vm->scope_stack_top - 1, shown = 0;
+                    si >= 0 && shown < 6; --si) {
+                    scope_t* sc = vm->scope_stack[si];
+                    if(sc == nullptr || !sc->is_func || sc->func == nullptr) continue;
+                    const char* furl = nullptr; int fln = 0, fcl = 0;
+                    bc_srcmap_locate_v8(&vm->bc, sc->func->pc, &furl, &fln, &fcl);
+                    const char* nm = (sc->func->nfe_name != nullptr) ? sc->func->nfe_name : "-";
+                    fprintf(stderr, "[spindbg]   f#%d name=%s fpc=%u retpc=%d at %s:%d:%d\n",
+                            shown++, nm, (unsigned)sc->func->pc, (int)sc->pc,
+                            furl != nullptr ? furl : "-", fln, fcl);
+                }
             }
         }
     }
@@ -2943,18 +3686,18 @@ int EWebEngine::jsPollTimers()
      * never completes and the mask dims (and click-blocks) the mounted shell
      * forever. The middleware RE-CREATES the widget after a hide (probe: fresh
      * instance at ~3.8 s), so a one-shot sweep is not enough: re-sweep every
-     * 500 ms for the first 60 s of the page, which reproduces the browser's
-     * post-handshake end-state. Host-scoped; runs in page scope so the DOM
+     * 500 ms for the page's whole lifetime. Late token retries can create the
+     * same bridge after the initial mount, long after the shell first becomes
+     * visible. This reproduces the browser's post-handshake end-state without
+     * hiding any real page content. Host-scoped; runs in page scope so the DOM
      * bridge repaints. */
     {
-        static uint64_t s_maskT0 = 0;
         static uint64_t s_maskLast = 0;
-        if(s_maskT0 == 0) s_maskT0 = ticMs();
         uint64_t now = ticMs();
         std::string url = jsDocumentUrl();
         bool host = (url.find("taobao.com") != std::string::npos ||
                      url.find("tmall.com")  != std::string::npos);
-        if(host && (now - s_maskT0) <= 60000 && (now - s_maskLast) >= 500) {
+        if(host && (now - s_maskLast) >= 500) {
             s_maskLast = now;
             static const char* kHideMask =
                 "(function(){var w=document.querySelectorAll('.J_MIDDLEWARE_FRAME_WIDGET');"
@@ -2987,6 +3730,7 @@ int EWebEngine::jsPollTimers()
             fflush(stderr);
         }
     }
+    jsRecoverAngularPhase();
     return fired;
 }
 
@@ -3310,15 +4054,88 @@ void EWebEngine::jsElSetText(void* ctx, void* el, const char* text)
     }
 }
 
+/* HTML-escaping + void-element helpers for the innerHTML serializer below. */
+static void js_html_escape_text(const std::string& in, std::string& out) {
+    for(size_t i = 0; i < in.size(); i++) {
+        char c = in[i];
+        if(c == '&') out += "&amp;";
+        else if(c == '<') out += "&lt;";
+        else if(c == '>') out += "&gt;";
+        else out += c;
+    }
+}
+static void js_html_escape_attr(const std::string& in, std::string& out) {
+    for(size_t i = 0; i < in.size(); i++) {
+        char c = in[i];
+        if(c == '&') out += "&amp;";
+        else if(c == '<') out += "&lt;";
+        else if(c == '>') out += "&gt;";
+        else if(c == '"') out += "&quot;";
+        else out += c;
+    }
+}
+static bool js_html_is_void(const char* tag) {
+    static const char* voids[] = {"area","base","br","col","embed","hr","img","input",
+                                  "link","meta","param","source","track","wbr", nullptr};
+    for(int i = 0; voids[i] != nullptr; i++)
+        if(strcmp(tag, voids[i]) == 0) return true;
+    return false;
+}
+/* Recursively serialise an element's children to markup (the DOM innerHTML
+ * getter). The old MVP returned get_text() - bare concatenated text - so any
+ * read of innerHTML on an element whose children are elements came back ""
+ * (or tag-less text), breaking jQuery .html(), DOM-diffing code and the
+ * fingerprint SDKs that serialise probe nodes. */
+static void js_serialize_children(litehtml::element* e, std::string& out) {
+    size_t n = e->get_children_count();
+    for(size_t i = 0; i < n; i++) {
+        litehtml::element* c = e->get_child((int)i);
+        if(c == nullptr) continue;
+        const char* tag = c->get_tagName();
+        if(tag == nullptr || tag[0] == 0 || (tag[0] == ':' && tag[1] == ':')) {
+            /* text / comment node: emit its (escaped) text. */
+            std::string t;
+            c->get_text(t);
+            js_html_escape_text(t, out);
+            continue;
+        }
+        out += '<';
+        out += tag;
+        const litehtml::string_map* am = c->eweb_attrs();
+        if(am != nullptr) {
+            for(litehtml::string_map::const_iterator it = am->begin(); it != am->end(); ++it) {
+                out += ' ';
+                out += it->first;
+                out += "=\"";
+                js_html_escape_attr(it->second, out);
+                out += '"';
+            }
+        }
+        out += '>';
+        if(!js_html_is_void(tag)) {
+            js_serialize_children(c, out);
+            out += "</";
+            out += tag;
+            out += '>';
+        }
+    }
+}
+
 char* EWebEngine::jsElGetHtml(void* ctx, void* el)
 {
     (void)ctx;
     if(el == nullptr) return nullptr;
-    /* litehtml has no innerHTML serializer; return the text content (MVP). */
     litehtml::element* e = (litehtml::element*)el;
-    std::string text;
-    e->get_text(text);
-    return js_strdup_mario(text.c_str());
+    const char* self_tag = e->get_tagName();
+    if(self_tag == nullptr || self_tag[0] == 0 || (self_tag[0] == ':' && self_tag[1] == ':')) {
+        /* Not an element (text node): its innerHTML is just its text. */
+        std::string text;
+        e->get_text(text);
+        return js_strdup_mario(text.c_str());
+    }
+    std::string out;
+    js_serialize_children(e, out);
+    return js_strdup_mario(out.c_str());
 }
 
 void EWebEngine::jsElSetHtml(void* ctx, void* el, const char* html)
@@ -3375,6 +4192,21 @@ char* EWebEngine::jsElGetAttr(void* ctx, void* el, const char* name)
     return js_strdup_mario(v);
 }
 
+int EWebEngine::jsElGetScriptAsync(void* ctx, void* el)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(self == nullptr || el == nullptr) return -1;
+    auto it = self->m_jsScriptAsyncProps.find(el);
+    return it == self->m_jsScriptAsyncProps.end() ? -1 : it->second;
+}
+
+void EWebEngine::jsElSetScriptAsync(void* ctx, void* el, bool async)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(self == nullptr || el == nullptr) return;
+    self->m_jsScriptAsyncProps[el] = async ? 1 : 0;
+}
+
 /* JS-driven changes to class/id alter which selectors match, and a style=
  * change alters the inline cascade: a layout-only invalidation would repaint
  * the OLD resolved values. Re-match the subtree against the sheets (budgeted
@@ -3420,6 +4252,9 @@ static void jsMaybePreloadImage(EWebEngine* self, litehtml::element* e)
     doc->container()->load_image(full.c_str(), 0, false);
     litehtml::size sz;
     doc->container()->get_image_size(full.c_str(), 0, sz);
+    if(getenv("EWEB_IMGDBG") != nullptr)
+        fprintf(stderr, "[IMGDBG] preload src=%.80s dims=%dx%d\n", full.c_str(),
+                (int)sz.width, (int)sz.height);
     if(sz.width > 0 && sz.height > 0)
         self->jsFireImgElEvent(full, "load");
 }
@@ -3429,6 +4264,11 @@ void EWebEngine::jsElSetAttr(void* ctx, void* el, const char* name, const char* 
     EWebEngine* self = (EWebEngine*)ctx;
     if(el == nullptr || name == nullptr) return;
     litehtml::element* e = (litehtml::element*)el;
+    if(getenv("EWEB_ATTRDBG") != nullptr && strcmp(name, "placeholder") == 0) {
+        fprintf(stderr, "[ATTRDBG] set tag=%s name=%s value=%s el=%p\n",
+                e->get_tagName() ? e->get_tagName() : "?", name,
+                value ? value : "(null)", el);
+    }
     /* Inserting an empty <script> does not start it: a loader may set its src
      * immediately afterwards (including through a with(insertBefore(...))
      * expression). Remember that transition before set_attr overwrites the old
@@ -3514,6 +4354,27 @@ char* EWebEngine::jsElGetTag(void* ctx, void* el)
     litehtml::element* e = (litehtml::element*)el;
     const char* t = e->get_tagName();
     return js_strdup_mario(t != nullptr ? t : "");
+}
+
+void EWebEngine::jsElGetImageSize(void* ctx, void* el, int* w, int* h)
+{
+    if(w != nullptr) *w = 0;
+    if(h != nullptr) *h = 0;
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(self == nullptr || el == nullptr || w == nullptr || h == nullptr) return;
+    litehtml::element* e = (litehtml::element*)el;
+    const char* tag = e->get_tagName();
+    if(tag == nullptr || strcmp(tag, "img") != 0) return;
+    const char* src = e->get_attr("src", nullptr);
+    if(src == nullptr || src[0] == 0) return;
+    litehtml::document* doc = e->get_document();
+    if(doc == nullptr || doc->container() == nullptr) return;
+    std::string full = EWebContainer::getFullURL(&self->m_port, src, self->jsDocumentUrl());
+    if(full.empty()) return;
+    litehtml::size sz;
+    doc->container()->get_image_size(full.c_str(), 0, sz);
+    *w = sz.width;
+    *h = sz.height;
 }
 
 /* ==================================================================
@@ -3766,6 +4627,8 @@ void* EWebEngine::jsCreateElement(void* ctx, const char* tag)
      * bridge routes to el_set_attr. */
     litehtml::string_map attrs;
     litehtml::element::ptr el = doc->create_element(lower.c_str(), attrs);
+    if(el != nullptr && lower == "script")
+        self->m_jsScriptAsyncProps[(void*)el] = 1;
     return (void*)el;
 }
 
@@ -3780,9 +4643,16 @@ void* EWebEngine::jsCreateTextNode(void* ctx, const char* text)
      * the way litehtml_alloc does (malloc + placement new) so that the
      * `delete` in jsElRemoveChild / jsFreeDetachedNodes resolves to free(),
      * matching how html_tag's destructor releases its children. */
+    const char* s = (text != nullptr) ? text : "";
+    if(js_text_all_space(s)) {
+        void* smem = malloc(sizeof(litehtml::el_space));
+        if(smem == nullptr) return nullptr;
+        litehtml::el_space* sp = new (smem) litehtml::el_space(s, doc);
+        return (void*)sp;
+    }
     void* mem = malloc(sizeof(litehtml::el_text));
     if(mem == nullptr) return nullptr;
-    litehtml::el_text* t = new (mem) litehtml::el_text(text != nullptr ? text : "", doc);
+    litehtml::el_text* t = new (mem) litehtml::el_text(s, doc);
     return (void*)t;
 }
 
@@ -3819,6 +4689,23 @@ void* EWebEngine::jsElCloneNode(void* ctx, void* el, int deep)
      * node. */
     litehtml::element::ptr cp = e->clone_node(deep != 0);
     EWEB_LOG("[ewebview] jsElCloneNode el=%p deep=%d -> cp=%p\n", el, deep, (void*)cp);
+    /* TEMP DIAG (EWEB_CLFDBG): trace every bridge clone's source/result shape. */
+    {
+        static int s_clfcl = -1;
+        if(s_clfcl < 0) s_clfcl = (getenv("EWEB_CLFDBG") != NULL) ? 1 : 0;
+        if(s_clfcl) {
+            const char* st = e->get_tagName();
+            const char* sc = e->get_attr("class", nullptr);
+            const char* sw = e->get_attr("ng-switch-when", nullptr);
+            const char* sd = e->get_attr("ng-switch-default", nullptr);
+            const char* ct = cp ? cp->get_tagName() : nullptr;
+            const char* cc = cp ? cp->get_attr("class", nullptr) : nullptr;
+            fprintf(stderr, "[clfcl] deep=%d src=%s.%s when=%s def=%s sraw=%d -> dst=%s.%s draw=%d sp=%p dp=%p\n",
+                    deep, st ? st : "?", sc ? sc : "-", sw ? sw : "-", sd ? sd : "-",
+                    (int)e->get_children_count(), ct ? ct : "?", cc ? cc : "-",
+                    cp ? (int)cp->get_children_count() : -1, el, (void*)cp);
+        }
+    }
     if(cp == nullptr) return nullptr;
     /* Park the clone so jsFreeDetachedNodes() reclaims it at teardown if the
      * script never inserts it; js_unpark() drops it once it goes back in. */
@@ -3826,11 +4713,47 @@ void* EWebEngine::jsElCloneNode(void* ctx, void* el, int deep)
     return (void*)cp;
 }
 
+/* Anonymous table boxes (the table/row-group/row wrappers
+ * fix_tables_layout splices into m_children) carry an empty tag name but
+ * are html_tags, not character data. Like pseudos they are layout
+ * artifacts: childNodes/children/firstChild must not expose them and
+ * parentNode must climb over them (Chrome: avatar.parentNode === header,
+ * not the anonymous row). Exposing them as text nodes made Angular see
+ * header.childNodes.length===1 and buried the cells under six wrappers. */
+static bool jsElIsAnonBox(void* el)
+{
+    if(el == nullptr) return false;
+    litehtml::element* e = (litehtml::element*)el;
+    if(!e->is_html_tag()) return false;
+    const char* t = e->get_tagName();
+    return (t == nullptr || t[0] == 0);
+}
+
+/* Chrome keeps anonymous table boxes out of the DOM entirely: the cells
+ * stay children of their original parent. litehtml splices the wrappers
+ * into m_children and MOVES the cells inside, so the bridge must flatten
+ * them away (splice their children in at the wrapper's position) rather
+ * than skip them - skipping hid avatar/info from header.childNodes. */
+static void jsElFlatChildren(litehtml::element* e, std::vector<void*>& out)
+{
+    size_t n = e->get_children_count();
+    for(size_t i = 0; i < n; i++)
+    {
+        void* c = (void*)e->get_child((int)i);
+        if(c == nullptr) continue;
+        if(jsElIsPseudo(c)) continue;
+        if(jsElIsAnonBox(c)) { jsElFlatChildren((litehtml::element*)c, out); continue; }
+        out.push_back(c);
+    }
+}
+
 void* EWebEngine::jsElParent(void* ctx, void* el)
 {
     (void)ctx;
     if(el == nullptr) return nullptr;
-    return (void*)((litehtml::element*)el)->parent();
+    litehtml::element* p = ((litehtml::element*)el)->parent();
+    while(p != nullptr && jsElIsAnonBox((void*)p)) p = p->parent();
+    return (void*)p;
 }
 
 /* Pseudo-elements (::before/::after) are layout artifacts of litehtml, not DOM
@@ -3855,6 +4778,10 @@ static bool jsElIsTextRun(void* el)
     if(jsElIsPseudo(el)) return false;
     litehtml::element* e = (litehtml::element*)el;
     if(e->is_comment()) return false;
+    /* Anonymous table wrappers are html_tags with an empty tag name;
+     * they are layout boxes, not character data (a text-run coalesce
+     * must stop at them, never set_data_replace them). */
+    if(e->is_html_tag()) return false;
     const char* t = e->get_tagName();
     return (t == nullptr || t[0] == 0);
 }
@@ -3866,13 +4793,27 @@ int EWebEngine::jsElChildCount(void* ctx, void* el)
     litehtml::element* e = (litehtml::element*)el;
     int n = 0;
     bool prevText = false;
-    for(size_t i = 0; i < e->get_children_count(); i++)
+    std::vector<void*> kids;
+    jsElFlatChildren(e, kids);
+    for(size_t i = 0; i < kids.size(); i++)
     {
-        void* c = (void*)e->get_child(i);
-        if(jsElIsPseudo(c)) continue;         /* pseudo: transparent to the DOM */
+        void* c = kids[i];
         bool isText = jsElIsTextRun(c);
         if(!(isText && prevText)) n++;        /* run leaders + every non-text node */
         prevText = isText;
+    }
+    /* TEMP DIAG (EWEB_CLFDBG): track ng-switch case element child counts. */
+    {
+        static int s_clfcnt = -1;
+        if(s_clfcnt < 0) s_clfcnt = (getenv("EWEB_CLFDBG") != NULL) ? 1 : 0;
+        if(s_clfcnt) {
+            const char* sw = e->get_attr("ng-switch-when", nullptr);
+            const char* sd = e->get_attr("ng-switch-default", nullptr);
+            if(sw != nullptr || sd != nullptr) {
+                fprintf(stderr, "[clfcnt] when=%s default=%s raw=%d coalesced=%d ptr=%p\n",
+                        sw ? sw : "-", sd ? sd : "-", (int)e->get_children_count(), n, (void*)e);
+            }
+        }
     }
     return n;
 }
@@ -3896,10 +4837,11 @@ void* EWebEngine::jsElChild(void* ctx, void* el, int idx)
     int seen = 0;
     bool prevText = false;
     void* ret = nullptr;
-    for(size_t i = 0; i < e->get_children_count(); i++)
+    std::vector<void*> kids;
+    jsElFlatChildren(e, kids);
+    for(size_t i = 0; i < kids.size(); i++)
     {
-        void* c = (void*)e->get_child(i);
-        if(jsElIsPseudo(c)) continue;
+        void* c = kids[i];
         bool isText = jsElIsTextRun(c);
         bool leader = !(isText && prevText);
         prevText = isText;
@@ -4064,19 +5006,23 @@ static void jsMaybeLoadDynamicStylesheet(EWebEngine* self, litehtml::element* c)
     std::string full = EWebContainer::getFullURL(&self->m_port, href, self->jsDocumentUrl());
     if(full.empty()) return;
     const char* media = c->get_attr("media", nullptr);
-    /* Track the element BEFORE loadCSS so the load/error event can reach it when
-     * the fetch settles (see jsFireLinkElEvent). A sheet that is already in the
-     * cache never queues a task and therefore never produces a result, so its
-     * "load" must be fired here or the chunk promise that parks on link.onload
-     * (Rspack miniCss) would strand. */
-    bool cached = self->hasSeenCSS(full);
+    /* "seen" includes a fetch that is still in flight. Only a sheet whose
+     * result was applied is a cache hit; an in-flight link keeps its tracking
+     * entry until processResults applies that result and fires the event. */
+    bool seen = self->hasSeenCSS(full);
+    bool loaded = self->hasLoadedCSS(full);
     if(getenv("EWEB_MODPATCH_DBG") != nullptr)
-        fprintf(stderr, "[csslink] MAYBE full=%s cached=%d\n", full.c_str(), cached ? 1 : 0);
+        fprintf(stderr, "[csslink] MAYBE full=%s seen=%d loaded=%d\n",
+                full.c_str(), seen ? 1 : 0, loaded ? 1 : 0);
     self->setCSSMedia(full, media ? std::string(media) : std::string());
     self->jsNoteDynamicStylesheet(full, c);
-    self->loadCSS(full);
-    if(cached)
-        self->jsFireLinkElEvent(full, "load");
+    if(loaded) {
+        /* appendChild is still on the JS/DOM stack: defer the cached load so
+         * webpack's onload->removeChild cannot re-enter this insertion. */
+        self->jsDeferLinkElEvent(full, "load");
+    } else {
+        self->loadCSS(full);
+    }
 }
 
 /* Env-gated (EWEB_MUTDBG) tree-mutation trace: logs parent/child/ref tags for
@@ -4096,8 +5042,25 @@ static void mutdbg_log(const char* op, litehtml::element* p, litehtml::element* 
         const char* v = e->get_attr("id", nullptr);
         return (v != nullptr) ? v : "";
     };
-    fprintf(stderr, "[MUT] %s parent=<%s%s> child=<%s%s> ref=<%s%s>\n", op,
-            tg(p), idof(p), tg(c), idof(c), tg(r), idof(r));
+    /* TEMP DIAG (ce18): pointers + comment/ng-switch identity for anchor tracing. */
+    auto ngof = [](litehtml::element* e) -> std::string {
+        if(e == nullptr) return "";
+        std::string out;
+        const char* w = e->get_attr("ng-switch-when", nullptr);
+        const char* d = e->get_attr("ng-switch-default", nullptr);
+        const char* m = e->get_attr("message-directive", nullptr);
+        if(w) out += std::string(" when=") + w;
+        if(d) out += " default";
+        if(m) out += " msgdir";
+        if(e->is_comment()) {
+            std::string txt; e->get_text(txt);
+            out += " cmt[" + txt.substr(0, 30) + "]";
+        }
+        return out;
+    };
+    fprintf(stderr, "[MUT] %s parent=<%s%s>%p child=<%s%s>%p%s ref=<%s%s>%p%s\n", op,
+            tg(p), idof(p), (void*)p, tg(c), idof(c), (void*)c, ngof(c).c_str(),
+            tg(r), idof(r), (void*)r, ngof(r).c_str());
 }
 
 bool EWebEngine::jsElAppendChild(void* ctx, void* parent, void* child)
@@ -4399,28 +5362,16 @@ void EWebEngine::jsElGetRect(void* ctx, void* el, int* x, int* y, int* w, int* h
      * (Pinterest's signup card, margin:40, read left=0 while the button inside
      * read left=40). Reporting the raw content box instead collapsed a padded
      * field (gestalt's 24px-padded birthday wrapper). */
-    litehtml::position p = e->get_placement();
+    /* Layout coordinates (scroll-blind): offsetTop/offsetLeft must not drift
+     * when an overflow ancestor scrolls. The viewport path (gBCR) subtracts
+     * the live ancestor scroll in jsElTransformRect instead. */
+    litehtml::position p = e->get_placement_layout();
     litehtml::margins pad = e->get_paddings();
     litehtml::margins brd = e->get_borders();
-    /* Only a REPLACED widget-mode control folds its chrome into m_pos, so its
-     * m_pos is already the BORDER box (unlike html_tag, whose m_pos is the
-     * content box). Applying the content->border correction below would
-     * double-count the padding+border and inflate getBoundingClientRect() by
-     * one chrome (a 55px field read as 87px). Report those as-is.
-     * A container-mode <button> (display:flex or real element children) is NOT
-     * replaced: it lays out through html_tag::render, so its m_pos is the
-     * CONTENT box and must take the correction below. Treating it as a border
-     * box under-reported the rect by one padding+border once the UA sheet sized
-     * buttons border-box (Pinterest's "Continue with Google" read 340x30 for a
-     * 402x48 box). */
-    void* fw = e->eweb_form_widget();
-    if(fw != nullptr && ((eweb_el_input*)fw)->is_replaced()) {
-        if(x) *x = p.x;
-        if(y) *y = p.y;
-        if(w) *w = p.width;
-        if(h) *h = p.height;
-        return;
-    }
+    /* eweb_el_input now follows the same content-box m_pos convention as
+     * html_tag/el_image in BOTH modes, so every element takes the uniform
+     * content->border correction below (the old is_replaced() split existed
+     * only for the widget-mode border-box convention and is gone). */
     if(x) *x = p.x - pad.left - brd.left;
     if(y) *y = p.y - pad.top - brd.top;
     if(w) *w = p.width + pad.left + pad.right + brd.left + brd.right;
@@ -4439,6 +5390,85 @@ void EWebEngine::jsElGetRect(void* ctx, void* el, int* x, int* y, int* w, int* h
     }
 }
 
+/* Contenteditable caret geometry (bridge el_caret_rect): the insertion
+ * point at `offset` in LAYOUT document coordinates, mirroring jsElGetRect's
+ * scroll-blind contract; jsUpdateCaret shifts ancestor scroll for paint. */
+bool EWebEngine::jsElCaretRect(void* ctx, void* el, int offset,
+                               int* x, int* y, int* w, int* h)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(x) *x = 0;
+    if(y) *y = 0;
+    if(w) *w = 0;
+    if(h) *h = 0;
+    if(el == nullptr) return false;
+    litehtml::element* e = (litehtml::element*)el;
+    if(self != nullptr) self->jsForceReflow();
+    if(e->get_display() == litehtml::display_none) return false;
+    litehtml::position r;
+    if(!e->get_caret_rect(offset, r)) return false;
+    if(x) *x = r.x;
+    if(y) *y = r.y;
+    if(w) *w = r.width;
+    if(h) *h = r.height;
+    return true;
+}
+
+void EWebEngine::jsUpdateCaret()
+{
+    /* ENGINE-THREAD ONLY. Refresh the painted caret from the script-side
+     * selection (hook op "caretrect" returns JSON {x,y,h} in layout coords).
+     * No VM / no focused editable host / a range selection -> no caret. */
+    m_caretValid = false;
+    m_caretDirty = false;
+    litehtml::element* host = (litehtml::element*)m_focusElement;
+    if(host == nullptr || editableHostOf(host) != host) return;
+    if(m_jsVm == nullptr || !m_jsEnabled || m_jsPageDisabled || m_jsInScript) return;
+    var_t* fn = var_find_own_member_var(m_jsVm->root, EWEB_CE_SLOT);
+    if(fn == nullptr || fn->is_func == 0) return;
+    jsVmEnter();
+    var_t* args = var_new_array(m_jsVm);
+    var_array_add(args, js_dom_wrap_element(m_jsVm, (js_element_t)host));
+    var_array_add(args, var_new_str(m_jsVm, "caretrect"));
+    var_array_add(args, var_new_str(m_jsVm, ""));
+    var_array_reverse(args);
+    var_t* ret = call_m_func(m_jsVm, m_jsVm->root, fn, args);
+    var_unref(args);
+    if(ret != nullptr) {
+        const char* s = (ret->type == V_STRING) ? var_get_str(ret) : nullptr;
+        double fx = 0, fy = 0, fh = 0;
+        /* Field-wise parse: JSON.stringify spacing is not contractual. */
+        bool got = false;
+        if(s != nullptr) {
+            const char* px = strstr(s, "\"x\"");
+            const char* py = strstr(s, "\"y\"");
+            const char* ph = strstr(s, "\"h\"");
+            if(px != nullptr && py != nullptr && ph != nullptr) {
+                fx = strtod(strchr(px, ':') + 1, nullptr);
+                fy = strtod(strchr(py, ':') + 1, nullptr);
+                fh = strtod(strchr(ph, ':') + 1, nullptr);
+                got = true;
+            }
+        }
+        if(got) {
+            int cx = (int)fx, cy = (int)fy, ch = (int)fh;
+            /* Layout -> viewport: every scrollable ancestor's live offset
+             * (same shift jsElTransformRect applies for gBCR). */
+            for(litehtml::element* a = host->parent(); a != nullptr; a = a->parent()) {
+                int sx = 0, sy = 0;
+                a->eweb_get_scroll(&sx, &sy);
+                cx -= sx;
+                cy -= sy;
+            }
+            m_caretRect = litehtml::position(cx, cy, 0, ch);
+            m_caretValid = true;
+            m_caretBlinkOn = true;   /* typing/focus shows the bar at once */
+        }
+        var_unref(ret);
+    }
+    jsVmExit();
+}
+
 /* getBoundingClientRect / IntersectionObserver report the border box UNDER the
  * element's CSS transform (own plus ancestors), while the offset* family keeps
  * the untransformed layout box jsElGetRect reports. The transform is therefore
@@ -4448,6 +5478,18 @@ void EWebEngine::jsElTransformRect(void* ctx, void* el, int* x, int* y, int* w, 
     (void)ctx;
     if(el == nullptr || x == nullptr || y == nullptr || w == nullptr || h == nullptr) return;
     litehtml::element* e = (litehtml::element*)el;
+    /* el_get_rect reports LAYOUT document coordinates; this viewport-only
+     * path shifts by every scrollable ancestor's live offset so gBCR tracks
+     * the painted box. Fixed boxes are viewport-pinned and skip the shift,
+     * matching the document-scroll skip in js_dom.c el_viewport_rect. */
+    if(e->get_element_position() != litehtml::element_position_fixed) {
+        for(litehtml::element* a = e->parent(); a != nullptr; a = a->parent()) {
+            int sx = 0, sy = 0;
+            a->eweb_get_scroll(&sx, &sy);
+            *x -= sx;
+            *y -= sy;
+        }
+    }
     litehtml::position bb;
     bb.x = *x;
     bb.y = *y;
@@ -4475,18 +5517,11 @@ void EWebEngine::jsElOffsetParentOrigin(void* ctx, void* el, int* x, int* y)
     if(e->get_element_position() == litehtml::element_position_fixed) return;
     for(litehtml::element* p = e->parent(); p != nullptr; p = p->parent()) {
         if(p->get_element_position() != litehtml::element_position_static || p->is_body()) {
-            litehtml::position pl = p->get_placement();
-            void* fw = p->eweb_form_widget();
-            if(fw != nullptr && ((eweb_el_input*)fw)->is_replaced()) {
-                /* A replaced widget-mode control's m_pos is the border box. */
-                if(x) *x = pl.x;
-                if(y) *y = pl.y;
-            } else {
-                litehtml::margins pad = p->get_paddings();
-                litehtml::margins brd = p->get_borders();
-                if(x) *x = pl.x - pad.left - brd.left;
-                if(y) *y = pl.y - pad.top - brd.top;
-            }
+            litehtml::position pl = p->get_placement_layout();
+            litehtml::margins pad = p->get_paddings();
+            litehtml::margins brd = p->get_borders();
+            if(x) *x = pl.x - pad.left - brd.left;
+            if(y) *y = pl.y - pad.top - brd.top;
             return;
         }
     }
@@ -4524,17 +5559,8 @@ void EWebEngine::jsElGetClientSize(void* ctx, void* el, int* w, int* h)
     if(e->get_display() == litehtml::display_none) return;
     litehtml::position p = e->get_placement();
     litehtml::margins pad = e->get_paddings();
-    void* fw = e->eweb_form_widget();
-    /* Only a replaced widget-mode control has m_pos == border box; a
-     * container-mode <button> lays out through html_tag (m_pos == content box)
-     * and takes the padding-box sum below, same as any html_tag. */
-    if(fw != nullptr && ((eweb_el_input*)fw)->is_replaced()) {
-        /* m_pos is the border box: the padding box is it minus the borders. */
-        litehtml::margins brd = e->get_borders();
-        if(w) *w = p.width - brd.left - brd.right;
-        if(h) *h = p.height - brd.top - brd.bottom;
-        return;
-    }
+    /* eweb_el_input m_pos is the content box in both modes now, so the
+     * padding-box sum below applies uniformly. */
     if(w) *w = p.width + pad.left + pad.right;
     if(h) *h = p.height + pad.top + pad.bottom;
 }
@@ -4654,6 +5680,7 @@ static bool elIsFocusCandidate(litehtml::element* e)
     if(tag != nullptr && tag[0] == 'a' && tag[1] == 0 &&
             href != nullptr && href[0] != 0)
         return true;
+    if(EWebEngine::editableHostOf(e) == e) return true;
     return e->get_attr("tabindex", nullptr) != nullptr;
 }
 
@@ -4824,6 +5851,38 @@ void EWebEngine::jsElScrollIntoView(void* ctx, void* el)
     self->m_jsScrollPending = true;
 }
 
+void EWebEngine::jsElScrollGet(void* ctx, void* el, int* x, int* y)
+{
+    (void)ctx;
+    if(x) *x = 0;
+    if(y) *y = 0;
+    if(el == nullptr) return;
+    ((litehtml::element*)el)->eweb_get_scroll(x, y);
+}
+
+bool EWebEngine::jsElScrollSet(void* ctx, void* el, int x, int y)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(el == nullptr) return false;
+    /* Clamp against a fresh layout: the caller may have just appended rows
+     * (wx's chat pane grows, then pins scrollTop to scrollHeight). */
+    if(self != nullptr) self->jsForceReflow();
+    if(!((litehtml::element*)el)->eweb_set_scroll(x, y)) return false;
+    /* The box paints shifted on the next frame; no re-layout needed. */
+    if(self != nullptr) self->markContentDirty();
+    return true;
+}
+
+void EWebEngine::jsElScrollExtent(void* ctx, void* el, int* w, int* h)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(w) *w = 0;
+    if(h) *h = 0;
+    if(el == nullptr) return;
+    if(self != nullptr) self->jsForceReflow();
+    ((litehtml::element*)el)->eweb_scroll_extent(w, h);
+}
+
 /* ==================================================================
  * Web/BOM bridge callbacks (js_web.h)
  * ================================================================== */
@@ -4878,6 +5937,19 @@ int EWebEngine::jsWebGetColorScheme(void* ctx)
     return feat.color_scheme;
 }
 
+float EWebEngine::jsWebGetDpr(void* ctx)
+{
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(self == nullptr || self->m_container == nullptr)
+        return 1.0f;
+    /* Same source of truth as the CSS side: media_features.resolution is
+     * 96 * dpr, so devicePixelRatio / matchMedia and the srcset density
+     * selection can never disagree about the display. */
+    litehtml::media_features feat;
+    self->m_container->get_media_features(feat);
+    return (feat.resolution > 0) ? (float)feat.resolution / 96.0f : 1.0f;
+}
+
 void EWebEngine::jsWebGetScreen(void* ctx, int* w, int* h, int* depth)
 {
     EWebEngine* self = (EWebEngine*)ctx;
@@ -4916,6 +5988,13 @@ void EWebEngine::jsWebNavigate(void* ctx, const char* url)
 {
     EWebEngine* self = (EWebEngine*)ctx;
     if(self == nullptr || url == nullptr || url[0] == 0) return;
+    if(strncasecmp(url, "javascript:", 11) == 0) {
+        /* location.href = "javascript:..." runs the body in the current
+         * page (see queueNavigation / jsRunPendingNavigation). */
+        self->m_jsPendingNav = url;
+        EWEB_LOG("[ewebview] js: javascript: URL queued -> %.60s\n", url);
+        return;
+    }
     /* Resolve against the current document so location.href = "next.html"
      * works; normalizeURL is the same helper loadCSS() uses. */
     std::string full = EWebContainer::normalizeURL(&self->m_port, std::string(url),
@@ -5043,12 +6122,37 @@ bool EWebEngine::jsWebRequestRaw(const eweb_port_t* port, const char* method,
             p += len;
             if(eol != nullptr) p += 2;
         }
-        for(size_t i = 0; i < keys.size(); i++) {
-            eweb_http_header_t h;
-            h.key = keys[i].c_str();
-            h.value = vals[i].c_str();
-            hdrs.push_back(h);
-        }
+    }
+
+    /* Browser-managed defaults are added only when the script did not supply
+     * them. XHR/fetch are CORS requests with destination "empty"; a cross-
+     * origin API call also carries the document's real Origin, unlike a
+     * classic JSONP <script> request (handled by EWebContainer::loadURL). */
+    auto has_key = [&keys](const char* key) {
+        for(size_t i = 0; i < keys.size(); ++i)
+            if(strcasecmp(keys[i].c_str(), key) == 0) return true;
+        return false;
+    };
+    auto add_default = [&keys, &vals, &has_key](const char* key, const std::string& value) {
+        if(value.empty() || has_key(key)) return;
+        keys.push_back(key);
+        vals.push_back(value);
+    };
+    std::string request_origin = ewebRequestOrigin(full);
+    std::string page_origin = ewebRequestOrigin(base_url);
+    add_default("Accept", "*/*");
+    add_default("Accept-Language", "en-US,en;q=0.9");
+    add_default("Referer", ewebRequestReferrer(full, base_url));
+    add_default("Sec-Fetch-Dest", "empty");
+    add_default("Sec-Fetch-Mode", "cors");
+    add_default("Sec-Fetch-Site", ewebRequestFetchSite(full, base_url));
+    if(!page_origin.empty() && page_origin != request_origin)
+        add_default("Origin", page_origin);
+    for(size_t i = 0; i < keys.size(); i++) {
+        eweb_http_header_t h;
+        h.key = keys[i].c_str();
+        h.value = vals[i].c_str();
+        hdrs.push_back(h);
     }
 
     int body_len = (body != nullptr) ? (int)strlen(body) : 0;
@@ -5815,6 +6919,7 @@ void EWebEngine::registerWebNatives(struct st_vm* vm)
     cb.get_scroll   = jsWebGetScroll;
     cb.scroll_to    = jsWebScrollTo;
     cb.get_color_scheme = jsWebGetColorScheme;
+    cb.get_dpr        = jsWebGetDpr;
 
     /* Navigation. Both defer through m_jsPendingNav because a navigation tears
      * down the VM the requesting script is running in.
@@ -5887,6 +6992,7 @@ void EWebEngine::jsInvalidateHandles()
         js_event_clear_listeners(m_jsVm);
         js_dom_reset_element_cache(m_jsVm);
     }
+    m_jsScriptAsyncProps.clear();
     m_jsHoverElement = nullptr;
 }
 
@@ -5896,6 +7002,7 @@ void EWebEngine::jsFreeDetachedNodes()
         /* Placement-new'd over malloc (see jsCreateTextNode), so the default
          * operator delete resolves to free() - the same release path
          * html_tag's destructor uses for its children. */
+        m_jsScriptAsyncProps.erase(m_jsDetached[i]);
         delete m_jsDetached[i];
     }
     if(!m_jsDetached.empty()) {
@@ -5990,6 +7097,34 @@ void EWebEngine::jsFireScrollEvent()
     jsVmExit();
 }
 
+/* Percent-decode a javascript: URL body. '+' stays literal: unlike form
+ * encoding, a URL's query/fragment does not turn '+' into space. */
+static int jsUrlHexVal(char c)
+{
+    if(c >= '0' && c <= '9') return c - '0';
+    if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static std::string jsUrlDecodeBody(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for(size_t i = 0; i < s.size(); i++) {
+        if(s[i] == '%' && i + 2 < s.size()) {
+            int hi = jsUrlHexVal(s[i+1]), lo = jsUrlHexVal(s[i+2]);
+            if(hi >= 0 && lo >= 0) {
+                out += (char)(hi * 16 + lo);
+                i += 2;
+                continue;
+            }
+        }
+        out += s[i];
+    }
+    return out;
+}
+
 void EWebEngine::jsRunPendingNavigation()
 {
     /* Engine-thread only: run by the engine loop after a script unwinds. Both
@@ -6006,15 +7141,129 @@ void EWebEngine::jsRunPendingNavigation()
     if(!m_jsPendingNav.empty()) {
         std::string url = m_jsPendingNav;
         m_jsPendingNav.clear();
+        if(url.size() >= 11 && strncasecmp(url.c_str(), "javascript:", 11) == 0) {
+            /* javascript: URL: execute the body in the current page through
+             * the external-eval path (same guards + VM reset). A string
+             * result would replace the document per spec, but real pages
+             * only use no-op bodies (";", "void(0)") or side effects. */
+            jsEvalExternal(jsUrlDecodeBody(url.substr(11)));
+            return;
+        }
         /* engineNavigate() tears the VM down (cleanupBuildResources) and queues
          * the fetch, so this must be the last thing done with JS state. */
         engineNavigate(url);
     }
 }
 
+bool EWebEngine::jsDispatchWheelEvent(int cx, int cy, int lines)
+{
+    if(m_jsVm == nullptr || !m_jsEnabled) return true;
+    /* Same re-entrancy guard as jsDispatchMouseEvent: a VM run in flight on
+     * this thread means no DOM events fire and the default scroll proceeds. */
+    if(m_jsInScript) return true;
+
+    litehtml::document* doc = jsActiveDoc();
+    litehtml::element* target = nullptr;
+    if(doc != nullptr) {
+        litehtml::element::ptr root = doc->root();
+        if(root != nullptr) {
+            doc->set_hit_scroll(m_engineScrollX, m_engineScrollY);
+            target = root->get_element_by_point(cx + m_engineScrollX, cy + m_engineScrollY, cx, cy);
+            if(target == nullptr) target = root;   /* blank area: the root */
+        }
+    }
+    if(target == nullptr) return true;
+    jsVmEnter();
+    /* Pixels per notch matches the embedder's SCROLL_STEP (48); wheelDelta
+     * is the legacy 120-per-notch unit with the opposite sign. */
+    bool allowed = js_event_dispatch_wheel(m_jsVm, (void*)target, cx, cy,
+                                           m_engineScrollX, m_engineScrollY,
+                                           0, lines * 48, -lines * 120);
+    jsVmExit();
+    return allowed;
+}
+
+void EWebEngine::jsRecoverAngularPhase()
+{
+    if(m_jsVm == nullptr || !m_jsEnabled || m_jsPageDisabled || m_jsInScript) return;
+    /* Cheap gate: only Angular pages carry the global. */
+    if(var_find_own_member_var(m_jsVm->root, "angular") == nullptr) return;
+    static uint64_t s_phaseLast = 0;
+    uint64_t now = ticMs();
+    if(now - s_phaseLast < 250) return;
+    s_phaseLast = now;
+    /* Angular 1.x sets $rootScope.$$phase around $digest/$apply and clears it
+     * in a finally. An uncaught error inside a timer callback longjmps past
+     * that finally (js_fire_timer isolates each job), leaving '$digest' set;
+     * every later $apply/$digest then throws [$rootScope:inprog] and the
+     * page's click/search/chat handlers stay dead. Between engine ticks no
+     * JS is on the stack, so any set phase is leaked garbage: clear it. */
+    static const char* kFixPhase =
+        "(function(){try{var a=window.angular;if(!a||!a.element)return;"
+        "var r=null;var b=document.body;"
+        "var s=b&&a.element(b).scope();if(s)r=s.$root;"
+        /* body itself may carry no scope (wx mounts ng-scope deeper): fall
+         * back to the first .ng-scope node, then to the injector. */
+        "if(!r){var el=document.querySelector('.ng-scope');"
+        "if(el){var s2=a.element(el).scope();if(s2)r=s2.$root;}}"
+        "if(!r&&b){var inj=a.element(b).injector();"
+        "if(inj)r=inj.get('$rootScope');}"
+        "if(r&&r.$$phase){r.$$phase=null;"
+        "console.log('[phasefix] cleared leaked $$phase');}"
+        "}catch(e){}})();";
+    m_jsVm->terminated = false;
+    m_jsVm->abort_run = false;
+    m_jsVm->propagating_err = nullptr;
+    m_jsVm->call_depth = 0;
+    jsVmEnter();
+    vm_load_run(m_jsVm, kFixPhase);
+    if(m_jsVm->propagating_err != nullptr) vm_report_uncaught(m_jsVm);
+    jsVmExit();
+}
+
+void EWebEngine::jsMaybeRecoverPage()
+{
+    /* The watchdog's page-wide disable is a safety valve, not a life sentence:
+     * wx's init can burn the abort budget on a runaway body while the rest of
+     * the page (chat, contacts, send) is perfectly runnable. Once the user
+     * interacts again after a short cooldown, re-enable timers/eval; the
+     * runaway ordered bodies stay dropped via m_jsRunawaySrcs. */
+    if(!m_jsPageDisabled) return;
+    if(m_jsDisabledAt != 0 && (ticMs() - m_jsDisabledAt) < 1500) return;
+    m_jsPageDisabled = false;
+    m_jsAbortCount = 0;
+    m_jsDisabledAt = 0;
+    fprintf(stderr, "[jsdbg] page JS re-enabled after watchdog cooldown (user activity)\n");
+}
+
+void EWebEngine::jsEvalExternal(const std::string& js)
+{
+    /* ENGINE-THREAD ONLY (ECMD_EVAL). Same guards as the phase sweep: no VM
+     * or a run already in flight means the script is dropped, never queued
+     * into a re-entrant run. The VM state reset mirrors jsRecoverAngularPhase
+     * so a previously aborted page run cannot poison the eval. */
+    jsMaybeRecoverPage();
+    if(m_jsVm == nullptr || !m_jsEnabled || m_jsPageDisabled || m_jsInScript) {
+        fprintf(stderr, "[jsdbg] eval dropped vm=%d en=%d dis=%d busy=%d\n",
+                m_jsVm != nullptr ? 1 : 0, m_jsEnabled ? 1 : 0,
+                m_jsPageDisabled ? 1 : 0, m_jsInScript ? 1 : 0);
+        return;
+    }
+    if(js.empty()) return;
+    m_jsVm->terminated = false;
+    m_jsVm->abort_run = false;
+    m_jsVm->propagating_err = nullptr;
+    m_jsVm->call_depth = 0;
+    jsVmEnter();
+    vm_load_run(m_jsVm, js.c_str());
+    if(m_jsVm->propagating_err != nullptr) vm_report_uncaught(m_jsVm);
+    jsVmExit();
+}
+
 bool EWebEngine::jsDispatchMouseEvent(int mouseState, int button, int cx, int cy)
 {
     if(m_jsVm == nullptr || !m_jsEnabled) return true;
+    jsMaybeRecoverPage();
     /* Engine-thread only (ECMD_INPUT handler): m_jsInScript means a VM run is
      * in flight on this thread and must not be re-entered - no DOM mouse
      * events fire and the default action proceeds. */
@@ -6144,6 +7393,33 @@ void EWebEngine::jsDispatchSimpleEvent(litehtml::element* el, const char* type, 
     jsVmEnter();
     js_event_dispatch_simple(m_jsVm, (void*)el, type, bubbles);
     jsVmExit();
+}
+
+bool EWebEngine::jsEditableCommand(litehtml::element* host, const char* op, const char* text)
+{
+    /* ENGINE-THREAD ONLY. Forward one editing command to the script-side
+     * model (EWebEditingJs.h). Same guards as jsDispatchSimpleEvent: without
+     * a live VM - or while a page script is on the stack - editing is inert.
+     * Returns true when the hook reports the host's content changed. */
+    if(m_jsVm == nullptr || !m_jsEnabled || m_jsPageDisabled || m_jsInScript) return false;
+    if(host == nullptr || op == nullptr) return false;
+    var_t* fn = var_find_own_member_var(m_jsVm->root, EWEB_CE_SLOT);
+    if(fn == nullptr || fn->is_func == 0) return false;
+    jsVmEnter();
+    var_t* args = var_new_array(m_jsVm);
+    var_array_add(args, js_dom_wrap_element(m_jsVm, (js_element_t)host));
+    var_array_add(args, var_new_str(m_jsVm, op));
+    var_array_add(args, var_new_str(m_jsVm, text != nullptr ? text : ""));
+    var_array_reverse(args);   /* call_m_func wants the last arg at index 0 */
+    var_t* ret = call_m_func(m_jsVm, m_jsVm->root, fn, args);
+    var_unref(args);
+    bool changed = false;
+    if(ret != nullptr) {
+        changed = var_get_bool(ret);
+        var_unref(ret);   /* release call_m_func's owned ref */
+    }
+    jsVmExit();
+    return changed;
 }
 
 bool EWebEngine::jsDispatchCancelableEvent(litehtml::element* el, const char* type, bool bubbles)

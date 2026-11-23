@@ -366,6 +366,30 @@ protected:
 		 * re-enable it stay testable because each element is judged by its own
 		 * flag. */
 		virtual bool				eweb_hit_testable() const { return true; }
+		/* Element-level scroll offset of an overflow:auto/scroll container (the
+		 * scrollTop/scrollLeft the DOM bridge reports). The base element never
+		 * scrolls; html_tag stores the offset, paints its children shifted by it
+		 * and hit-tests against the shifted boxes. eweb_set_scroll clamps to the
+		 * content extent and returns true when the offset actually moved. */
+		virtual void				eweb_get_scroll(int* x, int* y) const { if(x) *x = 0; if(y) *y = 0; }
+		virtual bool				eweb_set_scroll(int x, int y) { (void) x; (void) y; return false; }
+		/* Scrollable content extent (scrollWidth/scrollHeight): never smaller
+		 * than the padding box, so a non-overflowing container reports 0 max
+		 * scroll. The base reports the plain box. */
+		virtual void				eweb_scroll_extent(int* w, int* h) const;
+		/* Re-clamp live scroll offsets after a re-layout shrank the content
+		 * extent; the base walks the children, html_tag clamps itself first. */
+		virtual void				eweb_clamp_scroll_tree();
+		/* Layout-only absolute placement: like get_placement() but WITHOUT the
+		 * ancestor scroll offsets. offsetLeft/offsetTop are layout positions
+		 * relative to the offsetParent and must not drift when an intermediate
+		 * overflow container scrolls (Chrome semantics). */
+		position					get_placement_layout() const;
+		/* Caret geometry for contenteditable hosts: the insertion-point rect
+		 * at `offset` (UTF-16 code units inside a text node, child index for
+		 * containers), in layout document coordinates. Width 0 marks the
+		 * vertical bar; the base falls back to the element's own box. */
+		virtual bool					get_caret_rect(int offset, position& rect);
 		virtual element::ptr		get_element_by_point(int x, int y, int client_x, int client_y);
 		virtual element::ptr		get_child_by_point(int x, int y, int client_x, int client_y, draw_flag flag, int zindex);
 		virtual const background*	get_background(bool own_only = false);

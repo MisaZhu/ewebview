@@ -177,6 +177,33 @@ static void test_framing(void) {
     h2_buf_free(&io.in); h2_buf_free(&io.out);
 }
 
+static void test_header_storage_growth(void) {
+    H2Buf block; h2_buf_init(&block);
+    H2HpackDec dec; h2_hpack_dec_init(&dec);
+    for(int i = 0; i < 32; i++) {
+        char name[32], value[96];
+        snprintf(name, sizeof(name), "x-test-header-%d", i);
+        snprintf(value, sizeof(value),
+                 "value-%02d-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz", i);
+        CHECK(h2_hpack_encode_field(&block, name, value) == 0,
+              "growth header encoded");
+    }
+    CHECK(h2_hpack_decode_block(&dec, block.data, block.len) == 0,
+          "growth header block decode");
+    CHECK(dec.header_count == 32, "growth header count");
+    for(int i = 0; i < dec.header_count; i++) {
+        char name[32], value[96];
+        snprintf(name, sizeof(name), "x-test-header-%d", i);
+        snprintf(value, sizeof(value),
+                 "value-%02d-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz", i);
+        CHECK(strcmp(dec.headers[i].name, name) == 0 &&
+              strcmp(dec.headers[i].value, value) == 0,
+              "growth preserves earlier header strings");
+    }
+    h2_hpack_dec_free(&dec);
+    h2_buf_free(&block);
+}
+
 int main(void) {
     test_huffman_known();
     test_indexed();
@@ -184,6 +211,7 @@ int main(void) {
     test_decode_c3_block();
     test_dynamic();
     test_framing();
+    test_header_storage_growth();
     printf("\n%s (%d failures)\n", fails == 0 ? "ALL PASS" : "FAILURES", fails);
     return fails == 0 ? 0 : 1;
 }

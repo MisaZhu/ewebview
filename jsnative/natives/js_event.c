@@ -51,16 +51,11 @@ extern "C" {
  * every cached inline handler, so the GC keeps them reachable across runs. */
 #define EVENT_ANCHOR_KEY "@@listeners"
 
-/* Upper bound on simultaneously registered listeners. Fixed table: no
- * allocation on the (hot) input path. 64 was badly undersized for a modern
- * SPA: Pinterest alone attempts 600+ concurrent listeners (React synthetic
- * events on document/window plus per-node onclick/onload), and once the table
- * saturated ev_add_listener silently dropped every later registration -
- * including the <link onload> that Rspack's miniCss chunk loader parks the
- * CSS-chunk promise on, which wedged n.e(gestalt=78180) forever and left the
- * bottom signup form unmounted. 2048 covers realistic pages with headroom; a
- * saturated table is now reported under EWEB_MODPATCH_DBG instead of silent. */
-#define JS_LISTENER_MAX 2048
+/* Listener storage grows on demand. A fixed cap silently drops late SPA
+ * registrations, including the script/link onload handlers that settle webpack
+ * chunks; Taobao exceeds 2048 live listeners before its right column mounts.
+ * Slots are reused, while geometric growth bounds allocation and copy cost. */
+#define JS_LISTENER_INITIAL 256
 /* Inline `on*="src"` handlers are compiled on demand; the cache keeps the
  * common case (the same attribute firing repeatedly) off the compiler. */
 #define JS_INLINE_CACHE 16
@@ -118,7 +113,7 @@ static const char* kEventTypes[] = {
 static const char* kMouseTypes[] = {
     "click", "dblclick", "mousedown", "mouseup", "mouseover", "mouseout",
     "mousemove", "mouseenter", "mouseleave", "contextmenu", "wheel",
-    "pointerdown", "pointerup", "pointermove"
+    "mousewheel", "pointerdown", "pointerup", "pointermove"
 };
 /* Types whose event object carries the KeyboardEvent key fields. */
 static const char* kKeyTypes[] = { "keydown", "keyup", "keypress" };
@@ -149,6 +144,7 @@ typedef struct {
     bool          once;
     bool          from_prop;  /* installed through the on* property */
     bool          active;
+    uint64_t      id;         /* stable across table growth during dispatch */
 } js_listener_t;
 
 typedef struct {
@@ -167,7 +163,9 @@ typedef struct {
      * shim calls document.createEvent) cannot hijack the factory into infinite
      * recursion. Index order matches kEventClasses[] below. */
     var_t*        ev_cls[4];
-    js_listener_t listeners[JS_LISTENER_MAX];
+    js_listener_t* listeners;
+    int           listener_cap;
+    uint64_t      next_listener_id;
     js_inline_t   inline_cache[JS_INLINE_CACHE];
     int           inline_next;   /* round-robin eviction cursor */
 } js_event_state;
@@ -177,8 +175,9 @@ static void event_state_free(void* p) {
     if(st == NULL) return;
     for(int i = 0; i < 4; ++i)
         if(st->ev_cls[i] != NULL) var_unref(st->ev_cls[i]);   /* release the pinned class refs */
-    for(int i = 0; i < JS_LISTENER_MAX; ++i)
+    for(int i = 0; i < st->listener_cap; ++i)
         if(st->listeners[i].type != NULL) mario_free(st->listeners[i].type);
+    mario_free(st->listeners);
     for(int i = 0; i < JS_INLINE_CACHE; ++i)
         if(st->inline_cache[i].src != NULL) mario_free(st->inline_cache[i].src);
     mario_free(st);
@@ -201,7 +200,7 @@ static void ev_reanchor(vm_t* vm, js_event_state* st) {
     if(bridge == NULL) return;
     vm->gc.gc_defer++;
     var_t* fresh = var_new_array(vm);
-    for(int i = 0; i < JS_LISTENER_MAX; ++i)
+    for(int i = 0; i < st->listener_cap; ++i)
         if(st->listeners[i].active && st->listeners[i].fn != NULL)
             var_array_add(fresh, st->listeners[i].fn);
     for(int i = 0; i < JS_INLINE_CACHE; ++i)
@@ -289,7 +288,7 @@ static bool ev_add_listener(vm_t* vm, js_event_state* st, int kind, js_element_t
     /* An on* property holds at most one handler: assigning replaces the
      * previous one (but leaves addEventListener registrations alone). */
     if(from_prop) {
-        for(int i = 0; i < JS_LISTENER_MAX; ++i) {
+        for(int i = 0; i < st->listener_cap; ++i) {
             js_listener_t* r = &st->listeners[i];
             if(r->from_prop && listener_matches(r, kind, h, target, type))
                 listener_drop(r);
@@ -297,7 +296,7 @@ static bool ev_add_listener(vm_t* vm, js_event_state* st, int kind, js_element_t
     }
     else {
         /* DOM: re-registering the same (callback, capture) pair is a no-op. */
-        for(int i = 0; i < JS_LISTENER_MAX; ++i) {
+        for(int i = 0; i < st->listener_cap; ++i) {
             js_listener_t* r = &st->listeners[i];
             if(!r->from_prop && listener_matches(r, kind, h, target, type) &&
                r->fn == fn && r->capture == capture)
@@ -308,42 +307,61 @@ static bool ev_add_listener(vm_t* vm, js_event_state* st, int kind, js_element_t
     char* tcopy = js_strdup(type);
     if(tcopy == NULL) return false;
 
-    for(int i = 0; i < JS_LISTENER_MAX; ++i) {
-        js_listener_t* r = &st->listeners[i];
-        if(r->active) continue;
-        r->kind      = kind;
-        r->handle    = h;
-        r->target    = target;
-        r->type      = tcopy;
-        r->fn        = fn;
-        r->capture   = capture;
-        r->once      = once;
-        r->from_prop = from_prop;
-        r->active    = true;
-        if(getenv("EWEB_MODPATCH_DBG") != NULL) {
-            static int s_peak = 0;
-            int act = 0;
-            for(int j = 0; j < JS_LISTENER_MAX; ++j) if(st->listeners[j].active) act++;
-            if(act > s_peak) { s_peak = act; fprintf(stderr, "[evpeak] active=%d\n", act); }
+    int slot = -1;
+    for(int i = 0; i < st->listener_cap; ++i) {
+        if(!st->listeners[i].active) { slot = i; break; }
+    }
+    if(slot < 0) {
+        if(st->listener_cap > INT32_MAX / 2) {
+            mario_free(tcopy);
+            return false;
         }
-        ev_reanchor(vm, st);
-        return true;
+        int old_cap = st->listener_cap;
+        int new_cap = old_cap > 0 ? old_cap * 2 : JS_LISTENER_INITIAL;
+        size_t old_size = sizeof(js_listener_t) * (size_t)old_cap;
+        size_t new_size = sizeof(js_listener_t) * (size_t)new_cap;
+        if(new_size > UINT32_MAX) {
+            mario_free(tcopy);
+            return false;
+        }
+        js_listener_t* grown = (js_listener_t*)mario_realloc(
+            st->listeners, (uint32_t)old_size, (uint32_t)new_size);
+        if(grown == NULL) {
+            mario_free(tcopy);
+            return false;
+        }
+        memset(grown + old_cap, 0, new_size - old_size);
+        st->listeners = grown;
+        st->listener_cap = new_cap;
+        slot = old_cap;
     }
+
+    js_listener_t* r = &st->listeners[slot];
+    r->kind      = kind;
+    r->handle    = h;
+    r->target    = target;
+    r->type      = tcopy;
+    r->fn        = fn;
+    r->capture   = capture;
+    r->once      = once;
+    r->from_prop = from_prop;
+    r->active    = true;
+    r->id        = ++st->next_listener_id;
     if(getenv("EWEB_MODPATCH_DBG") != NULL) {
+        static int s_peak = 0;
         int act = 0;
-        for(int i = 0; i < JS_LISTENER_MAX; ++i) if(st->listeners[i].active) act++;
-        fprintf(stderr, "[evfull] DROP type=%s kind=%d from_prop=%d active=%d/%d\n",
-                type, kind, from_prop ? 1 : 0, act, JS_LISTENER_MAX);
+        for(int j = 0; j < st->listener_cap; ++j) if(st->listeners[j].active) act++;
+        if(act > s_peak) { s_peak = act; fprintf(stderr, "[evpeak] active=%d cap=%d\n", act, st->listener_cap); }
     }
-    mario_free(tcopy);
-    return false;   /* table full */
+    ev_reanchor(vm, st);
+    return true;
 }
 
 static bool ev_remove_listener(vm_t* vm, js_event_state* st, int kind, js_element_t h,
                                var_t* target, const char* type, var_t* fn, bool capture) {
     if(st == NULL || type == NULL) return false;
     bool removed = false;
-    for(int i = 0; i < JS_LISTENER_MAX; ++i) {
+    for(int i = 0; i < st->listener_cap; ++i) {
         js_listener_t* r = &st->listeners[i];
         if(!listener_matches(r, kind, h, target, type)) continue;
         if(fn != NULL && r->fn != fn) continue;
@@ -359,7 +377,7 @@ static bool ev_remove_listener(vm_t* vm, js_event_state* st, int kind, js_elemen
 static var_t* ev_prop_handler(js_event_state* st, int kind, js_element_t h,
                               var_t* target, const char* type) {
     if(st == NULL) return NULL;
-    for(int i = 0; i < JS_LISTENER_MAX; ++i) {
+    for(int i = 0; i < st->listener_cap; ++i) {
         js_listener_t* r = &st->listeners[i];
         if(r->from_prop && listener_matches(r, kind, h, target, type))
             return r->fn;
@@ -371,7 +389,7 @@ static var_t* ev_prop_handler(js_event_state* st, int kind, js_element_t h,
  * down so stale element handles cannot be invoked later. */
 static void ev_clear_listeners(vm_t* vm, js_event_state* st) {
     if(st == NULL) return;
-    for(int i = 0; i < JS_LISTENER_MAX; ++i)
+    for(int i = 0; i < st->listener_cap; ++i)
         if(st->listeners[i].active) listener_drop(&st->listeners[i]);
     ev_reanchor(vm, st);
 }
@@ -380,7 +398,7 @@ int js_event_listener_count(vm_t* vm) {
     js_event_state* st = ev_state(vm);
     if(st == NULL) return 0;
     int n = 0;
-    for(int i = 0; i < JS_LISTENER_MAX; ++i)
+    for(int i = 0; i < st->listener_cap; ++i)
         if(st->listeners[i].active) n++;
     return n;
 }
@@ -845,7 +863,7 @@ static var_t* on_prop_set(vm_t* vm, var_t* env, void* data) {
         /* `el.onclick = null` clears ONLY the property handler; listeners
          * added through addEventListener() are a separate registration and
          * must survive. */
-        for(int i = 0; i < JS_LISTENER_MAX; ++i) {
+        for(int i = 0; i < st->listener_cap; ++i) {
             js_listener_t* r = &st->listeners[i];
             if(r->from_prop && listener_matches(r, kind, h, self, type))
                 listener_drop(r);
@@ -1007,7 +1025,7 @@ static bool ev_invoke_at(vm_t* vm, js_event_state* st, const ev_node_t* nd,
         ev_run_inline(vm, st, nd->handle, nd->obj, type, ev);
     if(ev_flag(ev, EV_STOP)) return false;
 
-    for(int i = 0; i < JS_LISTENER_MAX; ++i) {
+    for(int i = 0; i < st->listener_cap; ++i) {
         js_listener_t* r = &st->listeners[i];
         if(!r->active) continue;
         if(!listener_matches(r, nd->kind, nd->handle, nd->obj, type)) continue;
@@ -1021,6 +1039,7 @@ static bool ev_invoke_at(vm_t* vm, js_event_state* st, const ev_node_t* nd,
 
         var_t* fn = r->fn;
         bool once = r->once;
+        uint64_t listener_id = r->id;
 
         var_t* args = var_new_array(vm);
         var_array_add(args, ev);
@@ -1028,7 +1047,17 @@ static bool ev_invoke_at(vm_t* vm, js_event_state* st, const ev_node_t* nd,
         var_unref(args);
         if(ret != NULL) var_unref(ret);
 
-        if(once) { listener_drop(r); ev_reanchor(vm, st); }
+        /* The callback may register enough listeners to grow and move the
+         * table, so never retain its slot pointer across call_m_func. */
+        if(once) {
+            for(int j = 0; j < st->listener_cap; ++j) {
+                if(st->listeners[j].active && st->listeners[j].id == listener_id) {
+                    listener_drop(&st->listeners[j]);
+                    break;
+                }
+            }
+            ev_reanchor(vm, st);
+        }
         if(ev_flag(ev, EV_STOP)) return false;
     }
     return true;
@@ -1162,6 +1191,51 @@ bool js_event_dispatch_mouse(vm_t* vm, js_element_t el, const char* type,
     in.buttons = (button == 0) ? 1 : (button == 2 ? 2 : 4);
     in.detail = click_count;
     return js_event_dispatch(vm, &in);
+}
+
+bool js_event_dispatch_wheel(vm_t* vm, js_element_t el, int x, int y,
+                             int scroll_x, int scroll_y,
+                             int delta_x, int delta_y, int wheel_delta) {
+    js_event_init_t in;
+    js_event_init(&in, "wheel");
+    in.target = el;
+    in.bubbles = true;
+    in.cancelable = true;
+    in.trusted = true;
+    in.client_x = x;
+    in.client_y = y;
+    in.screen_x = x;
+    in.screen_y = y;
+    in.scroll_x = scroll_x;
+    in.scroll_y = scroll_y;
+    var_t* ev = ev_new(vm, &in);
+    if(ev == NULL) return true;
+    ev_set_int(vm, ev, "deltaX", delta_x);
+    ev_set_int(vm, ev, "deltaY", delta_y);
+    ev_set_int(vm, ev, "deltaZ", 0);
+    ev_set_int(vm, ev, "deltaMode", 0);   /* DOM_DELTA_PIXEL */
+    /* ev_dispatch_on refs then unrefs, releasing ev_new's ownership. */
+    bool ok1 = ev_dispatch_on(vm, ev_state(vm), JS_EVENT_ON_ELEMENT, el, ev);
+
+    js_event_init(&in, "mousewheel");
+    in.target = el;
+    in.bubbles = true;
+    in.cancelable = true;
+    in.trusted = true;
+    in.client_x = x;
+    in.client_y = y;
+    in.screen_x = x;
+    in.screen_y = y;
+    in.scroll_x = scroll_x;
+    in.scroll_y = scroll_y;
+    ev = ev_new(vm, &in);
+    if(ev == NULL) return ok1;
+    /* Legacy units: +/-120 per notch, sign opposite to the pixel delta. */
+    ev_set_int(vm, ev, "wheelDelta", wheel_delta);
+    ev_set_int(vm, ev, "wheelDeltaX", 0);
+    ev_set_int(vm, ev, "wheelDeltaY", wheel_delta);
+    bool ok2 = ev_dispatch_on(vm, ev_state(vm), JS_EVENT_ON_ELEMENT, el, ev);
+    return ok1 && ok2;
 }
 
 bool js_event_dispatch_key(vm_t* vm, js_element_t el, const char* type,

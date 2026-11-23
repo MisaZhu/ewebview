@@ -396,10 +396,10 @@ static bool hl_net_request(void* ud, const char* url, const char* method,
     HttpsRequestSetMaxRedirections(request, 0);
     if(method && method[0] && strcmp(method, "GET") != 0)
         HttpsRequestSetMethod(request, method);
-    HttpsRequestAddHeader(request, "User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 MyEwokoBrowser/1.0");
-    HttpsRequestAddHeader(request, "Sec-CH-UA", "\"Chromium\";v=\"152\", \"Not=A?Brand\";v=\"99\", \"MyEwokoBrowser\";v=\"1.0\"");
+    HttpsRequestAddHeader(request, "User-Agent", EWEB_PORT_HTTP_UA);
+    HttpsRequestAddHeader(request, "Sec-CH-UA", EWEB_PORT_HTTP_CH_UA);
     HttpsRequestAddHeader(request, "Sec-CH-UA-Mobile", "?0");
-    HttpsRequestAddHeader(request, "Sec-CH-UA-Platform", "\"Linux\"");
+    HttpsRequestAddHeader(request, "Sec-CH-UA-Platform", "\"" EWEB_PORT_HTTP_UA_PLATFORM "\"");
     for(i = 0; i < req_header_count; i++) {
         if(req_headers[i].key)
             HttpsRequestAddHeader(request, req_headers[i].key,

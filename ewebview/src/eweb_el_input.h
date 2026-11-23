@@ -215,7 +215,6 @@ private:
     bool placeholder_color(litehtml::web_color& c) const;
     int  part_dim(bool thumb, const char* prop, int defval) const;
     float range_fraction();
-    void extra_box_size(int& w, int& h) const;
     /* The page cascade declares padding/border on the axis, i.e. it replaces
      * the UA control chrome there; gates the +24/24 intrinsic emulation in
      * get_content_size (a styled button sizes from its label alone). */

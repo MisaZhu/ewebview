@@ -79,6 +79,15 @@ namespace litehtml
 		 * scroll derives as vp_origin - y. 0 = no overscan (buffer ==
 		 * viewport, the long-standing layout). */
 		int								m_draw_vp_origin_y = 0;
+		/* Vertical viewport-cull band, in DOCUMENT coordinates, captured at
+		 * the top of draw() from the clip rect and the draw offset. In-flow
+		 * subtrees with no positioned descendant (m_has_pospart==false) whose
+		 * box lies entirely outside [top,bottom] paint nothing visible, so
+		 * draw_children_box skips both their own draw and their recursion.
+		 * Inactive (whole-document band) when draw() gets a NULL clip. */
+		int								m_draw_cull_top = 0;
+		int								m_draw_cull_bottom = 0;
+		bool							m_draw_cull_active = false;
 		fonts_map							m_fonts;
 		css_text::vector					m_css;
 		litehtml::css						m_styles;
@@ -200,6 +209,7 @@ namespace litehtml
 		int								get_draw_scroll_y() const { return m_draw_scroll_y; }
 		void							set_draw_vp_origin_y(int v) { m_draw_vp_origin_y = v; }
 		int								get_draw_vp_origin_y() const { return m_draw_vp_origin_y; }
+		bool							get_draw_cull_band(int& top, int& bottom) const { top = m_draw_cull_top; bottom = m_draw_cull_bottom; return m_draw_cull_active; }
 		void							get_fixed_boxes(position::vector& fixed_boxes);
 		void							add_fixed_box(const position& pos);
 		void							add_media_list(media_query_list::ptr list);

@@ -27,7 +27,20 @@ void usleep(uint32_t us) {
 }
 
 int main(int argc, char **argv) {
+    char url_buf[32768];
     const char *url = (argc > 1) ? argv[1] : "https://nghttp2.org/httpbin/get";
+    const char *url_file = getenv("EWEB_TEST_URL_FILE");
+    if(url_file) {
+        FILE *f = fopen(url_file, "r");
+        if(!f || !fgets(url_buf, sizeof(url_buf), f)) {
+            fprintf(stderr, "FAIL: cannot read %s\n", url_file);
+            if(f) fclose(f);
+            return 2;
+        }
+        fclose(f);
+        url_buf[strcspn(url_buf, "\r\n")] = '\0';
+        url = url_buf;
+    }
     const char *h2 = getenv("EWEB_HTTP2");
     printf("url=%s  EWEB_HTTP2=%s\n", url, h2 ? h2 : "(unset)");
 
@@ -35,8 +48,24 @@ int main(int argc, char **argv) {
     if(!req) { printf("FAIL: NewHttpsRequest returned NULL\n"); return 2; }
     HttpsRequestSetTimeout(req, 20000);
     HttpsRequestSetMaxRedirections(req, 3);
-    HttpsRequestAddHeader(req, "User-Agent", "ewebview-h2/1");
-    HttpsRequestAddHeader(req, "Accept", "*/*");
+    const char *header_file = getenv("EWEB_TEST_HEADER_FILE");
+    if(header_file) {
+        FILE *f = fopen(header_file, "r");
+        if(!f) { fprintf(stderr, "FAIL: cannot read %s\n", header_file); return 2; }
+        char line[32768];
+        while(fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            char *sep = strchr(line, ':');
+            if(!sep || sep == line) continue;
+            *sep++ = '\0';
+            while(*sep == ' ' || *sep == '\t') sep++;
+            HttpsRequestAddHeader(req, line, sep);
+        }
+        fclose(f);
+    } else {
+        HttpsRequestAddHeader(req, "User-Agent", "ewebview-h2/1");
+        HttpsRequestAddHeader(req, "Accept", "*/*");
+    }
 
     TinyHttpsResponse *resp = HttpsRequestFetch(req);
     if(!resp) { printf("FAIL: fetch returned NULL\n"); HttpsRequestFree(req); return 2; }
@@ -51,11 +80,20 @@ int main(int argc, char **argv) {
 
     int status = HttpsResponseGetStatusCode(resp);
     int size = 0;
-    const char *body = HttpsResponseReadBodyStr(resp, &size);
+    const char *body = HttpsResponseReadBody(resp, &size);
     const char *ct = HttpsResponseGetHeaderValueByKey(resp, "content-type");
     printf("status=%d  body_size=%d  content-type=%s\n", status, size, ct ? ct : "(none)");
+    int nh = BearHttpsResponse_get_headers_size(resp);
+    for(int i = 0; i < nh; i++)
+        printf("header %s: %s\n",
+               BearHttpsResponse_get_header_key_by_index(resp, i),
+               BearHttpsResponse_get_header_value_by_index(resp, i));
     if(body && size > 0) {
-        int n = size < 200 ? size : 200;
+        int n = size < 32 ? size : 32;
+        printf("body-hex:");
+        for(int i = 0; i < n; i++) printf(" %02x", (unsigned char)body[i]);
+        printf("\n");
+        n = size < 4096 ? size : 4096;
         printf("body[0..%d]: %.*s\n", n, n, body);
     }
     int ok = (status >= 200 && status < 400 && size > 0);

@@ -52,6 +52,8 @@
 #include <signal.h>
 #include <execinfo.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #if defined(__APPLE__)
 #include <sys/ucontext.h>
 #endif
@@ -365,7 +367,7 @@ typedef struct {
 #define INJ_MAX 256
 typedef enum {
     INJ_CLICK, INJ_DBLCLICK, INJ_MOVE, INJ_DOWN, INJ_UP,
-    INJ_TYPE, INJ_KEY, INJ_WAIT
+    INJ_TYPE, INJ_KEY, INJ_WAIT, INJ_WHEEL
 } inj_kind_t;
 
 typedef struct {
@@ -373,6 +375,7 @@ typedef struct {
     int      x, y;        /* content-local logical coords (mouse steps) */
     int      key;         /* EWEB_KEY_* (INJ_KEY) */
     int      mods;        /* EWEB_MOD_* */
+    int      wheel;       /* notches, positive = content down (INJ_WHEEL) */
     char     text[64];    /* INJ_TYPE run, or the CHAR payload for INJ_KEY */
     uint32_t delay;       /* ms to wait after this step */
 } inj_step_t;
@@ -405,6 +408,7 @@ typedef struct {
     int           frame_sx, frame_sy;   /* scroll the frame was rendered at */
     int           doc_w, doc_h;         /* full document size */
     int           scroll_x, scroll_y;   /* live UI scroll offset */
+    double        wheel_acc_y;          /* fractional SDL wheel notches pending */
     int           view_w, view_h;       /* ewebview viewport in LOGICAL CSS px */
     int           tex_w, tex_h;         /* frame texture size in DEVICE px */
     bool          pool_flush;           /* dpr changed: force frame pool turnover */
@@ -480,7 +484,6 @@ static void browser_refresh(browser_t* b);
 static void browser_resize(browser_t* b, int w, int h);
 static void browser_render(browser_t* b);
 static void browser_handle_event(browser_t* b, const SDL_Event* ev);
-static void browser_ui_scroll(browser_t* b, int dx, int dy);
 
 /* ------------------------------------------------------------------ */
 /* ewebview listener callbacks (all on the UI thread, inside tick)     */
@@ -635,23 +638,6 @@ static void browser_refresh(browser_t* b) {
     if(!url[0]) return;
     b->history_nav = true;                 /* same page: no duplicate push */
     if(b->view) ewebview_reload(b->view);
-}
-
-/* ------------------------------------------------------------------ */
-/* Scroll (UI-local, mirrors WidgetWebview::uiLocalScroll)             */
-/* ------------------------------------------------------------------ */
-
-static void browser_ui_scroll(browser_t* b, int dx, int dy) {
-    int nx = b->scroll_x + dx;
-    int ny = b->scroll_y + dy;
-    int maxx = b->doc_w - b->view_w; if(maxx < 0) maxx = 0;
-    int maxy = b->doc_h - b->view_h; if(maxy < 0) maxy = 0;
-    if(nx < 0) nx = 0; else if(nx > maxx) nx = maxx;
-    if(ny < 0) ny = 0; else if(ny > maxy) ny = maxy;
-    if(nx == b->scroll_x && ny == b->scroll_y) return;
-    b->scroll_x = nx;
-    b->scroll_y = ny;
-    if(b->view) ewebview_scroll(b->view, nx, ny);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1266,15 +1252,28 @@ static void browser_handle_event(browser_t* b, const SDL_Event* ev) {
     }
 
     case SDL_MOUSEWHEEL: {
-        /* wheel over the content area scrolls the page; the step is in LOGICAL
-         * CSS px because the engine's scroll offsets are logical. */
+        /* Wheel over the content area goes to the ENGINE as a DOM gesture:
+         * it dispatches wheel/mousewheel to the page and runs the default
+         * scroll (the overflow container under the pointer, else the
+         * document), then republishes the offset through cb_scroll. SDL
+         * reports fractional notches on trackpads: accumulate and deliver
+         * whole lines so no motion is lost. Engine sign: positive = down. */
         int mx, my; browser_mouse_pos(b, &mx, &my);
         SDL_Rect cr = content_rect(b);
-        if(point_in_rect(mx, my, &cr)) {
-            int step = SCROLL_STEP;
-            int dy = -ev->wheel.y * step;
-            int dx = -ev->wheel.x * step;
-            browser_ui_scroll(b, dx, dy);
+        if(b->view && point_in_rect(mx, my, &cr)) {
+            b->wheel_acc_y += ev->wheel.y;
+            int ly = (int)b->wheel_acc_y;
+            if(ly != 0) {
+                b->wheel_acc_y -= ly;
+                eweb_event_t wev;
+                memset(&wev, 0, sizeof(wev));
+                wev.mouse_state = EWEB_MOUSE_WHEEL;
+                wev.button = EWEB_BUTTON_NONE;
+                wev.cx = dev_to_logical(b, mx - cr.x);
+                wev.cy = dev_to_logical(b, my - cr.y);
+                wev.wheel = -ly;   /* SDL up-positive -> engine down-positive */
+                ewebview_post_event(b->view, &wev);
+            }
         }
         break;
     }
@@ -1566,6 +1565,7 @@ static void inj_parse_cmd(browser_t* b, char* raw) {
     if(!strncmp(cmd, "move ", 5))     { s->kind = INJ_MOVE;     sscanf(cmd + 5, "%d , %d", &s->x, &s->y); b->inject_count++; return; }
     if(!strncmp(cmd, "down ", 5))     { s->kind = INJ_DOWN;     sscanf(cmd + 5, "%d , %d", &s->x, &s->y); b->inject_count++; return; }
     if(!strncmp(cmd, "up ", 3))       { s->kind = INJ_UP;       sscanf(cmd + 3, "%d , %d", &s->x, &s->y); b->inject_count++; return; }
+    if(!strncmp(cmd, "wheel ", 6))    { s->kind = INJ_WHEEL;    sscanf(cmd + 6, "%d , %d , %d", &s->x, &s->y, &s->wheel); b->inject_count++; return; }
     if(!strncmp(cmd, "wait ", 5))     { s->kind = INJ_WAIT;     s->delay = (uint32_t)atoi(cmd + 5); b->inject_count++; return; }
     if(!strncmp(cmd, "key ", 4)) {
         const char* p = cmd + 4;
@@ -1643,6 +1643,15 @@ static void inj_exec(browser_t* b, const inj_step_t* s) {
     case INJ_MOVE: inj_post_mouse(b, EWEB_MOUSE_MOVE, s->x, s->y); break;
     case INJ_DOWN: inj_post_mouse(b, EWEB_MOUSE_DOWN, s->x, s->y); break;
     case INJ_UP:   inj_post_mouse(b, EWEB_MOUSE_UP, s->x, s->y); break;
+    case INJ_WHEEL: {
+        eweb_event_t wev;
+        memset(&wev, 0, sizeof(wev));
+        wev.mouse_state = EWEB_MOUSE_WHEEL;
+        wev.button = EWEB_BUTTON_NONE;
+        wev.cx = s->x; wev.cy = s->y; wev.wheel = s->wheel;
+        ewebview_post_event(b->view, &wev);
+        break;
+    }
     case INJ_TYPE: {
         const char* p = s->text;
         while(*p) {
@@ -1666,6 +1675,102 @@ static void inj_exec(browser_t* b, const inj_step_t* s) {
         }
         break;
     case INJ_WAIT: break;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Live command channel (EWEB_CMD_FIFO)                                */
+/* ------------------------------------------------------------------ */
+/* A FIFO whose lines are executed against the RUNNING window with the
+ * inject vocabulary (click/move/down/up/type/key/...), plus "wheel x,y,n"
+ * (engine notches, positive=down) and "shot <path>" (one BMP on demand).
+ * Lets an external harness drive a logged-in session autonomously: SDL's
+ * Cocoa backend never delivers synthetic mouse-button events, so CG
+ * clicks cannot be used for end-to-end click verification. */
+static void browser_save_frame_bmp(browser_t* b, const char* path);
+static int    s_cmdFd = -2;   /* -2 = not initialised, -1 = disabled */
+static char   s_cmdBuf[4096];
+static size_t s_cmdLen = 0;
+
+static void cmd_fifo_exec_line(browser_t* b, char* line)
+{
+    char* cmd = inj_trim(line);
+    if(!*cmd || !b->view) return;
+    if(!strncmp(cmd, "wheel ", 6)) {
+        int x = 0, y = 0, n = 0;
+        sscanf(cmd + 6, "%d , %d , %d", &x, &y, &n);
+        eweb_event_t wev;
+        memset(&wev, 0, sizeof(wev));
+        wev.mouse_state = EWEB_MOUSE_WHEEL;
+        wev.button = EWEB_BUTTON_NONE;
+        wev.cx = x; wev.cy = y; wev.wheel = n;
+        ewebview_post_event(b->view, &wev);
+        fprintf(stderr, "[cmdfifo] wheel %d,%d n=%d\n", x, y, n);
+        return;
+    }
+    if(!strncmp(cmd, "shot ", 5)) {
+        char fpath[512];
+        snprintf(fpath, sizeof(fpath), "%s", inj_trim(cmd + 5));
+        if(b->frame) browser_save_frame_bmp(b, fpath);
+        fprintf(stderr, "[cmdfifo] shot %s\n", fpath);
+        return;
+    }
+    if(!strcmp(cmd, "reload")) {
+        browser_refresh(b);
+        fprintf(stderr, "[cmdfifo] reload\n");
+        return;
+    }
+    if(!strncmp(cmd, "goto ", 5)) {
+        char* url = inj_trim(cmd + 5);
+        fprintf(stderr, "[cmdfifo] goto %s\n", url);
+        browser_load(b, url);
+        return;
+    }
+    if(!strncmp(cmd, "eval ", 5)) {
+        char* js = inj_trim(cmd + 5);
+        fprintf(stderr, "[cmdfifo] eval %.100s\n", js);
+        ewebview_eval_js(b->view, js);
+        return;
+    }
+    /* Reuse the inject parser on a scratch slot, exec immediately, then
+     * restore the count so a --shot script (if any) stays untouched. */
+    int old = b->inject_count;
+    inj_parse_cmd(b, cmd);
+    if(b->inject_count > old) {
+        inj_exec(b, &b->inject[old]);
+        b->inject_count = old;
+    }
+}
+
+static void cmd_fifo_drain(browser_t* b)
+{
+    if(s_cmdFd == -2) {
+        const char* p = getenv("EWEB_CMD_FIFO");
+        s_cmdFd = -1;
+        if(p && *p) {
+            mkfifo(p, 0600);   /* EEXIST ok */
+            s_cmdFd = open(p, O_RDONLY | O_NONBLOCK);
+            fprintf(stderr, "[cmdfifo] listening on %s fd=%d\n", p, s_cmdFd);
+        }
+    }
+    if(s_cmdFd < 0) return;
+    char rb[1024];
+    ssize_t n;
+    while((n = read(s_cmdFd, rb, sizeof(rb))) > 0) {
+        for(ssize_t i = 0; i < n; i++) {
+            char c = rb[i];
+            if(c == '\n') {
+                s_cmdBuf[s_cmdLen] = 0;
+                cmd_fifo_exec_line(b, s_cmdBuf);
+                s_cmdLen = 0;
+            } else if(s_cmdLen + 1 < sizeof(s_cmdBuf)) {
+                s_cmdBuf[s_cmdLen++] = c;
+            }
+        }
+    }
+    if(n == 0) {   /* writer closed: reopen so the next writer is heard */
+        close(s_cmdFd);
+        s_cmdFd = open(getenv("EWEB_CMD_FIFO"), O_RDONLY | O_NONBLOCK);
     }
 }
 
@@ -1944,6 +2049,12 @@ static void browser_save_frame_bmp(browser_t* b, const char* path) {
 
 int main(int argc, char** argv) {
     browser_t browser;
+#if defined(SIGPIPE)
+    /* A peer closing a TLS socket is an ordinary request failure, not a reason
+     * to kill the browser before a long-window screenshot can be captured.
+     * send() then returns EPIPE through tinyhttpsc's existing error path. */
+    signal(SIGPIPE, SIG_IGN);
+#endif
     browser_install_crash_handler();
     browser_detect_color_scheme();
     if(!browser_init(&browser, argc, argv)) {
@@ -1959,8 +2070,11 @@ int main(int argc, char** argv) {
 
         /* drain SDL events */
         SDL_Event ev;
-        while(SDL_PollEvent(&ev))
+        while(SDL_PollEvent(&ev)) {
             browser_handle_event(b, &ev);
+        }
+
+        cmd_fifo_drain(b);
 
         /* pump the engine (fires listener callbacks on this thread) */
         if(b->view)

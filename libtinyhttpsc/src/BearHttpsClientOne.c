@@ -94759,6 +94759,18 @@ static int private_BearHttps_sock_read(void *ctx, unsigned char *buf, size_t len
 
 static int private_BearHttps_sock_write(void *ctx, const unsigned char *buf, size_t len)
 {
+    /* TEMP DIAG: dump first TLS record (ClientHello) for fingerprint diffing. */
+    {
+        static int hello_dumped = 0;
+        if(!hello_dumped && getenv("EWEB_TLSHELLO_DBG")){
+            hello_dumped = 1;
+            size_t n = len < 600 ? len : 600;
+            fprintf(stderr, "[tlshello] len=%zu\n", len);
+            for(size_t i = 0; i < n; i++)
+                fprintf(stderr, "%02x%s", buf[i], ((i & 15) == 15) ? "\n" : " ");
+            fprintf(stderr, "\n");
+        }
+    }
     for (;;) {
         ssize_t write_len;
         write_len = Universal_send(*(int *)ctx, buf, len,0);
@@ -95438,7 +95450,24 @@ private_BearHttpsRequisitionProps * private_new_private_BearHttpsRequisitionProp
     }
 
     //1000 //2000
+    /* RFC 3986: the authority (hostname[:port]) ends at the FIRST of '/', '?'
+     * or '#'. Scanning only for '/' folds a path-less query URL's whole
+     * "?query" tail into hostname -- https://api.m.jd.com?appid=... yielded
+     * hostname "api.m.jd.com?appid=..." so getaddrinfo() failed (errno=22) and
+     * JD's main first-screen data requests (pchome_firstScreenSoa &co, which
+     * use host+'?' with no path) never resolved, leaving the home page grey.
+     * Take the earliest delimiter so hostname stops at the authority end. */
     int end_host_name_and_start_of_route = private_BearsslHttps_indexof_from_point(url,'/',start_size);
+    {
+        int end_query = private_BearsslHttps_indexof_from_point(url,'?',start_size);
+        int end_frag  = private_BearsslHttps_indexof_from_point(url,'#',start_size);
+        if(end_query != -1 &&
+           (end_host_name_and_start_of_route == -1 || end_query < end_host_name_and_start_of_route))
+            end_host_name_and_start_of_route = end_query;
+        if(end_frag != -1 &&
+           (end_host_name_and_start_of_route == -1 || end_frag < end_host_name_and_start_of_route))
+            end_host_name_and_start_of_route = end_frag;
+    }
 
     if(end_host_name_and_start_of_route == -1){
         end_host_name_and_start_of_route = url_size;
@@ -95448,9 +95477,22 @@ private_BearHttpsRequisitionProps * private_new_private_BearHttpsRequisitionProp
     long host_name_size = private_BearsslHttps_strlen(self->hostname);
 
     if(end_host_name_and_start_of_route == url_size){
-        self->route = private_BearsslHttps_strdup("/");    }
-    else{
+        self->route = private_BearsslHttps_strdup("/");
+    }
+    else if(url[end_host_name_and_start_of_route] == '/'){
          self->route = private_BearsslHttps_strndup((url+end_host_name_and_start_of_route),url_size-end_host_name_and_start_of_route+1);
+    }
+    else{
+         /* host followed directly by '?' or '#': the origin-form request-target
+          * (RFC 7230 5.3) must still begin with '/', so prepend it -- browsers
+          * send "GET /?appid=... HTTP/1.1" for a path-less query URL. */
+         long tail = url_size - end_host_name_and_start_of_route;
+         char *route_buf = (char *)BearsslHttps_allocate((size_t)tail + 2);
+         route_buf[0] = '/';
+         for(long k = 0; k < tail; k++)
+             route_buf[k+1] = url[end_host_name_and_start_of_route + k];
+         route_buf[tail+1] = '\0';
+         self->route = route_buf;
     }
     
     //iterate over hostname to determine if its ipv4

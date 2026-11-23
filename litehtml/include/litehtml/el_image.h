@@ -16,6 +16,7 @@ namespace litehtml
 		 * the first style pass can run before the window has its size. */
 		int		m_resolved_mw;
 		int		m_resolved_mh;
+		int		m_resolved_res;
 
 		/* width/height ATTRIBUTES are presentation hints in the CSS cascade:
 		 * they lose to EVERY author rule, so `.avatar img{width:100%}` must
@@ -42,6 +43,11 @@ namespace litehtml
 		virtual bool	is_replaced() const override;
 		virtual int		render(int x, int y, int max_width, bool second_pass = false) override;
 		virtual void	parse_attributes() override;
+		/* Dynamic src/srcset/width/height assignment (Angular mm-src, React
+		 * commit) must refresh m_src: render() only re-resolves on viewport
+		 * change, so without this the painted bitmap stays the creation-time
+		 * (often empty) src and the box shows its grey placeholder. */
+		virtual void	set_attr(const tchar_t* name, const tchar_t* val) override;
 		virtual void	parse_styles(bool is_reparse = false) override;
 		virtual void	draw(uint_ptr hdc, int x, int y, const position* clip) override;
 		virtual void	get_content_size(size& sz, int max_width) override;

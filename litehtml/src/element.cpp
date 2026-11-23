@@ -227,9 +227,56 @@ litehtml::position litehtml::element::get_placement() const
 	{
 		pos.x += cur_el->m_pos.x;
 		pos.y += cur_el->m_pos.y;
+		/* An overflow:auto/scroll ancestor paints this subtree shifted by its
+		 * scroll offset, so the RENDERED absolute position subtracts it. This
+		 * keeps getBoundingClientRect, the draw cull band and every placement
+		 * consumer aligned with what is actually on screen. offsetTop uses
+		 * get_placement_layout() instead (layout position, scroll-blind). */
+		int sx = 0, sy = 0;
+		cur_el->eweb_get_scroll(&sx, &sy);
+		pos.x -= sx;
+		pos.y -= sy;
 		cur_el = cur_el->parent();
 	}
 	return pos;
+}
+
+litehtml::position litehtml::element::get_placement_layout() const
+{
+	litehtml::position pos = m_pos;
+	element::ptr cur_el = parent();
+	while(cur_el)
+	{
+		pos.x += cur_el->m_pos.x;
+		pos.y += cur_el->m_pos.y;
+		cur_el = cur_el->parent();
+	}
+	return pos;
+}
+
+void litehtml::element::eweb_scroll_extent(int* w, int* h) const
+{
+	if(w) *w = m_pos.width;
+	if(h) *h = m_pos.height;
+}
+
+bool litehtml::element::get_caret_rect(int offset, position& rect)
+{
+	/* Fallback: the element's own content box left edge (an empty host's
+	 * caret sits at its start). Text nodes and containers override. */
+	(void)offset;
+	rect = get_placement_layout();
+	rect.width = 0;
+	return true;
+}
+
+void litehtml::element::eweb_clamp_scroll_tree()
+{
+	for(size_t i = 0; i < get_children_count(); i++)
+	{
+		element::ptr ch = get_child((int)i);
+		if(ch) ch->eweb_clamp_scroll_tree();
+	}
 }
 
 bool litehtml::element::is_inline_box() const

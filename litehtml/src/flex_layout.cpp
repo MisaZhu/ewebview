@@ -43,6 +43,25 @@ static int flexdbg_enabled(void)
 	if (s < 0) s = (getenv("EWEB_FLEXDBG") != NULL) ? 1 : 0;
 	return s;
 }
+/* TEMPORARY diagnosis gate (EWEB_FLEXMC=1): per-child dump of the min-content
+ * contributions for boxes whose class matches EWEB_FLEXMC_CLASS (default
+ * "image-search-icon"), to attribute a wrong automatic minimum (taobao
+ * .image-search-icon-wrapper floor 352 vs 76) to the offending child. */
+static int flexmc_enabled(void)
+{
+	static int s = -1;
+	if (s < 0) s = (getenv("EWEB_FLEXMC") != NULL) ? 1 : 0;
+	return s;
+}
+static bool flexmc_match(const litehtml::element::ptr& el)
+{
+	if (!el) return false;
+	const char* want = getenv("EWEB_FLEXMC_CLASS");
+	if (!want || !*want) want = "image-search-icon";
+	const litehtml::tchar_t* pc = el->get_attr(_t("class"), 0);
+	if (!pc) return false;
+	return strstr(pc, want) != NULL;
+}
 struct flex_depth_guard {
 	flex_depth_guard() { if(++g_flex_depth > g_flex_maxdepth) g_flex_maxdepth = g_flex_depth; }
 	~flex_depth_guard() { --g_flex_depth; }
@@ -723,12 +742,30 @@ static int flex_min_content_inner_impl(const litehtml::element::ptr& el)
 		if(!participates_in_layout(c)) continue;
 		if(c->get_element_position() == litehtml::element_position_absolute ||
 		   c->get_element_position() == litehtml::element_position_fixed) continue;
+		/* A flex container boxifies only its non-whitespace children into items
+		 * (render_flex and preferred_content_width both drop is_white_space()),
+		 * so the automatic minimum must not sum the inter-item whitespace runs
+		 * either: taobao's .image-search-icon-wrapper (pic + 搜同款, base 76)
+		 * carried six whitespace text nodes totalling ~138px plus ~142px more
+		 * inside .image-search-icon-pic, so the shrink floor came out 352 and
+		 * the §9.7 clamp RAISED the item's main size to 352 inside a 100px
+		 * fit-content pill - justify-content:center then centred the camera and
+		 * label ~160px right of the pill, over the promo cluster. */
+		if(flexd && c->is_white_space()) continue;
 		/* a child's contribution is its OUTER width: inner floor plus its own
 		 * padding and borders. Summing bare inner widths dropped 16px of button
 		 * padding per github nav item (583 vs 693), so the nav shrank below
 		 * its nowrap labels and "Open Source" broke across two lines. */
 		int cw = flex_min_content_inner(c) + c->padding_left() + c->padding_right() +
 				 c->border_left() + c->border_right();
+		if(flexmc_enabled() && flexmc_match(el))
+		{
+			const litehtml::tchar_t* pc = el->get_attr(_t("class"), 0);
+			fprintf(stderr, "[flexmc] el=%s child#%zu tag=%s ccls=%s disp=%d ws=%d cw=%d childw=%d\n",
+					pc ? pc : "", i, c->get_tagName(),
+					(c && c->get_attr(_t("class"), 0)) ? c->get_attr(_t("class"), 0) : "",
+					(int)c->get_display(), (int)c->is_white_space(), cw, c->width());
+		}
 		if(one_line)
 		{
 			/* row flex: the items sit side by side even at min-content, so
@@ -1001,7 +1038,11 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 				fixed_h -= m_padding.top + m_padding.bottom + m_borders.top + m_borders.bottom;
 			if(fixed_h < 0) fixed_h = 0;
 		}
-		int cont_h = has_fixed_h ? std::max(total, fixed_h) : total;
+		/* A definite block size is the flex container's used height, not a
+		 * lower bound for its contents. Overflowing items remain overflowing;
+		 * growing the box to total made taobao's 29px placeholder viewport as
+		 * tall as all three 50px rotating rows and leaked every word. */
+		int cont_h = has_fixed_h ? fixed_h : total;
 		/* Cap before the min floor: on a min>max conflict the min wins. */
 		{
 			int mxh = content_box_max_height();
@@ -1437,6 +1478,17 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		if(it.amr){ css_length v; v = (float)it.mr; ht->m_css_margins.right = v; }
 		if (flex_stats_enabled()) g_flex_row_p++;
 		it.el->render(ix, iy, it.main, second_pass);
+		/* A replaced/form-widget item's own render() sizes the face from its
+		 * intrinsic metrics and would discard the flexed main size, leaving a
+		 * flex:1 <input> drawn at its default width while the NEXT item is
+		 * placed at the far edge of the (invisible) grown box - the search-bar
+		 * idiom's detached button. Re-assert the flexed inner main size so the
+		 * widget fills its track. Grow-0 replaced items get main==base, a no-op. */
+		if(it.el->is_replaced())
+		{
+			int inner = it.main - it.ml - it.mr;
+			if(inner > 0) ht->m_pos.width = inner;
+		}
 		ht->m_css_margins.left = sml;
 		ht->m_css_margins.right = smr;
 		ht->m_pct_cb_width = saved;

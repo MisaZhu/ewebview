@@ -41,6 +41,20 @@ namespace litehtml
 		virtual void				draw_list_marker(litehtml::uint_ptr hdc, const litehtml::list_marker& marker) = 0;
 		virtual void				load_image(const litehtml::tchar_t* src, const litehtml::tchar_t* baseurl, bool redraw_on_ready) = 0;
 		virtual void				get_image_size(const litehtml::tchar_t* src, const litehtml::tchar_t* baseurl, litehtml::size& sz) = 0;
+		/* <iframe> payload fetch: the URL points at an HTML document, not a
+		 * bitmap. Containers without frame support fall back to load_image
+		 * (which decodes nothing and leaves the box empty). */
+		virtual void				load_iframe(const litehtml::tchar_t* src, const litehtml::tchar_t* baseurl, bool redraw_on_ready)
+		{
+			load_image(src, baseurl, redraw_on_ready);
+		}
+		/* Paint the static render of an iframe document into `pos` (device
+		 * coordinates, content box). Default: nothing. */
+		virtual void				draw_iframe(litehtml::uint_ptr hdc, const litehtml::tchar_t* src, const litehtml::tchar_t* baseurl,
+											const litehtml::position& pos, const litehtml::position* clip)
+		{
+			(void)hdc; (void)src; (void)baseurl; (void)pos; (void)clip;
+		}
 		virtual void				draw_background(litehtml::uint_ptr hdc, const litehtml::background_paint& bg) = 0;
 		virtual void				draw_borders(litehtml::uint_ptr hdc, const litehtml::borders& borders, const litehtml::position& draw_pos, bool root) = 0;
 		/* Optional paint-time affine transform, row-major [a b c d e f] with

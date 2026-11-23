@@ -81,6 +81,8 @@ BROWSER_NATIVE_OBJS = \
 	$(ARCH)/natives/js_event.o \
 	$(ARCH)/natives/js_web.o \
 	$(ARCH)/natives/js_canvas.o \
+	$(ARCH)/natives/js_glsl.o \
+	$(ARCH)/natives/js_webgl.o \
 	$(ARCH)/natives/js_wasm.o
 
 TASK_OBJS = $(VM_OBJS) $(NATIVE_OBJS) $(BROWSER_NATIVE_OBJS)
@@ -103,9 +105,22 @@ $(TASK): $(TASK_OBJS)
 	$(AR) crs $(TASK) $(TASK_OBJS)
 	cp $(MARIO_HEADERS) $(TARGET_DIR)/include/mario/
 
+# The interpreter loop in mario.c is the browser's hottest code, and the
+# size-first release flag ($(SIZE_OPT): -Oz/-Os, see host.rule) keeps its
+# static-inline helpers out of line, which costs about a third of the run time
+# on script-heavy pages. Swap that one flag for a speed level on the VM objects
+# only. It is replaced in place, so a later -O in CFLAGS_EXTRA (the ASan build)
+# still wins, and DEBUG=yes / OS_TYPE=ewokos builds, which define no SIZE_OPT,
+# are untouched. `make VM_OPT=-Oz` restores the size-first build.
+VM_OPT ?= -O2
+VM_CFLAGS = $(CFLAGS)
+ifneq ($(SIZE_OPT),)
+VM_CFLAGS = $(patsubst $(SIZE_OPT),$(VM_OPT),$(CFLAGS))
+endif
+
 $(ARCH)/vm/%.o: $(MARIO_VM)/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(VM_CFLAGS) -c $< -o $@
 
 -include $(TASK_OBJS:.o=.d)
 

@@ -16,5 +16,11 @@ namespace litehtml
 		 * appends, which is what the parser needs while streaming chunks). */
 		virtual void	set_data_replace(const tchar_t* data) override;
 		virtual bool	is_comment() const override;
+		/* cloneNode must preserve comment nodes: Angular transclusion clones a
+		 * compiled subtree whose childNodes include comment markers (ngBind /
+		 * interpolation / ngRepeat boundaries). Dropping them shifts the clone's
+		 * child sequence so the reused link function misaligns and descendant
+		 * directives link against undefined nodes. */
+		virtual element::ptr	clone_node(bool deep) override;
 	};
 }

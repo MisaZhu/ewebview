@@ -737,13 +737,24 @@ static void ek_stroke_bezier(void* ud, eweb_surface_t* h, int x0, int y0,
 
 static void ek_set_pixel(void* ud, eweb_surface_t* h, int x, int y, uint32_t color) {
     sdl_surf_t* s;
-    Uint8 r, g, b, a;
+    uint32_t* px;
     (void)ud;
     if(!h) return;
     s = S(h);
-    if(!s->rend) return;
-    sdl2_unpack_argb(color, &r, &g, &b, &a);
-    pixelRGBA(s->rend, (Sint16)sdl2_sp(s, x), (Sint16)sdl2_sp(s, y), r, g, b, a);
+    if(!s->surf) return;
+    x = sdl2_sp(s, x); y = sdl2_sp(s, y);   /* logical -> device; bounds below are device */
+    if(x < 0 || y < 0 || x >= s->surf->w || y >= s->surf->h) return;
+    /* Write the word straight into the backing store. The previous
+     * implementation routed single pixels through the SDL2_gfx software
+     * renderer (pixelRGBA), which never commits them to surf->pixels, while
+     * every readback path (ek_get_pixel / ek_surface_pixels / toDataURL /
+     * getImageData) reads surf->pixels directly - so putImageData and the
+     * getImageData internal copy were invisible to readback and canvas
+     * fingerprints degenerated to all-zero. putImageData is a replace, not a
+     * composite, so storing the 0xAARRGGBB word verbatim is both spec-correct
+     * and symmetric with ek_get_pixel. */
+    px = (uint32_t*)s->surf->pixels;
+    px[(size_t)y * (size_t)(s->surf->pitch / 4) + (size_t)x] = color;
 }
 
 static uint32_t ek_get_pixel(void* ud, eweb_surface_t* h, int x, int y) {
@@ -1230,6 +1241,13 @@ typedef struct {
     char           family[128];
     unsigned char* data;
     int            len;
+    /* Set when TTF failed to open the blob (e.g. a woff2 that slipped past
+     * the engine-side magic filter - FreeType needs brotli for it). A broken
+     * registration must NOT keep shadowing the family: every later resolve
+     * skips it so the handle falls back to an installed face instead of
+     * returning a NULL face forever (which measures every word as 0 wide and
+     * collapses all the page's text - Pinterest's Pin Sans woff2). */
+    int            broken;
 } sdl_webfont_t;
 
 static sdl_webfont_t s_webfonts[SDL_WEBFONT_MAX];
@@ -1239,7 +1257,7 @@ static unsigned      s_webfont_gen   = 0;
 static int sdl2_webfont_find(const char* tok) {
     int i;
     for(i = 0; i < s_webfont_count; i++)
-        if(strcmp(s_webfonts[i].family, tok) == 0) return i;
+        if(!s_webfonts[i].broken && strcmp(s_webfonts[i].family, tok) == 0) return i;
     return -1;
 }
 
@@ -1563,7 +1581,17 @@ static TTF_Font* sdl_font_faces(sdl_font_t* f, int size, TTF_Font** fb, TTF_Font
         sdl_webfont_t* wfn = &s_webfonts[f->prim.wf];
         SDL_RWops* rw = SDL_RWFromMem(wfn->data, wfn->len);
         face = rw ? TTF_OpenFontRW(rw, SDL_FALSE, size) : NULL;
-        if(!face) { if(rw) SDL_FreeRW(rw); return NULL; }
+        if(!face) {
+            /* Unopenable blob (woff2 without brotli, truncated download):
+             * poison the registration, drop the resolved family list and
+             * re-resolve so an installed face takes over. Without this the
+             * handle returns NULL forever and every measurement of the
+             * family collapses to zero width. */
+            if(rw) SDL_FreeRW(rw);
+            wfn->broken = 1;
+            f->resolved = 0;
+            return sdl_font_faces(f, size, fb, sy, em);
+        }
         f->faces[f->face_count].rw = rw;
     } else {
         face = TTF_OpenFontIndex(f->prim.path, size, f->prim.index);
@@ -2179,30 +2207,58 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
     TinyHttpsRequest* request;
     TinyHttpsResponse* response;
     sdl_http_t* st;
-    int i, n, body_size;
+    int i, n, body_size, attempt;
     const char* body;
     (void)ud;
     if(!url || !resp) return false;
     memset(resp, 0, sizeof(*resp));
 
+    /* Transient TLS failures (a CDN edge whose certificate does not cover the
+     * requested name - BR_ERR_X509_BAD_SERVER_NAME - or a handshake aborted by
+     * a middlebox) fail the whole request, because the connect loop commits
+     * to the first reachable address and never tries the next addrinfo. A
+     * fresh request re-resolves and usually lands on a good edge, so retry
+     * the transport before giving up: taobao's img.alicdn.com icons and card
+     * pictures otherwise stay skeleton-grey for the entire session. Only
+     * transport-level TLS errors retry, and only for idempotent methods. */
+    response = NULL;
+    for(attempt = 0; attempt < 3; attempt++) {
     {
         char safe[4096];
         request = NewHttpsRequest(ek_url_sanitize(url, safe, sizeof(safe)));
     }
     if(!request) return false;
 
-    HttpsRequestSetTimeout(request, 10000);
+    /* WeChat login checkLogin is a ~35s server-held long poll. libtinyhttpsc's
+     * connection_timeout also drives SO_RCVTIMEO, so a 10s ceiling aborts the
+     * poll with EAGAIN before the server can answer. 40s covers the long poll
+     * and stays close to browser behavior; connect uses non-blocking + select
+     * so live hosts still connect in milliseconds. */
+    HttpsRequestSetTimeout(request, 40000);
     HttpsRequestSetMaxRedirections(request, 0);   /* the core follows redirects */
     if(method && method[0] && strcmp(method, "GET") != 0)
         HttpsRequestSetMethod(request, method);   /* copies internally */
-    HttpsRequestAddHeader(request, "User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 MyEwokoBrowser/1.0");
-    HttpsRequestAddHeader(request, "Sec-CH-UA", "\"Chromium\";v=\"152\", \"Not=A?Brand\";v=\"99\", \"MyEwokoBrowser\";v=\"1.0\"");
+    HttpsRequestAddHeader(request, "User-Agent", EWEB_PORT_HTTP_UA);
+    HttpsRequestAddHeader(request, "Sec-CH-UA", EWEB_PORT_HTTP_CH_UA);
     HttpsRequestAddHeader(request, "Sec-CH-UA-Mobile", "?0");
-    HttpsRequestAddHeader(request, "Sec-CH-UA-Platform", "\"Linux\"");
+    HttpsRequestAddHeader(request, "Sec-CH-UA-Platform", "\"" EWEB_PORT_HTTP_UA_PLATFORM "\"");
     for(i = 0; i < req_header_count; i++) {
         if(req_headers[i].key)
             HttpsRequestAddHeader(request, req_headers[i].key,
                                   req_headers[i].value ? req_headers[i].value : "");
+    }
+    if(getenv("EWEB_NETDBG") && strstr(url, "h5api.m.taobao.com")) {
+        fprintf(stderr, "[netdbg] request-headers url=%s\n", url);
+        fprintf(stderr, "[netdbg] request-header User-Agent: %s\n", EWEB_PORT_HTTP_UA);
+        fprintf(stderr, "[netdbg] request-header Sec-CH-UA: %s\n", EWEB_PORT_HTTP_CH_UA);
+        fprintf(stderr, "[netdbg] request-header Sec-CH-UA-Mobile: ?0\n");
+        fprintf(stderr, "[netdbg] request-header Sec-CH-UA-Platform: \"%s\"\n",
+                EWEB_PORT_HTTP_UA_PLATFORM);
+        for(i = 0; i < req_header_count; i++) {
+            if(req_headers[i].key)
+                fprintf(stderr, "[netdbg] request-header %s: %s\n", req_headers[i].key,
+                        req_headers[i].value ? req_headers[i].value : "");
+        }
     }
     /* SendBodyStr copies the payload (default COPY strategy) and the client
      * emits Content-Length itself, so a borrowed pointer is safe here. */
@@ -2211,6 +2267,23 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
 
     response = HttpsRequestFetch(request);
     HttpsRequestFree(request);
+    if(!response) {
+        if(attempt < 2 && (!method || !method[0] || strcmp(method, "GET") == 0))
+            continue;
+        return false;
+    }
+    if(HttpsResponseError(response)) {
+        const char* em = HttpsResponseGetErrorMsg(response);
+        int tls_fail = (em != NULL) && (strstr(em, "tls handshake failed") != NULL);
+        if(tls_fail && attempt < 2 &&
+           (!method || !method[0] || strcmp(method, "GET") == 0)) {
+            HttpsResponseFree(response);
+            response = NULL;
+            continue;
+        }
+    }
+    break;
+    }
     if(!response) return false;
 
     st = (sdl_http_t*)calloc(1, sizeof(sdl_http_t));
@@ -2240,6 +2313,15 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
     resp->body      = (uint8_t*)body;   /* response-owned; freed with it */
     resp->body_size = (body && body_size > 0) ? body_size : 0;
     resp->native    = st;
+    if(getenv("EWEB_NETDBG") && strstr(url, "api.m.jd.com")) {
+        fprintf(stderr, "[netdbg] RESP-HDRS status=%d n=%d url=%.90s\n",
+                resp->status, n, url);
+        for(i = 0; i < n; i++) {
+            if(st->headers[i].key)
+                fprintf(stderr, "[netdbg]   resp-hdr %s: %s\n", st->headers[i].key,
+                        st->headers[i].value ? st->headers[i].value : "");
+        }
+    }
     /* Compressed payload? Inflate into a port-owned buffer and hand THAT to
      * the core; the Content-Encoding header is rewritten to identity so the
      * (key,value) index stays truthful about the bytes we now expose. */

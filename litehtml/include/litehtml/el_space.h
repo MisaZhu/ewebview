@@ -12,5 +12,6 @@ namespace litehtml
 
 		virtual bool	is_white_space() const override;
 		virtual bool	is_break() const override;
+		virtual element::ptr clone_node(bool deep) override;
 	};
 }

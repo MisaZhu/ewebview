@@ -21,6 +21,18 @@ bool litehtml::el_comment::is_comment() const
 	return true;
 }
 
+litehtml::element::ptr litehtml::el_comment::clone_node(bool deep)
+{
+	/* A comment node has no children, so deep and shallow clones are identical.
+	 * Built with malloc + placement-new exactly like litehtml_alloc and
+	 * jsCreateComment, keeping the matching free() on teardown balanced. */
+	void* mem = malloc(sizeof(el_comment));
+	if(!mem) return nullptr;
+	el_comment* c = new (mem) el_comment(m_doc);
+	c->m_text = m_text;
+	return c;
+}
+
 void litehtml::el_comment::set_data( const tchar_t* data )
 {
 	if(data)

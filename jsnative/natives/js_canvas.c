@@ -37,12 +37,22 @@ extern "C" {
 #endif
 
 #include "js_canvas.h"
+#include "js_webgl.h"
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+/* zlib for a real DEFLATE-compressed PNG IDAT (see cv_png_encode). Guarded so a
+ * target without <zlib.h> still builds and falls back to STORED blocks. The host
+ * binary already links -lz, so compress2 resolves at final link. */
+#if defined(__has_include)
+#  if __has_include(<zlib.h>)
+#    include <zlib.h>
+#    define CV_HAVE_ZLIB 1
+#  endif
+#endif
 
 #define CLS_ELEMENT   "Element"
 #define CLS_CTX2D     "CanvasRenderingContext2D"
@@ -3721,24 +3731,47 @@ static int cv_png_encode(cv_buf_t* out, const uint8_t* rgba, int w, int h) {
         rn += rowbytes;
     }
 
-    /* IDAT = zlib(stored-deflate(raw)). */
+    /* IDAT = zlib deflate of `raw`. A real browser emits a COMPRESSED PNG (a
+     * near-blank fingerprint canvas is a few KB); the STORED-block path emitted
+     * w*h*4 bytes (~180 KB at the 300x150 default), ballooning the fp SDK's
+     * canvas+webgl toDataURL strings so its MD5 + MurmurHash3 over the joined
+     * fingerprint ran for tens of seconds and never reached its e(u) callback,
+     * wedging the whole page build inside pc-tk.js. compress2 emits exactly the
+     * zlib-wrapped deflate stream (2-byte header + blocks + Adler-32 trailer) a
+     * PNG IDAT chunk requires; STORED blocks remain the no-zlib fallback. */
     cv_buf_t idat = { NULL, 0, 0 };
-    cv_buf_u8(&idat, 0x78); cv_buf_u8(&idat, 0x01);   /* zlib header, no preset */
-    size_t off = 0;
-    while(off < rn || (off == 0 && rn == 0)) {
-        size_t blk = rn - off;
-        if(blk > 65535) blk = 65535;
-        int final = (off + blk >= rn) ? 1 : 0;
-        cv_buf_u8(&idat, (uint8_t)(final ? 0x01 : 0x00));   /* BFINAL | BTYPE=00 */
-        uint16_t len = (uint16_t)blk, nlen = (uint16_t)(~blk);
-        uint8_t lh[4] = { (uint8_t)(len & 0xFF), (uint8_t)(len >> 8), (uint8_t)(nlen & 0xFF), (uint8_t)(nlen >> 8) };
-        cv_buf_put(&idat, lh, 4);
-        if(blk > 0) cv_buf_put(&idat, raw + off, blk);
-        off += blk;
-        if(rn == 0) break;   /* single empty stored block for a 0-size image */
+    int did_compress = 0;
+#ifdef CV_HAVE_ZLIB
+    {
+        uLongf clen = compressBound((uLong)rn);
+        uint8_t* comp = (uint8_t*)malloc((size_t)(clen ? clen : 1));
+        if(comp != NULL) {
+            if(compress2(comp, &clen, raw, (uLong)rn, Z_DEFAULT_COMPRESSION) == Z_OK) {
+                cv_buf_put(&idat, comp, (size_t)clen);
+                did_compress = 1;
+            }
+            free(comp);
+        }
     }
-    uint32_t adl = cv_adler32(raw, rn);
-    cv_buf_be32(&idat, adl);
+#endif
+    if(!did_compress) {
+        cv_buf_u8(&idat, 0x78); cv_buf_u8(&idat, 0x01);   /* zlib header, no preset */
+        size_t off = 0;
+        while(off < rn || (off == 0 && rn == 0)) {
+            size_t blk = rn - off;
+            if(blk > 65535) blk = 65535;
+            int final = (off + blk >= rn) ? 1 : 0;
+            cv_buf_u8(&idat, (uint8_t)(final ? 0x01 : 0x00));   /* BFINAL | BTYPE=00 */
+            uint16_t len = (uint16_t)blk, nlen = (uint16_t)(~blk);
+            uint8_t lh[4] = { (uint8_t)(len & 0xFF), (uint8_t)(len >> 8), (uint8_t)(nlen & 0xFF), (uint8_t)(nlen >> 8) };
+            cv_buf_put(&idat, lh, 4);
+            if(blk > 0) cv_buf_put(&idat, raw + off, blk);
+            off += blk;
+            if(rn == 0) break;   /* single empty stored block for a 0-size image */
+        }
+        uint32_t adl = cv_adler32(raw, rn);
+        cv_buf_be32(&idat, adl);
+    }
     free(raw);
 
     cv_png_chunk(out, "IDAT", idat.d, idat.n);
@@ -3882,6 +3915,13 @@ static var_t* gl_recon_get(vm_t* vm, var_t* env, void* data) {
     return var_new_native_func(vm, gl_recon_method, (void*)glrecon_intern(k));
 }
 
+/* True for the WebGL context ids every real browser accepts. */
+static int is_webgl_id(const char* type) {
+    if(type == NULL) return 0;
+    return !strcmp(type, "webgl") || !strcmp(type, "experimental-webgl") ||
+           !strcmp(type, "moz-webgl") || !strcmp(type, "webkit-3d");
+}
+
 static var_t* make_gl_recon_proxy(vm_t* vm) {
     /* Brand realism: a fingerprinter typically validates the context with
      * Object.prototype.toString.call(gl) === '[object WebGLRenderingContext]'
@@ -3946,11 +3986,13 @@ static var_t* js_el_getContext(vm_t* vm, var_t* env, void* data) {
     const char* type = get_str(env, "type");
     if(getenv("EWEB_CTXDBG") != NULL)
         fprintf(stderr, "[ctxdbg] getContext type='%s'\n", (type != NULL) ? type : "(null)");
-    if(type != NULL && type[0] != 0 && strcmp(type, "2d") != 0) {
-        if(getenv("EWEB_GLRECON") != NULL && strstr(type, "webgl") != NULL)
-            return make_gl_recon_proxy(vm);
+    int webgl = is_webgl_id(type);
+    if(type != NULL && type[0] != 0 && strcmp(type, "2d") != 0 && !webgl) {
+        /* Unknown context id -> null per spec. */
         return var_new_null(vm);
     }
+    if(webgl && getenv("EWEB_GLRECON") != NULL)
+        return make_gl_recon_proxy(vm);   /* diagnostic-only logging proxy */
 
     int w = el_int_attr(st, el, "width", 300);
     int h = el_int_attr(st, el, "height", 150);
@@ -3970,6 +4012,15 @@ static var_t* js_el_getContext(vm_t* vm, var_t* env, void* data) {
     void* canvas = st->cb.canvas_create(st->ctx, id, w, h);
     if(id != idbuf && id != NULL) mario_free((void*)id);
     if(canvas == NULL) return var_new_null(vm);
+
+    /* WebGL path: build a real software GL context whose framebuffer flushes
+     * into the SAME embedder canvas handle, so toDataURL()/compositing read the
+     * genuinely rasterised pixels. `t` is the <canvas> Element var (gl.canvas). */
+    if(webgl) {
+        if(st->cb.set_pixel == NULL) return var_new_null(vm);
+        return js_webgl_create_context(vm, w, h, st->ctx, canvas,
+                                       (webgl_set_pixel_fn)st->cb.set_pixel, t);
+    }
 
     js_canvas_ctx* cv = ctx_for_canvas(st, canvas, w, h);
     if(cv == NULL) return var_new_null(vm);
@@ -4025,6 +4076,10 @@ bool js_register_canvas_natives(vm_t* vm, void* ctx, const js_canvas_callbacks_t
     var_t* bridge = var_new_obj_no_proto(vm, st, canvas_state_free);
     if(bridge == NULL) { mario_free(st); return false; }
     var_add(vm->root, CANVAS_BRIDGE_KEY, bridge);
+
+    /* Build + pin the WebGL classes so getContext('webgl') can hand back a real
+     * software-backed WebGLRenderingContext (see js_webgl.h). */
+    js_webgl_register(vm);
 
     /* ---- CanvasRenderingContext2D ---- */
     var_t* ctx_cls = vm_new_class(vm, CLS_CTX2D);

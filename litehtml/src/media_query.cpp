@@ -356,14 +356,31 @@ litehtml::media_query::ptr litehtml::media_query::create_from_string(const tstri
 									expr.val = (int) (length.val() * 2.54);
 								} else if(length.units() == css_units_dpi)
 								{
-									expr.val = (int) (length.val() * 2.54);
+									/* features.resolution is DPI: a dpi value is
+									 * already in the target unit (the old *2.54
+									 * here turned 192dpi into 487 and broke every
+									 * retina media query). */
+									expr.val = (int) length.val();
 								} else
 								{
-									if(doc)
+									/* dppx / x are not css_length units; convert
+									 * them to DPI like media_range_value does. */
+									tstring rv = expr_tokens[1];
+									trim(rv);
+									if(rv.length() > 4 && rv.compare(rv.length() - 4, 4, _t("dppx")) == 0)
 									{
-										doc->cvt_units(length, doc->container()->get_default_font_size());
+										expr.val = (int) (t_strtod(rv.substr(0, rv.length() - 4).c_str(), 0) * 96.0);
+									} else if(rv.length() > 1 && rv[rv.length() - 1] == _t('x') && rv[rv.length() - 2] != _t('p'))
+									{
+										expr.val = (int) (t_strtod(rv.substr(0, rv.length() - 1).c_str(), 0) * 96.0);
+									} else
+									{
+										if(doc)
+										{
+											doc->cvt_units(length, doc->container()->get_default_font_size());
+										}
+										expr.val = (int) length.val();
 									}
-									expr.val = (int) length.val();
 								}
 							}
 						}

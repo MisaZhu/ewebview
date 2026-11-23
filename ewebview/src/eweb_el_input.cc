@@ -478,7 +478,8 @@ void eweb_el_input::chooseActiveOption()
 void eweb_el_input::setRangeFromX(int localX)
 {
     if(m_inputType != EWEB_INPUT_RANGE) return;
-    int w = m_pos.width;
+    /* localX is border-box local; the track spans the border box. */
+    int w = m_pos.width + m_padding.width() + m_borders.width();
     if(w <= 0) return;
     double f = (double)localX / (double)w;
     if(f < 0.0) f = 0.0;
@@ -609,8 +610,11 @@ bool eweb_el_input::spinnerHit(int localX, int localY, int* dir)
 {
     if(!isNumberInput()) return false;
     /* Mirror the geometry draw() uses for the UA spinner column so hit-test
-     * and paint can never disagree. localX/localY are border-box local. */
+     * and paint can never disagree. localX/localY are border-box local;
+     * get_placement() is the content box, so grow it over the chrome. */
     litehtml::position pos = ((litehtml::element*)this)->get_placement();
+    pos += m_padding;
+    pos += m_borders;
     int ir = m_padding.right + m_borders.right;
     int sx = pos.width - ir - 9;
     if(localX < sx || localX > sx + 7) return false;
@@ -988,25 +992,8 @@ void eweb_el_input::get_content_size(litehtml::size& sz, int max_width)
         sz.height = 0;
         break;
     }
-    /* sz is the CONTENT box here; render() folds in the page padding/borders
-     * (extra_box_size) before assigning m_pos, which is the border box. */
-}
-
-void eweb_el_input::extra_box_size(int& w, int& h) const
-{
-    switch (m_inputType) {
-    case EWEB_INPUT_TEXT:
-    case EWEB_INPUT_TEXTAREA:
-    case EWEB_INPUT_BUTTON:
-    case EWEB_INPUT_SELECT:
-    case EWEB_INPUT_RANGE:
-        break;
-    default:
-        /* checkbox/radio/hidden keep their fixed UA chrome */
-        return;
-    }
-    w += m_padding.left + m_padding.right + m_borders.left + m_borders.right;
-    h += m_padding.top + m_padding.bottom + m_borders.top + m_borders.bottom;
+    /* sz is the CONTENT box; render() stores it in m_pos verbatim (the
+     * engine content-box convention) and draw() expands over the chrome. */
 }
 
 bool eweb_el_input::styled_horizontal() const
@@ -1232,28 +1219,19 @@ void eweb_el_input::draw_page_box(litehtml::uint_ptr hdc, int x, int y, const li
     litehtml::position pos = m_pos;
     pos.x += x;
     pos.y += y;
-    if (clip && !pos.does_intersect(clip)) {
+    /* m_pos is the CONTENT box: init_background_paint takes it verbatim and
+     * re-adds padding+borders for the border box (mirrors el_image::draw).
+     * The widget chrome / segment fill below need the border box itself. */
+    litehtml::position bb = pos;
+    bb += m_padding;
+    bb += m_borders;
+    if (clip && !bb.does_intersect(clip)) {
         return;
     }
-    /* Mirrors el_image::draw, but m_pos here is already the BORDER box (the
-     * intrinsic size folds in padding+borders), so init_background_paint -
-     * which treats its argument as the CONTENT box and re-adds them - gets the
-     * shrunk content rect, and the border box is m_pos verbatim. Adding them
-     * again painted every styled control a padding+border slab taller than its
-     * layout box, which bled into the next flex-wrap line. */
-    int bx = m_padding.left + m_borders.left + m_padding.right + m_borders.right;
-    int by = m_padding.top + m_borders.top + m_padding.bottom + m_borders.bottom;
     const litehtml::background* bg = get_background();
     if (bg) {
-        litehtml::position content = pos;
-        content.x += m_padding.left + m_borders.left;
-        content.y += m_padding.top + m_borders.top;
-        content.width -= bx;
-        content.height -= by;
-        if (content.width < 0) content.width = 0;
-        if (content.height < 0) content.height = 0;
         litehtml::background_paint bg_paint;
-        init_background_paint(content, bg_paint, bg);
+        init_background_paint(pos, bg_paint, bg);
         /* A rounded overflow clip (.segmented{border-radius;overflow:hidden})
          * must round the corners of a child background that touch the clip's
          * corners: the HAL clip is rectangular, so without this the active
@@ -1266,13 +1244,13 @@ void eweb_el_input::draw_page_box(litehtml::uint_ptr hdc, int x, int y, const li
             /* Only a control that spans the clip's full height and touches a
              * rounded side is a segment of that clip; a small chip centred
              * inside a rounded card must keep its own square fill. */
-            bool spans_v = (pos.height >= cr.height - 2);
-            bool round_l = spans_v && (pos.x <= cr.x + 1);
-            bool round_r = spans_v && (pos.right() >= cr.right() - 1);
+            bool spans_v = (bb.height >= cr.height - 2);
+            bool round_l = spans_v && (bb.x <= cr.x + 1);
+            bool round_r = spans_v && (bb.right() >= cr.right() - 1);
             bool tl = round_l, bl = round_l, tr = round_r, br = round_r;
             if (tl || tr || bl || br) {
                 int r = crad;
-                int half = (pos.width < cr.height ? pos.width : cr.height) / 2;
+                int half = (bb.width < cr.height ? bb.width : cr.height) / 2;
                 if (r > half) r = half;
                 uint32_t col = ((uint32_t)bg_paint.color.alpha << 24) |
                                ((uint32_t)bg_paint.color.red << 16) |
@@ -1286,14 +1264,14 @@ void eweb_el_input::draw_page_box(litehtml::uint_ptr hdc, int x, int y, const li
                  * corners and the r x r square added back at a corner restores
                  * a square corner there. */
                 if (gfx->fill_round)
-                    gfx->fill_round(gfx->ud, s, pos.x, cr.y, pos.width, cr.height, r, col);
+                    gfx->fill_round(gfx->ud, s, bb.x, cr.y, bb.width, cr.height, r, col);
                 else if (gfx->fill_rect)
-                    gfx->fill_rect(gfx->ud, s, pos.x, cr.y, pos.width, cr.height, col);
+                    gfx->fill_rect(gfx->ud, s, bb.x, cr.y, bb.width, cr.height, col);
                 if (gfx->fill_rect) {
-                    if (!tl) gfx->fill_rect(gfx->ud, s, pos.x, cr.y, r, r, col);
-                    if (!tr) gfx->fill_rect(gfx->ud, s, pos.x + pos.width - r, cr.y, r, r, col);
-                    if (!bl) gfx->fill_rect(gfx->ud, s, pos.x, cr.y + cr.height - r, r, r, col);
-                    if (!br) gfx->fill_rect(gfx->ud, s, pos.x + pos.width - r, cr.y + cr.height - r, r, r, col);
+                    if (!tl) gfx->fill_rect(gfx->ud, s, bb.x, cr.y, r, r, col);
+                    if (!tr) gfx->fill_rect(gfx->ud, s, bb.x + bb.width - r, cr.y, r, r, col);
+                    if (!bl) gfx->fill_rect(gfx->ud, s, bb.x, cr.y + cr.height - r, r, r, col);
+                    if (!br) gfx->fill_rect(gfx->ud, s, bb.x + bb.width - r, cr.y + cr.height - r, r, r, col);
                 }
                 filled = true;
             }
@@ -1301,8 +1279,8 @@ void eweb_el_input::draw_page_box(litehtml::uint_ptr hdc, int x, int y, const li
         if (!filled) doc->container()->draw_background(hdc, bg_paint);
     }
     litehtml::borders bdr = m_css_borders;
-    bdr.radius = m_css_borders.radius.calc_percents(pos.width, pos.height);
-    doc->container()->draw_borders(hdc, bdr, pos, false);
+    bdr.radius = m_css_borders.radius.calc_percents(bb.width, bb.height);
+    doc->container()->draw_borders(hdc, bdr, bb, false);
 }
 
 /* The computed 'color' of the control as HAL ARGB. */
@@ -1348,14 +1326,28 @@ void eweb_el_input::draw(litehtml::uint_ptr hdc, int x, int y, const litehtml::p
     if (get_opacity_cum() <= 0.004f) {
         return;
     }
+    /* clip:rect(1px,1px,1px,1px) - WebUploader's .webuploader-element-invisible
+     * file input - leaves no visible region; mirror html_tag::draw's gate so
+     * the widget face/text never paints (the null-box artifact). */
+    if (css_clip_hides_all(x, y)) {
+        return;
+    }
     const eweb_gfx_t* gfx = &m_port->gfx;
 
     litehtml::position pos = m_pos;
     pos.x += x;
     pos.y += y;
+    /* m_pos is the CONTENT box (engine convention); the widget face paints
+     * the BORDER box, so expand over padding+borders exactly like el_image. */
+    pos += m_padding;
+    pos += m_borders;
     if (clip && !pos.does_intersect(clip)) {
         return;
     }
+    /* Partial clip:rect() regions constrain the widget paint exactly like the
+     * normal box path; pushed after the early-out so every return above stays
+     * clip-neutral. */
+    bool css_clipped = push_css_clip(hdc, x, y);
 
     switch (m_inputType) {
     case EWEB_INPUT_TEXT:
@@ -1661,12 +1653,18 @@ void eweb_el_input::draw(litehtml::uint_ptr hdc, int x, int y, const litehtml::p
     default:
         break;
     }
+    if (css_clipped) {
+        get_document()->container()->del_clip();
+    }
 }
 
 void eweb_el_input::draw_stacking_context(litehtml::uint_ptr hdc, int x, int y, const litehtml::position* clip, bool with_positioned)
 {
     if (container_mode()) {
         litehtml::html_tag::draw_stacking_context(hdc, x, y, clip, with_positioned);
+        return;
+    }
+    if (css_clip_hides_all(x, y)) {
         return;
     }
     /* Replaced control: draw() paints the whole widget, label included. A
@@ -1757,10 +1755,26 @@ int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
 
     document* doc = get_document();
 
+    /* m_pos follows the engine CONTENT-box convention, exactly like el_image:
+     * size = content edges, origin shifted by content_margins (margin+padding+
+     * border) below, render() returns the OUTER width. The old border-box m_pos
+     * broke every engine consumer that assumes content: line_box::add_element
+     * placed the content origin one padding+border too far right and consumed
+     * width() (which re-adds the chrome) double-counted, and draw_page_box's
+     * init_background_paint re-expanded the already-border box by the chrome
+     * again (wx's 214px+30px-padding search field painted 274px wide). */
+    const int chrome_w = m_padding.width() + m_borders.width();
+    const int chrome_h = m_padding.height() + m_borders.height();
+    const bool bb_sizing = (m_box_sizing == litehtml::box_sizing_border_box);
+    /* A specified width/height names the border edge under border-box sizing;
+     * m_pos stores the content edge, so fold the chrome out of it. */
+    auto spec_to_content = [&](int v, int chrome) {
+        if (bb_sizing) v -= chrome;
+        return v < 0 ? 0 : v;
+    };
+
     litehtml::size sz;
-    get_content_size(sz, max_width);
-    /* content box -> border box (the page padding/borders the widget draws) */
-    extra_box_size(sz.width, sz.height);
+    get_content_size(sz, max_width);   /* CONTENT size (no chrome fold) */
 
     m_pos.width = sz.width;
     m_pos.height = sz.height;
@@ -1772,7 +1786,8 @@ int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
 
         if (!m_css_max_width.is_predefined())
         {
-            int max_width_val = doc->cvt_units(m_css_max_width, m_font_size, parent_width);
+            int max_width_val = spec_to_content(
+                doc->cvt_units(m_css_max_width, m_font_size, parent_width), chrome_w);
             if (m_pos.width > max_width_val)
             {
                 m_pos.width = max_width_val;
@@ -1781,7 +1796,8 @@ int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
 
         if (!m_css_max_height.is_predefined())
         {
-            int max_height = doc->cvt_units(m_css_max_height, m_font_size);
+            int max_height = spec_to_content(
+                doc->cvt_units(m_css_max_height, m_font_size), chrome_h);
             if (m_pos.height > max_height)
             {
                 m_pos.height = max_height;
@@ -1794,10 +1810,12 @@ int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
         {
             m_pos.height = (int)m_css_height.val();
         }
+        m_pos.height = border_box_content_height(m_pos.height);
 
         if (!m_css_max_height.is_predefined())
         {
-            int max_height = doc->cvt_units(m_css_max_height, m_font_size);
+            int max_height = spec_to_content(
+                doc->cvt_units(m_css_max_height, m_font_size), chrome_h);
             if (m_pos.height > max_height)
             {
                 m_pos.height = max_height;
@@ -1810,11 +1828,13 @@ int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
     }
     else if (m_css_height.is_predefined() && !m_css_width.is_predefined())
     {
-        m_pos.width = (int)m_css_width.calc_percent(parent_width);
+        m_pos.width = spec_to_content(
+            (int)m_css_width.calc_percent(parent_width), chrome_w);
 
         if (!m_css_max_width.is_predefined())
         {
-            int max_width_val = doc->cvt_units(m_css_max_width, m_font_size, parent_width);
+            int max_width_val = spec_to_content(
+                doc->cvt_units(m_css_max_width, m_font_size, parent_width), chrome_w);
             if (m_pos.width > max_width_val)
             {
                 m_pos.width = max_width_val;
@@ -1827,16 +1847,19 @@ int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
     }
     else
     {
-        m_pos.width = (int)m_css_width.calc_percent(parent_width);
+        m_pos.width = spec_to_content(
+            (int)m_css_width.calc_percent(parent_width), chrome_w);
         m_pos.height = 0;
         if (!get_predefined_height(m_pos.height))
         {
             m_pos.height = (int)m_css_height.val();
         }
+        m_pos.height = border_box_content_height(m_pos.height);
 
         if (!m_css_max_height.is_predefined())
         {
-            int max_height = doc->cvt_units(m_css_max_height, m_font_size);
+            int max_height = spec_to_content(
+                doc->cvt_units(m_css_max_height, m_font_size), chrome_h);
             if (m_pos.height > max_height)
             {
                 m_pos.height = max_height;
@@ -1845,7 +1868,8 @@ int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
 
         if (!m_css_max_width.is_predefined())
         {
-            int max_width_val = doc->cvt_units(m_css_max_width, m_font_size, parent_width);
+            int max_width_val = spec_to_content(
+                doc->cvt_units(m_css_max_width, m_font_size, parent_width), chrome_w);
             if (m_pos.width > max_width_val)
             {
                 m_pos.width = max_width_val;
@@ -1855,41 +1879,22 @@ int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
 
     calc_auto_margins(parent_width);
 
-    /* m_pos is the BORDER box: draw() paints the widget face straight from it
-     * and draw_page_box shrinks it back to the content box for backgrounds.
-     * Offsetting by content_margins (margin+padding+border) instead of the
-     * margins alone shifted every control right/down by its own padding and
-     * broke alignment with non-replaced flex siblings (seed-row dice). */
-    m_pos.x += margin_left();
-    m_pos.y += margin_top();
-
-    /* content-box sizing: a specified width/height names the content edge,
-     * so the border box (m_pos) must add the chrome back. border-box (the
-     * common page default) and intrinsic sizes already include it. */
-    if (m_box_sizing == litehtml::box_sizing_content_box) {
-        if (!m_css_width.is_predefined()) {
-            m_pos.width += m_padding.width() + m_borders.width();
-        }
-        if (!m_css_height.is_predefined()) {
-            m_pos.height += m_padding.height() + m_borders.height();
-        }
-    }
+    /* Content-box origin: shift over margin+padding+border, same as el_image
+     * and html_tag::render_box. draw() expands m_pos back to the border box
+     * for the widget face; the engine's line/float placement and the rect
+     * bridges all read the content box. */
+    m_pos.x += content_margins_left();
+    m_pos.y += content_margins_top();
 
     /* CSS min-height floors the field (gestalt TextField
      * .md_input_height_1d{min-height:36px}): the branches above only honour
      * max-height, so a field with no explicit height collapsed to the
      * intrinsic 24px line and its absolutely-positioned helper/escapes
-     * overlapped the next row. m_pos is the border box here, so a content-box
-     * min-height (which names the content edge) carries the chrome in its
-     * floor; border-box declarations compare against m_pos directly. */
+     * overlapped the next row. m_pos is the content box, so a border-box
+     * min-height (which names the border edge) folds the chrome out. */
     if (!m_css_min_height.is_predefined() &&
         m_css_min_height.units() != litehtml::css_units_percentage) {
-        int min_box = (int)m_css_min_height.val();
-        if (m_box_sizing == litehtml::box_sizing_content_box) {
-            /* m_pos is the border box here; a content-box min-height names
-             * the content edge, so the floor carries the chrome. */
-            min_box += m_padding.height() + m_borders.height();
-        }
+        int min_box = spec_to_content((int)m_css_min_height.val(), chrome_h);
         if (m_pos.height < min_box) {
             m_pos.height = min_box;
         }
@@ -1901,10 +1906,10 @@ int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
      * each non-text child a box centred in the content box, honouring its own
      * CSS width/height (the 16px dice glyph). */
     if (m_inputType == EWEB_INPUT_BUTTON) {
-        int bx = m_pos.x + m_padding.left + m_borders.left;
-        int by = m_pos.y + m_padding.top + m_borders.top;
-        int bw = m_pos.width - m_padding.width() - m_borders.width();
-        int bh = m_pos.height - m_padding.height() - m_borders.height();
+        int bx = m_pos.x;
+        int by = m_pos.y;
+        int bw = m_pos.width;
+        int bh = m_pos.height;
         for (int i = 0; i < (int)get_children_count(); i++) {
             litehtml::element::ptr ch = get_child(i);
             if (!ch || !ch->get_tagName() || t_strcasecmp(ch->get_tagName(), _t("svg"))) continue;
@@ -1915,7 +1920,7 @@ int eweb_el_input::render(int x, int y, int max_width, bool second_pass)
         }
     }
 
-    return m_pos.width + margin_left() + margin_right();
+    return m_pos.width + content_margins_left() + content_margins_right();
 }
 
 void eweb_el_input::parse_styles(bool is_reparse)

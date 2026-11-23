@@ -369,11 +369,20 @@ video {
 /* HTML5 static-rendering defaults. Elements whose payload needs decoders or
    scripting this browser lacks are hidden instead of spilling fallback markup
    or raw text into the flow. <svg> has a native renderer (el_svg), and
-   <canvas>/<noscript> keep their (correct no-JS) fallback content. */
-template, dialog, math, audio, iframe,
+   <canvas>/<noscript> keep their (correct no-JS) fallback content. <iframe>
+   is NOT hidden: el_iframe renders its src document statically (Fix20). */
+template, dialog, math, audio,
 frame, frameset, noframes, embed, object, applet, portal,
 source, track {
 	display: none;
+}
+
+/* HTML default iframe: a 300x150 replaced box; author CSS (width/height)
+   overrides it through the el_image sizing cascade. */
+iframe {
+	display: inline-block;
+	width: 300px;
+	height: 150px;
 }
 
 dialog[open] {

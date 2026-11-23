@@ -114,6 +114,17 @@ typedef struct js_dom_callbacks {
     char* (*el_get_attr)(void* ctx, js_element_t el, const char* name);
     void  (*el_set_attr)(void* ctx, js_element_t el, const char* name, const char* value);
     char* (*el_get_tag)(void* ctx, js_element_t el);
+    /* Decoded intrinsic size for HTMLImageElement.naturalWidth/naturalHeight.
+     * Zero dimensions mean that no decoded bitmap is available yet. OPTIONAL:
+     * image properties degrade to zero / incomplete when this is NULL. */
+    void  (*el_get_image_size)(void* ctx, js_element_t el, int* w, int* h);
+
+    /* Contenteditable caret geometry: insertion-point rect at `offset`
+     * (UTF-16 code units for text nodes, child index for containers), in
+     * LAYOUT document coordinates like el_get_rect; width 0 marks the bar.
+     * OPTIONAL: NULL reports no caret (the native returns null). */
+    bool  (*el_caret_rect)(void* ctx, js_element_t el, int offset,
+                           int* x, int* y, int* w, int* h);
 
     /* Handle-liveness gate. A JS Element wrapper can outlive the node it wraps:
      * the embedder frees the element (innerHTML replacement, a document
@@ -200,6 +211,14 @@ typedef struct js_dom_callbacks {
 
     void (*el_remove_attr)(void* ctx, js_element_t el, const char* name);
 
+    /* HTMLScriptElement.async needs one bit of state beyond the content
+     * attribute: a dynamically-created script is async by default, while an
+     * explicit `.async=false` removes the attribute yet makes its execution
+     * ordered. The getter returns -1 when no dynamic override is known, 0/1
+     * otherwise. OPTIONAL: NULL falls back to attribute presence. */
+    int  (*el_get_script_async)(void* ctx, js_element_t el);
+    void (*el_set_script_async)(void* ctx, js_element_t el, bool async);
+
     /* ---- geometry / computed style / focus ---- */
 
     /* Border box in document coordinates (the same space the embedder
@@ -266,6 +285,19 @@ typedef struct js_dom_callbacks {
      * as opposed to the viewport box el_get_rect reports for it. OPTIONAL:
      * without it scroll* on the scrolling element fall back to el_rect. */
     void  (*get_document_size)(void* ctx, int* w, int* h);
+    /* Element-level scrolling (overflow:auto/scroll containers). el_scroll_get
+     * reports the live offset (scrollTop/scrollLeft); el_scroll_set clamps to
+     * the content extent, moves the box and returns true when it changed (the
+     * bridge then fires the element's "scroll" event); el_scroll_extent reports
+     * scrollWidth/scrollHeight (never below the client box). OPTIONAL: without
+     * them scrollTop/Left read 0 and writes are no-ops, as before. */
+    void  (*el_scroll_get)(void* ctx, js_element_t el, int* x, int* y);
+    bool  (*el_scroll_set)(void* ctx, js_element_t el, int x, int y);
+    void  (*el_scroll_extent)(void* ctx, js_element_t el, int* w, int* h);
+    /* Whole-document scroll (window.scrollTo semantics): scrollTop/Left writes
+     * on the scrolling element (html/body) route here instead of the element
+     * hooks. OPTIONAL: without it those writes are no-ops. */
+    void  (*scroll_to)(void* ctx, int x, int y);
 } js_dom_callbacks_t;
 
 /* Register `document`, `window`, `alert`, the timers and the Element class

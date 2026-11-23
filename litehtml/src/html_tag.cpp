@@ -7,6 +7,7 @@
 #include "stylesheet.h"
 #include "table.h"
 #include <algorithm>
+#include <set>
 #include <unordered_map>
 #include <locale>
 #include <new>
@@ -60,6 +61,33 @@ static int floatprune_stats_enabled(void)
 		s = (getenv("EWEB_FLOATPRUNE_STATS") != NULL) ? 1 : 0;
 		if (s) atexit(floatprune_stats_report);
 	}
+	return s;
+}
+
+/* Vertical viewport-cull statistics (EWEB_VPCULL_STATS=1): counts, per
+ * process, the in-flow child boxes skipped because they lie entirely
+ * outside the visible document band vs those drawn. EWEB_VPCULL_OFF=1
+ * disables the cull (restores the unconditional walk). */
+static uint64_t g_vpcull_drawn = 0, g_vpcull_culled = 0;
+static void vpcull_stats_report(void)
+{
+	fprintf(stderr, "[vpcull] drawn=%llu culled=%llu\n",
+		(unsigned long long)g_vpcull_drawn, (unsigned long long)g_vpcull_culled);
+}
+static int vpcull_stats_enabled(void)
+{
+	static int s = -1;
+	if (s < 0)
+	{
+		s = (getenv("EWEB_VPCULL_STATS") != NULL) ? 1 : 0;
+		if (s) atexit(vpcull_stats_report);
+	}
+	return s;
+}
+static int vpcull_off(void)
+{
+	static int s = -1;
+	if (s < 0) s = (getenv("EWEB_VPCULL_OFF") != NULL) ? 1 : 0;
 	return s;
 }
 
@@ -193,6 +221,8 @@ struct own_style_refs
 	litehtml::tstring text_decoration;
 	litehtml::tstring position;
 	litehtml::tstring overflow;
+	litehtml::tstring overflow_x;
+	litehtml::tstring overflow_y;
 	litehtml::tstring display;
 	litehtml::tstring box_sizing;
 	litehtml::tstring text_align;
@@ -243,6 +273,8 @@ static own_style_refs collect_own_style_refs(const litehtml::style& style)
 			break;
 		case 'o':
 			if(!t_strcmp(name, _t("overflow"))) refs.overflow = value;
+			else if(!t_strcmp(name, _t("overflow-x"))) refs.overflow_x = value;
+			else if(!t_strcmp(name, _t("overflow-y"))) refs.overflow_y = value;
 			break;
 		case 'p':
 			if(!t_strcmp(name, _t("position"))) refs.position = value;
@@ -406,6 +438,8 @@ litehtml::html_tag::html_tag(litehtml::document* doc) : litehtml::element(doc)
 	m_has_css_clip			= false;
 	m_has_css_clip_path		= false;
 	m_overflow				= overflow_visible;
+	m_scroll_x				= 0;
+	m_scroll_y				= 0;
 	m_box					= 0;
 	m_text_align			= text_align_left;
 	m_text_transform		= text_transform_none;
@@ -2748,6 +2782,21 @@ void litehtml::html_tag::expand_css_functions()
 void litehtml::html_tag::parse_styles(bool is_reparse)
 {
 	document* step_doc = get_document();
+	if(getenv("EWEB_BGDBG") != nullptr)
+	{
+		const tchar_t* dbg_style = get_attr(_t("style"));
+		if(dbg_style && strstr(dbg_style, "background-image"))
+		{
+			const tchar_t* cls = get_attr(_t("class"));
+			fprintf(stderr, "[BGDBG] styles-enter tag=%s class=%s reparse=%d fast=%d phase=%d stamp=%llu epoch=%llu done=%d style=%s\n",
+				get_tagName(), cls ? cls : "", is_reparse ? 1 : 0,
+				step_doc && step_doc->is_fast_mode() ? 1 : 0,
+				step_doc ? step_doc->style_step_phase() : -1,
+				(unsigned long long)m_step_stamp,
+				(unsigned long long)(step_doc ? step_doc->style_step_epoch() : 0),
+				m_step_done ? 1 : 0, dbg_style);
+		}
+	}
 	bool step_parse = (!is_reparse && step_doc && step_doc->style_step_phase() == 2);
 	if(step_parse)
 	{
@@ -2763,6 +2812,9 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 			 * O(path length) instead of O(tree). */
 			if(m_step_done)
 			{
+				const tchar_t* dbg_style = getenv("EWEB_BGDBG") ? get_attr(_t("style")) : nullptr;
+				if(dbg_style && strstr(dbg_style, "background-image"))
+					fprintf(stderr, "[BGDBG] styles-early reason=step-done tag=%s\n", get_tagName());
 				return;
 			}
 			for(auto& el : m_children)
@@ -2781,6 +2833,9 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		{
 			/* Slice exhausted before this element: leave it for the next chunk.
 			 * Cache stays warm; the resume pass clears it when work is done. */
+			const tchar_t* dbg_style = getenv("EWEB_BGDBG") ? get_attr(_t("style")) : nullptr;
+			if(dbg_style && strstr(dbg_style, "background-image"))
+				fprintf(stderr, "[BGDBG] styles-early reason=step-exhausted tag=%s\n", get_tagName());
 			return;
 		}
 	}
@@ -2871,6 +2926,30 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		own_overflow = _t("hidden");
 	}
 	m_overflow		= (overflow)			value_index((own_overflow && t_strcasecmp(own_overflow, _t("inherit"))) ? own_overflow : _t("visible"),		overflow_strings,			overflow_visible);
+	/* overflow-x / overflow-y longhands: the shorthand above sets both axes,
+	 * a longhand overrides its own axis (wx's chat pane is overflow-y:auto +
+	 * overflow-x:hidden, its contact modal overflow-y:scroll - parsing only
+	 * the shorthand left those boxes overflow:visible and unscrollable).
+	 * css-overflow-3: a visible axis paired with a non-visible one computes
+	 * to auto. The single m_overflow keeps the strongest axis. */
+	{
+		const tchar_t* own_ovx = own_style_ref_ptr(own_refs.overflow_x);
+		const tchar_t* own_ovy = own_style_ref_ptr(own_refs.overflow_y);
+		if(own_ovx || own_ovy)
+		{
+			overflow vx = m_overflow, vy = m_overflow;
+			if(own_ovx && t_strcasecmp(own_ovx, _t("inherit")))
+				vx = (overflow)value_index(!t_strcasecmp(own_ovx, _t("clip")) ? _t("hidden") : own_ovx, overflow_strings, overflow_visible);
+			if(own_ovy && t_strcasecmp(own_ovy, _t("inherit")))
+				vy = (overflow)value_index(!t_strcasecmp(own_ovy, _t("clip")) ? _t("hidden") : own_ovy, overflow_strings, overflow_visible);
+			if(vx == overflow_visible && vy != overflow_visible) vx = overflow_auto;
+			if(vy == overflow_visible && vx != overflow_visible) vy = overflow_auto;
+			m_overflow = (vx == overflow_scroll || vy == overflow_scroll) ? overflow_scroll :
+			             (vx == overflow_auto   || vy == overflow_auto)   ? overflow_auto :
+			             (vx == overflow_hidden || vy == overflow_hidden) ? overflow_hidden :
+			             overflow_visible;
+		}
+	}
 	/* css-overflow-3 §3.3: the root's overflow - or <body>'s when the root is
 	 * visible - propagates to the viewport and the element's own used value
 	 * becomes visible. The shell scrolls the viewport itself, so the propagated
@@ -3158,6 +3237,8 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 
 	if(m_style.empty())
 	{
+		if(style && getenv("EWEB_BGDBG") && strstr(style, "background-image"))
+			fprintf(stderr, "[BGDBG] styles-early reason=empty tag=%s style=%s\n", get_tagName(), style);
 		m_css_text_indent.fromString(_t("0"), _t("0"));
 		css_length_set_predef0(m_css_width);
 		css_length_set_predef0(m_css_height);
@@ -3266,6 +3347,8 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 
 	if(doc->is_fast_mode() && !is_reparse)
 	{
+		if(style && getenv("EWEB_BGDBG") && strstr(style, "background-image"))
+			fprintf(stderr, "[BGDBG] styles-early reason=fast tag=%s style=%s\n", get_tagName(), style);
 		css_length_set_zero(m_css_text_indent);
 		css_length_set_predef0(m_css_width);
 		css_length_set_predef0(m_css_height);
@@ -3918,6 +4001,12 @@ void litehtml::html_tag::parse_styles(bool is_reparse)
 		part_start = sys_tic_ms(0);
 	}
 
+	if(getenv("EWEB_BGDBG") != nullptr)
+	{
+		const tchar_t* dbg_style = get_attr(_t("style"));
+		if(dbg_style && strstr(dbg_style, "background-image"))
+			fprintf(stderr, "[BGDBG] before-background tag=%s style=%s\n", get_tagName(), dbg_style);
+	}
 	parse_background();
 	if(profile_enabled)
 	{
@@ -4129,6 +4218,34 @@ int litehtml::html_tag::get_base_line()
 		bl = m_boxes.back()->baseline() + content_margins_bottom();
 	}
 	return bl;
+}
+
+bool litehtml::html_tag::get_caret_rect(int offset, position& rect)
+{
+	/* Container insertion point: `offset` indexes childNodes. Land on the
+	 * addressed child's left edge; past the last child, the right edge of
+	 * the last laid-out child (an empty host falls back to its own box). */
+	int n = get_children_count();
+	if(n <= 0)
+		return element::get_caret_rect(offset, rect);
+	if(offset >= n)
+	{
+		element::ptr last = get_child(n - 1);
+		if(last && last->get_display() != display_none)
+		{
+			rect = last->get_placement_layout();
+			rect.x += rect.width;
+			rect.width = 0;
+			return true;
+		}
+		return element::get_caret_rect(offset, rect);
+	}
+	if(offset < 0) offset = 0;
+	element::ptr ch = get_child(offset);
+	if(!ch) return element::get_caret_rect(offset, rect);
+	rect = ch->get_placement_layout();
+	rect.width = 0;
+	return true;
 }
 
 void litehtml::html_tag::init()
@@ -5882,6 +5999,13 @@ int litehtml::html_tag::find_next_line_top( int top, int width, int def_right )
 
 void litehtml::html_tag::parse_background()
 {
+	if(getenv("EWEB_BGDBG") != nullptr)
+	{
+		const tchar_t* dbg_style = get_attr(_t("style"));
+		if(dbg_style && strstr(dbg_style, "background-image"))
+			fprintf(stderr, "[BGDBG] background-enter tag=%s own=%s\n", get_tagName(),
+				get_style_property_own(_t("background-image")) ? get_style_property_own(_t("background-image")) : "(null)");
+	}
 	const tchar_t* bg_color = get_style_property_own(_t("background-color"));
 	const tchar_t* bg_position = get_style_property_own(_t("background-position"));
 	const tchar_t* bg_size = get_style_property_own(_t("background-size"));
@@ -6126,6 +6250,18 @@ void litehtml::html_tag::parse_background()
 	   t_strncasecmp(m_bg.m_image.c_str(), _t("conic-gradient("), 15))
 	{
 		doc->container()->load_image(m_bg.m_image.c_str(), m_bg.m_baseurl.empty() ? 0 : m_bg.m_baseurl.c_str(), true);
+	}
+	if(getenv("EWEB_BGDBG") != nullptr && !m_bg.m_image.empty())
+	{
+		static std::set<std::string> logged;
+		std::string key = m_bg.m_image + "|" + m_bg.m_baseurl;
+		if(logged.insert(key).second)
+		{
+			const tchar_t* cls = get_attr(_t("class"));
+			fprintf(stderr, "[BGDBG] parse tag=%s class=%s raw=%s image=%s base=%s\n",
+				get_tagName(), cls ? cls : "", bg_image ? bg_image : "",
+				m_bg.m_image.c_str(), m_bg.m_baseurl.c_str());
+		}
 	}
 }
 
@@ -8550,6 +8686,21 @@ void litehtml::html_tag::render_positioned(render_type rt)
 					need_render = true;
 				}
 			}
+			/* Definite px size on an axis, captured before the both-insets stretch
+			 * below overwrites m_pos: with left+right (or top+bottom) AND a px
+			 * size, CSS ignores the extra inset instead of stretching, and auto
+			 * margins on that axis center the box (the inset:0;margin:auto
+			 * dialog idiom). Percentages already flow through new_width/height. */
+			int def_w = -1, def_h = -1;
+			if(!el_w.is_predefined() && el_w.units() != css_units_percentage) def_w = el->m_pos.width;
+			if(!el_h.is_predefined() && el_h.units() != css_units_percentage) def_h = el->m_pos.height;
+			/* The auto-margin centering below applies only when the box carries auto
+			 * margins on that axis (the inset:0;margin:auto dialog idiom). el is an
+			 * element::ptr, but a positioned box is always an html_tag, so the cast
+			 * is safe (the same cast is used further down this function). */
+			html_tag* el_ht = static_cast<html_tag*>(el);
+			bool ml_auto = el_ht->margin_left_is_auto(),  mr_auto = el_ht->margin_right_is_auto();
+			bool mt_auto = el_ht->margin_top_is_auto(),   mb_auto = el_ht->margin_bottom_is_auto();
 
 			bool cvt_x = false;
 			bool cvt_y = false;
@@ -8568,6 +8719,12 @@ void litehtml::html_tag::render_positioned(render_type rt)
 					{
 						el->m_pos.x		= css_left.calc_percent(parent_width) + el->content_margins_left();
 						el->m_pos.width	= parent_width - css_left.calc_percent(parent_width) - css_right.calc_percent(parent_width) - (el->content_margins_left() + el->content_margins_right());
+						if(def_w != -1 && el->m_pos.width != def_w)
+						{
+							if(ml_auto && mr_auto && el->m_pos.width > def_w)
+								el->m_pos.x += (el->m_pos.width - def_w) / 2;
+							el->m_pos.width = def_w;
+						}
 						need_render = true;
 					}
 				}
@@ -8584,6 +8741,12 @@ void litehtml::html_tag::render_positioned(render_type rt)
 					{
 						el->m_pos.y			= css_top.calc_percent(parent_height) + el->content_margins_top();
 						el->m_pos.height	= parent_height - css_top.calc_percent(parent_height) - css_bottom.calc_percent(parent_height) - (el->content_margins_top() + el->content_margins_bottom());
+						if(def_h != -1 && el->m_pos.height != def_h)
+						{
+							if(mt_auto && mb_auto && el->m_pos.height > def_h)
+								el->m_pos.y += (el->m_pos.height - def_h) / 2;
+							el->m_pos.height = def_h;
+						}
 						need_render = true;
 					}
 				}
@@ -8613,6 +8776,12 @@ void litehtml::html_tag::render_positioned(render_type rt)
                             el->m_pos.x += (el->m_pos.width - new_width) / 2;
                             el->m_pos.width = new_width;
                         }
+                        else if(def_w != -1 && el->m_pos.width != def_w)
+                        {
+                            if(ml_auto && mr_auto && el->m_pos.width > def_w)
+                                el->m_pos.x += (el->m_pos.width - def_w) / 2;
+                            el->m_pos.width = def_w;
+                        }
                         need_render = true;
 					}
 					cvt_x = true;
@@ -8634,6 +8803,12 @@ void litehtml::html_tag::render_positioned(render_type rt)
                         {
                             el->m_pos.y += (el->m_pos.height - new_height) / 2;
                             el->m_pos.height = new_height;
+                        }
+                        else if(def_h != -1 && el->m_pos.height != def_h)
+                        {
+                            if(mt_auto && mb_auto && el->m_pos.height > def_h)
+                                el->m_pos.y += (el->m_pos.height - def_h) / 2;
+                            el->m_pos.height = def_h;
                         }
                         need_render = true;
 					}
@@ -8701,9 +8876,16 @@ void litehtml::html_tag::render_positioned(render_type rt)
 				 * through the intermediate chain. Intermediates are in-flow (a
 				 * positioned box in between would be the cb), and in-flow m_pos
 				 * already includes each box's own border+padding, so only the
-				 * cb's border+padding has to be added explicitly. */
-				int offset_x = cb->m_borders.left + cb->m_padding.left;
-				int offset_y = cb->m_borders.top + cb->m_padding.top;
+				 * cb's border+padding has to be added explicitly. NOTE: the draw
+			 * path places a child at (parent CONTENT-box origin + m_pos), and the
+			 * content-box origin already sits border+padding inside the cb border
+			 * box, so only the cb PADDING may be subtracted here. Subtracting the
+			 * cb border too double-counted it and pulled every abs child of a
+			 * bordered containing block up/left by exactly border-width (taobao
+			 * .search-bd 2px orange border: search button + left cluster floated
+			 * 2px high and 2px off the right padding edge). */
+				int offset_x = cb->m_padding.left;
+				int offset_y = cb->m_padding.top;
 				element::ptr cur_el = el->parent();
 				element::ptr this_el = cb;
 				while(cur_el && cur_el != this_el)
@@ -8786,6 +8968,51 @@ void litehtml::html_tag::render_positioned(render_type rt)
 				}
 			}
 
+			/* Flex/grid layout deliberately skips positioned children. An absolute
+			 * child with only left/top and auto dimensions therefore reaches this
+			 * list with a 0x0 box and no earlier render() at all: the inset code sets
+			 * its origin but does not mark need_render. Run the ordinary shrink-to-fit
+			 * pass once content exists, and keep the resulting auto dimensions instead
+			 * of restoring the never-laid-out zero box (taobao search placeholder).
+			 *
+			 * The same pass is required when script replaces the contents later: the
+			 * outer positioned box still has its old non-zero dimensions, while every
+			 * new descendant is at 0x0. Looking only at the outer box leaves that new
+			 * subtree forever unlaid even though the document repaints. */
+			bool has_unlaid_descendant = false;
+			if(!el->is_replaced() && el->get_children_count() > 0)
+			{
+				std::vector<element::ptr> pending;
+				for(size_t i = 0; i < el->get_children_count(); ++i)
+					pending.push_back(el->get_child((int)i));
+				while(!pending.empty() && !has_unlaid_descendant)
+				{
+					element::ptr child = pending.back();
+					pending.pop_back();
+					if(!child || child->get_display() == display_none) continue;
+					element_position child_position = child->get_element_position();
+					if(child_position == element_position_absolute ||
+					   child_position == element_position_fixed) continue;
+					if(!child->is_replaced() && child->get_children_count() > 0 &&
+					   child->m_pos.width <= 0 && child->m_pos.height <= 0)
+					{
+						has_unlaid_descendant = true;
+						break;
+					}
+					for(size_t i = 0; i < child->get_children_count(); ++i)
+						pending.push_back(child->get_child((int)i));
+				}
+			}
+			bool auto_width_layout = !el->is_replaced() && el_w.is_predefined() &&
+				(el->m_pos.width <= 0 || has_unlaid_descendant) &&
+				(css_left.is_predefined() || css_right.is_predefined());
+			bool auto_height_layout = !el->is_replaced() && el_h.is_predefined() &&
+				(el->m_pos.height <= 0 || has_unlaid_descendant) &&
+				(css_top.is_predefined() || css_bottom.is_predefined());
+			bool auto_size_layout = el->get_children_count() > 0 &&
+				(auto_width_layout || auto_height_layout);
+			if(auto_size_layout) need_render = true;
+
 			if(need_render)
 			{
 				position pos = el->m_pos;
@@ -8807,8 +9034,28 @@ void litehtml::html_tag::render_positioned(render_type rt)
 					css_length forced; forced = (float)css_h;
 					positioned_tag->m_css_height = forced;
 				}
-				el->render(el->left(), el->top(), el->width(), true);
+				int render_width = el->width();
+				bool width_from_insets = el_w.is_predefined() &&
+					!css_left.is_predefined() && !css_right.is_predefined();
+				if(auto_width_layout && !width_from_insets)
+				{
+					/* render()'s third argument is the OUTER available width:
+					 * render_box subtracts this box's own content margins from it
+					 * for an auto-width block. Subtracting them here as well
+					 * double-counted the padding/border/margin and handed the
+					 * shrink-to-fit pass a too-small available width, so taobao's
+					 * absolutely-positioned price badge (left:32px inside a 64px
+					 * card, 6px padding) measured 8px of content room instead of
+					 * 20px and its nowrap price text collapsed to an 8px sliver. */
+					render_width = parent_width;
+					if(!css_left.is_predefined()) render_width -= css_left.calc_percent(parent_width);
+					if(!css_right.is_predefined()) render_width -= css_right.calc_percent(parent_width);
+					if(render_width < 0) render_width = 0;
+				}
+				el->render(el->left(), el->top(), render_width, !auto_size_layout);
 				if(force_used_height) positioned_tag->m_css_height = saved_css_height;
+				if(auto_width_layout) pos.width = el->m_pos.width;
+				if(auto_height_layout) pos.height = el->m_pos.height;
 				if(replaced_autosize)
 				{
 					/* Preserve the CSS-driven position and any definite dimension,
@@ -8959,6 +9206,108 @@ void litehtml::html_tag::draw_stacking_context( uint_ptr hdc, int x, int y, cons
 litehtml::overflow litehtml::html_tag::get_overflow() const
 {
 	return m_overflow;
+}
+
+/* Content reach of the laid-out subtree below an overflow container, in this
+ * box's content coordinates: the farthest child border edge (margins included
+ * via content_margins_*). A nested overflow container contributes only its own
+ * box - its inner content is clipped and scrolls independently. Fixed boxes
+ * are viewport-anchored and never extend the scrollable area. */
+static void eweb_scroll_extent_walk(const litehtml::element* el, int ox, int oy, int& mx, int& my)
+{
+	for(size_t i = 0; i < el->get_children_count(); i++)
+	{
+		litehtml::element::ptr ch = el->get_child((int)i);
+		if(!ch || !ch->is_visible() || ch->get_element_position() == litehtml::element_position_fixed)
+			continue;
+		int cx = ox + ch->left();
+		int cy = oy + ch->top();
+		int cw, chh;
+		if(ch->get_overflow() != litehtml::overflow_visible)
+		{
+			litehtml::margins cp = ch->get_paddings();
+			litehtml::margins cb = ch->get_borders();
+			cw  = ch->width()  - ch->content_margins_left() - ch->content_margins_right() + cp.width()  + cb.width();
+			chh = ch->height() - ch->content_margins_top()  - ch->content_margins_bottom() + cp.height() + cb.height();
+		}
+		else
+		{
+			cw  = ch->width();
+			chh = ch->height();
+			eweb_scroll_extent_walk(ch, cx, cy, mx, my);
+		}
+		if(cx + cw > mx) mx = cx + cw;
+		if(cy + chh > my) my = cy + chh;
+	}
+}
+
+void litehtml::html_tag::eweb_get_scroll(int* x, int* y) const
+{
+	if(x) *x = m_scroll_x;
+	if(y) *y = m_scroll_y;
+}
+
+void litehtml::html_tag::eweb_scroll_extent(int* w, int* h) const
+{
+	/* scrollWidth/scrollHeight never report less than the padding box
+	 * (clientWidth/Height), so a non-overflowing container has 0 max scroll. */
+	int mw = m_pos.width  + m_padding.width()  + m_borders.width();
+	int mh = m_pos.height + m_padding.height() + m_borders.height();
+	if(m_overflow > overflow_visible)
+	{
+		int mx = 0, my = 0;
+		eweb_scroll_extent_walk(this, 0, 0, mx, my);
+		if(mx + m_padding.right + m_borders.right > mw)
+			mw = mx + m_padding.right + m_borders.right;
+		if(my + m_padding.bottom + m_borders.bottom > mh)
+			mh = my + m_padding.bottom + m_borders.bottom;
+	}
+	/* Classic scrollbar gutter: an overflow:scroll box reserves scrollbar
+	 * space even when its content fits (Windows Chrome parity). jQuery
+	 * Scrollbar's overlay probe (wx) measures exactly this - an offscreen
+	 * overflow:scroll probe whose scrollTop/Left can move means non-overlay
+	 * scrollbars, so the plugin initializes and gives wx's session/contact
+	 * lists their .scroll-content overflow:scroll. Without the reserve the
+	 * probe reads overlay, the plugin disables itself (ignoreOverlay) and
+	 * the lists stay unscrollable. */
+	if(m_overflow == overflow_scroll)
+	{
+		int gw = m_pos.width  + m_padding.width()  + m_borders.width()  + 15;
+		int gh = m_pos.height + m_padding.height() + m_borders.height() + 15;
+		if(mw < gw) mw = gw;
+		if(mh < gh) mh = gh;
+	}
+	if(w) *w = mw;
+	if(h) *h = mh;
+}
+
+bool litehtml::html_tag::eweb_set_scroll(int x, int y)
+{
+	if(m_overflow <= overflow_visible) return false;
+	int ew = 0, eh = 0;
+	eweb_scroll_extent(&ew, &eh);
+	int max_x = ew - (m_pos.width  + m_padding.width());
+	int max_y = eh - (m_pos.height + m_padding.height());
+	if(max_x < 0) max_x = 0;
+	if(max_y < 0) max_y = 0;
+	if(x < 0) x = 0; else if(x > max_x) x = max_x;
+	if(y < 0) y = 0; else if(y > max_y) y = max_y;
+	if(x == m_scroll_x && y == m_scroll_y) return false;
+	m_scroll_x = x;
+	m_scroll_y = y;
+	return true;
+}
+
+void litehtml::html_tag::eweb_clamp_scroll()
+{
+	if(m_overflow > overflow_visible && (m_scroll_x != 0 || m_scroll_y != 0))
+		eweb_set_scroll(m_scroll_x, m_scroll_y);
+}
+
+void litehtml::html_tag::eweb_clamp_scroll_tree()
+{
+	eweb_clamp_scroll();
+	litehtml::element::eweb_clamp_scroll_tree();
 }
 
 bool litehtml::html_tag::is_nth_child(const element::ptr& el, int num, int off, bool of_type) const
@@ -9459,8 +9808,10 @@ litehtml::element::ptr litehtml::html_tag::get_child_by_point(int x, int y, int 
 	}
 
 	position pos = m_pos;
-	pos.x	= x - pos.x;
-	pos.y	= y - pos.y;
+	/* Children paint shifted by -m_scroll_x/y inside this overflow
+	 * container, so the parent-local test point adds the offset back. */
+	pos.x	= x - pos.x + m_scroll_x;
+	pos.y	= y - pos.y + m_scroll_y;
 
 	for(elements_vector::reverse_iterator i = m_children.rbegin(); i != m_children.rend() && !ret; i++)
 	{
@@ -9880,7 +10231,16 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 		 * max-width resolve against the flex container content box, while
 		 * render() hands them their resolved main size as parent_width. */
 		int w;
-		if (m_css_width.units() == css_units_percentage && !is_body() && have_parent()
+		/* Fix21: a definite parent_width IS the containing block's used content
+		 * width - including for the root html box (no parent) and body. Falling
+		 * through to calc_width() there resolved the root's width:100% against
+		 * container()->get_client_rect(), i.e. the EMBEDDER's main viewport: an
+		 * iframe sub-document sharing the container then laid out at the main
+		 * window width and its paragraphs overflowed the frame box (wx reader
+		 * article lines clipped mid-glyph). render() passes the frame width as
+		 * max_width for sub-documents and the main client width for the top
+		 * document, so resolving against parent_width is exact in both. */
+		if (m_css_width.units() == css_units_percentage
 			&& (m_pct_cb_width > 0 || parent_width > 0))
 		{
 			/* A percentage width resolves against the CONTAINING BLOCK's used
@@ -10289,29 +10649,41 @@ int litehtml::html_tag::render_box(int x, int y, int max_width, bool second_pass
 	ret_width += content_margins_left() + content_margins_right();
 
 	// re-render with new width
-	if (ret_width < max_width && !second_pass && have_parent())
+	/* width:fit-content / max-content / min-content on an in-flow block, and
+	 * every float / inline-block / table / absolutely-positioned auto-width
+	 * box, sizes by shrink-to-fit (CSS 2.1 10.3.7 / css-sizing-3):
+	 *   used = min( max(preferred-minimum, available), preferred )
+	 * ret_width is the OUTER natural width (content + margins, min-width
+	 * floored); max_width is the CONTENT available width. The shrink case
+	 * (natural narrower than available) re-renders tight, then lets margin:auto
+	 * centre the narrowed box (the first-pass calc_auto_margins saw the full
+	 * width). The grow case covers unbreakable content whose preferred-minimum
+	 * (min-content) exceeds the available width - white-space:nowrap text or a
+	 * long word: shrink-to-fit floors at min-content, so the box must expand to
+	 * ret_width and overflow the available space rather than clamp to it and
+	 * hide the tail. Without this, taobao's nowrap price badge (left:32px in a
+	 * 64px card) clamped to its 20px available and its white digits painted on
+	 * the white card outside the 20px orange pill, i.e. invisible. */
+	bool intrinsic_width = m_css_width.is_predefined() && m_css_width.predef() > 0;
+	bool shrink_to_fit = m_display == display_inline_block ||
+		intrinsic_width ||
+		(m_css_width.is_predefined() &&
+		(m_float != float_none ||
+		m_display == display_table ||
+		m_el_position == element_position_absolute ||
+		m_el_position == element_position_fixed
+		)
+		);
+	int content_natural = ret_width - (content_margins_left() + content_margins_right());
+	if (shrink_to_fit && !second_pass && have_parent() &&
+		(ret_width < max_width || (max_width > 0 && content_natural > max_width)))
 	{
-		/* width:fit-content / max-content / min-content on an in-flow block:
-		 * shrink-to-fit exactly like a float, then let margin:auto centre the
-		 * narrowed box (the first-pass calc_auto_margins saw the full width). */
-		bool intrinsic_width = m_css_width.is_predefined() && m_css_width.predef() > 0;
-		if (m_display == display_inline_block ||
-			intrinsic_width ||
-			m_css_width.is_predefined() &&
-			(m_float != float_none ||
-			m_display == display_table ||
-			m_el_position == element_position_absolute ||
-			m_el_position == element_position_fixed
-			)
-			)
+		render(x, y, ret_width, true);
+		m_pos.width = content_natural;
+		if (intrinsic_width && m_display == display_block)
 		{
-			render(x, y, ret_width, true);
-			m_pos.width = ret_width - (content_margins_left() + content_margins_right());
-			if (intrinsic_width && m_display == display_block)
-			{
-				calc_auto_margins(parent_width);
-				m_pos.x = x + content_margins_left();
-			}
+			calc_auto_margins(parent_width);
+			m_pos.x = x + content_margins_left();
 		}
 	}
 
@@ -10702,6 +11074,17 @@ void litehtml::html_tag::draw_children_box(uint_ptr hdc, int x, int y, const pos
 		doc->container()->set_clip(pad_box, bdr_radius, true, true);
 	}
 
+	/* Element-level scroll: shift the child paint origin by the live
+	 * offset; the clip above stays at the (unshifted) padding box, so the
+	 * scrolled content slides inside its scrollport exactly like a browser.
+	 * Fixed-positioned children paint from browser_wnd below and do not
+	 * scroll; absolutely-positioned ones use pos and scroll with the box. */
+	if (m_overflow > overflow_visible)
+	{
+		pos.x -= m_scroll_x;
+		pos.y -= m_scroll_y;
+	}
+
 	/* browser_wnd is read only by the draw_positioned phase (fixed
 	 * placement, sticky pin height) - fetching the client rect is a
 	 * container virtual call, so defer it to first use instead of paying
@@ -10709,12 +11092,58 @@ void litehtml::html_tag::draw_children_box(uint_ptr hdc, int x, int y, const pos
 	position browser_wnd;
 	bool browser_wnd_init = false;
 
+	/* Vertical viewport cull: fetch the visible document band once per box.
+	 * Only the block/floats/inlines passes cull - positioned elements paint
+	 * at their own z level and may be fixed/sticky, so their pass is left
+	 * untouched. EWEB_VPCULL_OFF restores the unconditional walk. */
+	int cull_top = 0, cull_bottom = 0;
+	bool cull_on = (flag != draw_positioned) && !vpcull_off() &&
+	               doc->get_draw_cull_band(cull_top, cull_bottom);
+
 	element::ptr el = 0;
 	for (auto& item : m_children)
 	{
 		el = item;
 		if (el->is_visible())
 		{
+			/* Skip an in-flow subtree that lies entirely outside the visible
+			 * band. Gated on !has_pospart() so no absolutely/fixed-positioned
+			 * descendant can escape this box and paint inside the viewport.
+			 * A DEFINITE-height box with overflow:visible does not bound its
+			 * in-flow content either: the UA html/body height:100% resolves
+			 * to the viewport while the article bands flow far past it, and
+			 * culling on the box height deleted the whole document below
+			 * scrollY ~ viewport+margin (iframe sub-doc AND main document
+			 * deep scroll painted white). Auto-height boxes grow to fit
+			 * their content and overflow>visible boxes clip at the padding
+			 * edge, so for those the box bottom still bounds the subtree. */
+			bool definite_h = false;
+			{
+				css_length ch = el->get_css_height();
+				definite_h = !ch.is_predefined();
+			}
+			if (cull_on && !el->has_pospart() &&
+			    !(el->get_overflow() == overflow_visible && definite_h))
+			{
+				position pl = el->get_placement();
+				/* get_placement() already returns ABSOLUTE document
+				 * coordinates (it accumulates every ancestor's m_pos), and
+				 * the cull band lives in that same document space, so the
+				 * in-flow viewport test must use pl.y directly. Adding
+				 * pos.y (this box's own absolute y) double-counted the
+				 * offset: apple's hero CTA button sits at document y=641
+				 * (inside the band) but was measured as 757+641=1398, past
+				 * cull_bottom, so the whole in-flow subtree - button label,
+				 * tile subhead - was culled and never painted. */
+				int abs_top = pl.y;
+				int abs_bot = pl.y + pl.height;
+				if (abs_top > cull_bottom || abs_bot < cull_top)
+				{
+					if (vpcull_stats_enabled()) g_vpcull_culled++;
+					continue;
+				}
+			}
+			if (cull_on && vpcull_stats_enabled()) g_vpcull_drawn++;
 			switch (flag)
 			{
 			case draw_positioned:

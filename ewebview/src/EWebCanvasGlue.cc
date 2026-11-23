@@ -199,14 +199,31 @@ static int jsCanvasFlattenCubic(void* ctx, float x0, float y0, float cx1, float 
 
 static void jsCanvasSetPixel(void* ctx, void* canvas, int x, int y, uint32_t color)
 {
-    (void)ctx; EWebCanvas* cv = (EWebCanvas*)canvas;
-    if(cv) cv->setPixel(x, y, color);
+    if(canvas == nullptr) return;
+    EWebEngine* self = (EWebEngine*)ctx;
+    /* The bridge routes BOTH handle kinds through set_pixel: the ctx's canvas
+     * (a registered EWebCanvas*) and anonymous ImageData bitmaps (a raw
+     * eweb_surface_t* from bitmap_create). Casting a raw surface to EWebCanvas*
+     * writes into a misinterpreted object and silently drops the pixel, which
+     * is why getImageData/putImageData round-trips read back all zero. Branch
+     * on registry membership; raw surfaces go straight to the port gfx table. */
+    if(self != nullptr && self->isJsCanvas(canvas)) {
+        ((EWebCanvas*)canvas)->setPixel(x, y, color);
+        return;
+    }
+    if(self != nullptr && self->m_port.gfx.set_pixel != nullptr)
+        self->m_port.gfx.set_pixel(self->m_port.gfx.ud, (eweb_surface_t*)canvas, x, y, color);
 }
 
 static uint32_t jsCanvasGetPixel(void* ctx, void* canvas, int x, int y)
 {
-    (void)ctx; EWebCanvas* cv = (EWebCanvas*)canvas;
-    return cv ? cv->getPixel(x, y) : 0;
+    if(canvas == nullptr) return 0;
+    EWebEngine* self = (EWebEngine*)ctx;
+    if(self != nullptr && self->isJsCanvas(canvas))
+        return ((EWebCanvas*)canvas)->getPixel(x, y);
+    if(self != nullptr && self->m_port.gfx.get_pixel != nullptr)
+        return self->m_port.gfx.get_pixel(self->m_port.gfx.ud, (eweb_surface_t*)canvas, x, y);
+    return 0;
 }
 
 static void jsCanvasBlit(void* ctx, void* canvas, void* src,
@@ -309,6 +326,14 @@ EWebCanvas* EWebEngine::getOrCreateCanvas(const std::string& id, int w, int h)
     if(!cv->valid()) { delete cv; return nullptr; }
     m_jsCanvases.push_back(cv);
     return cv;
+}
+
+bool EWebEngine::isJsCanvas(void* h) const
+{
+    if(h == nullptr) return false;
+    for(size_t i = 0; i < m_jsCanvases.size(); ++i)
+        if((void*)m_jsCanvases[i] == h) return true;
+    return false;
 }
 
 void EWebEngine::freeCanvases()
