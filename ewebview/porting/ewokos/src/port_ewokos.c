@@ -58,8 +58,8 @@
  * natural-pixel buffers with dpr == 1; blit scales the src rect by the
  * source's dpr and the dst rect by the destination's.
  *
- * WidgetWebview follows the xwin HiDPI setting (see XBROWSER_DPR for an
- * explicit override). At dpr == 1 every path below is numerically identical
+ * WidgetWebview follows the xwin HiDPI setting (an explicit ctor ratio
+ * overrides it). At dpr == 1 every path below is numerically identical
  * to a plain 1x port; higher ratios rasterise at native device resolution. */
 typedef struct {
     graph_t* g;    /* device-pixel buffer: w = lw*dpr, h = lh*dpr        */

@@ -361,7 +361,7 @@ void eweb_port_ewokos(eweb_port_t* port, void* ud);
  * ewebview_set_viewport() so the frame pool allocates device-sized buffers.
  * The core keeps laying out in logical pixels; the port rasterises at native
  * resolution. The port itself defaults to 1.0; WidgetWebview passes the xwin
- * HiDPI ratio, with XBROWSER_DPR available as an explicit override. */
+ * HiDPI ratio, or an explicit ratio given to its constructor. */
 void eweb_port_ewokos_set_dpr(float dpr);
 
 /* HiDPI (EwokOS port only): recover the device-pixel graph_t* backing a
