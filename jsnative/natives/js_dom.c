@@ -62,12 +62,25 @@ extern "C" {
 /* Element wrapper identity cache. Handing back the SAME var for the same
  * embedder handle is what makes `e.target === el` and `a === b` behave like a
  * real browser; without it every getElementById() builds a fresh object and
- * identity comparisons always fail. The table GROWS and is never evicted:
- * the anchor array is the only root keeping a wrapper alive while a script
- * holds it across a GC, so dropping an entry (a previous 128-slot ring did)
- * lets the VM recycle memory a live JS variable still points at - the wrapper
- * then reads back as a prototype-less plain object and every member access
- * on it yields undefined. Cleared only when the document goes away. */
+ * identity comparisons always fail. The anchor array roots each wrapper so a
+ * script holding it across a GC keeps it alive. Entries are pruned, but ONLY
+ * when dropping them cannot break a live JS reference (a previous 128-slot
+ * ring evicted referenced wrappers and the VM recycled memory a live variable
+ * still pointed at):
+ *   - the embedder reports the handle dead (element freed by an innerHTML /
+ *     subtree rewrite or document swap), or
+ *   - under cache pressure, the anchor holds the wrapper's LAST reference
+ *     (refs <= 1): no JS variable points at it, so re-wrapping the element
+ *     later hands out a fresh object nobody can compare against the old one.
+ * Cleared outright when the document goes away. */
+
+/* Prune cadence: start once the cache is big enough for DOM churn to matter,
+ * then every PRUNE_EVERY new wraps; HARD forces a pass regardless of cadence.
+ * PRESSURE additionally retires cache-only wrappers (see above). */
+#define JS_ELCACHE_PRUNE_AT    512
+#define JS_ELCACHE_PRUNE_EVERY 128
+#define JS_ELCACHE_PRESSURE    2048
+#define JS_ELCACHE_HARD        4096
 
 typedef struct {
     js_element_t          handle;       /* NULL when the slot is empty */
@@ -111,7 +124,7 @@ typedef struct {
     long                  timer_drops;    /* callbacks lost to table overflow */
     uint64_t              timer_last_now; /* embedder clock at the previous poll */
     bool                  timer_synced;   /* false until the first poll seeds it */
-    js_el_cache_t*        el_cache;       /* growable, never evicted (see above) */
+    js_el_cache_t*        el_cache;       /* growable, pruned (see above) */
     int                   el_cache_len;
     int                   el_cache_cap;
     bool                  dom_loaded;     /* false until DOMContentLoaded fires */
@@ -288,7 +301,15 @@ static var_t* native_eval(vm_t* vm, var_t* env, void* data) {
         vm_load_run_native(vm, src);
         return NULL;
     }
-    return var_find_own_member_var(vm->root, EVAL_RET_KEY); /* borrowed */
+    /* Take the capture binding OUT of the global object: leaving it behind
+     * retained the last eval result on vm->root forever (and every value-
+     * returning eval overwrote it, churning the global shape). The transferred
+     * node ref is dropped to the refs==0 borrowed-return baseline - func_call
+     * adopts it, exactly like the Function constructor's wrapper binding. */
+    var_t* ret = var_take_own_member(vm->root, EVAL_RET_KEY);
+    if(ret != NULL)
+        ret->refs--;
+    return ret;
 }
 
 /* ------------------------------------------------------------------ */
@@ -443,6 +464,53 @@ static void js_reanchor_el_cache(vm_t* vm, js_dom_state* st) {
     vm->gc.gc_defer--;
 }
 
+/* O(1) anchor append for a freshly wrapped element. Rebuilding the whole
+ * anchor array on every wrap (the old path) is O(n) per wrap - quadratic
+ * allocation churn on a page that touches thousands of nodes. The rebuild
+ * stays for prune/reset, where entries actually leave the set. */
+static void js_anchor_append_el(vm_t* vm, js_dom_state* st, var_t* obj) {
+    (void)st;
+    var_t* bridge = dom_bridge_var(vm);
+    if(bridge == NULL) return;
+    vm->gc.gc_defer++;
+    var_t* arr = var_find_own_member_var(bridge, DOM_ELCACHE_KEY);
+    if(arr == NULL || !arr->is_array) {
+        arr = var_new_array(vm);
+        node_t* n = var_add(bridge, DOM_ELCACHE_KEY, arr);
+        if(n != NULL) { n->invisable = 1; n->be_unenumerable = 1; }
+    }
+    var_array_add(arr, obj);
+    vm->gc.gc_defer--;
+}
+
+/* Retire cache entries that can no longer be observed by script (see the
+ * identity-cache note at the top of this file). Compacts the table in place
+ * and rebuilds the anchor once; the anchor replacement drops the cache's
+ * reference to every retired wrapper, so anything script still holds stays
+ * alive and anything it dropped is collected. */
+static void js_prune_el_cache(vm_t* vm, js_dom_state* st) {
+    bool pressure = st->el_cache_len > JS_ELCACHE_PRESSURE;
+    int w = 0;
+    bool dropped = false;
+    for(int i = 0; i < st->el_cache_len; ++i) {
+        js_el_cache_t* e = &st->el_cache[i];
+        /* obj is rooted by the anchor array, so it is alive by construction. */
+        bool retire = (e->handle == NULL || e->obj == NULL);
+        if(!retire && st->cb.el_is_live != NULL)
+            retire = !st->cb.el_is_live(st->ctx, e->handle);
+        /* refs <= 1: the anchor array is the only root. Value-stack and scope
+         * references are counted too, so a wrapper any live JS variable (or
+         * in-flight native) points at always reads >= 2 and is kept. */
+        if(!retire && pressure && e->obj->refs <= 1)
+            retire = true;
+        if(retire) { dropped = true; continue; }
+        st->el_cache[w++] = *e;
+    }
+    st->el_cache_len = w;
+    if(dropped)
+        js_reanchor_el_cache(vm, st);
+}
+
 /* Map a lower-case HTML tag name to its DOM interface name for the
  * Object.prototype.toString brand ([object HTMLDivElement] ...). Most tags are
  * the generic HTML<Cap>tag<Element>; the spec special-cases a handful (a, img,
@@ -488,9 +556,25 @@ static void js_html_interface_name(const char* tag, char* out, size_t outsz) {
 static var_t* wrap_element(vm_t* vm, js_element_t el) {
     js_dom_state* st = state_from_vm(vm);
     if(st != NULL) {
-        for(int i = 0; i < st->el_cache_len; ++i)
-            if(st->el_cache[i].handle == el && st->el_cache[i].obj != NULL)
-                return st->el_cache[i].obj;   /* rooted by the anchor array */
+        /* Periodic prune: DOM churn (innerHTML rewrites, list re-renders)
+         * otherwise accumulates a rooted wrapper per ever-touched node for
+         * the whole page lifetime. */
+        if(st->el_cache_len >= JS_ELCACHE_PRUNE_AT &&
+           ((st->el_cache_len & (JS_ELCACHE_PRUNE_EVERY - 1)) == 0 ||
+            st->el_cache_len >= JS_ELCACHE_HARD))
+            js_prune_el_cache(vm, st);
+        for(int i = 0; i < st->el_cache_len; ++i) {
+            if(st->el_cache[i].handle == el && st->el_cache[i].obj != NULL) {
+                /* A cached handle can be dead AND its address reused by a new
+                 * element; handing back the old wrapper would alias the wrong
+                 * node. Retire the slot and wrap the live element anew. */
+                if(st->cb.el_is_live == NULL || st->cb.el_is_live(st->ctx, el))
+                    return st->el_cache[i].obj;   /* rooted by the anchor array */
+                st->el_cache[i].handle = NULL;
+                st->el_cache[i].obj    = NULL;
+                break;
+            }
+        }
     }
     /* new_obj() constructs an instance of the registered "Element" class
      * (prototype + constructor already wired by js_register_dom_natives).
@@ -561,7 +645,7 @@ static var_t* wrap_element(vm_t* vm, js_element_t el) {
             st->el_cache[st->el_cache_len].handle = el;
             st->el_cache[st->el_cache_len].obj    = obj;
             st->el_cache_len++;
-            js_reanchor_el_cache(vm, st);
+            js_anchor_append_el(vm, st, obj);
         }
     }
     return obj;

@@ -3705,6 +3705,11 @@ void EWebEngine::cleanupBuildResources()
      * vm_close() frees the VM and resetJsVm() nulls the pointer. Also drop
      * the extracted scripts and reset the document.write reparse guard. */
     resetJsVm();
+    /* The module prefetch pool is engine-lifetime, so without this flush the
+     * page being left keeps up to kPrefetchBudget of fetched bundle bodies
+     * (plus its queued import graph) resident under the NEW site. Drop it
+     * all; jsSeedPrefetch re-seeds for the incoming page. */
+    jsPrefetchFlush();
     m_caretValid = false;
     m_caretDirty = false;
     m_jsScripts.clear();

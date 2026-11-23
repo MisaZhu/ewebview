@@ -168,6 +168,7 @@ typedef struct {
     uint64_t      next_listener_id;
     js_inline_t   inline_cache[JS_INLINE_CACHE];
     int           inline_next;   /* round-robin eviction cursor */
+    int           adds_since_sweep; /* cadence for the dead-handle listener sweep */
 } js_event_state;
 
 static void event_state_free(void* p) {
@@ -284,6 +285,29 @@ static bool ev_add_listener(vm_t* vm, js_event_state* st, int kind, js_element_t
                             bool capture, bool once, bool from_prop) {
     if(st == NULL || type == NULL || type[0] == 0 || fn == NULL || !fn->is_func)
         return false;
+
+    /* DOM churn sweep: a listener whose element was FREED (innerHTML/subtree
+     * rewrite, document swap - not merely detached) can never fire again, but
+     * its callback stays anchored and its slot stays dispatch-scanned for the
+     * whole page lifetime. Drop such records once the table is big enough to
+     * matter; window/document listeners are singletons and never swept. */
+    if(st->listener_cap >= 256 && ++st->adds_since_sweep >= 64) {
+        st->adds_since_sweep = 0;
+        const js_dom_callbacks_t* dom = js_dom_callbacks(vm);
+        void* ctx = js_dom_ctx(vm);
+        if(dom != NULL && dom->el_is_live != NULL) {
+            bool swept = false;
+            for(int i = 0; i < st->listener_cap; ++i) {
+                js_listener_t* r = &st->listeners[i];
+                if(r->active && r->kind == JS_EVENT_ON_ELEMENT && r->handle != NULL &&
+                   !dom->el_is_live(ctx, r->handle)) {
+                    listener_drop(r);
+                    swept = true;
+                }
+            }
+            if(swept) ev_reanchor(vm, st);
+        }
+    }
 
     /* An on* property holds at most one handler: assigning replaces the
      * previous one (but leaves addEventListener registrations alone). */

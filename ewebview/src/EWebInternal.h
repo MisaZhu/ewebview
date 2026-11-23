@@ -817,12 +817,17 @@ public:
     ModulePrefetch*           m_jsPrefetch;
     void jsPrefetchStart();
     void jsPrefetchStop();
+    /* Drop all cached bodies + queued fetches of the page being left (every
+     * navigation/reload); in-flight old-page fetches discard their results. */
+    void jsPrefetchFlush();
     static void* jsPrefetchWorker(void* arg);
-    /* Scan a fetched module body for import specifiers and enqueue them. */
-    void jsPrefetchScan(const std::string& module_url, const char* body);
+    /* Scan a fetched module body for import specifiers and enqueue them.
+     * gen is the page generation the body belongs to; a flush (navigation)
+     * makes stale specifiers drop instead of entering the new page's queue. */
+    void jsPrefetchScan(const std::string& module_url, const char* body, uint64_t gen);
     /* Enqueue one absolute-or-relative specifier (resolved against base, or
      * the import map for bare specifiers) for background fetch. */
-    void jsPrefetchEnqueue(const std::string& spec, const std::string& base);
+    void jsPrefetchEnqueue(const std::string& spec, const std::string& base, uint64_t gen);
     /* Seed workers + enqueue every parser-extracted module <script src>. */
     void jsSeedPrefetch();
     /* Cache lookup: 1 = hit (*body/*status malloc'd copies), -1 = waited for

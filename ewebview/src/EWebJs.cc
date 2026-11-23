@@ -6287,9 +6287,12 @@ static EWebEngine* js_engine_of_vm(vm_t* vm)
  * ------------------------------------------------------------------ */
 struct EWebEngine::ModulePrefetch {
     struct Entry {
-        int   state;      /* 0 = queued/in-flight, 1 = fetched, -1 = failed */
-        int   status;     /* HTTP status once fetched */
-        char* body;       /* malloc'd NUL-terminated body, nullptr until done */
+        int    state;      /* 0 = queued/in-flight, 1 = fetched, -1 = failed,
+                            * 2 = consumed/evicted (body gone; take re-fetches) */
+        int    status;     /* HTTP status once fetched */
+        char*  body;       /* malloc'd NUL-terminated body, nullptr until done */
+        size_t bytes;      /* strlen(body) while state == 1, for the budget */
+        uint64_t seq;      /* fetch completion order: oldest evicted first */
     };
     pthread_mutex_t lock;
     pthread_cond_t  cv;
@@ -6298,13 +6301,49 @@ struct EWebEngine::ModulePrefetch {
     std::vector<pthread_t> workers;
     bool stop;
     int  hits, waits, misses, fetched, failed, discovered;
+    uint64_t seq_next;
+    size_t total_bytes;    /* sum of live (state == 1) bodies */
+    /* Page generation, bumped by jsPrefetchFlush on every navigation. A
+     * worker captures it before its fetch and re-checks it before publishing:
+     * a body fetched for the page being left is dropped, never cached. */
+    uint64_t gen;
 
     ModulePrefetch() : stop(false), hits(0), waits(0), misses(0),
-                       fetched(0), failed(0), discovered(0) {
+                       fetched(0), failed(0), discovered(0),
+                       seq_next(0), total_bytes(0), gen(0) {
         pthread_mutex_init(&lock, nullptr);
         pthread_cond_init(&cv, nullptr);
     }
 };
+
+/* Byte budget for fetched-but-not-yet-imported bodies. The scanner over-matches
+ * (any `import`/`from` string literal), so speculative fetches can pile up tens
+ * of MB of bundles the page never imports. Past the budget the oldest completed
+ * bodies are dropped (state 2): a later import of one simply re-fetches it
+ * synchronously, so correctness is unaffected. */
+static const size_t kPrefetchBudget = 8u * 1024u * 1024u;
+
+/* Drop oldest fetched bodies until the cache fits the budget. Lock held. */
+static void js_prefetch_trim(EWebEngine::ModulePrefetch* pf)
+{
+    while(pf->total_bytes > kPrefetchBudget) {
+        uint64_t best = UINT64_MAX;
+        std::map<std::string, EWebEngine::ModulePrefetch::Entry>::iterator victim = pf->cache.end();
+        for(std::map<std::string, EWebEngine::ModulePrefetch::Entry>::iterator it = pf->cache.begin();
+            it != pf->cache.end(); ++it) {
+            if(it->second.state == 1 && it->second.body != nullptr && it->second.seq < best) {
+                best = it->second.seq;
+                victim = it;
+            }
+        }
+        if(victim == pf->cache.end()) break;
+        pf->total_bytes -= victim->second.bytes;
+        free(victim->second.body);
+        victim->second.body = nullptr;
+        victim->second.bytes = 0;
+        victim->second.state = 2;
+    }
+}
 
 static bool js_prefetch_disabled()
 {
@@ -6318,10 +6357,15 @@ void* EWebEngine::jsPrefetchWorker(void* arg)
     ModulePrefetch* pf = self->m_jsPrefetch;
     for(;;) {
         std::string url;
+        uint64_t gen = 0;
         pthread_mutex_lock(&pf->lock);
         for(;;) {
             if(pf->stop) { pthread_mutex_unlock(&pf->lock); return nullptr; }
-            if(!pf->queue.empty()) { url = pf->queue.front(); pf->queue.pop_front(); break; }
+            if(!pf->queue.empty()) {
+                url = pf->queue.front(); pf->queue.pop_front();
+                gen = pf->gen;   /* the page this fetch belongs to */
+                break;
+            }
             pthread_cond_wait(&pf->cv, &pf->lock);
         }
         pthread_mutex_unlock(&pf->lock);
@@ -6332,24 +6376,55 @@ void* EWebEngine::jsPrefetchWorker(void* arg)
                                   nullptr, self->jsDocumentUrl(), &status, &body, nullptr);
         ok = ok && body != nullptr && status >= 200 && status < 300;
 
+        /* A navigation may have flushed the pool while this fetch was in
+         * flight: the body belongs to the page being left, so drop it without
+         * scanning or publishing (the scan would enqueue the old site's import
+         * graph into the new page's queue). */
         pthread_mutex_lock(&pf->lock);
+        if(gen != pf->gen) {
+            /* Wake take() waiters: the entry they may be waiting on will
+             * never be published now. */
+            pthread_cond_broadcast(&pf->cv);
+            pthread_mutex_unlock(&pf->lock);
+            if(body != nullptr) free(body);
+            continue;
+        }
+        pthread_mutex_unlock(&pf->lock);
+
+        /* Scan BEFORE publishing: once the body sits in the cache the engine
+         * thread may consume (and free) it at any moment, so the worker must
+         * not read it after the handoff. Enqueueing children first also means
+         * a waiter that wakes on this URL's publish finds its imports already
+         * in flight. */
+        if(ok) self->jsPrefetchScan(url, body, gen);
+
+        pthread_mutex_lock(&pf->lock);
+        if(gen != pf->gen) {   /* flushed during the scan: drop the result */
+            pthread_cond_broadcast(&pf->cv);   /* wake take() waiters */
+            pthread_mutex_unlock(&pf->lock);
+            if(body != nullptr) free(body);
+            continue;
+        }
         ModulePrefetch::Entry& e = pf->cache[url];
         if(ok) {
             e.state = 1;
             e.status = status;
             e.body = body;   /* cache adopts the malloc'd body */
+            e.bytes = strlen(body);
+            e.seq = ++pf->seq_next;
+            pf->total_bytes += e.bytes;
             pf->fetched++;
+            js_prefetch_trim(pf);
         } else {
             if(body != nullptr) free(body);
             e.state = -1;
             e.status = status;
             e.body = nullptr;
+            e.bytes = 0;
             pf->failed++;
         }
         pthread_cond_broadcast(&pf->cv);
         pthread_mutex_unlock(&pf->lock);
-
-        if(ok) self->jsPrefetchScan(url, body);
     }
     return nullptr;
 }
@@ -6361,7 +6436,7 @@ void* EWebEngine::jsPrefetchWorker(void* arg)
  * single lines where an alternation regex risks pathological backtracking.
  * Over-matching is harmless: anything that fails to fetch is dropped, and
  * jsModuleLoad never reads a cache entry the VM did not ask for. */
-void EWebEngine::jsPrefetchScan(const std::string& module_url, const char* body)
+void EWebEngine::jsPrefetchScan(const std::string& module_url, const char* body, uint64_t gen)
 {
     if(body == nullptr) return;
     const char* p = body;
@@ -6383,7 +6458,7 @@ void EWebEngine::jsPrefetchScan(const std::string& module_url, const char* body)
             const char* st = s;
             while(*s != 0 && *s != q && *s != '\n') s++;
             if(*s == q && s - st > 0 && s - st <= 512) {
-                jsPrefetchEnqueue(std::string(st, (size_t)(s - st)), module_url);
+                jsPrefetchEnqueue(std::string(st, (size_t)(s - st)), module_url, gen);
                 count++;
             }
             p = (*s != 0) ? s + 1 : s;
@@ -6396,7 +6471,7 @@ void EWebEngine::jsPrefetchScan(const std::string& module_url, const char* body)
         fprintf(stderr, "[prefetch] scan %s -> %d specifier(s)\n", module_url.c_str(), count);
 }
 
-void EWebEngine::jsPrefetchEnqueue(const std::string& spec, const std::string& base)
+void EWebEngine::jsPrefetchEnqueue(const std::string& spec, const std::string& base, uint64_t gen)
 {
     ModulePrefetch* pf = m_jsPrefetch;
     if(pf == nullptr || spec.empty()) return;
@@ -6415,10 +6490,15 @@ void EWebEngine::jsPrefetchEnqueue(const std::string& spec, const std::string& b
     if(full.empty() || strstr(full.c_str(), "://") == nullptr) return;
 
     pthread_mutex_lock(&pf->lock);
+    if(gen != pf->gen) {   /* page flushed mid-scan: this specifier is stale */
+        pthread_mutex_unlock(&pf->lock);
+        return;
+    }
     pf->discovered++;
     if(pf->cache.find(full) == pf->cache.end()) {
         if(pf->cache.size() < 4096) {
             ModulePrefetch::Entry e; e.state = 0; e.status = 0; e.body = nullptr;
+            e.bytes = 0; e.seq = 0;
             pf->cache[full] = e;
             pf->queue.push_back(full);
             pthread_cond_signal(&pf->cv);
@@ -6447,6 +6527,15 @@ int EWebEngine::jsPrefetchTake(const std::string& url, int* status, char** body)
     if(it->second.state == 1 && it->second.body != nullptr) {
         if(status != nullptr) *status = it->second.status;
         if(body != nullptr) *body = strdup(it->second.body);
+        /* Consume the entry: the VM's module registry evaluates each spec once,
+         * so keeping a second private copy of every bundle here (on top of the
+         * VM's own source copy) was pure accumulation on module-heavy pages.
+         * A repeat take of the same URL falls back to a synchronous fetch. */
+        pf->total_bytes -= it->second.bytes;
+        free(it->second.body);
+        it->second.body = nullptr;
+        it->second.bytes = 0;
+        it->second.state = 2;
         pf->hits++;
         if(waited) pf->waits++;
         uint64_t waited_ms = ticMs() - t0;
@@ -6455,6 +6544,12 @@ int EWebEngine::jsPrefetchTake(const std::string& url, int* status, char** body)
             fprintf(stderr, "[prefetch] HIT %s (%s, waited %llu ms)\n", url.c_str(),
                     waited ? "in-flight" : "cached", (unsigned long long)waited_ms);
         return (*body != nullptr) ? 1 : 0;
+    }
+    if(it->second.state == 2) {
+        /* Consumed or budget-evicted: report a miss so jsModuleLoad re-fetches. */
+        pthread_mutex_unlock(&pf->lock);
+        pf->misses++;
+        return 0;
     }
     int st = it->second.status;
     pthread_mutex_unlock(&pf->lock);
@@ -6508,21 +6603,52 @@ void EWebEngine::jsPrefetchStop()
     delete pf;
 }
 
+/* Drop everything the pool holds for the page being left: every cached body
+ * (up to kPrefetchBudget of bundles the old site fetched but never imported),
+ * the pending fetch queue and the URL bookkeeping. Called from
+ * cleanupBuildResources on every navigation/reload, so a new site never
+ * inherits the previous site's module memory. The workers stay alive (they
+ * are engine-lifetime, parked on the condvar); the generation bump makes any
+ * fetch still in flight for the old page discard its result instead of
+ * re-populating the cache. jsSeedPrefetch re-seeds the pool for the new page.
+ * Non-blocking: no worker join, so a slow old-site transfer cannot stall the
+ * navigation. */
+void EWebEngine::jsPrefetchFlush()
+{
+    ModulePrefetch* pf = m_jsPrefetch;
+    if(pf == nullptr) return;
+    pthread_mutex_lock(&pf->lock);
+    pf->gen++;
+    pf->queue.clear();
+    for(std::map<std::string, ModulePrefetch::Entry>::iterator it = pf->cache.begin();
+        it != pf->cache.end(); ++it)
+        if(it->second.body != nullptr) free(it->second.body);
+    pf->cache.clear();
+    pf->total_bytes = 0;
+    pthread_cond_broadcast(&pf->cv);   /* wake take() waiters: entries are gone */
+    pthread_mutex_unlock(&pf->lock);
+}
+
 void EWebEngine::jsSeedPrefetch()
 {
     if(js_prefetch_disabled() || !m_jsEnabled) return;
     jsPrefetchStart();
     if(m_jsPrefetch == nullptr) return;
+    /* Snapshot the current page generation: a concurrent flush must not let
+     * this page's seeds land in the next page's queue. */
+    pthread_mutex_lock(&m_jsPrefetch->lock);
+    uint64_t gen = m_jsPrefetch->gen;
+    pthread_mutex_unlock(&m_jsPrefetch->lock);
     /* Seed with the parser-extracted module <script src>s; the import graph
      * fans out from there via jsPrefetchScan. */
     for(size_t i = 0; i < m_jsScriptSrcs.size(); i++) {
         if(i < m_jsScriptDeferred.size() && m_jsScriptDeferred[i] &&
            !m_jsScriptSrcs[i].empty())
-            jsPrefetchEnqueue(m_jsScriptSrcs[i], jsDocumentUrl());
+            jsPrefetchEnqueue(m_jsScriptSrcs[i], jsDocumentUrl(), gen);
     }
     /* Plus every import-map target (react/react-dom/scheduler/... on github). */
     for(size_t i = 0; i < m_jsImportMap.size(); i++)
-        jsPrefetchEnqueue(m_jsImportMap[i].second, jsDocumentUrl());
+        jsPrefetchEnqueue(m_jsImportMap[i].second, jsDocumentUrl(), gen);
 }
 
 /* Import-map resolution for a bare specifier: exact key first, then the
@@ -6631,8 +6757,12 @@ mstr_t* EWebEngine::jsModuleLoad(vm_t* vm, const char* spec)
              cached > 0 ? "prefetch" : "sync");
     /* The graph continues in the background even for a synchronously fetched
      * module: its own imports become prefetch candidates. */
-    if(self->m_jsPrefetch != nullptr)
-        self->jsPrefetchScan(spec, js->cstr);
+    if(self->m_jsPrefetch != nullptr) {
+        pthread_mutex_lock(&self->m_jsPrefetch->lock);
+        uint64_t gen = self->m_jsPrefetch->gen;
+        pthread_mutex_unlock(&self->m_jsPrefetch->lock);
+        self->jsPrefetchScan(spec, js->cstr, gen);
+    }
     /* Debug aid: EWEB_MODULE_DUMP=<dir> writes every fetched module body to
      * <dir>/<n>.js (with a .url sidecar) so an in-browser compile failure can be
      * reproduced offline with `mario -c`. EWEB_MODULE_TRACE=1 logs each load. */
