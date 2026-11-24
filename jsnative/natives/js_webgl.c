@@ -250,7 +250,13 @@ static var_t* g_shd_cls   = NULL;  static var_t* g_shd_proto   = NULL;
 static var_t* g_prg_cls   = NULL;  static var_t* g_prg_proto   = NULL;
 static var_t* g_uloc_cls  = NULL;  static var_t* g_uloc_proto  = NULL;
 static var_t* g_ainfo_cls = NULL;  static var_t* g_ainfo_proto = NULL;
-static int    g_registered = 0;
+/* The VM the pins above belong to. Every navigation closes the page VM and
+ * builds a fresh one, so the pins are per-VM state: a process-wide "registered
+ * once" flag left them pointing into the closed VM's freed heap, and the next
+ * page's getContext('webgl') built its context on a dangling prototype
+ * (heap-use-after-free in var_add; a data abort on EwokOS once the trunk
+ * allocator recycled the block). */
+static vm_t*  g_reg_vm = NULL;
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
@@ -863,8 +869,11 @@ static var_t* gl_getUniformLocation(vm_t* vm, var_t* env, void* data) {
     gl_uniform* u = p ? prog_find_uniform(p, name) : NULL;
     mstr_free(m);
     if(u == NULL) return var_new_null(vm);
-    /* The location object borrows the program-owned gl_uniform (no-op free). */
-    return var_new_obj(vm, g_uloc_proto, u, NULL);
+    /* The location object borrows the program-owned gl_uniform, so it must
+     * carry an explicit no-op free: a NULL free_func makes var_clean()
+     * mario_free() the payload, which freed the uniform out from under the
+     * program (use-after-free on the next draw, double free in program_free). */
+    return var_new_obj(vm, g_uloc_proto, u, free_none);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1161,7 +1170,8 @@ static void gl_ctx_on_destroy(void* vp) {
 var_t* js_webgl_create_context(vm_t* vm, int w, int h,
                                void* embed_ctx, void* canvas,
                                webgl_set_pixel_fn setpx, var_t* canvas_el) {
-    if(g_ctx_proto == NULL) return var_new_null(vm);
+    /* The pins must belong to THIS vm (see g_reg_vm). */
+    if(vm == NULL || g_reg_vm != vm || g_ctx_proto == NULL) return var_new_null(vm);
     if(w <= 0) w = 300;
     if(h <= 0) h = 150;
     gl_ctx* g = (gl_ctx*)calloc(1, sizeof(gl_ctx));
@@ -1223,9 +1233,29 @@ static void reg(vm_t* vm, var_t* cls, const char* decl, native_func_t fn) {
     vm_reg_native(vm, cls, decl, fn, NULL);
 }
 
+/* Drop the pins when their VM closes: vm_close() frees every var they point
+ * at, and the next VM re-registers from scratch. */
+static void gl_unpin(void) {
+    g_ctx_cls = NULL;   g_ctx_proto = NULL;
+    g_buf_cls = NULL;   g_buf_proto = NULL;
+    g_shd_cls = NULL;   g_shd_proto = NULL;
+    g_prg_cls = NULL;   g_prg_proto = NULL;
+    g_uloc_cls = NULL;  g_uloc_proto = NULL;
+    g_ainfo_cls = NULL; g_ainfo_proto = NULL;
+    g_nregents = 0;
+    g_reg_vm = NULL;
+}
+
+static void gl_vm_close(void* data) {
+    if(g_reg_vm == (vm_t*)data)
+        gl_unpin();
+}
+
 bool js_webgl_register(vm_t* vm) {
-    if(g_registered) return true;
     if(vm == NULL) return false;
+    if(g_reg_vm == vm) return true;
+    /* A different (or no) VM owns the pins: they are stale for this one. */
+    gl_unpin();
 
     /* Pin every class var (kept alive for the vm lifetime) and build instances
      * from the pinned prototype directly - never by global-name lookup, which a
@@ -1440,7 +1470,8 @@ bool js_webgl_register(vm_t* vm) {
         add_const(vm, p, "HIGH_INT", GL_HIGH_INT);
     }
 
-    g_registered = 1;
+    g_reg_vm = vm;
+    vm_reg_close(vm, gl_vm_close, vm);
     return true;
 }
 

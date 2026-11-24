@@ -95085,14 +95085,18 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
         }
 
         if(requisition_props->is_ipv4 == false){
+            #ifdef HTTPS_TRACE_DEBUG
             fprintf(stderr, "HTTPS_TRACE dns/connect %s\n", requisition_props->hostname);
+#endif
             response->connection_file_descriptor =private_BearHttps_connect_host(
                 self,
                 response,
                 requisition_props->hostname,
                 requisition_props->port
             );
+            #ifdef HTTPS_TRACE_DEBUG
             fprintf(stderr, "HTTPS_TRACE connected fd=%d\n", response->connection_file_descriptor);
+#endif
         }
 
          if(response->connection_file_descriptor < 0){
@@ -95302,7 +95306,9 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
 
          }
 
-         fprintf(stderr, "HTTPS_TRACE request sent\n");
+         #ifdef HTTPS_TRACE_DEBUG
+        fprintf(stderr, "HTTPS_TRACE request sent\n");
+#endif
          private_BearHttpsResponse_read_til_end_of_headers_or_reach_limit(response,self->header_chunk_read_size,self->header_chunk_reallocator_factor);
 
          if(tlsphase_dbg && requisition_props->is_https){
@@ -95313,7 +95319,9 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
                  (long)((tp_t4.tv_sec-tp_t3.tv_sec)*1000 + (tp_t4.tv_nsec-tp_t3.tv_nsec)/1000000));
          }
 
-         fprintf(stderr, "HTTPS_TRACE headers done\n");
+         #ifdef HTTPS_TRACE_DEBUG
+        fprintf(stderr, "HTTPS_TRACE headers done\n");
+#endif
          
          if(BearHttpsResponse_error(response)){
              private_BearHttpsRequisitionProps_free(requisition_props);

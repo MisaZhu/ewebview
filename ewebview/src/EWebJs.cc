@@ -7132,6 +7132,10 @@ void EWebEngine::jsInvalidateHandles()
         js_dom_reset_element_cache(m_jsVm);
     }
     m_jsScriptAsyncProps.clear();
+    /* Same rule for the dynamic <link>/<img> load waiters: they are raw
+     * element handles into the document being rebuilt. */
+    m_jsLinkEls.clear();
+    m_jsImgEls.clear();
     m_jsHoverElement = nullptr;
 }
 

@@ -3922,6 +3922,18 @@ static int is_webgl_id(const char* type) {
            !strcmp(type, "moz-webgl") || !strcmp(type, "webkit-3d");
 }
 
+/* make_gl_recon_proxy's cached prototype is a var of the VM that built it and
+ * dies in that VM's vm_close(); drop it there so the next page VM rebuilds it
+ * instead of hanging its proxies on a freed prototype. */
+static var_t* s_gl_proto = NULL;
+static vm_t*  s_gl_proto_vm = NULL;
+static void gl_recon_vm_close(void* data) {
+    if(s_gl_proto_vm == (vm_t*)data) {
+        s_gl_proto = NULL;
+        s_gl_proto_vm = NULL;
+    }
+}
+
 static var_t* make_gl_recon_proxy(vm_t* vm) {
     /* Brand realism: a fingerprinter typically validates the context with
      * Object.prototype.toString.call(gl) === '[object WebGLRenderingContext]'
@@ -3933,8 +3945,9 @@ static var_t* make_gl_recon_proxy(vm_t* vm) {
      * and lay an own @@toStringTag on the proxy (toString). Without this the
      * probe would be brand-rejected and we would falsely conclude the page never
      * touches WebGL. */
-    static var_t* s_gl_proto = NULL;
-    if(s_gl_proto == NULL) {
+    if(s_gl_proto == NULL || s_gl_proto_vm != vm) {
+        s_gl_proto = NULL;
+        s_gl_proto_vm = NULL;
         var_t* cls = vm_new_class(vm, "WebGLRenderingContext");
         if(cls != NULL) {
             var_t* proto = var_get_prototype(cls);
@@ -3943,6 +3956,8 @@ static var_t* make_gl_recon_proxy(vm_t* vm) {
                                      var_new_str(vm, "WebGLRenderingContext"));
                 if(pn != NULL) { pn->invisable = 1; pn->be_unenumerable = 1; }
                 s_gl_proto = proto;
+                s_gl_proto_vm = vm;
+                vm_reg_close(vm, gl_recon_vm_close, vm);
             }
         }
     }

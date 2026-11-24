@@ -140,6 +140,27 @@ int main(int argc, char** argv) {
 				ewebview_post_event(view, &wev);
 			}
 		}
+		/* Test-only back-and-forth navigation (HL_NAV_ALT=<url2>,
+		 * HL_NAV_EVERY_MS=<ms>): alternates between <url> and <url2> so the
+		 * headless ASan gate can exercise engineNavigate's teardown of a
+		 * still-running page (resetJsVm -> vm_close) over and over. */
+		{
+			static uint64_t s_navLast = 0;
+			static uint32_t s_navCount = 0;
+			const char* alt = getenv("HL_NAV_ALT");
+			const char* every = getenv("HL_NAV_EVERY_MS");
+			uint64_t now = port.clock.tic_ms(port.clock.ud);
+			if(s_navLast == 0)
+				s_navLast = start;
+			if(alt != NULL && every != NULL && atoi(every) > 0 && url != NULL &&
+			   now - s_navLast >= (uint64_t)atoi(every)) {
+				s_navLast = now;
+				s_navCount++;
+				const char* next = (s_navCount & 1) ? alt : url;
+				fprintf(stderr, "[hl] nav #%u -> %s\n", s_navCount, next);
+				ewebview_load(view, next);
+			}
+		}
 		if(getenv("HL_LOG_STAT") != NULL) {
 			uint64_t now = port.clock.tic_ms(port.clock.ud);
 			if(now - last_log >= 5000) {

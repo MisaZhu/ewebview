@@ -1720,6 +1720,8 @@ static void rdDumpChain(litehtml::element* e)
     }
 }
 
+static size_t firstReadyResult(const std::vector<EWebResult>& q, bool hold_images);
+
 void EWebEngine::engineLoop()
 {
     /* The engine thread body. Each iteration:
@@ -2006,9 +2008,31 @@ void EWebEngine::engineLoop()
                           ticMs() >= m_inputPaintUntil &&
                           (m_contentDirtySince == 0 ||
                            (ticMs() - m_contentDirtySince) < kRepaintDeferMaxMs);
-        if(m_doc && (!m_cacheValid || scrollMoved ||
-                     (m_contentDirty && !deferPaint))) {
-            engineRenderFrame(true);
+        /* Adaptive repaint pacing: a perpetually-animating page (taobao) kept
+         * m_animActive/m_contentDirty set every tick, so the engine re-rendered
+         * the whole heavy DOM at the busy-tick rate (was 4ms = 250fps). That
+         * flood saturates the single-threaded shared GUI services (xserverd /
+         * fontd / consoled) and starves every OTHER window - the whole desktop
+         * freezes while unrelated ssh stays alive. Pace full frames by measured
+         * render cost (gap = 2x last cost, clamped 33..250ms) so a costly page
+         * renders slower instead of monopolising the compositor; input-driven
+         * paints (now < m_inputPaintUntil) bypass the gap to stay snappy. */
+        {
+            static uint64_t s_lastRenderAt = 0;
+            static uint64_t s_renderCost = 0;
+            uint64_t nowMs = ticMs();
+            uint64_t gap = s_renderCost * 2;
+            if(gap < 33) gap = 33;
+            if(gap > 250) gap = 250;
+            bool renderDue = (nowMs - s_lastRenderAt) >= gap ||
+                             nowMs < m_inputPaintUntil;
+            if(m_doc && renderDue && (!m_cacheValid || scrollMoved ||
+                         (m_contentDirty && !deferPaint))) {
+                uint64_t r0 = ticMs();
+                engineRenderFrame(true);
+                s_renderCost = ticMs() - r0;
+                s_lastRenderAt = ticMs();
+            }
         }
 
         /* 10. park when there is nothing to do, so an idle page costs no CPU.
@@ -2046,7 +2070,7 @@ void EWebEngine::engineLoop()
 
         uint32_t timeout_ms;
         if(blocked_on_adopt)     timeout_ms = 16;   /* waiting for the UI to adopt */
-        else if(busy)            timeout_ms = 4;    /* pace a build/wait, no pure spin */
+        else if(busy)            timeout_ms = 16;   /* pace a build/wait at frame rate; 4ms (250fps) over-rendered animating pages into a 100% CPU spin */
         else if(vm_active)       timeout_ms = 16;   /* timer granularity */
         else                     timeout_ms = 200;  /* fully idle */
 
@@ -2054,9 +2078,29 @@ void EWebEngine::engineLoop()
          * landed since step 3). Lock order is result-then-cmd and never
          * nested, so it cannot deadlock with pushResult (result-only) or
          * postCommand (cmd-only). */
+        /* Only a result step 3 can actually consume counts: held images
+         * (see firstReadyResult) must not turn the park into a spin. */
+        bool hold_images = (m_buildPhase != BUILD_IDLE && !m_jsPostSwapRun);
         pthread_mutex_lock(&m_resultMutex);
-        bool have_results = !m_resultQueue.empty();
+        bool have_results = firstReadyResult(m_resultQueue, hold_images) < m_resultQueue.size();
         pthread_mutex_unlock(&m_resultMutex);
+        /* TEMPDIAG(loopdbg): why does the engine loop never park on heavy pages?
+         * Dumps the park-decision inputs once per 2s under EWEB_LOOPDBG. */
+        {
+            static int s_dbg = -1;
+            static uint64_t s_last = 0;
+            if(s_dbg < 0) s_dbg = (getenv("EWEB_LOOPDBG") != nullptr) ? 1 : 0;
+            uint64_t now = ticMs();
+            if(s_dbg && now - s_last >= 2000) {
+                s_last = now;
+                fprintf(stderr, "[loopdbg] busy=%d adopt=%d res=%d hold=%d phase=%d dirty=%d lay=%d sty=%d anim=%d cache=%d tq=%u rq=%u nav=%u scroll=%d\n",
+                    (int)busy, (int)blocked_on_adopt, (int)have_results, (int)hold_images,
+                    (int)m_buildPhase, (int)m_contentDirty, (int)m_needsLayout, (int)m_needsStyleUpdate,
+                    (int)m_animActive, (int)m_cacheValid,
+                    (unsigned)m_taskQueue.size(), (unsigned)m_resultQueue.size(),
+                    (unsigned)m_jsPendingNav.size(), (int)m_jsScrollPending);
+            }
+        }
         if(!have_results) {
             pthread_mutex_lock(&m_cmdMutex);
             if(m_cmdQueue.empty() && !m_engineStop) {
@@ -2568,6 +2612,16 @@ void EWebEngine::engineDropPendingWork()
 
     pthread_mutex_lock(&m_resultMutex);
     for(size_t i = 0; i < m_resultQueue.size(); ++i) {
+        /* A stylesheet that was fetched but never consumed still holds its
+         * m_pendingCss slot (loadCSSContent releases it). Dropping the result
+         * without releasing the slot left the count stuck above zero for the
+         * rest of the session: every later first paint waited out
+         * kFirstPaintCssWaitMs on a sheet that no longer existed. */
+        if(m_resultQueue[i].type == EWEB_TASK_CSS) {
+            forgetCSS(m_resultQueue[i].url);
+            if(m_pendingCss > 0)
+                m_pendingCss--;
+        }
         if(m_resultQueue[i].image != nullptr) {
             m_port.gfx.surface_free(m_port.gfx.ud, m_resultQueue[i].image);
             m_resultQueue[i].image = nullptr;
@@ -3721,6 +3775,13 @@ void EWebEngine::cleanupBuildResources()
     m_jsScriptDone.clear();
     m_jsScriptRan.clear();
     m_jsScriptEls.clear();
+    /* The dynamic <link>/<img> waiters are element handles of the page being
+     * left, parked for a VM that resetJsVm() just closed. Left behind, a late
+     * same-url result (an in-flight fetch of the old page, or the next visit
+     * re-requesting the sheet) fired through them on the NEW vm after the old
+     * document was freed: heap-use-after-free in jsElIsLive. */
+    m_jsLinkEls.clear();
+    m_jsImgEls.clear();
     m_jsHasInlineHandlers = false;
     m_jsCurScriptEl = nullptr;
     m_jsCurScriptElUrl.clear();
@@ -5339,15 +5400,37 @@ void EWebEngine::pushResult(const EWebResult& result)
     pthread_cond_signal(&m_cmdCond);
 }
 
+/* Index of the first result the engine can consume right now, or q.size().
+ * An image result is HELD (left in place, skipped) during a pre-swap build
+ * (hold_images): the page on screen owns the caches again only once
+ * m_jsPostSwapRun starts.
+ * It used to be popped and re-inserted at the HEAD instead, which wedged the
+ * queue behind it: a late image of the page being left (in-flight fetches
+ * survive engineDropPendingWork) landed ahead of the new page's stylesheets,
+ * so BUILD_RENDER_DOC waited out kFirstPaintCssWaitMs on sheets that had
+ * already arrived, and the non-empty queue kept the loop from parking - a
+ * flat-out spin posting one EUET_BUILD_STATUS per iteration for the whole
+ * wait (millions of UI events on a back-and-forth navigation). */
+static size_t firstReadyResult(const std::vector<EWebResult>& q, bool hold_images)
+{
+    size_t i = 0;
+    while(i < q.size() && hold_images && q[i].type == EWEB_TASK_IMAGE)
+        ++i;
+    return i;
+}
+
 bool EWebEngine::getResult(EWebResult& result)
 {
+    /* ENGINE-THREAD ONLY (reads the build state). */
+    bool hold_images = (m_buildPhase != BUILD_IDLE && !m_jsPostSwapRun);
     pthread_mutex_lock(&m_resultMutex);
-    if(m_resultQueue.empty()) {
+    size_t at = firstReadyResult(m_resultQueue, hold_images);
+    if(at >= m_resultQueue.size()) {
         pthread_mutex_unlock(&m_resultMutex);
         return false;
     }
-    result = m_resultQueue.front();
-    m_resultQueue.erase(m_resultQueue.begin());
+    result = m_resultQueue[at];
+    m_resultQueue.erase(m_resultQueue.begin() + at);
     if(result.type == EWEB_TASK_IMAGE) {
         EWEB_LOG("[ewebview] pop image result: remain=%d url=%s hash=%08x ok=%d size=%d\n",
             (int)m_resultQueue.size(), result.url.c_str(), debug_hash_text(result.url),
@@ -5389,20 +5472,9 @@ bool EWebEngine::processResults()
      * Stylesheets are NOT deferred: loadCSSContent() routes them into the
      * build context while a build is in flight, and BUILD_RENDER_DOC waits
      * for them to drain so the first paint carries the author CSS instead
-     * of an unstyled skeleton that restyles live seconds later. */
-    if(result.type == EWEB_TASK_IMAGE && m_buildPhase != BUILD_IDLE && !m_jsPostSwapRun) {
-        EWEB_LOG("[ewebview] process image deferred by build: size=%d phase=%d\n",
-            (int)result.content.size(), (int)m_buildPhase);
-        static int imgdbg3 = -1;
-        if(imgdbg3 < 0) { const char* e = getenv("EWEB_IMGDBG"); imgdbg3 = (e && e[0] == '1') ? 1 : 0; }
-        if(imgdbg3)
-            fprintf(stderr, "[IMGDBG] DEFER url=%.80s phase=%d postswap=%d t=%u\n",
-                result.url.c_str(), (int)m_buildPhase, m_jsPostSwapRun ? 1 : 0, (uint32_t)ticMs());
-        pthread_mutex_lock(&m_resultMutex);
-        m_resultQueue.insert(m_resultQueue.begin(), result);
-        pthread_mutex_unlock(&m_resultMutex);
-        return false;
-    }
+     * of an unstyled skeleton that restyles live seconds later.
+     * Images that cannot land yet are held inside getResult() (see
+     * firstReadyResult), never popped, so they do not block what follows. */
 
     uint64_t process_start = ticMs();
     EWEB_LOG("[ewebview] process result: type=%d ok=%d size=%d\n",
