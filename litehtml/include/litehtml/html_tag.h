@@ -298,6 +298,10 @@ namespace litehtml
 		 * were styled while detached - ancestor-dependent selectors could not
 		 * match then, so re-attachment must re-run the cascade. */
 		void						reapply_style_cascade(const litehtml::css& master, const litehtml::css& doc_css);
+		/* Drop accumulated cascade state (merged properties, matched-selector
+		 * list, generated content) WITHOUT destroying the element, so a
+		 * ::before/::after box can be refilled in place by the next pass. */
+		void						reset_cascade_state();
 		virtual void				refresh_styles() override;
 
 		virtual bool				is_white_space() const override;

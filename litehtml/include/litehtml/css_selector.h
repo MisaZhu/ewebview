@@ -90,12 +90,19 @@ namespace litehtml
 			m_media_query	= media;
 			m_combinator	= combinator_descendant;
 			m_order			= 0;
+			m_left			= nullptr;
+			m_style			= nullptr;
 		}
-
+		
 		~css_selector()
 		{
+			/* m_left is the owned ancestor chain (built by parse(), deep-copied
+			 * by the copy ctor). m_style is shared by every selector of a comma
+			 * list and m_media_query by every rule of an @media block; css::clear()
+			 * frees each of those unique pointers exactly once. */
+			delete m_left;
 		}
-
+		
 		css_selector(const css_selector& val)
 		{
 			m_right			= val.m_right;
@@ -110,6 +117,7 @@ namespace litehtml
 			m_specificity	= val.m_specificity;
 			m_order			= val.m_order;
 			m_media_query	= val.m_media_query;
+			m_style			= nullptr;
 		}
 
 		bool parse(const tstring& text);

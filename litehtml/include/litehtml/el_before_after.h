@@ -11,11 +11,19 @@ namespace litehtml
 	
 		virtual void add_style(const litehtml::style& st, const litehtml::selector_specificity& spec = litehtml::inline_style_specificity) override;
 		virtual void apply_stylesheet(const litehtml::css& stylesheet) override;
+		virtual void reset_generated() override;
 		virtual style_display get_display() const override;
 	private:
 		void	add_text(const tstring& txt);
 		void	add_function(const tstring& fnc, const tstring& params);
 		tstring convert_escape(const tchar_t* txt);
+		/* Generated children are never deleted during restyle: ancestor
+		 * positioned-box caches and the render walk can still hold them until
+		 * the next full rebuild. Retired nodes park here and are reused by the
+		 * next content pass; ~html_tag deletes them with the owning element. */
+		elements_vector	m_parked;
+		element::ptr take_parked(bool want_space);
+		void	park_children();
 		/* a pseudo-element whose computed content stays none/normal (or
 		 * absent) generates no box at all, per CSS; without this the
 		 * universal `*, *::before, *::after` reset inserts phantom

@@ -479,7 +479,14 @@ litehtml::html_tag::~html_tag()
 	 * timeline never holds a dangling pointer after the element is freed. */
 	{
 		document* doc = get_document();
-		if(doc) doc->clear_animations_for(this);
+		if(doc)
+		{
+			doc->clear_animations_for(this);
+			/* Same hazard for the tabular-fixup list: it holds raw pointers
+			 * and fix_tables_layout walks it after every restyle epoch. */
+			doc->remove_tabular(this);
+			doc->clear_over_element(this);
+		}
 	}
 	// Clear parent reference for all children before deleting them
 	// to prevent any issues with dangling parent pointers
@@ -9630,20 +9637,35 @@ void litehtml::html_tag::update_floats(int dy, const element::ptr &parent)
 
 void litehtml::html_tag::remove_before_after()
 {
+	/* element::ptr is a raw pointer: the old erase-without-delete leaked the
+	 * generated box (and its content text children) on EVERY cascade rebuild
+	 * and refresh_styles pass - thousands of ::before/::after orphans per
+	 * real-site session. Deleting instead is not safe either: positioned-box
+	 * lists, the tabular registry and JS-side handles can still reference the
+	 * box until the next rebuild. Reuse the object in place - drop its cascade
+	 * state so the coming pass refills it, keeping the pointer stable. */
 	if(!m_children.empty())
 	{
 		if( !t_strcmp(m_children.front()->get_tagName(), _t("::before")) )
 		{
-			m_children.erase(m_children.begin());
+			static_cast<html_tag*>(m_children.front())->reset_cascade_state();
 		}
 	}
 	if(!m_children.empty())
 	{
 		if( !t_strcmp(m_children.back()->get_tagName(), _t("::after")) )
 		{
-			m_children.erase(m_children.end() - 1);
+			static_cast<html_tag*>(m_children.back())->reset_cascade_state();
 		}
 	}
+}
+
+void litehtml::html_tag::reset_cascade_state()
+{
+	clear_style_property_cache();
+	m_style.clear();
+	m_used_styles.clear();
+	reset_generated();
 }
 
 litehtml::element::ptr litehtml::html_tag::get_element_before()

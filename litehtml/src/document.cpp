@@ -329,7 +329,6 @@ void litehtml::profile_color_parse(uint64_t start_ms)
 
 litehtml::document::~document()
 {
-	fprintf(stderr, "[VMLIFE] ~document this=%p\n", (void*)this);
 	m_over_element = 0;
 	if(m_container)
 	{

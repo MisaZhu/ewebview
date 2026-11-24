@@ -54,6 +54,7 @@ namespace litehtml
 	public:
 		media_query_list();
 		media_query_list(const media_query_list& val);
+		~media_query_list();
 
 		static media_query_list::ptr create_from_string(const tstring& str, document* doc);
 		bool is_used() const;
@@ -69,6 +70,18 @@ namespace litehtml
 	inline media_query_list::media_query_list()
 	{
 		m_is_used = false;
+	}
+
+	/* m_queries entries are raw pointers created by create_from_string and
+	 * owned by the list (the document's m_media_lists is a non-owning
+	 * observer vector; css::clear() frees the lists its selectors reference). */
+	inline media_query_list::~media_query_list()
+	{
+		for(media_query::vector::iterator it = m_queries.begin(); it != m_queries.end(); ++it)
+		{
+			delete *it;
+		}
+		m_queries.clear();
 	}
 
 	inline bool media_query_list::is_used() const

@@ -1759,7 +1759,7 @@ void EWebEngine::engineLoop()
         /* 2. deferred deletions parked by the last BUILD_SWAP_DOC (freeing
          * them inside the swap would re-enter the container while it is still
          * live). */
-        if(m_pendingDeleteDoc) { fprintf(stderr, "[VMLIFE] flush delete doc=%p\n", (void*)m_pendingDeleteDoc); delete m_pendingDeleteDoc; m_pendingDeleteDoc = nullptr; }
+        if(m_pendingDeleteDoc) { delete m_pendingDeleteDoc; m_pendingDeleteDoc = nullptr; }
         if(m_pendingDeleteContainer) { delete m_pendingDeleteContainer; m_pendingDeleteContainer = nullptr; }
 
         /* 3. download results. Drain everything that has landed; stop early
@@ -2479,7 +2479,6 @@ void EWebEngine::engineNavigate(const std::string& url)
     }
     engineDropPendingWork();
     cleanupBuildResources();
-    fprintf(stderr, "[VMLIFE] engineNavigate cleaned -> %.60s\n", url.c_str());
 
     m_engineScrollX = 0;
     m_engineScrollY = 0;
@@ -5144,11 +5143,6 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
                                          m_jsEnabled ? &m_jsImportMap : nullptr,
                                          m_jsEnabled ? &m_jsHasInlineHandlers : nullptr,
                                          &m_jsBuildHasModules);
-    /* TEMP: dump final HTML to /tmp for debugging (unique name: the old
-     * fixed path kept showing stale content from unrelated runs). */
-    { FILE* _dbg2 = fopen("/tmp/eweb_final_rk.html", "w");
-      if(_dbg2) { fwrite(m_buildHtmlContent.data(), 1, m_buildHtmlContent.size(), _dbg2); fclose(_dbg2); }
-      else fprintf(stderr, "[htmldump] eweb_final_rk fopen FAILED errno=%d\n", errno); }
     /* Browser async-script ordering (DEFAULT ON): an `async` <script src> holds
      * no document-order slot in a real browser - it executes when its fetch
      * lands, which in practice is after the parser has already run every inline
@@ -6111,7 +6105,6 @@ void EWebEngine::advanceBuildStep()
         // re-entrant corruption (the engine loop flushes these at its top).
         if(m_pendingDeleteDoc) delete m_pendingDeleteDoc;
         if(m_pendingDeleteContainer) delete m_pendingDeleteContainer;
-        fprintf(stderr, "[VMLIFE] swap park old_doc=%p\n", (void*)old_doc);
         m_pendingDeleteDoc = old_doc;
         m_pendingDeleteContainer = old_container;
 

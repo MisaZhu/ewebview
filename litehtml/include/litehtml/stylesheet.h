@@ -87,20 +87,50 @@ namespace litehtml
 		
 		~css()
 		{
-
+			clear();
 		}
-
+		
 		const css_selector::vector& selectors() const
 		{
 			return m_selectors;
 		}
-
+		
 		void clear()
 		{
+			/* Raw-pointer ownership (css_selector::ptr / style::ptr /
+			 * media_query_list::ptr are all raw): each selector owns its m_left
+			 * chain (freed by ~css_selector), while one style is shared by every
+			 * selector of a comma list and one media list by every rule of an
+			 * @media block. Collect the shared pointers first, then free each
+			 * unique one exactly once. Dropping the vector alone leaked the whole
+			 * parsed sheet on every context reset / document teardown. */
+			std::set<style::ptr> styles;
+			std::set<media_query_list::ptr> medias;
+			for(size_t i = 0; i < m_selectors.size(); i++)
+			{
+				css_selector::ptr s = m_selectors[i];
+				for(css_selector::ptr l = s; l; l = l->m_left)
+				{
+					if(l->m_style) styles.insert(l->m_style);
+					if(l->m_media_query) medias.insert(l->m_media_query);
+				}
+				delete s;
+			}
+			for(std::set<style::ptr>::iterator it = styles.begin(); it != styles.end(); ++it)
+			{
+				delete *it;
+			}
+			for(std::set<media_query_list::ptr>::iterator it = medias.begin(); it != medias.end(); ++it)
+			{
+				delete *it;
+			}
 			m_selectors.clear();
 			m_has_before_after = false;
 			m_attr_names.clear();
 			m_index.built = false;
+			m_index.buckets.clear();
+			m_index.universal.clear();
+			m_index.stamps.clear();
 		}
 
 		bool	uses_attribute(const tstring& name) const

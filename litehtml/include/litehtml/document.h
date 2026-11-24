@@ -223,6 +223,8 @@ namespace litehtml
 		bool							lang_changed();
 		bool                            match_lang(const tstring & lang);
 		void							add_tabular(const element::ptr& el);
+		void							remove_tabular(const element::ptr& el);
+		void							clear_over_element(const element::ptr& el);
 		void							update_master_styles();
 		/* Runs one time-bounded chunk of the master-style update; returns true
 		 * when the whole update (refresh+apply+parse) has completed. Callers
@@ -330,6 +332,28 @@ namespace litehtml
 		{
 			m_tabular_elements.push_back(el);
 			m_tabular_dirty = true;
+		}
+	}
+	inline void document::remove_tabular(const element::ptr& el)
+	{
+		/* ~html_tag unregisters here: m_tabular_elements holds raw pointers,
+		 * and a deleted element (e.g. a ::before/::after discarded by a
+		 * cascade rebuild) left a dangling entry that fix_tables_layout
+		 * later dereferenced. */
+		elements_vector::iterator it = std::find(m_tabular_elements.begin(), m_tabular_elements.end(), el);
+		if(it != m_tabular_elements.end())
+		{
+			m_tabular_elements.erase(it);
+		}
+	}
+	inline void document::clear_over_element(const element::ptr& el)
+	{
+		/* A hovered element deleted by a restyle (e.g. a regenerated
+		 * ::before/::after) must not stay referenced until the next mouse
+		 * event dereferences it. */
+		if(m_over_element == el)
+		{
+			m_over_element = nullptr;
 		}
 	}
 	inline bool document::match_lang(const tstring & lang)

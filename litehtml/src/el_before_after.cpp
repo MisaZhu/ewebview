@@ -18,7 +18,61 @@ litehtml::el_before_after_base::el_before_after_base(litehtml::document* doc, bo
 
 litehtml::el_before_after_base::~el_before_after_base()
 {
+	/* Parked nodes are owned here (they left m_children on retirement);
+	 * ~html_tag only deletes the active children. */
+	for(auto& el : m_parked)
+	{
+		if(el) delete el;
+	}
+	m_parked.clear();
+}
 
+void litehtml::el_before_after_base::park_children()
+{
+	/* Retire the generated children WITHOUT freeing them: ancestor
+	 * positioned-box caches (m_positioned, walked by render_fixed_only
+	 * without a rebuild) and in-flight render walks can still hold these
+	 * pointers until the next full layout. Parked nodes stay valid and are
+	 * reused by the next content pass; deletion happens only at document
+	 * teardown via ~el_before_after_base / ~html_tag. */
+	for(auto& child : m_children)
+	{
+		if(child)
+		{
+			child->parent(nullptr);
+			m_parked.push_back(child);
+		}
+	}
+	m_children.clear();
+}
+
+litehtml::element::ptr litehtml::el_before_after_base::take_parked(bool want_space)
+{
+	/* Reuse a retired node of the matching kind (el_space vs plain el_text;
+	 * both carry an empty tag name, is_white_space tells them apart). */
+	for(elements_vector::iterator it = m_parked.begin(); it != m_parked.end(); ++it)
+	{
+		element::ptr el = *it;
+		if(!el) continue;
+		const litehtml::tchar_t* tag = el->get_tagName();
+		if(tag && tag[0]) continue;   /* img or other non-text node */
+		if(el->is_white_space() == want_space)
+		{
+			m_parked.erase(it);
+			return el;
+		}
+	}
+	return nullptr;
+}
+
+void litehtml::el_before_after_base::reset_generated()
+{
+	/* Cascade-rebuild reuse: retire the generated content children into the
+	 * park and drop the content cache so the next add_style pass regenerates
+	 * them from the new winning value. */
+	park_children();
+	m_content.clear();
+	m_box_content = false;
 }
 
 void litehtml::el_before_after_base::add_style(const litehtml::style& st, const litehtml::selector_specificity& spec)
@@ -35,7 +89,9 @@ void litehtml::el_before_after_base::add_style(const litehtml::style& st, const 
 	 * Rebuild generated children only when the winning content value changes;
 	 * reparsing it after every unrelated rule duplicates attr()/string text. */
 	m_content = content;
-	m_children.clear();
+	/* Retire the previous content's children into the park (never free them
+	 * mid-restyle: render caches may still reference them). */
+	park_children();
 	m_box_content = false;
 	if(content.empty())
 	{
@@ -148,12 +204,28 @@ void litehtml::el_before_after_base::add_text( const tstring& txt )
 			{
 				if(!word.empty())
 				{
-					element::ptr el = new el_text(word.c_str(), get_document());
+					element::ptr el = take_parked(false);
+					if(el)
+					{
+						static_cast<el_text*>(el)->set_text(word);
+					}
+					else
+					{
+						el = new el_text(word.c_str(), get_document());
+					}
 					appendChild(el);
 					word.clear();
 				}
-
-				element::ptr el = new el_space(txt.substr(i, 1).c_str(), get_document());
+				
+				element::ptr el = take_parked(true);
+				if(el)
+				{
+					static_cast<el_text*>(el)->set_text(txt.substr(i, 1));
+				}
+				else
+				{
+					el = new el_space(txt.substr(i, 1).c_str(), get_document());
+				}
 				appendChild(el);
 			} else
 			{
@@ -182,7 +254,15 @@ void litehtml::el_before_after_base::add_text( const tstring& txt )
 	}
 	if(!word.empty())
 	{
-		element::ptr el = new el_text(word.c_str(), get_document());
+		element::ptr el = take_parked(false);
+		if(el)
+		{
+			static_cast<el_text*>(el)->set_text(word);
+		}
+		else
+		{
+			el = new el_text(word.c_str(), get_document());
+		}
 		appendChild(el);
 		word.clear();
 	}

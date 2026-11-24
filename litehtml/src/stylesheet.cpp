@@ -117,7 +117,11 @@ void css::parse_stylesheet(const tchar_t* str, const tchar_t* baseurl, document*
 			style::ptr st = new style();
 			st->add(style_start + 1, style_end - style_start - 2, baseurl);
 
-			parse_selectors(ptr_to_string(p, style_start), st, media);
+			if(!parse_selectors(ptr_to_string(p, style_start), st, media))
+			{
+				/* No selector took ownership of the rule style. */
+				delete st;
+			}
 
 			if(media && doc)
 			{
@@ -237,6 +241,11 @@ bool css::parse_selectors( const tstring& txt, const litehtml::style::ptr& style
 			selector->calc_specificity();
 			add_selector(selector);
 			added_something = true;
+		} else
+		{
+			/* Unparsed selector is owned by nobody else (m_style is the shared
+			 * rule style, freed by the caller when no selector took it). */
+			delete selector;
 		}
 	}
 

@@ -680,6 +680,7 @@ bool litehtml::element::appendChild(const ptr &el)						LITEHTML_RETURN_FUNC(fal
 bool litehtml::element::removeChild(const ptr &el)						LITEHTML_RETURN_FUNC(false)
 bool litehtml::element::insertBefore(const ptr &el, const ptr &ref)	LITEHTML_RETURN_FUNC(false)
 void litehtml::element::clearRecursive()											LITEHTML_EMPTY_FUNC
+void litehtml::element::reset_generated()									LITEHTML_EMPTY_FUNC
 const litehtml::tchar_t* litehtml::element::get_tagName() const						LITEHTML_RETURN_FUNC(_t(""))
 bool litehtml::element::is_html_tag() const
 {

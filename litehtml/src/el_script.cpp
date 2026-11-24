@@ -20,7 +20,27 @@ litehtml::el_script::el_script(litehtml::document* doc) : litehtml::element(doc)
 
 litehtml::el_script::~el_script()
 {
-
+	/* el_script derives from element (NOT html_tag), and the base element
+	 * destructor does not release m_children. appendChild() keeps the body
+	 * text node as a real child (script.childNodes.length == 1 for React
+	 * hydration), so without this the inline <script>'s el_text leaked on
+	 * every document teardown - one orphaned text node per navigation.
+	 * Mirror html_tag::~html_tag: unlink then delete each owned child. */
+	for(auto& child : m_children)
+	{
+		if(child)
+		{
+			child->parent(nullptr);
+		}
+	}
+	for(auto& child : m_children)
+	{
+		if(child)
+		{
+			delete child;
+		}
+	}
+	m_children.clear();
 }
 
 void litehtml::el_script::parse_attributes()

@@ -170,6 +170,9 @@ protected:
 		 * protected m_children. Returns false when `el` is null. */
 		virtual bool				insertBefore(const ptr &el, const ptr &ref);
 		virtual void				clearRecursive();
+		/* Reset generated-content state before a cascade rebuild refills it.
+		 * Only el_before_after_base carries any; the base is a no-op. */
+		virtual void				reset_generated();
 
 		virtual const tchar_t*		get_tagName() const;
 		/* True only for html_tag and subclasses. Several element subclasses

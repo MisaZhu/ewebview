@@ -469,7 +469,6 @@ void EWebEngine::initJsVm()
     int vcSize = (getenv("EWEB_NOVCACHE") != nullptr) ? 0 : VAR_CACHE_MAX_DEF;
     int ncSize = (getenv("EWEB_NOLNCACHE") != nullptr) ? 0 : LOAD_NCACHE_MAX_DEF;
     m_jsVm = vm_new(js_compile, vcSize, ncSize);
-    fprintf(stderr, "[VMLIFE] vm_new vm=%p\n", (void*)m_jsVm);
     if(m_jsVm == nullptr) {
         EWEB_LOG("[ewebview] js: vm_new failed\n");
         return;
@@ -605,7 +604,6 @@ void EWebEngine::initJsVm()
 void EWebEngine::resetJsVm()
 {
     if(m_jsVm == nullptr) return;
-    fprintf(stderr, "[VMLIFE] resetJsVm close vm=%p\n", (void*)m_jsVm);
     /* Abandon async-fetch jobs created on this VM before freeing it: their
      * __resolve/__reject closures live inside the VM, and the global fetch
      * queues outlive it, so the next js_web_fetch_poll() (on the fresh
@@ -613,7 +611,6 @@ void EWebEngine::resetJsVm()
      * closures - a heap-use-after-free on the freed VM region. */
     js_web_fetch_purge_vm(m_jsVm);
     vm_close(m_jsVm);      /* frees the VM and everything it owns */
-    fprintf(stderr, "[VMLIFE] vm_close done\n");
     m_jsVm = nullptr;
 }
 
@@ -4629,6 +4626,15 @@ void* EWebEngine::jsCreateElement(void* ctx, const char* tag)
     litehtml::element::ptr el = doc->create_element(lower.c_str(), attrs);
     if(el != nullptr && lower == "script")
         self->m_jsScriptAsyncProps[(void*)el] = 1;
+    /* Park the fresh node exactly like jsElCloneNode: a script that builds a
+     * subtree off-document (createElement('template') + innerHTML, then inserts
+     * only a clone and drops the original) leaves the root detached - it is not
+     * under m_root, so ~document never reaches it. Without parking it leaked a
+     * fixed per-page residue (the template/source/whitespace orphans). Parking
+     * keeps it alive while JS may still hold the handle; js_unpark() drops it the
+     * moment appendChild/insertBefore splices it in, and jsFreeDetachedNodes()
+     * reclaims whatever was never inserted at teardown. */
+    if(el != nullptr) self->m_jsDetached.push_back(el);
     return (void*)el;
 }
 
@@ -4648,11 +4654,13 @@ void* EWebEngine::jsCreateTextNode(void* ctx, const char* text)
         void* smem = malloc(sizeof(litehtml::el_space));
         if(smem == nullptr) return nullptr;
         litehtml::el_space* sp = new (smem) litehtml::el_space(s, doc);
+        if(self != nullptr) self->m_jsDetached.push_back(sp);  /* see jsCreateElement */
         return (void*)sp;
     }
     void* mem = malloc(sizeof(litehtml::el_text));
     if(mem == nullptr) return nullptr;
     litehtml::el_text* t = new (mem) litehtml::el_text(s, doc);
+    if(self != nullptr) self->m_jsDetached.push_back(t);  /* see jsCreateElement */
     return (void*)t;
 }
 
@@ -4672,6 +4680,7 @@ void* EWebEngine::jsCreateComment(void* ctx, const char* text)
     litehtml::el_comment* c = new (mem) litehtml::el_comment(doc);
     if(text != nullptr)
         c->set_data(text);
+    if(self != nullptr) self->m_jsDetached.push_back(c);  /* see jsCreateElement */
     return (void*)c;
 }
 
