@@ -1033,8 +1033,29 @@ int litehtml::html_tag::render_flex( int x, int y, int max_width, bool second_pa
 		bool has_fixed_h = !m_css_height.is_predefined() && m_css_height.units() != css_units_none;
 		if(has_fixed_h)
 		{
-			fixed_h = get_document()->cvt_units(m_css_height, m_font_size, 0);
-			if(m_box_sizing == box_sizing_border_box)
+			if(m_css_height.units() == css_units_percentage)
+			{
+				/* A percentage block size resolves against a definite ancestor
+				 * height only. An auto-height parent makes it compute to auto,
+				 * so the column must be content-driven: w3.org's
+				 * .card{block-size:100%;flex-direction:column} sits in a
+				 * content-sized li, and resolving 100% against the parent's
+				 * still-zero m_pos.height collapsed every card to height 0,
+				 * dropping the whole ecosystems grid. Mirrors the row-flex
+				 * cross-size handling below (get_predefined_height walks the
+				 * percentage chain and returns false when no ancestor supplies
+				 * a definite height). */
+				int spec_h = 0;
+				if(get_predefined_height(spec_h))
+					fixed_h = spec_h;
+				else
+					has_fixed_h = false;
+			}
+			else
+			{
+				fixed_h = get_document()->cvt_units(m_css_height, m_font_size, 0);
+			}
+			if(has_fixed_h && m_box_sizing == box_sizing_border_box)
 				fixed_h -= m_padding.top + m_padding.bottom + m_borders.top + m_borders.bottom;
 			if(fixed_h < 0) fixed_h = 0;
 		}
