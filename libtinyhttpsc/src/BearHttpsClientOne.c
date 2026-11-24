@@ -94400,6 +94400,36 @@ static void private_BearHttps_cache_dns(const char* host, const char* ip_str) {
     }				
 }
 
+/* The resolver (gethostbyname) and Universal_inet_ntoa both return pointers
+ * into process-wide static storage. Concurrent fetch threads used to race
+ * inside that window: thread A could copy thread B's address, connect to the
+ * wrong server and then cache the wrong IP under its own hostname FOREVER
+ * (the cache has no TTL). The wrong edge answers with a certificate for
+ * another name -> X509 BAD_SERVER_NAME/EXPIRED on every later request to the
+ * poisoned host. Serialize the resolve+copy window and drop a host's cached
+ * IP whenever its certificate fails verification, so the next attempt
+ * resolves fresh instead of hammering the poisoned entry. */
+#if defined(__MACH__) || defined(__linux__) || defined(__unix__)
+#include <pthread.h>
+static pthread_mutex_t private_BearHttps_dns_lock = PTHREAD_MUTEX_INITIALIZER;
+#define PRIVATE_DNS_LOCK()   pthread_mutex_lock(&private_BearHttps_dns_lock)
+#define PRIVATE_DNS_UNLOCK() pthread_mutex_unlock(&private_BearHttps_dns_lock)
+#else
+#define PRIVATE_DNS_LOCK()   ((void)0)
+#define PRIVATE_DNS_UNLOCK() ((void)0)
+#endif
+
+static void private_BearHttps_evict_dns(const char* host) {
+    if(host == NULL) return;
+    PRIVATE_DNS_LOCK();
+    for(int i = 0; i < BEARSSL_DNS_CACHE_SIZE; i++){
+        privateBearHttpsDnsCache *cache = &privateBearHttpsDnsCache_itens[i];
+        if(private_BearsslHttp_strcmp(cache->host, host) == 0)
+            cache->host[0] = '\0';
+    }
+    PRIVATE_DNS_UNLOCK();
+}
+
 //silver_chain_scope_end
 #if !defined(__EMSCRIPTEN__)
 
@@ -94413,41 +94443,56 @@ static int private_BearHttps_connect_host(BearHttpsRequest *self, BearHttpsRespo
         }
     }
 
+    char cached_ip[BEARSSL_DNS_CACHE_IP_SIZE];
+    int have_cached = 0;
+    PRIVATE_DNS_LOCK();
     for(int i = 0; i < BEARSSL_DNS_CACHE_SIZE;i++){
         privateBearHttpsDnsCache *cache = &privateBearHttpsDnsCache_itens[i];
-        if(private_BearsslHttp_strcmp(cache->host,host) == 0){
-            int sockfd = private_BearHttpsRequest_connect_ipv4_no_error_raise(cache->ip,port,self->connection_timeout);
-            if(sockfd < 0){
-                break;
-            }
-            return sockfd;
+        if(cache->host[0] != '\0' && private_BearsslHttp_strcmp(cache->host,host) == 0){
+            private_BearsslHttps_strcpy(cached_ip, cache->ip);
+            have_cached = 1;
+            break;
         }
     }
+    PRIVATE_DNS_UNLOCK();
+    if(have_cached){
+        int sockfd = private_BearHttpsRequest_connect_ipv4_no_error_raise(cached_ip,port,self->connection_timeout);
+        if(sockfd >= 0){
+            return sockfd;
+        }
+        /* cached edge unreachable: fall through to a fresh resolution */
+    }
 
-    // Try gethostbyname first
+    // Try gethostbyname first. The resolver and inet_ntoa both hand back
+    // pointers into static storage, so snapshot the addresses under the DNS
+    // lock before any other fetch thread can overwrite them; the connect
+    // attempts themselves then run unlocked.
+    char ip_snapshot[4][BEARSSL_DNS_CACHE_IP_SIZE];
+    int ip_count = 0;
+    PRIVATE_DNS_LOCK();
     Universal_hostent *he = Universal_gethostbyname(host);
     if(he != NULL) {
-        for(int i = 0; he->h_addr_list[i] != NULL; i++) {
+        for(int i = 0; he->h_addr_list[i] != NULL && ip_count < 4; i++) {
             Universal_in_addr addr;
             memcpy(&addr, he->h_addr_list[i], sizeof(Universal_in_addr));
             const char *ip_str = Universal_inet_ntoa(addr);
-            /*
-             * [diag] gethostbyname() is the ONLY active resolver here (the
-             * DNS-over-HTTPS fallback below is dead code and there is a
-             * "return -1" before it). If the system resolver hands back a
-             * poisoned/interceptor IP -- common for foreign domains behind a
-             * filtering network -- we would complete a TLS handshake with a
-             * middlebox and then get a bare FIN with no HTTP response, exactly
-             * the observed symptom. Log the resolved IP so it can be compared
-             * against a known-good resolution for the same hostname.
-             */
-
             if(ip_str != NULL) {
-                int sockfd = private_BearHttpsRequest_connect_ipv4_no_error_raise(ip_str, port, self->connection_timeout);
-                if(sockfd >= 0) {
-                    private_BearHttps_cache_dns(host, ip_str);
-                    return sockfd;
-                }
+                private_BearsslHttps_strcpy(ip_snapshot[ip_count], ip_str);
+                ip_count++;
+            }
+        }
+    }
+    int dns_errno = errno;
+    PRIVATE_DNS_UNLOCK();
+
+    if(ip_count > 0) {
+        for(int i = 0; i < ip_count; i++) {
+            int sockfd = private_BearHttpsRequest_connect_ipv4_no_error_raise(ip_snapshot[i], port, self->connection_timeout);
+            if(sockfd >= 0) {
+                PRIVATE_DNS_LOCK();
+                private_BearHttps_cache_dns(host, ip_snapshot[i]);
+                PRIVATE_DNS_UNLOCK();
+                return sockfd;
             }
         }
         char connect_error[192] = {0};
@@ -94457,7 +94502,7 @@ static int private_BearHttps_connect_host(BearHttpsRequest *self, BearHttpsRespo
     }
     else {
         char dns_error[96] = {0};
-        snprintf(dns_error, sizeof(dns_error), "failed to dns resolv errno=%d", errno);
+        snprintf(dns_error, sizeof(dns_error), "failed to dns resolv errno=%d", dns_errno);
         BearHttpsResponse_set_error(response, dns_error, BEARSSL_HTTPS_FAILT_TO_CREATE_DNS_REQUEST);
     }
     return -1;
@@ -95135,6 +95180,11 @@ BearHttpsResponse * BearHttpsRequest_fetch(BearHttpsRequest *self){
                    char herr[128];
                    unsigned ssl_state = br_ssl_engine_current_state(&response->ssl_client.eng);
                    int ssl_err = br_ssl_engine_last_error(&response->ssl_client.eng);
+                   /* Any handshake failure (X509 wrong edge, or a blackholed
+                    * edge that accepts TCP then drops TLS with ssl_err==0):
+                    * drop the cached IP so a retry re-resolves instead of
+                    * hammering the same dead edge forever. */
+                   private_BearHttps_evict_dns(response->tls_hostname);
                    snprintf(herr, sizeof(herr),
                        "tls handshake failed (alpn probe) ssl_state=0x%x ssl_err=%d",
                        ssl_state, ssl_err);
@@ -95891,6 +95941,9 @@ void private_BearHttpsResponse_read_til_end_of_headers_or_reach_limit(
 
         int readded = private_BearHttpsResponse_recv(self,content_point, chunk_size);
         if(readded == 0){
+            /* Peer vanished mid-body (blackholed edge / RST): drop the cached
+             * IP so the retry re-resolves to a live edge. */
+            private_BearHttps_evict_dns(self->tls_hostname);
             BearHttpsResponse_set_error(self,"invalid http response",BEARSSL_HTTPS_INVALID_HTTP_RESPONSE);
             return;
 
@@ -95898,6 +95951,7 @@ void private_BearHttpsResponse_read_til_end_of_headers_or_reach_limit(
 
         if(readded < 0){
             char error_buff[128] ={0};
+            private_BearHttps_evict_dns(self->tls_hostname);
             if(self->is_https){
                 unsigned ssl_state = br_ssl_engine_current_state(&self->ssl_client.eng);
                 int ssl_err = br_ssl_engine_last_error(&self->ssl_client.eng);
@@ -95990,9 +96044,14 @@ int private_BearHttpsResponse_write(BearHttpsResponse *self,unsigned char *bufer
        * post-handshake read failure.
        */
       if(wret < 0 && !BearHttpsResponse_error(self)){
-          char werr[128];
+          char werr[160];
           unsigned ssl_state = br_ssl_engine_current_state(&self->ssl_client.eng);
           int ssl_err = br_ssl_engine_last_error(&self->ssl_client.eng);
+          /* Any handshake/write failure (X509 wrong edge, or a blackholed
+           * edge that accepts TCP then drops TLS with ssl_err==0): drop the
+           * cached IP so a retry re-resolves instead of hammering the same
+           * dead edge forever. */
+          private_BearHttps_evict_dns(self->tls_hostname);
           snprintf(werr, sizeof(werr),
               "tls handshake/write fail: ret=%d errno=%d ssl_state=0x%x ssl_err=%d",
               wret, errno, ssl_state, ssl_err);

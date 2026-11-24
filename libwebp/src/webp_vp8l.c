@@ -438,7 +438,11 @@ static int decode_image_data(WebpBits* br, int width, int height, int is_argb,
     }
 
     /* lz77-coded-image */
+    int eof_before_last = 0;
     while (y < height) {
+        /* eof raised before this iteration means the stream ran dry mid
+         * image; the zero fill would decode phantom symbols from there on. */
+        eof_before_last = br->eof;
         const WebpHuff* codes =
             &groups[huff_group_at(entropy, entropy_bits, entropy_w, x, y) *
                     VP8L_NUM_HUFF_CODES];
@@ -491,7 +495,12 @@ static int decode_image_data(WebpBits* br, int width, int height, int is_argb,
             ++y;
         }
     }
-    ok = !br->eof;
+    /* Every pixel landed. Only reject an eof that predates the final
+     * iteration: the Huffman reader peeks ahead of the symbol it returns, so
+     * the very last symbol of a perfectly valid stream raises eof while its
+     * look-ahead runs past the final byte. That trailing eof is benign; an
+     * earlier one means the zero fill fed phantom symbols into the image. */
+    ok = !eof_before_last;
 
 end:
     free(cache);
