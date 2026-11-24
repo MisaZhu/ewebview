@@ -1,4 +1,10 @@
 // easm runtime: store, instantiation, const-expr evaluation, traps
+/* glibc hides pthread_getattr_np (the Linux stack-size probe below) behind
+ * __USE_GNU; the browser build passes -std=c99 -D_POSIX_C_SOURCE, so request
+ * it before any header pulls in features.h. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include "easm.h"
 #include "opcodes.h"
 #include <stdio.h>
@@ -785,7 +791,22 @@ int ea_instance_invoke(EaStore *s, EaInstance *inst, uint32_t func_idx,
     // thread stack traps as TRAP_STACK_EXHAUSTED instead of faulting
     {
         void *sp0 = (void *)&ex;
-        size_t ssz = pthread_get_stacksize_np(pthread_self());
+        size_t ssz;
+#if defined(__APPLE__)
+        ssz = pthread_get_stacksize_np(pthread_self());
+#elif defined(__linux__)
+        /* Linux has no *_np stack probe; read it off the thread attributes.
+         * On failure keep a conservative 1 MiB floor (the limit only gates
+         * JIT'd frames, and the stub JIT never checks it). */
+        pthread_attr_t attr;
+        ssz = 1024 * 1024;
+        if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+            pthread_attr_getstacksize(&attr, &ssz);
+            pthread_attr_destroy(&attr);
+        }
+#else
+        ssz = 1024 * 1024;
+#endif
         ex->jit_stack_limit = (char *)sp0 - ssz + 256 * 1024;
     }
     jmp_buf jb;
