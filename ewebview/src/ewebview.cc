@@ -1273,6 +1273,7 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
     , m_buildTargetContext(nullptr)
     , m_taskThreads(0)
     , m_taskBusy(0)
+    , m_holdScriptsForCss(false)
     , m_task_ended(false)
     , m_clientWidth(640)
     , m_clientHeight(480)
@@ -2609,6 +2610,7 @@ void EWebEngine::engineDropPendingWork()
         }
     }
     pthread_mutex_unlock(&m_taskMutex);
+    releaseScriptHold();
 
     pthread_mutex_lock(&m_resultMutex);
     for(size_t i = 0; i < m_resultQueue.size(); ++i) {
@@ -3753,6 +3755,9 @@ void EWebEngine::scrollByKey(int dx, int dy)
 
 void EWebEngine::cleanupBuildResources()
 {
+    /* The build is over: never leave script fetches held for a page that
+     * will not paint (stop / abort / navigate). */
+    releaseScriptHold();
     /* Tear down any JS VM from the previous page so its globals and the
      * DOM-bridge element handles do not outlive the document they point into;
      * vm_close() frees the VM and resetJsVm() nulls the pointer. Also drop
@@ -4107,6 +4112,23 @@ static void* _ew_task_thread(void* p)
     return nullptr;
 }
 
+bool EWebEngine::taskClaimableLocked(const EWebTask& t) const
+{
+    /* Held scripts are invisible to claim/wait/spawn accounting alike, so
+     * the pool neither fetches them nor grows parked workers for them. */
+    return !t.loading && !(m_holdScriptsForCss && t.type == EWEB_TASK_SCRIPT);
+}
+
+void EWebEngine::releaseScriptHold()
+{
+    pthread_mutex_lock(&m_taskMutex);
+    if(m_holdScriptsForCss) {
+        m_holdScriptsForCss = false;
+        pthread_cond_broadcast(&m_taskCond);
+    }
+    pthread_mutex_unlock(&m_taskMutex);
+}
+
 /* Park on m_taskCond until a task is claimable, shutdown is raised or
  * timeout_ms elapses. Called with m_taskMutex held and returns with it
  * held. The wait is sliced (100 ms per chunk, timed with the port clock)
@@ -4120,7 +4142,7 @@ bool EWebEngine::taskWaitLocked(uint32_t timeout_ms)
         if(m_task_ended)
             return false;
         for(size_t i = 0; i < m_taskQueue.size(); i++) {
-            if(!m_taskQueue[i].loading)
+            if(taskClaimableLocked(m_taskQueue[i]))
                 return true;
         }
         uint64_t now = ticMs();
@@ -4200,12 +4222,17 @@ void EWebEngine::taskLoop()
          * raised) while the wait was ending cannot be missed. */
         bool claimable = false;
         for(size_t i = 0; i < m_taskQueue.size(); i++) {
-            if(!m_taskQueue[i].loading) {
+            if(taskClaimableLocked(m_taskQueue[i])) {
                 claimable = true;
                 break;
             }
         }
         if(claimable)
+            continue;
+        /* Held scripts are not claimable yet: stay parked instead of
+         * idle-exiting, so releaseScriptHold's broadcast always has live
+         * workers to wake when the sheets drain. */
+        if(m_holdScriptsForCss)
             continue;
         break;   /* idle timeout: leave the pool */
     }
@@ -4219,7 +4246,11 @@ void EWebEngine::taskLoop()
  * but only once nothing render-useful is waiting. */
 static int taskPriorityFor(const std::string& url, int type)
 {
-    if(type == EWEB_TASK_HTML || type == EWEB_TASK_CSS ||
+    /* First paint gates on m_pendingCss, so a render-blocking sheet must
+     * outrank the script burst queued ahead of it during the build. */
+    if(type == EWEB_TASK_CSS)
+        return kTaskPrioCritical;
+    if(type == EWEB_TASK_HTML ||
        type == EWEB_TASK_SCRIPT || type == EWEB_TASK_FONT_FACE ||
        type == EWEB_TASK_IFRAME)
         return kTaskPrioHigh;
@@ -4258,13 +4289,22 @@ bool EWebEngine::addTask(const EWebTask& task)
             (int)m_taskQueue.size(), m_taskThreads, m_taskBusy);
     }
 
-    /* Pool policy: prefer waking a parked worker (any live worker that is
-     * not mid-fetch is parked on m_taskCond); only when every live worker
-     * is busy grow the pool, up to kTaskPoolMax. Everything is decided
-     * under m_taskMutex, so the counts a departing worker updates on its
-     * way out cannot race this into a lost wakeup or an over-spawn. */
+    /* Pool policy: wake a parked worker when one can cover the new task;
+     * otherwise grow the pool, up to kTaskPoolMax. "Idle" is measured against
+     * the unclaimed queue depth, not just m_taskBusy: during a burst the
+     * engine queues many tasks before fresh workers get scheduled to claim
+     * them, so busy-count alone under-spawns (taobao's 26-task build burst
+     * once ran on only 5 workers, leaving render-blocking CSS queued ~2.2 s).
+     * Everything is decided under m_taskMutex, so the counts a departing
+     * worker updates on its way out cannot race this into a lost wakeup or
+     * an over-spawn. */
+    int unclaimed = 0;
+    for(auto& t : m_taskQueue) {
+        if(taskClaimableLocked(t))
+            unclaimed++;
+    }
     bool spawn = false;
-    if(m_taskThreads - m_taskBusy <= 0 && m_taskThreads < kTaskPoolMax) {
+    if(unclaimed > m_taskThreads - m_taskBusy && m_taskThreads < kTaskPoolMax) {
         m_taskThreads++;   /* claimed here so concurrent addTask calls agree */
         spawn = true;
     } else {
@@ -4340,7 +4380,7 @@ bool EWebEngine::getTaskLocked(EWebTask& task)
     // (the strictly-greater comparison keeps the earliest maximum).
     int best = -1;
     for(size_t i = 0; i < m_taskQueue.size(); i++) {
-        if(m_taskQueue[i].loading) continue;
+        if(!taskClaimableLocked(m_taskQueue[i])) continue;
         if(best < 0 || m_taskQueue[i].priority > m_taskQueue[best].priority)
             best = (int)i;
     }
@@ -5274,6 +5314,14 @@ bool EWebEngine::loadHtmlContent(const std::string& content)
             break;
         }
     }
+    /* Paint-first page: its scripts only run after BUILD_SWAP_DOC, so their
+     * fetches must not contend with the render-blocking sheets first paint
+     * waits on. Hold them queued until the sheets drain (releaseScriptHold
+     * in BUILD_RENDER_DOC / swap / teardown). Run-before-paint pages keep
+     * the parallel fetch: there the scripts themselves gate the paint. */
+    pthread_mutex_lock(&m_taskMutex);
+    m_holdScriptsForCss = !m_jsRunBeforePaint;
+    pthread_mutex_unlock(&m_taskMutex);
     m_jsPrePaintAt = m_jsRunBeforePaint ? ticMs() : 0;
     m_jsAbortPrePaint = false;
     m_jsPrePaintCut = false;
@@ -6029,6 +6077,11 @@ void EWebEngine::advanceBuildStep()
 
     if(m_buildPhase == BUILD_RENDER_DOC) {
         setBuildStatus("layout and first paint", 80);
+        /* The parse is done: a page with no render-blocking sheets releases
+         * the script hold right away; otherwise it drops on the tick after
+         * the last sheet lands (m_pendingCss == 0) or when the wait caps. */
+        if(m_pendingCss == 0)
+            releaseScriptHold();
         /* Render-blocking stylesheets: the <link> fetches queued during the
          * parse land in the build context now that processResults no longer
          * defers them, so hold the swap until they drain - the previous page
@@ -6043,6 +6096,7 @@ void EWebEngine::advanceBuildStep()
             if(ticMs() - m_firstPaintCssWaitSince < kFirstPaintCssWaitMs)
                 return;
             EWEB_LOG("[ewebview] first paint css wait timed out with %d pending\n", m_pendingCss);
+            releaseScriptHold();
         }
         m_firstPaintCssWaitSince = 0;
         if(m_buildDoc) {
@@ -6100,6 +6154,9 @@ void EWebEngine::advanceBuildStep()
 
     if(m_buildPhase == BUILD_SWAP_DOC) {
         setBuildStatus("displaying page", 100);
+        /* The page is on screen: post-swap script fetches must flow even if
+         * a sheet never landed (the css wait capped out above). */
+        releaseScriptHold();
         // Save old pointers (engine-owned; freed on a later loop iteration)
         EWebContainer* old_container = m_container;
         litehtml::document::ptr old_doc = m_doc;

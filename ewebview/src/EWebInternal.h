@@ -211,9 +211,9 @@ static const uint32_t kFirstPaintCssWaitMs = 6000;
 static const uint64_t kStyleBudgetIdleMs   = 25;
 
 /* Download worker pool. The pool starts empty; addTask() wakes a parked
- * worker or spawns a new one (up to kTaskPoolMax) only when every live
- * worker is busy. A worker idle for kTaskIdleExitMs tears itself down, so
- * the pool shrinks back to zero once a page's fetches drain. */
+ * worker or spawns a new one (up to kTaskPoolMax) whenever unclaimed tasks
+ * outnumber the idle workers. A worker idle for kTaskIdleExitMs tears itself
+ * down, so the pool shrinks back to zero once a page's fetches drain. */
 static const int      kTaskPoolMax         = 32;
 static const uint32_t kTaskIdleExitMs      = 4000;
 
@@ -222,11 +222,16 @@ static const uint32_t kTaskIdleExitMs      = 4000;
  * queue behind the hundreds of fire-and-forget analytics beacons a page
  * fires (taobao opens ~600 mmstat connections per visit); under a plain FIFO
  * claim order those beacons held the majority of the worker pool and starved
- * visible content, which is what made scrolling feel slow. */
+ * visible content, which is what made scrolling feel slow.
+ * Render-blocking CSS sits one level above scripts: first paint waits on
+ * m_pendingCss, while scripts on a paint-first page only run after the swap,
+ * so a sheet must never queue behind a burst of script fetches (taobao's 5
+ * sheets once waited ~2.2 s behind ~21 scripts for a worker to free up). */
 enum {
-    kTaskPrioLow    = 0,   /* analytics/tracking beacon: run only when idle */
-    kTaskPrioNormal = 1,   /* content image                                   */
-    kTaskPrioHigh   = 2,   /* html / css / script / font-face                 */
+    kTaskPrioLow      = 0,   /* analytics/tracking beacon: run only when idle */
+    kTaskPrioNormal   = 1,   /* content image                                 */
+    kTaskPrioHigh     = 2,   /* html / script / font-face                     */
+    kTaskPrioCritical = 3,   /* render-blocking stylesheet                    */
 };
 
 /* ------------------------------------------------------------------ */
@@ -452,6 +457,11 @@ public:
     void removeTask(const std::string& url);
     bool getTask(EWebTask& task);
     bool getTaskLocked(EWebTask& task);   /* m_taskMutex held */
+    /* A queued task a worker may claim right now (m_taskMutex held): script
+     * fetches stay parked while m_holdScriptsForCss is raised. */
+    bool taskClaimableLocked(const EWebTask& t) const;
+    /* Drop the script-fetch hold and wake the pool (any thread). */
+    void releaseScriptHold();
     std::string taskPageUrl();
     void setTaskPageUrl(const std::string& url);
     bool loadHtmlTask(const std::string& url);
@@ -916,6 +926,14 @@ public:
      * outside the lock by the workers' wait loops, hence volatile. */
     int                         m_taskThreads;
     int                         m_taskBusy;
+    /* Paint-first build: script fetches stay queued (taskClaimableLocked)
+     * until the render-blocking sheets drain, so a burst of ~20 script TLS
+     * connections cannot contend with the handful of sheets first paint
+     * waits on (taobao: 5 sheets fetched in ~0.4 s alone vs ~1.4 s alongside
+     * 21 scripts). Raised by loadHtmlContent, dropped by releaseScriptHold
+     * once m_pendingCss reaches 0 / the css wait caps / the build ends.
+     * Guarded by m_taskMutex. */
+    bool                        m_holdScriptsForCss;
     volatile bool               m_task_ended;
     pthread_cond_t              m_taskCond;
     int                         m_clientWidth;
