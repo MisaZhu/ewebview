@@ -62,6 +62,7 @@ extern "C" void bc_dump_window(bytecode_t* bc, PC center, PC radius);
 #include <vector>
 #include <signal.h>
 #include <unistd.h>   /* usleep (await spin tick idle wait) */
+#include <time.h>     /* clock_gettime fallback for the budget calibration */
 
 /* mario entry points that live in libmario.a but are not declared in a public
  * header: the JS bytecode compiler (passed to vm_new) and the all-natives
@@ -70,6 +71,78 @@ extern "C" bool js_compile(bytecode_t* bc, const char* input);
 extern "C" void reg_all_natives(vm_t* vm);
 /* Promise debug ledger (native_Promise.h is not on the ewebview include path). */
 extern "C" void mario_promise_ledger_dump(vm_t* vm);
+
+/* ==================================================================
+ * Device-capability calibration for the JS wall-clock budgets
+ * (see EWEB_JS_BUDGET in EWebInternal.h)
+ *
+ * The budget constants are tuned on a fast desktop host. The same
+ * interpreter work takes several times longer on a slow embedded CPU or
+ * under emulation, where a fixed wall clock cuts legitimate boot scripts
+ * and the page never renders. One fixed integer workload is timed against
+ * the port clock at first use; its cost relative to the host reference
+ * becomes the budget multiplier (clamped to [1, 8]). The hard ceiling
+ * stays armed on every device - it just buys the same amount of work.
+ * ================================================================== */
+namespace eweb {
+
+static uint64_t (*s_budgetClock)(void*) = nullptr;
+static void*    s_budgetClockUd = nullptr;
+
+void jsBudgetClockRegister(uint64_t (*tic)(void*), void* ud)
+{
+    s_budgetClock = tic;
+    s_budgetClockUd = ud;
+}
+
+static uint64_t budgetNowMs()
+{
+    if(s_budgetClock != nullptr)
+        return s_budgetClock(s_budgetClockUd);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+uint32_t jsBudgetScale()
+{
+    static uint32_t s_scale = 0;
+    if(s_scale != 0)
+        return s_scale;
+    /* Explicit override for A/B runs (0/absent = calibrate). */
+    const char* ov = getenv("EWEB_JS_BUDGET_SCALE");
+    if(ov != nullptr) {
+        int v = atoi(ov);
+        if(v >= 1 && v <= 8) {
+            s_scale = (uint32_t)v;
+            return s_scale;
+        }
+    }
+    /* Fixed integer workload: ~4 ms on the reference desktop host. volatile
+     * sink keeps the optimizer from folding the loop away; no FP so the
+     * probe tracks the integer path the interpreter actually uses. */
+    volatile uint32_t sink = 0;
+    uint32_t a = 123456789u;
+    uint64_t t0 = budgetNowMs();
+    for(uint32_t i = 0; i < 4000000u; i++) {
+        a = a * 1664525u + 1013904223u;
+        a ^= (a >> 13);
+    }
+    sink = a;
+    (void)sink;
+    uint64_t cost = budgetNowMs() - t0;
+    /* cost / 4ms, clamped: fast hosts stay at 1x, slow devices get up to 8x
+     * the wall clock for the same interpreter work. */
+    uint32_t scale = (uint32_t)(cost / 4);
+    if(scale < 1) scale = 1;
+    if(scale > 8) scale = 8;
+    s_scale = scale;
+    EWEB_LOG("[ewebview] js: budget calibration workload=%llums scale=%u\n",
+        (unsigned long long)cost, (unsigned)s_scale);
+    return s_scale;
+}
+
+} /* namespace eweb (budget calibration) */
 
 /* ==================================================================
  * SIGSEGV recovery checkpoints
@@ -1952,7 +2025,7 @@ bool EWebEngine::runPageScripts()
          * post-swap phase (BUILD_SWAP_DOC re-arms BUILD_RUN_JS for them) and
          * let the build paint now. Checked before the fetch wait below too, so
          * a slow subresource cannot hold the first paint either. */
-        if(m_jsPrePaintAt != 0 && (ticMs() - m_jsPrePaintAt) > kJsPrePaintBudgetMs) {
+        if(m_jsPrePaintAt != 0 && (ticMs() - m_jsPrePaintAt) > EWEB_JS_BUDGET(kJsPrePaintBudgetMs)) {
             EWEB_LOG("[ewebview] js: pre-paint budget exhausted at script %d of %d - painting first\n",
                 (int)i, (int)m_jsScripts.size());
             m_jsPrePaintAt = 0;
@@ -2346,8 +2419,8 @@ bool EWebEngine::runNextPageScript()
         uint32_t postBudget = (m_postSwapSkelLatch ||
                                m_jsStreamingSsr ||
                                (m_jsBuildHasModules && pageHasSkeletonAny()))
-                                  ? kJsPostSwapSkeletonBudgetMs
-                                  : kJsPostSwapBudgetMs;
+                                  ? EWEB_JS_BUDGET(kJsPostSwapSkeletonBudgetMs)
+                                  : EWEB_JS_BUDGET(kJsPostSwapBudgetMs);
         /* DIAG: EWEB_JS_NOBUDGET lifts the per-run watchdog (jsOnVmStep); also
          * skip the phase drop so a slow-but-legitimate tail can be proven end
          * to end without either budget cutting it. */
@@ -2383,9 +2456,9 @@ bool EWebEngine::runNextPageScript()
             bool nextIsRetry = (i < m_jsScripts.size() && !m_jsScripts[i].empty() &&
                 std::find(m_jsRequeuedSrcs.begin(), m_jsRequeuedSrcs.end(),
                           m_jsScripts[i]) != m_jsRequeuedSrcs.end());
-            if((nextIsDynamic || nextIsRetry) && postBudget != kJsPostSwapSkeletonBudgetMs) {
+            if((nextIsDynamic || nextIsRetry) && postBudget != EWEB_JS_BUDGET(kJsPostSwapSkeletonBudgetMs)) {
                 m_postSwapSkelLatch = true;
-                postBudget = kJsPostSwapSkeletonBudgetMs;
+                postBudget = EWEB_JS_BUDGET(kJsPostSwapSkeletonBudgetMs);
             }
         }
         if(!s_nobudgetPhase && m_jsPostSwapAt != 0 && (ticMs() - m_jsPostSwapAt) > postBudget) {
@@ -3178,15 +3251,15 @@ void EWebEngine::jsVmEnter(bool appScript)
         std::find(m_jsRequeuedSrcs.begin(), m_jsRequeuedSrcs.end(),
                   *m_jsCurScriptSrc) != m_jsRequeuedSrcs.end());
     m_jsRunDeadline = m_jsEnterAt +
-        ((m_jsPrePaintAt != 0) ? kJsRunBudgetMs
+        ((m_jsPrePaintAt != 0) ? EWEB_JS_BUDGET(kJsRunBudgetMs)
                                : (jsSkeletonProbeCached() ||
                                   (m_jsPostSwapRun && m_postSwapSkelLatch && appScript) ||
                                   m_jsBuildHasModules ||
                                   m_jsStreamingSsr ||
                                   retryRun ||
                                   s_forceSkelBudget)
-                                      ? kJsRunBudgetSkeletonMs
-                                      : kJsRunBudgetLiveMs);
+                                      ? EWEB_JS_BUDGET(kJsRunBudgetSkeletonMs)
+                                      : EWEB_JS_BUDGET(kJsRunBudgetLiveMs));
     if(getenv("EWEB_SCRIPTRANDBG") != nullptr)
         fprintf(stderr, "[budgetdbg] enter app=%d retry=%d skel=%d latch=%d mods=%d budget=%u url=%.60s\n",
             (int)appScript, (int)retryRun, (int)jsSkeletonProbeCached(),
@@ -3228,7 +3301,7 @@ bool EWebEngine::jsVmExit()
          * fine, the build just has to stop deferring the first paint. Charging
          * it to the watchdog would drop a working page's scripts after three. */
         EWEB_LOG("[ewebview] js: pre-paint budget %u ms exhausted - deferring the rest post-swap\n",
-             (unsigned)kJsPrePaintBudgetMs);
+             (unsigned)EWEB_JS_BUDGET(kJsPrePaintBudgetMs));
         return true;
     }
     /* An abort raised by a termination/navigation request DURING this run (the
@@ -3601,11 +3674,11 @@ void EWebEngine::jsOnVmStep(struct st_vm* vm)
     /* Pre-paint pages additionally answer to the phase wall clock, so ONE slow
      * script cannot spend the whole run budget before the first paint: the
      * cut is flagged so jsVmExit does not charge it to the watchdog. */
-    if(m_jsPrePaintAt != 0 && (now - m_jsPrePaintAt) > kJsPrePaintBudgetMs) {
+    if(m_jsPrePaintAt != 0 && (now - m_jsPrePaintAt) > EWEB_JS_BUDGET(kJsPrePaintBudgetMs)) {
         if(getenv("MARIO_RUNEXIT") != nullptr)
             fprintf(stderr, "[RUNEXIT] stephook PREPAINT terminate pc=%u depth=%d over=%llums\n",
                  (unsigned)vm->pc, (int)vm->call_depth,
-                 (unsigned long long)((now - m_jsPrePaintAt) - kJsPrePaintBudgetMs));
+                 (unsigned long long)((now - m_jsPrePaintAt) - EWEB_JS_BUDGET(kJsPrePaintBudgetMs)));
         m_jsAbortPrePaint = true;
         vm->terminated = true;
         return;

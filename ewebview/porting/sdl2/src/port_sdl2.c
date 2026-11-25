@@ -2275,7 +2275,14 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
     if(HttpsResponseError(response)) {
         const char* em = HttpsResponseGetErrorMsg(response);
         int tls_fail = (em != NULL) && (strstr(em, "tls handshake failed") != NULL);
-        if(tls_fail && attempt < 2 &&
+        /* CDN edges sometimes RST the connection right after the headers
+         * (anti-bot / per-client connection limits), leaving a truncated
+         * body. A fresh request re-resolves DNS and usually lands on a
+         * different edge, so retry idempotent GETs on truncation too.
+         * Kept identical to the ewokos port. */
+        int truncated = (em != NULL) &&
+                        (strstr(em, "truncated response body") != NULL);
+        if((tls_fail || truncated) && attempt < 2 &&
            (!method || !method[0] || strcmp(method, "GET") == 0)) {
             HttpsResponseFree(response);
             response = NULL;
@@ -2351,11 +2358,6 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
             }
         }
     }
-    /* The HAL response only carries `error`/`status`, so the core's loadURL
-     * failure branches cannot show WHY a transport failed. Surface tinyhttpsc's
-     * own error string/code here (same stderr stream as the [ewebview] logs) on
-     * a transport error or a non-2xx status, so a failed fetch is diagnosable
-     * without a rebuild. */
     if(getenv("EWEB_NETDBG") != NULL) {
         fprintf(stderr, "[netdbg] url=%s status=%d body=%d\n", url,
                 (int)resp->status, (int)resp->body_size);
@@ -2388,15 +2390,6 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
             fprintf(stderr, "[netdbg] body[0..%d]=\n%.*s\n", len, len,
                     (const char*)resp->body);
         }
-    }
-    if(resp->error || resp->status < 200 || resp->status > 299) {
-        fprintf(stderr,
-            "[ewebview] net.request diag: url=%s status=%d error=%d code=%d "
-            "msg=%s body=%d\n",
-            url, resp->status, resp->error ? 1 : 0,
-            HttpsResponseGetErrorCode(response),
-            HttpsResponseGetErrorMsg(response) ? HttpsResponseGetErrorMsg(response) : "(null)",
-            resp->body_size);
     }
     return true;
 }

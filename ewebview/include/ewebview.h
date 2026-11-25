@@ -60,8 +60,10 @@ typedef struct ewebview ewebview_t;
 
 /* Mouse gesture state, mapped 1:1 from the platform's pointer events by the
  * embedder. The engine dispatches the matching DOM mouse events and follows
- * <a href> clicks; it ignores EWEB_MOUSE_WHEEL (the embedder turns a wheel
- * gesture into ewebview_scroll()). */
+ * <a href> clicks. EWEB_MOUSE_WHEEL dispatches wheel/mousewheel to the page
+ * and, unless a listener preventDefault()'d them, runs the default scroll
+ * (overflow container under the pointer, else the document). An embedder may
+ * instead turn a wheel gesture into ewebview_scroll() to bypass the page. */
 enum {
     EWEB_MOUSE_MOVE = 0,
     EWEB_MOUSE_DOWN,

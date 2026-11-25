@@ -1373,6 +1373,8 @@ EWebEngine::EWebEngine(const eweb_port_t* port)
 {
     eweb_listener_init(&m_listener);
     m_container = new EWebContainer(&m_port, this);
+    /* Budget calibration times its probe workload against the port clock. */
+    jsBudgetClockRegister(m_port.clock.tic_ms, m_port.clock.ud);
 
     pthread_mutex_init(&m_cssMediaMutex, NULL);
     pthread_mutex_init(&m_taskMutex, NULL);

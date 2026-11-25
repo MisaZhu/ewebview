@@ -42,12 +42,12 @@
 #include <ewebview.h>
 #include <ewebview_port.h>
 
-/* TEMP DIAGNOSTIC: in-process crash backtrace. lldb changes timing enough that
- * the intermittent SIGSEGV (Heisenbug) never reproduces under it, and /cores is
- * root-only so no core dump lands. Installing a SIGSEGV/SIGBUS handler that
- * walks the native stack with backtrace_symbols_fd() captures the faulting
- * frames without a debugger and without perturbing timing. Remove with the rest
- * of the temporary diagnostics once the crash root cause is fixed. */
+/* In-process crash handling: a SIGSEGV/SIGBUS that hits an armed JS recovery
+ * checkpoint longjmps back and skips the faulting unit; a fatal fault reports
+ * signal/addr plus a native backtrace via backtrace_symbols_fd() and exits.
+ * lldb perturbs timing enough that intermittent faults never reproduce under
+ * it, and /cores is root-only, so the handler captures frames without a
+ * debugger. Only async-signal-safe write(2) + local formatters are used. */
 #if defined(__APPLE__) || defined(__linux__)
 #include <signal.h>
 #include <execinfo.h>
@@ -137,76 +137,6 @@ static void browser_crash_handler(int sig, siginfo_t* si, void* uc) {
     hp = crash_fmt_hex(hp, (unsigned long long)(uintptr_t)(si ? si->si_addr : (void*)0));
     *hp++ = '\n';
     crash_write(hdr, hp);
-#if defined(__APPLE__) && defined(__arm64__)
-    /* TEMP DIAGNOSTIC: dump the real faulting PC/LR/SP and the callee-saved +
-     * argument registers straight from the signal ucontext. The backtrace below
-     * only yields return addresses (the LR pushed at the `blr` site), so it can
-     * not show WHICH opcode handler dereferenced the wild data pointer nor which
-     * register held it. __knownsym is a static symbol whose link-time address is
-     * in nm; slide = runtime(__knownsym) - static(__knownsym) lets the raw pc be
-     * mapped back to a disassemblable file offset. */
-    if(uc != NULL) {
-        ucontext_t* ucp = (ucontext_t*)uc;
-        _STRUCT_MCONTEXT64* mc = (_STRUCT_MCONTEXT64*)ucp->uc_mcontext;
-        if(mc != NULL) {
-            struct __darwin_arm_thread_state64 ss = mc->__ss;
-            static volatile int knownsym_anchor = 0;
-            (void)knownsym_anchor;
-            char rb[1024]; char* rp = rb;
-            rp = crash_fmt_str(rp, "[crashreg] pc=");
-            rp = crash_fmt_hex(rp, (unsigned long long)ss.__pc);
-            rp = crash_fmt_str(rp, " lr=");
-            rp = crash_fmt_hex(rp, (unsigned long long)ss.__lr);
-            rp = crash_fmt_str(rp, " sp=");
-            rp = crash_fmt_hex(rp, (unsigned long long)ss.__sp);
-            rp = crash_fmt_str(rp, " fp=");
-            rp = crash_fmt_hex(rp, (unsigned long long)ss.__fp);
-            rp = crash_fmt_str(rp, " knownsym=");
-            rp = crash_fmt_hex(rp, (unsigned long long)(uintptr_t)&browser_crash_handler);
-            *rp++ = '\n';
-            crash_write(rb, rp);
-            for(int i = 0; i < 29; i += 4) {
-                char xb[512]; char* xp = xb;
-                for(int j = i; j < i + 4; j++) {
-                    xp = crash_fmt_str(xp, "[crashreg] x");
-                    xp = crash_fmt_dec(xp, j);
-                    xp = crash_fmt_str(xp, "=");
-                    xp = crash_fmt_hex(xp, (j < 29) ? (unsigned long long)ss.__x[j] : 0ULL);
-                    if(j < i + 3) *xp++ = ' ';
-                }
-                *xp++ = '\n';
-                crash_write(xb, xp);
-            }
-            /* TEMP DIAG (fpwalk): backtrace() yields ~0 frames when the fault is
-             * in a leaf/prologue - here std::map<string,string> __tree::destroy
-             * recursing onto a wild node (0x1<<32) during a litehtml html_tag
-             * teardown. Walk the frame-pointer chain straight from the ucontext
-             * instead: at each frame fp[0]=caller fp, fp[1]=return address. Dump
-             * the whole return-address chain so atos can reconstruct the FULL
-             * call stack and name WHICH teardown path double-destroyed / used
-             * the string_map after free. Remove with the other temp probes. */
-            {
-                uint64_t fp = (uint64_t)ss.__fp;
-                char fb[8192]; char* fbp = fb;
-                for(int i = 0; i < 48 && fp && fbp < fb + (int)sizeof(fb) - 128; i++) {
-                    uint64_t* f = (uint64_t*)fp;
-                    uint64_t next_fp = f[0];
-                    uint64_t ret = f[1];
-                    fbp = crash_fmt_str(fbp, "[fpwalk] #");
-                    fbp = crash_fmt_dec(fbp, i);
-                    fbp = crash_fmt_str(fbp, " fp=");
-                    fbp = crash_fmt_hex(fbp, fp);
-                    fbp = crash_fmt_str(fbp, " ret=");
-                    fbp = crash_fmt_hex(fbp, ret);
-                    *fbp++ = '\n';
-                    if(next_fp <= fp || (next_fp & 0xF) != 0) break;
-                    fp = next_fp;
-                }
-                crash_write(fb, fbp);
-            }
-        }
-    }
-#endif
     backtrace_symbols_fd(frames, n, STDERR_FILENO);
     _exit(128 + sig);
 }

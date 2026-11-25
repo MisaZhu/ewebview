@@ -405,19 +405,34 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
     TinyHttpsRequest* request;
     TinyHttpsResponse* response;
     ek_http_t* st;
-    int i, n, body_size;
+    int i, n, body_size, attempt;
     const char* body;
     (void)ud;
     if(!url || !resp) return false;
     memset(resp, 0, sizeof(*resp));
 
+    /* Transient TLS failures (a CDN edge whose certificate does not cover the
+     * requested name - BR_ERR_X509_BAD_SERVER_NAME - or a handshake aborted by
+     * a middlebox) fail the whole request, because the connect loop commits
+     * to the first reachable address and never tries the next addrinfo. A
+     * fresh request re-resolves and usually lands on a good edge, so retry
+     * the transport before giving up. Only transport-level TLS errors and
+     * mid-body truncation (edge RST) retry, and only for idempotent methods.
+     * Kept identical to the sdl2 port. */
+    response = NULL;
+    for(attempt = 0; attempt < 3; attempt++) {
     {
         char safe[4096];
         request = NewHttpsRequest(ek_url_sanitize(url, safe, sizeof(safe)));
     }
     if(!request) return false;
 
-    HttpsRequestSetTimeout(request, 10000);
+    /* connection_timeout also drives SO_RCVTIMEO, so a 10s ceiling aborts
+     * server-held long polls (and slow netd transfers on a busy system) with
+     * EAGAIN before the answer arrives. 40s stays close to browser behavior;
+     * connect uses non-blocking + select so live hosts still connect fast.
+     * Kept identical to the sdl2 port. */
+    HttpsRequestSetTimeout(request, 40000);
     HttpsRequestSetMaxRedirections(request, 0);   /* the core follows redirects */
     if(method && method[0] && strcmp(method, "GET") != 0)
         HttpsRequestSetMethod(request, method);   /* copies internally */
@@ -437,6 +452,29 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
 
     response = HttpsRequestFetch(request);
     HttpsRequestFree(request);
+    if(!response) {
+        if(attempt < 2 && (!method || !method[0] || strcmp(method, "GET") == 0))
+            continue;
+        return false;
+    }
+    if(HttpsResponseError(response)) {
+        const char* em = HttpsResponseGetErrorMsg(response);
+        int tls_fail = (em != NULL) && (strstr(em, "tls handshake failed") != NULL);
+        /* CDN edges sometimes RST the connection right after the headers
+         * (anti-bot / per-client connection limits), leaving a truncated
+         * body. A fresh request re-resolves DNS and usually lands on a
+         * different edge, so retry idempotent GETs on truncation too. */
+        int truncated = (em != NULL) &&
+                        (strstr(em, "truncated response body") != NULL);
+        if((tls_fail || truncated) && attempt < 2 &&
+           (!method || !method[0] || strcmp(method, "GET") == 0)) {
+            HttpsResponseFree(response);
+            response = NULL;
+            continue;
+        }
+    }
+    break;
+    }
     if(!response) return false;
 
     st = (ek_http_t*)calloc(1, sizeof(ek_http_t));
@@ -494,19 +532,6 @@ static bool ek_net_request(void* ud, const char* url, const char* method,
                      "inflate failed: url=%s bytes=%d\n", url, resp->body_size);
             }
         }
-    }
-    /* The HAL response only carries `error`/`status`, so the core's loadURL
-     * failure branches cannot show WHY a transport failed. Surface tinyhttpsc's
-     * own error string/code through klog (the EwokOS log stream the rest of
-     * this port uses) on a transport error or a non-2xx status, so a failed
-     * fetch is diagnosable without a rebuild. */
-    if(resp->error || resp->status < 200 || resp->status > 299) {
-        slog("[ewebview] net.request diag: url=%s status=%d error=%d code=%d "
-             "msg=%s body=%d\n",
-             url, resp->status, resp->error ? 1 : 0,
-             HttpsResponseGetErrorCode(response),
-             HttpsResponseGetErrorMsg(response) ? HttpsResponseGetErrorMsg(response) : "(null)",
-             resp->body_size);
     }
     return true;
 }

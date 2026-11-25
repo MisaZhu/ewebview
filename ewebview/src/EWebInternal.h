@@ -151,6 +151,20 @@ static const uint32_t kJsPostSwapBudgetMs = 8000;
  * placeholder. The window only applies while NOTHING real is on screen. */
 static const uint32_t kJsPostSwapSkeletonBudgetMs = 180000;
 
+/* Device-capability scaling for the wall-clock budgets above. The constants
+ * are tuned on a fast desktop host; the SAME interpreter work takes several
+ * times longer on a slow embedded CPU (or under emulation), so a fixed wall
+ * clock there cuts legitimate scripts mid-boot and the page never renders.
+ * jsBudgetScale() (EWebJs.cc) calibrates ONE fixed integer workload against
+ * the port clock at first use and returns a multiplier clamped to [1, 8];
+ * every WORK budget is consumed through EWEB_JS_BUDGET() so the hard ceiling
+ * still exists on every device - it just buys the same amount of interpreter
+ * work everywhere. Cadence constants (flush gaps, probe TTL) are NOT work
+ * budgets and stay unscaled. EWEB_JS_BUDGET_SCALE=<n> overrides the probe. */
+uint32_t jsBudgetScale();
+void jsBudgetClockRegister(uint64_t (*tic)(void*), void* ud);
+#define EWEB_JS_BUDGET(ms) ((uint32_t)(ms) * jsBudgetScale())
+
 /* Visible non-whitespace characters at or above which the blank-shell probe
  * (pageShowsSkeletonPlaceholder) counts a page as carrying real content.
  * A CSR shell paints at most chrome fragments (a skip-link, an empty aria

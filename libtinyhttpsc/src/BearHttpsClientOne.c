@@ -94804,18 +94804,6 @@ static int private_BearHttps_sock_read(void *ctx, unsigned char *buf, size_t len
 
 static int private_BearHttps_sock_write(void *ctx, const unsigned char *buf, size_t len)
 {
-    /* TEMP DIAG: dump first TLS record (ClientHello) for fingerprint diffing. */
-    {
-        static int hello_dumped = 0;
-        if(!hello_dumped && getenv("EWEB_TLSHELLO_DBG")){
-            hello_dumped = 1;
-            size_t n = len < 600 ? len : 600;
-            fprintf(stderr, "[tlshello] len=%zu\n", len);
-            for(size_t i = 0; i < n; i++)
-                fprintf(stderr, "%02x%s", buf[i], ((i & 15) == 15) ? "\n" : " ");
-            fprintf(stderr, "\n");
-        }
-    }
     for (;;) {
         ssize_t write_len;
         write_len = Universal_send(*(int *)ctx, buf, len,0);
