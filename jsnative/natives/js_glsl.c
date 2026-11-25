@@ -45,6 +45,7 @@ typedef struct glsl_ex {
     char*  name;              /* EXK_VAR / EXK_CALL */
     int    op;                /* EXK_BIN / EXK_UN / EXK_ASSIGN */
     int    ncomp;             /* EXK_CTOR target size, EXK_SWIZ comp count */
+    int    mat;               /* EXK_CTOR: matN target dimension (0 = vector) */
     int    swiz[4];           /* EXK_SWIZ component indices */
     struct glsl_ex* a;        /* unary operand / binary lhs / ternary cond / assign target / swiz base */
     struct glsl_ex* b;        /* binary rhs / ternary true */
@@ -62,6 +63,8 @@ typedef struct glsl_st {
                                * enclosing function scope, GLSL/C-like). */
     char* name;               /* STK_DECL variable name */
     int   type;               /* STK_DECL base component count */
+    int   mat;                /* STK_DECL matN dimension (0 = not a matrix) */
+    int   samp;               /* STK_DECL sampler2D flag */
     glsl_ex* init;            /* STK_DECL initializer / STK_RETURN value */
     glsl_ex* cond;            /* STK_IF / STK_WHILE / STK_FOR condition */
     glsl_ex* upd;             /* STK_FOR update expression */
@@ -72,7 +75,7 @@ typedef struct glsl_st {
     struct glsl_st* s2;       /* STK_IF else */
 } glsl_st;
 
-typedef struct { char* name; int kind; int base; } glsl_iface;
+typedef struct { char* name; int kind; int base; int mat; int samp; } glsl_iface;
 
 struct glsl_shader {
     int   stage;
@@ -178,7 +181,19 @@ static int type_comps(const char* id) {
     if(!strcmp(id,"vec4")||!strcmp(id,"ivec4")||!strcmp(id,"bvec4")) return 4;
     return 0;   /* not a scalar/vector type we support */
 }
-static int is_type_ident(const char* id) { return type_comps(id) != 0; }
+/* matN dimension (2/3/4), 0 for anything else. */
+static int type_mat(const char* id) {
+    if(!strcmp(id,"mat2")) return 2;
+    if(!strcmp(id,"mat3")) return 3;
+    if(!strcmp(id,"mat4")) return 4;
+    return 0;
+}
+static int type_sampler(const char* id) {
+    return !strcmp(id,"sampler2D");
+}
+static int is_type_ident(const char* id) {
+    return type_comps(id) != 0 || type_mat(id) != 0 || type_sampler(id);
+}
 
 static glsl_ex* parse_expr(parser* p);
 static glsl_st* parse_stmt(parser* p);
@@ -271,12 +286,14 @@ static glsl_ex* parse_primary(parser* p) {
         }
         if(is_type_ident(t->text) && pk2(p)->k==TK_PUNCT && !strcmp(pk2(p)->text,"(")) {
             int nc = type_comps(t->text);
+            int mt = type_mat(t->text);
             adv(p);   /* type name */
             adv(p);   /* '(' */
             glsl_ex** args = NULL;
             int n = parse_args(p, &args);
             glsl_ex* e = new_ex(EXK_CTOR);
-            e->ncomp = nc; e->args = args; e->nargs = (n<0?0:n);
+            e->ncomp = mt ? mt : nc; e->mat = mt;
+            e->args = args; e->nargs = (n<0?0:n);
             return e;
         }
         adv(p);
@@ -390,6 +407,8 @@ static glsl_ex* parse_expr(parser* p) {
  * token has NOT been consumed yet. */
 static glsl_st* parse_decl_stmt(parser* p) {
     int base = type_comps(pk(p)->text);
+    int mt = type_mat(pk(p)->text);
+    int sp = type_sampler(pk(p)->text);
     adv(p);   /* type */
     glsl_st* blk = new_st(STK_BLOCK);
     glsl_st** items = NULL; int n = 0, cap = 0;
@@ -398,7 +417,7 @@ static glsl_st* parse_decl_stmt(parser* p) {
         if(idt->k != TK_IDENT) { perr(p, "expected identifier in declaration"); break; }
         adv(p);
         glsl_st* d = new_st(STK_DECL);
-        d->name = xdup(idt->text); d->type = base;
+        d->name = xdup(idt->text); d->type = base; d->mat = mt; d->samp = sp;
         if(eat_punct(p, "=")) d->init = parse_expr(p);
         if(n == cap) { cap = cap?cap*2:4; items = (glsl_st**)realloc(items, (size_t)cap*sizeof(glsl_st*)); }
         items[n++] = d;
@@ -484,7 +503,7 @@ static glsl_st* parse_stmt(parser* p) {
 }
 
 /* Record an interface variable (attribute/varying/uniform) for reflection. */
-static void iface_add(glsl_shader* sh, const char* name, int kind, int base) {
+static void iface_add(glsl_shader* sh, const char* name, int kind, int base, int mat, int samp) {
     for(int i = 0; i < sh->niface; ++i)
         if(!strcmp(sh->iface[i].name, name)) return;   /* dedupe across stages */
     if(sh->niface == sh->icap) {
@@ -494,6 +513,8 @@ static void iface_add(glsl_shader* sh, const char* name, int kind, int base) {
     sh->iface[sh->niface].name = xdup(name);
     sh->iface[sh->niface].kind = kind;
     sh->iface[sh->niface].base = base;
+    sh->iface[sh->niface].mat = mat;
+    sh->iface[sh->niface].samp = samp;
     sh->niface++;
 }
 
@@ -501,13 +522,15 @@ static void iface_add(glsl_shader* sh, const char* name, int kind, int base) {
  * `qual` is -1 for none, else GLSL_VAR_*. */
 static void parse_top_decl(parser* p, int qual, glsl_shader* sh) {
     int base = type_comps(pk(p)->text);
-    if(base == 0) { perr(p, "unsupported top-level type"); while(pk(p)->k!=TK_EOF && !is_punct(p,";")) adv(p); eat_punct(p,";"); return; }
+    int mt = type_mat(pk(p)->text);
+    int sp = type_sampler(pk(p)->text);
+    if(base == 0 && mt == 0 && sp == 0) { perr(p, "unsupported top-level type"); while(pk(p)->k!=TK_EOF && !is_punct(p,";")) adv(p); eat_punct(p,";"); return; }
     adv(p);   /* type */
     for(;;) {
         tk* idt = pk(p);
         if(idt->k != TK_IDENT) { perr(p, "expected identifier"); break; }
         adv(p);
-        if(qual >= 0) iface_add(sh, idt->text, qual, base);
+        if(qual >= 0) iface_add(sh, idt->text, qual, base, mt, sp);
         if(eat_punct(p,"=")) { glsl_ex* e = parse_expr(p); (void)e; }   /* const init: parsed, unused */
         if(eat_punct(p,",")) continue;
         break;
@@ -638,6 +661,20 @@ const char* glsl_var_name(glsl_shader* s, int kind, int i) {
         if(s->iface[j].kind == kind) { if(c == i) return s->iface[j].name; c++; }
     return NULL;
 }
+int glsl_var_mat(glsl_shader* s, int kind, int i) {
+    if(s == NULL) return 0;
+    int c = 0;
+    for(int j = 0; j < s->niface; ++j)
+        if(s->iface[j].kind == kind) { if(c == i) return s->iface[j].mat; c++; }
+    return 0;
+}
+int glsl_var_sampler(glsl_shader* s, int kind, int i) {
+    if(s == NULL) return 0;
+    int c = 0;
+    for(int j = 0; j < s->niface; ++j)
+        if(s->iface[j].kind == kind) { if(c == i) return s->iface[j].samp; c++; }
+    return 0;
+}
 
 /* ------------------------------------------------------------------ */
 /* Interpreter                                                         */
@@ -647,11 +684,19 @@ typedef struct { char name[64]; glsl_val v; } local_t;
 typedef struct {
     glsl_shader* sh;
     void* ud; glsl_getvar_fn getv; glsl_setvar_fn setv;
+    glsl_sample_fn sample;
     local_t locals[96]; int nlocals;
     int discarded, returned;
 } run_t;
 
-static glsl_val vzero(int n) { glsl_val v; v.n = n; v.c[0]=v.c[1]=v.c[2]=v.c[3]=0.0f; return v; }
+static glsl_val vzero(int n) { glsl_val v; memset(&v, 0, sizeof(v)); v.n = n; return v; }
+/* Identity matN (column-major). */
+static glsl_val videntity(int dim) {
+    glsl_val v = vzero(dim);
+    v.mat = dim;
+    for(int i = 0; i < dim; ++i) v.m[i * dim + i] = 1.0f;
+    return v;
+}
 static int vtruthy(const glsl_val* v) { return (v->n >= 1) ? (v->c[0] != 0.0f) : 0; }
 
 static local_t* find_local(run_t* r, const char* name) {
@@ -690,6 +735,48 @@ static void   exec_st(run_t* r, glsl_st* s);
 
 static glsl_val do_ctor(glsl_ex* e, run_t* r) {
     int target = e->ncomp;
+    /* matN constructors: identity (no args), scalar diagonal, matrix copy
+     * (same or larger source -> upper-left submatrix), or column-major fill
+     * from flattened scalar/vector arguments (GLSL ES 1.00 rules). */
+    if(e->mat >= 2 && e->mat <= 4) {
+        int dim = e->mat;
+        glsl_val out = vzero(dim);
+        out.mat = dim;
+        if(e->nargs == 0) {
+            for(int i = 0; i < dim; ++i) out.m[i * dim + i] = 1.0f;
+            return out;
+        }
+        if(e->nargs == 1) {
+            glsl_val a = eval_ex(r, e->args[0]);
+            if(a.mat >= 2) {
+                int src = a.mat;
+                int cp = dim < src ? dim : src;
+                for(int col = 0; col < cp; ++col)
+                    for(int row = 0; row < cp; ++row)
+                        out.m[col * dim + row] = a.m[col * src + row];
+                return out;
+            }
+            if(a.n == 1) {
+                for(int i = 0; i < dim; ++i) out.m[i * dim + i] = a.c[0];
+                return out;
+            }
+            /* single vector shorter than dim*dim: fill leading elements */
+            for(int i = 0; i < dim * dim && i < a.n; ++i) out.m[i] = a.c[i];
+            return out;
+        }
+        int fill = 0;
+        for(int i = 0; i < e->nargs && fill < dim * dim; ++i) {
+            glsl_val a = eval_ex(r, e->args[i]);
+            if(a.mat >= 2) {
+                for(int j = 0; j < a.mat * a.mat && fill < dim * dim; ++j)
+                    out.m[fill++] = a.m[j];
+            } else {
+                for(int j = 0; j < a.n && fill < dim * dim; ++j)
+                    out.m[fill++] = a.c[j];
+            }
+        }
+        return out;
+    }
     glsl_val out = vzero(target);
     /* Single scalar argument broadcasts to all components (GLSL rule). */
     if(e->nargs == 1) {
@@ -711,7 +798,7 @@ static float fmax2(float a, float b){ return a>b?a:b; }
 
 /* Apply a scalar unary math builtin to every component. */
 static glsl_val map1(const glsl_val* a, int fn) {
-    glsl_val r; r.n = a->n;
+    glsl_val r = vzero(a->n);
     for(int i=0;i<a->n;++i) {
         float x = a->c[i], y = 0;
         switch(fn) {
@@ -743,7 +830,7 @@ static glsl_val map1(const glsl_val* a, int fn) {
 
 /* Component-wise binary with scalar broadcast (min/max/mod/pow/mix/step/...). */
 static glsl_val map2(const glsl_val* a, const glsl_val* b, int fn) {
-    glsl_val r; r.n = (a->n > b->n) ? a->n : b->n;
+    glsl_val r = vzero((a->n > b->n) ? a->n : b->n);
     for(int i=0;i<r.n;++i) {
         float x = comp(a,i), y = comp(b,i), z = 0;
         switch(fn) {
@@ -772,7 +859,22 @@ static glsl_val eval_call(run_t* r, glsl_ex* e) {
     glsl_val A[4]; int na = e->nargs < 4 ? e->nargs : 4;
     for(int i=0;i<na;++i) A[i] = eval_ex(r, e->args[i]);
 
-    if(!strcmp(fn,"texture2D")||!strcmp(fn,"texture")) { glsl_val t = vzero(4); t.c[3]=1.0f; return t; }
+    if(!strcmp(fn,"texture2D")||!strcmp(fn,"texture")) {
+        /* Real sampling when the GL layer supplied a callback: A[0] is the
+         * sampler (c[0] = texture unit), A[1] the (s,t) coordinate. Without a
+         * callback keep the historical opaque-black stub. */
+        if(r->sample != NULL && na >= 2) {
+            glsl_val out = vzero(4);
+            if(r->sample(r->ud, (int)comp(&A[0],0), comp(&A[1],0), comp(&A[1],1), &out))
+                return out;
+        }
+        glsl_val t = vzero(4); t.c[3]=1.0f; return t;
+    }
+    if(!strcmp(fn,"matrixCompMult") && na >= 2 && A[0].mat >= 2 && A[0].mat == A[1].mat) {
+        glsl_val r = vzero(A[0].mat); r.mat = A[0].mat;
+        for(int i = 0; i < r.mat * r.mat; ++i) r.m[i] = A[0].m[i] * A[1].m[i];
+        return r;
+    }
     if(!strcmp(fn,"float")) { glsl_val v = vzero(1); v.c[0] = na?comp(&A[0],0):0; return v; }
     if(!strcmp(fn,"int")||!strcmp(fn,"bool")) { glsl_val v = vzero(1); v.c[0] = na?(float)(int)comp(&A[0],0):0; return v; }
     if(na == 0) return vzero(1);
@@ -793,7 +895,7 @@ static glsl_val eval_call(run_t* r, glsl_ex* e) {
     if(!strcmp(fn,"step")) return map2(&A[0],&A[1],4);
 
     if(!strcmp(fn,"length"))   { glsl_val v=vzero(1); v.c[0]=vlen(&A[0]); return v; }
-    if(!strcmp(fn,"distance")) { glsl_val d; d.n=A[0].n; for(int i=0;i<d.n;++i) d.c[i]=comp(&A[0],i)-comp(&A[1],i); glsl_val v=vzero(1); v.c[0]=vlen(&d); return v; }
+    if(!strcmp(fn,"distance")) { glsl_val d = vzero(A[0].n); for(int i=0;i<d.n;++i) d.c[i]=comp(&A[0],i)-comp(&A[1],i); glsl_val v=vzero(1); v.c[0]=vlen(&d); return v; }
     if(!strcmp(fn,"dot"))      { glsl_val v=vzero(1); v.c[0]=vdot(&A[0],&A[1]); return v; }
     if(!strcmp(fn,"normalize")){ float L=vlen(&A[0]); glsl_val r=A[0]; if(L!=0) for(int i=0;i<r.n;++i) r.c[i]/=L; return r; }
     if(!strcmp(fn,"cross")) {
@@ -808,7 +910,7 @@ static glsl_val eval_call(run_t* r, glsl_ex* e) {
         return r;
     }
     if(!strcmp(fn,"mix")) {
-        glsl_val r; r.n=(A[0].n>A[1].n)?A[0].n:A[1].n;
+        glsl_val r = vzero((A[0].n>A[1].n)?A[0].n:A[1].n);
         for(int i=0;i<r.n;++i){ float x=comp(&A[0],i),y=comp(&A[1],i),a=comp(&A[2],i); r.c[i]=x*(1.0f-a)+y*a; }
         return r;
     }
@@ -818,7 +920,7 @@ static glsl_val eval_call(run_t* r, glsl_ex* e) {
         return r;
     }
     if(!strcmp(fn,"smoothstep")) {
-        glsl_val r; r.n=A[2].n;
+        glsl_val r = vzero(A[2].n);
         for(int i=0;i<r.n;++i){
             float e0=comp(&A[0],i),e1=comp(&A[1],i),x=comp(&A[2],i);
             float denom=(e1-e0); float t=(denom!=0)?(x-e0)/denom:0.0f;
@@ -830,10 +932,94 @@ static glsl_val eval_call(run_t* r, glsl_ex* e) {
     return vzero(A[0].n);
 }
 
+/* Matrix algebra helpers (column-major: element(row,col) = m[col*dim+row]). */
+static glsl_val mat_mul_vec(const glsl_val* m, const glsl_val* v) {
+    int dim = m->mat;
+    glsl_val r = vzero(dim);
+    for(int row = 0; row < dim; ++row) {
+        float s = 0;
+        for(int k = 0; k < dim; ++k) s += m->m[k * dim + row] * comp(v, k);
+        r.c[row] = s;
+    }
+    return r;
+}
+static glsl_val vec_mul_mat(const glsl_val* v, const glsl_val* m) {
+    int dim = m->mat;
+    glsl_val r = vzero(dim);
+    for(int col = 0; col < dim; ++col) {
+        float s = 0;
+        for(int k = 0; k < dim; ++k) s += comp(v, k) * m->m[col * dim + k];
+        r.c[col] = s;
+    }
+    return r;
+}
+static glsl_val mat_mul_mat(const glsl_val* a, const glsl_val* b) {
+    int dim = a->mat;   /* caller guarantees matching dimensions */
+    glsl_val r = vzero(dim);
+    r.mat = dim;
+    for(int col = 0; col < dim; ++col)
+        for(int row = 0; row < dim; ++row) {
+            float s = 0;
+            for(int k = 0; k < dim; ++k)
+                s += a->m[k * dim + row] * b->m[col * dim + k];
+            r.m[col * dim + row] = s;
+        }
+    return r;
+}
+/* Component-wise op of a matrix with a scalar or another same-dim matrix. */
+static glsl_val mat_compwise(int op, const glsl_val* a, const glsl_val* b) {
+    int dim = a->mat, ne = dim * dim;
+    glsl_val r = vzero(dim);
+    r.mat = dim;
+    int bmat = (b->mat == dim);
+    for(int i = 0; i < ne; ++i) {
+        float x = a->m[i], y = bmat ? b->m[i] : comp(b, 0), z = 0;
+        if(op==OP_ADD) z=x+y;
+        else if(op==OP_SUB) z=x-y;
+        else if(op==OP_MUL) z=x*y;
+        else z = (y!=0)? x/y : (x!=0? (x>0?INFINITY:-INFINITY):0.0f);
+        r.m[i] = z;
+    }
+    return r;
+}
+
 static glsl_val do_binop(int op, glsl_val a, glsl_val b) {
+    /* GLSL matrix rules: mat*vec / vec*mat / mat*mat are linear algebra;
+     * mat+mat, mat+-scalar, mat*scalar, mat/scalar are component-wise. */
+    if(a.mat >= 2 || b.mat >= 2) {
+        if(op == OP_MUL) {
+            if(a.mat >= 2 && b.mat == 0 && b.n == a.mat) return mat_mul_vec(&a, &b);
+            if(a.mat == 0 && b.mat >= 2 && a.n == b.mat) return vec_mul_mat(&a, &b);
+            if(a.mat >= 2 && a.mat == b.mat) return mat_mul_mat(&a, &b);
+            if(a.mat >= 2 && b.mat == 0 && b.n == 1) return mat_compwise(OP_MUL, &a, &b);
+            if(b.mat >= 2 && a.mat == 0 && a.n == 1) {
+                /* scalar * mat: component-wise, commute */
+                return mat_compwise(OP_MUL, &b, &a);
+            }
+        }
+        if(a.mat >= 2 && (op==OP_ADD || op==OP_SUB || op==OP_DIV) &&
+           (b.mat == a.mat || (b.mat == 0 && b.n == 1)))
+            return mat_compwise(op, &a, &b);
+        if(b.mat >= 2 && (op==OP_ADD || op==OP_SUB) && a.mat == 0 && a.n == 1) {
+            /* scalar + mat is component-wise; scalar - mat too */
+            glsl_val am = vzero(b.mat); am.mat = b.mat;
+            for(int i = 0; i < b.mat * b.mat; ++i) am.m[i] = a.c[0];
+            return mat_compwise(op, &am, &b);
+        }
+        if(op == OP_EQ || op == OP_NE) {
+            int eq = (a.mat == b.mat);
+            if(eq) for(int i = 0; i < a.mat * a.mat; ++i)
+                if(a.m[i] != b.m[i]) { eq = 0; break; }
+            glsl_val r = vzero(1);
+            r.c[0] = (op==OP_EQ) ? (eq?1.0f:0.0f) : (eq?0.0f:1.0f);
+            return r;
+        }
+        /* Unsupported matrix combination: zero scalar (never crash). */
+        return vzero(1);
+    }
     switch(op) {
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: {
-            glsl_val r; r.n = (a.n>b.n)?a.n:b.n;
+            glsl_val r = vzero((a.n>b.n)?a.n:b.n);
             for(int i=0;i<r.n;++i){
                 float x=comp(&a,i), y=comp(&b,i), z=0;
                 if(op==OP_ADD) z=x+y;
@@ -898,7 +1084,7 @@ static glsl_val eval_ex(run_t* r, glsl_ex* e) {
         case EXK_CALL: return eval_call(r, e);
         case EXK_SWIZ: {
             glsl_val base = eval_ex(r, e->a);
-            glsl_val out; out.n = e->ncomp;
+            glsl_val out = vzero(e->ncomp);
             for(int i=0;i<e->ncomp;++i) out.c[i] = comp(&base, e->swiz[i]);
             return out;
         }
@@ -906,7 +1092,9 @@ static glsl_val eval_ex(run_t* r, glsl_ex* e) {
             glsl_val a = eval_ex(r, e->a);
             if(e->op==UN_NOT){ glsl_val r2=vzero(1); r2.c[0]=vtruthy(&a)?0.0f:1.0f; return r2; }
             if(e->op==UN_POS) return a;
-            glsl_val r2=a; for(int i=0;i<a.n;++i) r2.c[i]=-a.c[i]; return r2;
+            glsl_val r2=a;
+            if(a.mat >= 2) { for(int i=0;i<a.mat*a.mat;++i) r2.m[i]=-a.m[i]; return r2; }
+            for(int i=0;i<a.n;++i) r2.c[i]=-a.c[i]; return r2;
         }
         case EXK_BIN: {
             glsl_val a = eval_ex(r, e->a);
@@ -947,8 +1135,11 @@ static void exec_st(run_t* r, glsl_st* s) {
     switch(s->k) {
         case STK_BLOCK: exec_block(r, s); return;
         case STK_DECL: {
-            glsl_val v = s->init ? eval_ex(r, s->init) : vzero(s->type ? s->type : 1);
-            if(!s->init) v.n = s->type ? s->type : 1;
+            glsl_val v;
+            if(s->init) v = eval_ex(r, s->init);
+            else if(s->mat >= 2) v = videntity(s->mat);
+            else v = vzero(s->type ? s->type : 1);
+            if(!s->init && s->mat == 0) v.n = s->type ? s->type : 1;
             set_local(r, s->name ? s->name : "", &v);
             return;
         }
@@ -996,9 +1187,14 @@ static void exec_st(run_t* r, glsl_st* s) {
 }
 
 int glsl_run(glsl_shader* s, void* ud, glsl_getvar_fn getv, glsl_setvar_fn setv) {
+    return glsl_run_ex(s, ud, getv, setv, NULL);
+}
+
+int glsl_run_ex(glsl_shader* s, void* ud, glsl_getvar_fn getv, glsl_setvar_fn setv,
+                glsl_sample_fn sample) {
     if(s == NULL || s->main_body == NULL) return 1;
     run_t r; memset(&r, 0, sizeof(r));
-    r.sh = s; r.ud = ud; r.getv = getv; r.setv = setv;
+    r.sh = s; r.ud = ud; r.getv = getv; r.setv = setv; r.sample = sample;
     exec_block(&r, s->main_body);
     return r.discarded ? 0 : 1;
 }

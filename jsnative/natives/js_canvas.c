@@ -4034,7 +4034,7 @@ static var_t* js_el_getContext(vm_t* vm, var_t* env, void* data) {
     if(webgl) {
         if(st->cb.set_pixel == NULL) return var_new_null(vm);
         return js_webgl_create_context(vm, w, h, st->ctx, canvas,
-                                       (webgl_set_pixel_fn)st->cb.set_pixel, t);
+                                       (webgl_set_pixel_fn)st->cb.set_pixel, t, &st->cb);
     }
 
     js_canvas_ctx* cv = ctx_for_canvas(st, canvas, w, h);
@@ -4237,6 +4237,9 @@ bool js_register_canvas_natives(vm_t* vm, void* ctx, const js_canvas_callbacks_t
      * created; registered with data = bridge so state_any() recovers st. */
     var_t* el_cls = var_find_own_member_var(vm->root, CLS_ELEMENT);
     if(el_cls != NULL) {
+        /* Tag the prototype so image-source resolution (cv_resolve_image /
+         * WebGL texImage2D) can recognise Element instances by class name. */
+        tag_class(vm, el_cls, CLS_ELEMENT);
         vm_reg_native(vm, el_cls, "getContext(type)", js_el_getContext, bridge);
         vm_reg_native(vm, el_cls, "toDataURL(type, quality)", js_el_toDataURL, bridge);
         reg_accessor(vm, el_cls, "width",  js_el_get_width,  NULL);

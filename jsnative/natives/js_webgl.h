@@ -44,22 +44,31 @@ extern "C" {
  * through this so toDataURL()/compositing see the rendered result. */
 typedef void (*webgl_set_pixel_fn)(void* ctx, void* canvas, int x, int y, uint32_t color);
 
+/* Forward declaration (full definition in js_canvas.h): the canvas callback
+ * table is handed to the GL context so texImage2D can resolve <img>/canvas/
+ * ImageData sources through the SAME embedder pixel path the 2D bridge uses. */
+struct js_canvas_callbacks;
+
 /* Build and pin the WebGL classes (WebGLRenderingContext, WebGLBuffer,
- * WebGLShader, WebGLProgram, WebGLUniformLocation, WebGLActiveInfo) on vm,
- * registering every native method, accessor and numeric constant. Idempotent:
- * safe to call more than once (only the first call registers). Must run AFTER
- * vm_init() and BEFORE any getContext('webgl'). Returns true on success. */
+ * WebGLShader, WebGLProgram, WebGLUniformLocation, WebGLActiveInfo,
+ * WebGLTexture) on vm, registering every native method, accessor and numeric
+ * constant. Idempotent: safe to call more than once (only the first call
+ * registers). Must run AFTER vm_init() and BEFORE any getContext('webgl').
+ * Returns true on success. */
 bool js_webgl_register(vm_t* vm);
 
 /* Create a WebGLRenderingContext bound to a w x h framebuffer that flushes into
  * `canvas` (the embedder handle from canvas_create) via `setpx`. `embed_ctx` is
  * passed verbatim to setpx. `canvas_el` (may be NULL) is the <canvas> Element
- * var returned by gl.canvas; it is ref'd for the context's lifetime. Returns the
- * context object, or var_new_null(vm) if allocation failed. */
+ * var returned by gl.canvas; it is ref'd for the context's lifetime. `cb` (may
+ * be NULL) is the canvas callback table copied by value; texImage2D uses its
+ * bitmap_from_element / bitmap_dims / bitmap_data / get_pixel entries to read
+ * image sources. Returns the context object, or var_new_null(vm) on failure. */
 var_t* js_webgl_create_context(vm_t* vm, int w, int h,
                                void* embed_ctx, void* canvas,
                                webgl_set_pixel_fn setpx,
-                               var_t* canvas_el);
+                               var_t* canvas_el,
+                               const struct js_canvas_callbacks* cb);
 
 #ifdef __cplusplus
 }

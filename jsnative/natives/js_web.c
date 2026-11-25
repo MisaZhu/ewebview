@@ -402,15 +402,29 @@ static void uri_append_escaped(mstr_t* out, unsigned char c) {
     mstr_add(out, hex[c & 0xF]);
 }
 
+/* ToString arg 0 into `s` unconditionally: js_arg_cstr would return a
+ * V_STRING's internal buffer and leave `s` empty, so the byte-length walk
+ * below must read the coerced copy (same shape as the CLI's uri_arg_cstr). */
+static const char* uri_arg_cstr(var_t* env, mstr_t* s) {
+    var_t* arg = js_arg(env, 0);
+    if(arg != NULL)
+        var_to_str(arg, s);
+    return s->cstr;
+}
+
 static var_t* uri_encode(vm_t* vm, var_t* env, bool component) {
     mstr_t* s = mstr_new("");
-    const char* str = js_arg_cstr(env, 0, s);
+    const char* str = uri_arg_cstr(env, s);
     mstr_t* out = mstr_new("");
-    for(const unsigned char* p = (const unsigned char*)str; *p != 0; ++p) {
-        if(uri_unreserved(*p) || (!component && uri_reserved(*p)))
-            mstr_add(out, (char)*p);
+    /* Walk the stored byte length: an embedded U+0000 must encode to %00,
+     * not terminate the scan (strlen semantics would drop the tail). */
+    uint32_t sn = s->len, si;
+    for(si = 0; si < sn; ++si) {
+        unsigned char c = (unsigned char)str[si];
+        if(uri_unreserved(c) || (!component && uri_reserved(c)))
+            mstr_add(out, (char)c);
         else
-            uri_append_escaped(out, *p);
+            uri_append_escaped(out, c);
     }
     mstr_free(s);
     var_t* r = var_new_str(vm, out->cstr);
@@ -430,7 +444,7 @@ static int hex_val(char c) {
 
 static var_t* uri_decode(vm_t* vm, var_t* env, bool component) {
     mstr_t* s = mstr_new("");
-    const char* str = js_arg_cstr(env, 0, s);
+    const char* str = uri_arg_cstr(env, s);
     mstr_t* out = mstr_new("");
     for(const char* p = str; *p != 0; ) {
         if(p[0] == '%' && hex_val(p[1]) >= 0 && hex_val(p[2]) >= 0) {
@@ -452,7 +466,10 @@ static var_t* uri_decode(vm_t* vm, var_t* env, bool component) {
         }
     }
     mstr_free(s);
-    var_t* r = var_new_str(vm, out->cstr);
+    /* NUL-safe: %00 decodes to a real U+0000 code unit; the strlen-bounded
+     * var_new_str would cut the result there (mapTracker's decoder finishes
+     * its byte strings through decodeURIComponent). */
+    var_t* r = var_new_str_bin(vm, out->cstr, out->len);
     mstr_free(out);
     return r;
 }
