@@ -50,7 +50,20 @@ endif
 endif
 
 SRC = $(CORE_SRC) $(WASI_SRC) $(JIT_SRC)
-OBJ = $(SRC:src/%.c=$(ARCH)/src/%.o)
+
+# Objects are namespaced by $(ARCH) AND OS_TYPE, exactly like the fix below
+# for the old flat build/ dir.  ARCH alone is not enough on an aarch64 Linux
+# host: a host build (Ubuntu gcc, default -fstack-protector-strong +
+# _FORTIFY_SOURCE) and the ewokos cross build (aarch64-none-elf-gcc) would
+# share aarch64/src/*.o, so host objects got archived into the target
+# libeasm.a and ld failed on glibc-only symbols (__stack_chk_guard,
+# __fprintf_chk, __snprintf_chk, ...).
+ifeq ($(OS_TYPE),ewokos)
+OBJ_DIR = $(ARCH)/ewokos
+else
+OBJ_DIR = $(ARCH)/host
+endif
+OBJ = $(SRC:src/%.c=$(OBJ_DIR)/src/%.o)
 
 all: $(TARGET)
 
@@ -60,7 +73,7 @@ all: $(TARGET)
 # objects: an x86 build's build/*.o were archived into the aarch64 libeasm.a
 # (make saw them newer than the .c and skipped recompiling), which the aarch64
 # ld then rejected with "skipping incompatible ... when searching for -leasm".
-$(ARCH)/%.o: %.c src/easm.h src/opcodes.h src/a64_emit.h
+$(OBJ_DIR)/%.o: %.c src/easm.h src/opcodes.h src/a64_emit.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
